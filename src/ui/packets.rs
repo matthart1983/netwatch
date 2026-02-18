@@ -132,7 +132,12 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 expert_row_style(pkt.expert)
             };
 
-            let (expert_icon, expert_style) = expert_indicator(pkt.expert);
+            let is_bookmarked = app.bookmarks.contains(&pkt.id);
+            let (expert_icon, expert_style) = if is_bookmarked {
+                ("★", Style::default().fg(Color::Yellow).bold())
+            } else {
+                expert_indicator(pkt.expert)
+            };
 
             // Use stored hostname, or try live cache lookup for late-resolved IPs
             let src_resolved = pkt.src_host.clone()
@@ -195,10 +200,16 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
     )
     .header(header)
     .block({
-        let title = if filter_expr.is_some() {
-            format!(" Packets ({total} / {total_all}) ")
+        let bm_count = app.bookmarks.len();
+        let bm_label = if bm_count > 0 {
+            format!(" ★{bm_count}")
         } else {
-            format!(" Packets ({total_all}) ")
+            String::new()
+        };
+        let title = if filter_expr.is_some() {
+            format!(" Packets ({total} / {total_all}){bm_label} ")
+        } else {
+            format!(" Packets ({total_all}){bm_label} ")
         };
         Block::default()
             .title(title)
@@ -257,6 +268,29 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 }
             }
 
+            // Whois info lines (on-demand)
+            let mut whois_lines: Vec<Line> = Vec::new();
+            for (label, ip) in [("Src", &pkt.src_ip), ("Dst", &pkt.dst_ip)] {
+                if let Some(whois) = app.whois_cache.lookup(ip) {
+                    let mut parts = Vec::new();
+                    if !whois.net_name.is_empty() { parts.push(whois.net_name.clone()); }
+                    if !whois.org.is_empty() { parts.push(whois.org.clone()); }
+                    if !whois.net_range.is_empty() { parts.push(whois.net_range.clone()); }
+                    if !whois.country.is_empty() { parts.push(whois.country.clone()); }
+                    let summary = parts.join(" │ ");
+                    whois_lines.push(Line::from(Span::styled(
+                        format!("  Whois {label}: {summary}"),
+                        Style::default().fg(Color::LightMagenta),
+                    )));
+                    if !whois.description.is_empty() {
+                        whois_lines.push(Line::from(Span::styled(
+                            format!("         {}", whois.description),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+
             // Protocol detail lines with color per layer
             let mut detail_lines: Vec<Line> = pkt.details.iter().map(|line| {
                 let color = if line.starts_with("Frame:") {
@@ -275,6 +309,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 Line::from(Span::styled(format!("  {line}"), Style::default().fg(color)))
             }).collect();
             detail_lines.extend(geo_lines);
+            detail_lines.extend(whois_lines);
 
             let proto_detail = Paragraph::new(detail_lines)
                 .block(
@@ -592,8 +627,20 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(":Save  "),
             Span::styled("f", Style::default().fg(Color::Yellow).bold()),
             Span::raw(":Follow  "),
+            Span::styled("m", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Bookmark  "),
+            Span::styled("n/N", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Next/Prev  "),
+            Span::styled("W", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Whois  "),
+            Span::styled("p", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Pause  "),
+            Span::styled("r", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Refresh  "),
             Span::styled("1-5", Style::default().fg(Color::Yellow).bold()),
             Span::raw(":Tab  "),
+            Span::styled("g", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Geo  "),
             Span::styled("?", Style::default().fg(Color::Yellow).bold()),
             Span::raw(":Help"),
             follow_indicator,

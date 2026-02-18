@@ -1,6 +1,7 @@
 use crate::collectors::config::ConfigCollector;
 use crate::collectors::connections::{Connection, ConnectionCollector};
 use crate::collectors::geo::GeoCache;
+use crate::collectors::whois::WhoisCache;
 use crate::collectors::health::HealthProber;
 use crate::collectors::packets::PacketCollector;
 use crate::collectors::traffic::TrafficCollector;
@@ -9,6 +10,7 @@ use crate::platform::{self, InterfaceInfo};
 use crate::ui;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
+use std::collections::HashSet;
 use ratatui::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,8 @@ pub struct App {
     pub help_scroll: usize,
     pub geo_cache: GeoCache,
     pub show_geo: bool,
+    pub whois_cache: WhoisCache,
+    pub bookmarks: HashSet<u64>,
     info_tick: u32,
     conn_tick: u32,
     health_tick: u32,
@@ -110,6 +114,8 @@ impl App {
             help_scroll: 0,
             geo_cache: GeoCache::new(),
             show_geo: true,
+            whois_cache: WhoisCache::new(),
+            bookmarks: HashSet::new(),
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
@@ -416,6 +422,38 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     app.packet_collector.clear();
                     app.packet_scroll = 0;
                     app.packet_selected = None;
+                    app.bookmarks.clear();
+                }
+                KeyCode::Char('m') if app.current_tab == Tab::Packets && !app.stream_view_open => {
+                    if let Some(sel_id) = app.packet_selected {
+                        if !app.bookmarks.remove(&sel_id) {
+                            app.bookmarks.insert(sel_id);
+                        }
+                    }
+                }
+                KeyCode::Char('n') if app.current_tab == Tab::Packets && !app.stream_view_open => {
+                    // Jump to next bookmark after current selection
+                    let packets = app.packet_collector.get_packets();
+                    let current_id = app.packet_selected.unwrap_or(0);
+                    if let Some((idx, pkt)) = packets.iter().enumerate()
+                        .find(|(_, p)| p.id > current_id && app.bookmarks.contains(&p.id))
+                    {
+                        app.packet_selected = Some(pkt.id);
+                        app.packet_scroll = idx;
+                        app.packet_follow = false;
+                    }
+                }
+                KeyCode::Char('N') if app.current_tab == Tab::Packets && !app.stream_view_open => {
+                    // Jump to previous bookmark before current selection
+                    let packets = app.packet_collector.get_packets();
+                    let current_id = app.packet_selected.unwrap_or(u64::MAX);
+                    if let Some((idx, pkt)) = packets.iter().enumerate().rev()
+                        .find(|(_, p)| p.id < current_id && app.bookmarks.contains(&p.id))
+                    {
+                        app.packet_selected = Some(pkt.id);
+                        app.packet_scroll = idx;
+                        app.packet_follow = false;
+                    }
                 }
                 KeyCode::Char('f') if app.current_tab == Tab::Packets => {
                     app.packet_follow = !app.packet_follow;
@@ -444,6 +482,35 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                         }
                     }
                     app.export_status_tick = 0;
+                }
+                KeyCode::Char('W') if app.current_tab == Tab::Packets && !app.stream_view_open => {
+                    // Trigger whois lookup for selected packet's IPs
+                    if let Some(sel_id) = app.packet_selected {
+                        let packets = app.packet_collector.get_packets();
+                        if let Some(pkt) = packets.iter().find(|p| p.id == sel_id) {
+                            app.whois_cache.request(&pkt.src_ip);
+                            app.whois_cache.request(&pkt.dst_ip);
+                        }
+                    }
+                }
+                KeyCode::Char('W') if app.current_tab == Tab::Connections => {
+                    // Trigger whois lookup for selected connection's remote IP
+                    let mut conns = app.connection_collector.connections.clone();
+                    match app.sort_column {
+                        0 => conns.sort_by(|a, b| a.process_name.as_deref().unwrap_or("").cmp(b.process_name.as_deref().unwrap_or(""))),
+                        1 => conns.sort_by(|a, b| a.pid.cmp(&b.pid)),
+                        2 => conns.sort_by(|a, b| a.protocol.cmp(&b.protocol)),
+                        3 => conns.sort_by(|a, b| a.state.cmp(&b.state)),
+                        4 => conns.sort_by(|a, b| a.local_addr.cmp(&b.local_addr)),
+                        5 => conns.sort_by(|a, b| a.remote_addr.cmp(&b.remote_addr)),
+                        _ => {}
+                    }
+                    if let Some(conn) = conns.get(app.connection_scroll) {
+                        let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
+                        if let Some(ip) = remote_ip {
+                            app.whois_cache.request(&ip);
+                        }
+                    }
                 }
                 KeyCode::Char('s') => {
                     if app.current_tab == Tab::Connections {
