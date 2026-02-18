@@ -46,7 +46,7 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         if app.sort_column == col { " ▼" } else { "" }
     };
 
-    let header = Row::new(vec![
+    let mut header_cells = vec![
         Cell::from(format!("Process{}", sort_indicator(0)))
             .style(Style::default().fg(Color::Cyan).bold()),
         Cell::from(format!("PID{}", sort_indicator(1)))
@@ -59,8 +59,14 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::Cyan).bold()),
         Cell::from(format!("Remote Address{}", sort_indicator(5)))
             .style(Style::default().fg(Color::Cyan).bold()),
-    ])
-    .height(1);
+    ];
+    if app.show_geo {
+        header_cells.push(
+            Cell::from("Location")
+                .style(Style::default().fg(Color::Cyan).bold()),
+        );
+    }
+    let header = Row::new(header_cells).height(1);
 
     let mut conns = app.connection_collector.connections.clone();
     match app.sort_column {
@@ -99,7 +105,7 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
                 Style::default()
             };
 
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(conn.process_name.as_deref().unwrap_or("—").to_string()),
                 Cell::from(
                     conn.pid
@@ -110,22 +116,37 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(conn.state.clone()).style(state_style),
                 Cell::from(conn.local_addr.clone()),
                 Cell::from(conn.remote_addr.clone()),
-            ])
-            .style(row_style)
+            ];
+            if app.show_geo {
+                let remote_ip = extract_ip(&conn.remote_addr);
+                let geo_label = remote_ip
+                    .and_then(|ip| app.geo_cache.lookup(ip))
+                    .map(|g| {
+                        if g.city.is_empty() {
+                            format!("{} {}", g.country_code, g.org)
+                        } else {
+                            format!("{} {}, {}", g.country_code, g.city, g.org)
+                        }
+                    })
+                    .unwrap_or_default();
+                cells.push(Cell::from(geo_label).style(Style::default().fg(Color::DarkGray)));
+            }
+            Row::new(cells).style(row_style)
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(16),
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(14),
-            Constraint::Length(24),
-            Constraint::Min(24),
-        ],
-    )
+    let mut widths: Vec<Constraint> = vec![
+        Constraint::Length(16),
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(14),
+        Constraint::Length(22),
+        Constraint::Length(22),
+    ];
+    if app.show_geo {
+        widths.push(Constraint::Min(20));
+    }
+    let table = Table::new(rows, widths)
     .header(header)
     .block(
         Block::default()
@@ -155,6 +176,8 @@ fn render_footer(f: &mut Frame, area: Rect) {
         Span::raw(":Tab  "),
         Span::styled("p", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Pause  "),
+        Span::styled("g", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":Geo  "),
         Span::styled("?", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Help"),
     ]))
@@ -164,4 +187,18 @@ fn render_footer(f: &mut Frame, area: Rect) {
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     f.render_widget(footer, area);
+}
+
+fn extract_ip(addr: &str) -> Option<&str> {
+    if addr == "*:*" || addr.is_empty() {
+        return None;
+    }
+    if let Some(bracket_end) = addr.rfind("]:") {
+        Some(&addr[1..bracket_end])
+    } else if let Some(colon) = addr.rfind(':') {
+        let ip = &addr[..colon];
+        if ip == "*" { None } else { Some(ip) }
+    } else {
+        Some(addr)
+    }
 }

@@ -80,6 +80,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(key_line("p", "Pause/resume data collection"));
     lines.push(key_line("r", "Force refresh all data"));
     lines.push(key_line("?", "Toggle this help overlay"));
+    lines.push(key_line("g", "Toggle GeoIP location display"));
     lines.push(Line::raw(""));
 
     // DASHBOARD

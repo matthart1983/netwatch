@@ -457,6 +457,8 @@ fn render_footer(f: &mut Frame, area: Rect) {
         Span::raw(":Refresh  "),
         Span::styled("1-5", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Tab  "),
+        Span::styled("g", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":Geo  "),
         Span::styled("?", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Help"),
     ]))

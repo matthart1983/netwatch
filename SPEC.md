@@ -489,3 +489,4 @@ netwatch/
 | M13 | Connection → Packet Linking       | Press `Enter` on a connection in tab 2 to jump to Packets tab with a display filter auto-set matching that connection's protocol, remote IP, and port |
 | M14 | Capture Filters (BPF)             | Press `b` to set a BPF expression (e.g. `port 443`, `host 10.0.0.1`) applied via `pcap::set_filter()` before capture starts. Shown in header, editable when stopped |
 | M15 | Help Overlay                      | Press `?` for full-screen scrollable help popup with all keybindings by context, display filter syntax reference, expert info legend. Esc/?:close, ↑↓:scroll |
+| M16 | GeoIP Location                    | Background GeoIP lookup via ip-api.com for public IPs. Location column in Connections tab, Geo lines in packet detail. `g` key toggles on/off. Rate-limited, cached, skips private IPs |
