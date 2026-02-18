@@ -94,7 +94,7 @@ fn render_detail_table(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Red)
             };
 
-            let row_style = if i == app.selected_interface {
+            let row_style = if app.selected_interface == Some(i) {
                 Style::default().bg(Color::DarkGray)
             } else {
                 Style::default()
@@ -147,7 +147,7 @@ fn render_detail_table(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
-    let selected = app.traffic.interfaces.get(app.selected_interface);
+    let selected = app.selected_interface.and_then(|i| app.traffic.interfaces.get(i));
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct InterfaceStats {
+    #[allow(dead_code)]
     pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,

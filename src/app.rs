@@ -1,5 +1,5 @@
 use crate::collectors::config::ConfigCollector;
-use crate::collectors::connections::ConnectionCollector;
+use crate::collectors::connections::{Connection, ConnectionCollector};
 use crate::collectors::health::HealthProber;
 use crate::collectors::packets::PacketCollector;
 use crate::collectors::traffic::TrafficCollector;
@@ -11,11 +11,19 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDirectionFilter {
+    Both,
+    AtoB,
+    BtoA,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
     Connections,
     Interfaces,
     Packets,
+    Stats,
 }
 
 pub struct App {
@@ -25,7 +33,7 @@ pub struct App {
     pub config_collector: ConfigCollector,
     pub health_prober: HealthProber,
     pub packet_collector: PacketCollector,
-    pub selected_interface: usize,
+    pub selected_interface: Option<usize>,
     pub paused: bool,
     pub current_tab: Tab,
     pub connection_scroll: usize,
@@ -34,6 +42,22 @@ pub struct App {
     pub packet_selected: Option<u64>,
     pub packet_follow: bool,
     pub capture_interface: String,
+    pub stream_view_open: bool,
+    pub stream_view_index: Option<u32>,
+    pub stream_scroll: usize,
+    pub stream_direction_filter: StreamDirectionFilter,
+    pub stream_hex_mode: bool,
+    pub packet_filter_input: bool,
+    pub packet_filter_text: String,
+    pub packet_filter_active: Option<String>,
+    pub export_status: Option<String>,
+    export_status_tick: u32,
+    pub bpf_filter_input: bool,
+    pub bpf_filter_text: String,
+    pub bpf_filter_active: Option<String>,
+    pub stats_scroll: usize,
+    pub show_help: bool,
+    pub help_scroll: usize,
     info_tick: u32,
     conn_tick: u32,
     health_tick: u32,
@@ -56,7 +80,7 @@ impl App {
             config_collector,
             health_prober: HealthProber::new(),
             packet_collector: PacketCollector::new(),
-            selected_interface: 0,
+            selected_interface: None,
             paused: false,
             current_tab: Tab::Dashboard,
             connection_scroll: 0,
@@ -65,6 +89,22 @@ impl App {
             packet_selected: None,
             packet_follow: true,
             capture_interface,
+            stream_view_open: false,
+            stream_view_index: None,
+            stream_scroll: 0,
+            stream_direction_filter: StreamDirectionFilter::Both,
+            stream_hex_mode: false,
+            packet_filter_input: false,
+            packet_filter_text: String::new(),
+            packet_filter_active: None,
+            export_status: None,
+            export_status_tick: 0,
+            bpf_filter_input: false,
+            bpf_filter_text: String::new(),
+            bpf_filter_active: None,
+            stats_scroll: 0,
+            show_help: false,
+            help_scroll: 0,
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
@@ -102,6 +142,15 @@ impl App {
     }
 
     fn tick(&mut self) {
+        // Clear export status after 5 ticks
+        if self.export_status.is_some() {
+            self.export_status_tick += 1;
+            if self.export_status_tick >= 5 {
+                self.export_status = None;
+                self.export_status_tick = 0;
+            }
+        }
+
         if self.paused {
             return;
         }
@@ -136,6 +185,48 @@ impl App {
     }
 }
 
+fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
+    if addr == "*:*" || addr.is_empty() {
+        return (None, None);
+    }
+    if let Some(bracket_end) = addr.rfind("]:") {
+        let ip = addr[1..bracket_end].to_string();
+        let port = addr[bracket_end + 2..].to_string();
+        (Some(ip), Some(port))
+    } else if let Some(colon) = addr.rfind(':') {
+        let ip = &addr[..colon];
+        let port = &addr[colon + 1..];
+        let ip = if ip == "*" { None } else { Some(ip.to_string()) };
+        let port = if port == "*" { None } else { Some(port.to_string()) };
+        (ip, port)
+    } else {
+        (Some(addr.to_string()), None)
+    }
+}
+
+fn build_connection_filter(conn: &Connection) -> String {
+    let (remote_ip, remote_port) = parse_addr_parts(&conn.remote_addr);
+
+    let mut parts = Vec::new();
+
+    let proto = conn.protocol.to_lowercase();
+    if proto == "tcp" || proto == "udp" {
+        parts.push(proto);
+    }
+
+    if let Some(ip) = remote_ip {
+        parts.push(ip);
+    }
+
+    if let Some(port) = remote_port {
+        if port.parse::<u16>().is_ok() {
+            parts.push(format!("port {port}"));
+        }
+    }
+
+    parts.join(" and ")
+}
+
 pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     let mut app = App::new();
     let mut events = EventHandler::new(1000);
@@ -156,11 +247,79 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 Tab::Connections => ui::connections::render(f, &app, area),
                 Tab::Interfaces => ui::interfaces::render(f, &app, area),
                 Tab::Packets => ui::packets::render(f, &app, area),
+                Tab::Stats => ui::stats::render(f, &app, area),
+            }
+            if app.show_help {
+                ui::help::render(f, &app, area);
             }
         })?;
 
         match events.next().await? {
-            AppEvent::Key(key) => match key.code {
+            AppEvent::Key(key) => {
+                // Help overlay — intercept keys first
+                if app.show_help {
+                    match key.code {
+                        KeyCode::Char('?') | KeyCode::Esc => {
+                            app.show_help = false;
+                            app.help_scroll = 0;
+                        }
+                        KeyCode::Up => {
+                            app.help_scroll = app.help_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            app.help_scroll += 1;
+                        }
+                        KeyCode::Char('q') => {
+                            app.packet_collector.stop_capture();
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                // Filter input mode — capture all keys
+                if app.packet_filter_input && app.current_tab == Tab::Packets {
+                    match key.code {
+                        KeyCode::Enter => {
+                            app.packet_filter_input = false;
+                            if app.packet_filter_text.trim().is_empty() {
+                                app.packet_filter_active = None;
+                            } else {
+                                app.packet_filter_active = Some(app.packet_filter_text.clone());
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.packet_filter_input = false;
+                            app.packet_filter_text = app.packet_filter_active.clone().unwrap_or_default();
+                        }
+                        KeyCode::Backspace => { app.packet_filter_text.pop(); }
+                        KeyCode::Char(c) => { app.packet_filter_text.push(c); }
+                        _ => {}
+                    }
+                    continue;
+                }
+                // BPF filter input mode — capture all keys
+                if app.bpf_filter_input && app.current_tab == Tab::Packets {
+                    match key.code {
+                        KeyCode::Enter => {
+                            app.bpf_filter_input = false;
+                            if app.bpf_filter_text.trim().is_empty() {
+                                app.bpf_filter_active = None;
+                            } else {
+                                app.bpf_filter_active = Some(app.bpf_filter_text.clone());
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.bpf_filter_input = false;
+                            app.bpf_filter_text = app.bpf_filter_active.clone().unwrap_or_default();
+                        }
+                        KeyCode::Backspace => { app.bpf_filter_text.pop(); }
+                        KeyCode::Char(c) => { app.bpf_filter_text.push(c); }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match key.code {
                 KeyCode::Char('q') => {
                     app.packet_collector.stop_capture();
                     return Ok(());
@@ -168,6 +327,10 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.packet_collector.stop_capture();
                     return Ok(());
+                }
+                KeyCode::Char('?') => {
+                    app.show_help = !app.show_help;
+                    app.help_scroll = 0;
                 }
                 KeyCode::Char('p') => app.paused = !app.paused,
                 KeyCode::Char('r') => {
@@ -186,13 +349,57 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 KeyCode::Char('2') => app.current_tab = Tab::Connections,
                 KeyCode::Char('3') => app.current_tab = Tab::Interfaces,
                 KeyCode::Char('4') => app.current_tab = Tab::Packets,
+                KeyCode::Char('5') => app.current_tab = Tab::Stats,
+                // Stream view controls (intercept before other Packets keys)
+                KeyCode::Esc if app.current_tab == Tab::Packets && app.stream_view_open => {
+                    app.stream_view_open = false;
+                    app.stream_view_index = None;
+                    app.stream_scroll = 0;
+                }
+                KeyCode::Char('h') if app.current_tab == Tab::Packets && app.stream_view_open => {
+                    app.stream_hex_mode = !app.stream_hex_mode;
+                }
+                KeyCode::Char('a') if app.current_tab == Tab::Packets && app.stream_view_open => {
+                    app.stream_direction_filter = StreamDirectionFilter::Both;
+                }
+                KeyCode::Right if app.current_tab == Tab::Packets && app.stream_view_open => {
+                    app.stream_direction_filter = StreamDirectionFilter::AtoB;
+                }
+                KeyCode::Left if app.current_tab == Tab::Packets && app.stream_view_open => {
+                    app.stream_direction_filter = StreamDirectionFilter::BtoA;
+                }
+                KeyCode::Up if app.current_tab == Tab::Packets && app.stream_view_open => {
+                    app.stream_scroll = app.stream_scroll.saturating_sub(1);
+                }
+                KeyCode::Down if app.current_tab == Tab::Packets && app.stream_view_open => {
+                    app.stream_scroll += 1;
+                }
+                KeyCode::Char('s') if app.current_tab == Tab::Packets && !app.stream_view_open => {
+                    if let Some(sel_id) = app.packet_selected {
+                        let packets = app.packet_collector.get_packets();
+                        if let Some(pkt) = packets.iter().find(|p| p.id == sel_id) {
+                            if pkt.stream_index.is_some() {
+                                app.stream_view_open = true;
+                                app.stream_view_index = pkt.stream_index;
+                                app.stream_scroll = 0;
+                                app.stream_direction_filter = StreamDirectionFilter::Both;
+                                app.stream_hex_mode = false;
+                            }
+                        }
+                    }
+                }
                 KeyCode::Char('c') if app.current_tab == Tab::Packets => {
                     if app.packet_collector.is_capturing() {
                         app.packet_collector.stop_capture();
                     } else {
                         let iface = app.capture_interface.clone();
-                        app.packet_collector.start_capture(&iface);
+                        let bpf = app.bpf_filter_active.as_deref();
+                        app.packet_collector.start_capture(&iface, bpf);
                     }
+                }
+                KeyCode::Char('b') if app.current_tab == Tab::Packets && !app.packet_collector.is_capturing() && !app.stream_view_open => {
+                    app.bpf_filter_input = true;
+                    app.bpf_filter_text = app.bpf_filter_active.clone().unwrap_or_default();
                 }
                 KeyCode::Char('i') if app.current_tab == Tab::Packets => {
                     if !app.packet_collector.is_capturing() {
@@ -207,9 +414,55 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 KeyCode::Char('f') if app.current_tab == Tab::Packets => {
                     app.packet_follow = !app.packet_follow;
                 }
+                KeyCode::Char('w') if app.current_tab == Tab::Packets => {
+                    use crate::collectors::packets::{export_pcap, parse_filter, matches_packet};
+                    let packets = app.packet_collector.get_packets();
+                    let to_export: Vec<_> = if let Some(ref ft) = app.packet_filter_active {
+                        if let Some(expr) = parse_filter(ft) {
+                            packets.iter().filter(|p| matches_packet(&expr, p)).cloned().collect()
+                        } else {
+                            packets
+                        }
+                    } else {
+                        packets
+                    };
+                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    let path = format!("{home}/netwatch_capture_{ts}.pcap");
+                    match export_pcap(&to_export, &path) {
+                        Ok(n) => {
+                            app.export_status = Some(format!("Saved {n} packets to {path}"));
+                        }
+                        Err(e) => {
+                            app.export_status = Some(format!("Export failed: {e}"));
+                        }
+                    }
+                    app.export_status_tick = 0;
+                }
                 KeyCode::Char('s') => {
                     if app.current_tab == Tab::Connections {
                         app.sort_column = (app.sort_column + 1) % 6;
+                    }
+                }
+                KeyCode::Enter if app.current_tab == Tab::Connections => {
+                    let mut conns = app.connection_collector.connections.clone();
+                    match app.sort_column {
+                        0 => conns.sort_by(|a, b| a.process_name.as_deref().unwrap_or("").cmp(b.process_name.as_deref().unwrap_or(""))),
+                        1 => conns.sort_by(|a, b| a.pid.cmp(&b.pid)),
+                        2 => conns.sort_by(|a, b| a.protocol.cmp(&b.protocol)),
+                        3 => conns.sort_by(|a, b| a.state.cmp(&b.state)),
+                        4 => conns.sort_by(|a, b| a.local_addr.cmp(&b.local_addr)),
+                        5 => conns.sort_by(|a, b| a.remote_addr.cmp(&b.remote_addr)),
+                        _ => {}
+                    }
+                    if let Some(conn) = conns.get(app.connection_scroll) {
+                        let filter = build_connection_filter(conn);
+                        app.packet_filter_text = filter.clone();
+                        app.packet_filter_active = Some(filter);
+                        app.packet_filter_input = false;
+                        app.packet_scroll = 0;
+                        app.packet_follow = false;
+                        app.current_tab = Tab::Packets;
                     }
                 }
                 KeyCode::Enter if app.current_tab == Tab::Packets => {
@@ -241,10 +494,14 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                             app.packet_selected = Some(pkt.id);
                         }
                     }
+                    Tab::Stats => {
+                        app.stats_scroll = app.stats_scroll.saturating_sub(1);
+                    }
                     _ => {
-                        if app.selected_interface > 0 {
-                            app.selected_interface -= 1;
-                        }
+                        app.selected_interface = match app.selected_interface {
+                            Some(0) | None => None,
+                            Some(i) => Some(i - 1),
+                        };
                     }
                 },
                 KeyCode::Down => match app.current_tab {
@@ -273,13 +530,28 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                             app.packet_selected = Some(pkt.id);
                         }
                     }
+                    Tab::Stats => {
+                        app.stats_scroll += 1;
+                    }
                     _ => {
-                        if app.selected_interface + 1 < app.traffic.interfaces.len() {
-                            app.selected_interface += 1;
-                        }
+                        let max = app.traffic.interfaces.len().saturating_sub(1);
+                        app.selected_interface = match app.selected_interface {
+                            None => Some(0),
+                            Some(i) if i < max => Some(i + 1),
+                            other => other,
+                        };
                     }
                 },
+                KeyCode::Char('/') if app.current_tab == Tab::Packets && !app.stream_view_open => {
+                    app.packet_filter_input = true;
+                    app.packet_filter_text = app.packet_filter_active.clone().unwrap_or_default();
+                }
+                KeyCode::Esc if app.current_tab == Tab::Packets && !app.stream_view_open && app.packet_filter_active.is_some() => {
+                    app.packet_filter_active = None;
+                    app.packet_filter_text.clear();
+                }
                 _ => {}
+            }
             },
             AppEvent::Tick => {
                 app.tick();

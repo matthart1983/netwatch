@@ -5,6 +5,8 @@ use std::thread;
 
 const MAX_PACKETS: usize = 5000;
 const DNS_CACHE_MAX: usize = 4096;
+const MAX_STREAM_SEGMENTS: usize = 10_000;
+const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CapturedPacket {
@@ -23,6 +25,90 @@ pub struct CapturedPacket {
     pub payload_text: String,
     pub raw_hex: String,
     pub raw_ascii: String,
+    pub raw_bytes: Vec<u8>,
+    pub stream_index: Option<u32>,
+    pub tcp_flags: Option<u8>,
+    pub expert: ExpertSeverity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertSeverity {
+    Chat,     // normal informational (SYN, DNS query)
+    Note,     // noteworthy (FIN, DNS response)
+    Warn,     // warning (zero window, ICMP unreachable)
+    Error,    // error (RST, DNS NXDOMAIN/SERVFAIL)
+}
+
+pub fn classify_expert(protocol: &str, info: &str, tcp_flags: Option<u8>) -> ExpertSeverity {
+    // TCP RST → Error
+    if let Some(flags) = tcp_flags {
+        if flags & 0x04 != 0 {
+            return ExpertSeverity::Error;
+        }
+        // SYN (without ACK) → Chat (connection initiation)
+        if flags & 0x02 != 0 && flags & 0x10 == 0 {
+            return ExpertSeverity::Chat;
+        }
+        // FIN → Note (connection teardown)
+        if flags & 0x01 != 0 {
+            return ExpertSeverity::Note;
+        }
+    }
+
+    // DNS errors
+    if protocol == "DNS" {
+        if info.contains("NXDOMAIN") || info.contains("Server Failure") || info.contains("Refused") {
+            return ExpertSeverity::Error;
+        }
+        if info.contains("Format Error") {
+            return ExpertSeverity::Warn;
+        }
+        if info.contains("Response") {
+            return ExpertSeverity::Note;
+        }
+        // DNS query
+        return ExpertSeverity::Chat;
+    }
+
+    // ICMP errors
+    if protocol == "ICMP" || protocol == "ICMPv6" {
+        if info.contains("Unreachable") || info.contains("Time Exceeded") {
+            return ExpertSeverity::Warn;
+        }
+        if info.contains("Redirect") {
+            return ExpertSeverity::Note;
+        }
+    }
+
+    // ARP
+    if protocol == "ARP" {
+        return ExpertSeverity::Chat;
+    }
+
+    // TCP zero window in info string
+    if info.contains("Win=0 ") || info.contains("Win=0,") {
+        return ExpertSeverity::Warn;
+    }
+
+    // TLS
+    if protocol == "TLS" {
+        if info.contains("Client Hello") {
+            return ExpertSeverity::Chat;
+        }
+        if info.contains("Server Hello") {
+            return ExpertSeverity::Note;
+        }
+    }
+
+    // HTTP errors  
+    if protocol == "HTTP" {
+        if info.contains("HTTP/1.1 4") || info.contains("HTTP/1.1 5") ||
+           info.contains("HTTP/1.0 4") || info.contains("HTTP/1.0 5") {
+            return ExpertSeverity::Warn;
+        }
+    }
+
+    ExpertSeverity::Chat
 }
 
 #[derive(Clone)]
@@ -98,6 +184,164 @@ impl DnsCache {
     }
 }
 
+// ── Stream tracking ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct StreamKey {
+    pub protocol: StreamProtocol,
+    pub addr_a: (String, u16),
+    pub addr_b: (String, u16),
+}
+
+impl StreamKey {
+    pub fn new(protocol: StreamProtocol, ip1: &str, port1: u16, ip2: &str, port2: u16) -> Self {
+        let a = (ip1.to_string(), port1);
+        let b = (ip2.to_string(), port2);
+        if a <= b {
+            Self { protocol, addr_a: a, addr_b: b }
+        } else {
+            Self { protocol, addr_a: b, addr_b: a }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDirection {
+    AtoB,
+    BtoA,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamSegment {
+    #[allow(dead_code)]
+    pub packet_id: u64,
+    #[allow(dead_code)]
+    pub timestamp: String,
+    pub direction: StreamDirection,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Stream {
+    #[allow(dead_code)]
+    pub index: u32,
+    pub key: StreamKey,
+    pub segments: Vec<StreamSegment>,
+    pub total_bytes_a_to_b: u64,
+    pub total_bytes_b_to_a: u64,
+    pub packet_count: u32,
+    pub initiator: Option<(String, u16)>,
+    total_payload_bytes: usize,
+}
+
+pub struct StreamTracker {
+    streams: HashMap<StreamKey, u32>,
+    pub all_streams: Vec<Stream>,
+    next_index: u32,
+}
+
+impl StreamTracker {
+    pub fn new() -> Self {
+        Self {
+            streams: HashMap::new(),
+            all_streams: Vec::new(),
+            next_index: 0,
+        }
+    }
+
+    pub fn track_packet(
+        &mut self,
+        src_ip: &str,
+        src_port: u16,
+        dst_ip: &str,
+        dst_port: u16,
+        protocol: StreamProtocol,
+        payload: &[u8],
+        packet_id: u64,
+        timestamp: &str,
+        tcp_flags: Option<u8>,
+    ) -> u32 {
+        let key = StreamKey::new(protocol, src_ip, src_port, dst_ip, dst_port);
+
+        let stream_index = if let Some(&idx) = self.streams.get(&key) {
+            idx
+        } else {
+            let idx = self.next_index;
+            self.next_index += 1;
+            self.streams.insert(key.clone(), idx);
+            self.all_streams.push(Stream {
+                index: idx,
+                key: key.clone(),
+                segments: Vec::new(),
+                total_bytes_a_to_b: 0,
+                total_bytes_b_to_a: 0,
+                packet_count: 0,
+                initiator: None,
+                total_payload_bytes: 0,
+            });
+            idx
+        };
+
+        let stream = &mut self.all_streams[stream_index as usize];
+        stream.packet_count += 1;
+
+        let is_a_to_b = key.addr_a == (src_ip.to_string(), src_port);
+        let direction = if is_a_to_b {
+            StreamDirection::AtoB
+        } else {
+            StreamDirection::BtoA
+        };
+
+        if stream.initiator.is_none() {
+            if let Some(flags) = tcp_flags {
+                if flags & 0x02 != 0 {
+                    stream.initiator = Some((src_ip.to_string(), src_port));
+                }
+            }
+            if stream.initiator.is_none() {
+                stream.initiator = Some((src_ip.to_string(), src_port));
+            }
+        }
+
+        if is_a_to_b {
+            stream.total_bytes_a_to_b += payload.len() as u64;
+        } else {
+            stream.total_bytes_b_to_a += payload.len() as u64;
+        }
+
+        if !payload.is_empty()
+            && stream.segments.len() < MAX_STREAM_SEGMENTS
+            && stream.total_payload_bytes < MAX_STREAM_BYTES
+        {
+            stream.total_payload_bytes += payload.len();
+            stream.segments.push(StreamSegment {
+                packet_id,
+                timestamp: timestamp.to_string(),
+                direction,
+                payload: payload.to_vec(),
+            });
+        }
+
+        stream_index
+    }
+
+    pub fn get_stream(&self, index: u32) -> Option<&Stream> {
+        self.all_streams.get(index as usize)
+    }
+
+    pub fn clear(&mut self) {
+        self.streams.clear();
+        self.all_streams.clear();
+        self.next_index = 0;
+    }
+}
+
 fn resolve_ip(ip: &str) -> Option<String> {
     // Use getaddrinfo reverse lookup via the system resolver
     let addr = format!("{}:0", ip);
@@ -134,6 +378,7 @@ pub struct PacketCollector {
     pub capturing: Arc<Mutex<bool>>,
     pub error: Arc<Mutex<Option<String>>>,
     pub dns_cache: DnsCache,
+    pub stream_tracker: Arc<Mutex<StreamTracker>>,
     counter: Arc<Mutex<u64>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -145,12 +390,13 @@ impl PacketCollector {
             capturing: Arc::new(Mutex::new(false)),
             error: Arc::new(Mutex::new(None)),
             dns_cache: DnsCache::new(),
+            stream_tracker: Arc::new(Mutex::new(StreamTracker::new())),
             counter: Arc::new(Mutex::new(0)),
             handle: None,
         }
     }
 
-    pub fn start_capture(&mut self, interface: &str) {
+    pub fn start_capture(&mut self, interface: &str, bpf_filter: Option<&str>) {
         {
             let mut cap = self.capturing.lock().unwrap();
             if *cap {
@@ -164,8 +410,10 @@ impl PacketCollector {
         let capturing = Arc::clone(&self.capturing);
         let error = Arc::clone(&self.error);
         let counter = Arc::clone(&self.counter);
+        let tracker = Arc::clone(&self.stream_tracker);
         let dns = self.dns_cache.clone();
         let iface = interface.to_string();
+        let bpf = bpf_filter.map(|s| s.to_string());
 
         self.handle = Some(thread::spawn(move || {
             // Try with promiscuous mode first, fall back to non-promiscuous
@@ -191,10 +439,35 @@ impl PacketCollector {
                 }
             };
 
+            // Apply BPF capture filter if specified
+            if let Some(filter) = bpf.as_deref() {
+                if let Err(e) = cap.filter(filter, true) {
+                    *error.lock().unwrap() = Some(format!("BPF filter error: {e}"));
+                    *capturing.lock().unwrap() = false;
+                    return;
+                }
+            }
+
             while *capturing.lock().unwrap() {
                 match cap.next_packet() {
                     Ok(packet) => {
-                        if let Some(parsed) = parse_packet(packet.data, &counter, &dns) {
+                        if let Some(mut parsed) = parse_packet(packet.data, &counter, &dns) {
+                            if let (Some(sp), Some(dp)) = (parsed.src_port, parsed.dst_port) {
+                                let proto = if parsed.tcp_flags.is_some() {
+                                    StreamProtocol::Tcp
+                                } else {
+                                    StreamProtocol::Udp
+                                };
+                                let payload = extract_app_payload(packet.data, proto);
+                                let idx = tracker.lock().unwrap().track_packet(
+                                    &parsed.src_ip, sp,
+                                    &parsed.dst_ip, dp,
+                                    proto, &payload,
+                                    parsed.id, &parsed.timestamp,
+                                    parsed.tcp_flags,
+                                );
+                                parsed.stream_index = Some(idx);
+                            }
                             let mut pkts = packets.lock().unwrap();
                             pkts.push(parsed);
                             if pkts.len() > MAX_PACKETS {
@@ -219,6 +492,7 @@ impl PacketCollector {
 
     pub fn clear(&self) {
         self.packets.lock().unwrap().clear();
+        self.stream_tracker.lock().unwrap().clear();
     }
 
     pub fn is_capturing(&self) -> bool {
@@ -231,6 +505,10 @@ impl PacketCollector {
 
     pub fn get_packets(&self) -> Vec<CapturedPacket> {
         self.packets.lock().unwrap().clone()
+    }
+
+    pub fn get_stream(&self, index: u32) -> Option<Stream> {
+        self.stream_tracker.lock().unwrap().get_stream(index).cloned()
     }
 }
 
@@ -264,16 +542,16 @@ fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Optio
         0x0800 => parse_ipv4_packet(data, &data[14..], &mut details, counter, dns),
         0x0806 => {
             let info = parse_arp(&data[14..], &mut details);
-            Some(build_packet(counter, "ARP", data.len() as u32, "—", "—", None, None, &info, details, &[], data, dns))
+            Some(build_packet(counter, "ARP", data.len() as u32, "—", "—", None, None, &info, details, &[], data, dns, None))
         }
         0x86DD => parse_ipv6_packet(data, &data[14..], &mut details, counter, dns),
         _ => None,
     }
 }
 
-// Transport parse result: (protocol, src_port, dst_port, info, app_payload_offset)
+// Transport parse result: (protocol, src_port, dst_port, info, app_payload_offset, tcp_flags)
 // app_payload_offset is relative to the transport data start
-type TransportResult = (String, Option<u16>, Option<u16>, String, usize);
+type TransportResult = (String, Option<u16>, Option<u16>, String, usize, Option<u8>);
 
 fn parse_ipv4_packet(
     raw: &[u8], data: &[u8], details: &mut Vec<String>, counter: &Arc<Mutex<u64>>, dns: &DnsCache,
@@ -294,7 +572,7 @@ fn parse_ipv4_packet(
     ));
 
     let transport_data = if data.len() > ihl { &data[ihl..] } else { &[] };
-    let (protocol, src_port, dst_port, info, payload_off) =
+    let (protocol, src_port, dst_port, info, payload_off, flags) =
         parse_transport(protocol_num, transport_data, &src, &dst, details);
 
     let app_payload = if transport_data.len() > payload_off {
@@ -305,7 +583,7 @@ fn parse_ipv4_packet(
 
     Some(build_packet(
         counter, &protocol, raw.len() as u32,
-        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw, dns,
+        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw, dns, flags,
     ))
 }
 
@@ -327,7 +605,7 @@ fn parse_ipv6_packet(
     ));
 
     let transport_data = if data.len() > 40 { &data[40..] } else { &[] };
-    let (protocol, src_port, dst_port, info, payload_off) =
+    let (protocol, src_port, dst_port, info, payload_off, flags) =
         parse_transport(next_header, transport_data, &src, &dst, details);
 
     let app_payload = if transport_data.len() > payload_off {
@@ -338,7 +616,7 @@ fn parse_ipv6_packet(
 
     Some(build_packet(
         counter, &protocol, raw.len() as u32,
-        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw, dns,
+        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw, dns, flags,
     ))
 }
 
@@ -350,16 +628,16 @@ fn parse_transport(
         17 if data.len() >= 8 => parse_udp(data, src_ip, dst_ip, details),
         1 => {
             let r = parse_icmp(data, src_ip, dst_ip, details);
-            (r.0, r.1, r.2, r.3, data.len())
+            (r.0, r.1, r.2, r.3, data.len(), None)
         }
         58 => {
             let r = parse_icmpv6(data, src_ip, dst_ip, details);
-            (r.0, r.1, r.2, r.3, data.len())
+            (r.0, r.1, r.2, r.3, data.len(), None)
         }
         _ => {
             let name = ip_protocol_name(proto);
             details.push(format!("{}: {} → {}", name, src_ip, dst_ip));
-            (name.clone(), None, None, format!("{} → {} {}", src_ip, dst_ip, name), data.len())
+            (name.clone(), None, None, format!("{} → {} {}", src_ip, dst_ip, name), data.len(), None)
         }
     }
 }
@@ -397,7 +675,7 @@ fn parse_tcp(
         if let Some((dns_info, dns_detail)) = parse_dns(dns_data) {
             details.push(dns_detail);
             let info = format!("{} → {} {}", src_ip, dst_ip, dns_info);
-            return ("DNS".into(), Some(src_port), Some(dst_port), info, data_offset);
+            return ("DNS".into(), Some(src_port), Some(dst_port), info, data_offset, Some(flags));
         }
     }
 
@@ -409,7 +687,7 @@ fn parse_tcp(
                 "{}:{} → {}:{} {} [{}]",
                 src_ip, src_port, dst_ip, dst_port, tls_info, flag_str
             );
-            return ("TLS".into(), Some(src_port), Some(dst_port), info, data_offset);
+            return ("TLS".into(), Some(src_port), Some(dst_port), info, data_offset, Some(flags));
         }
     }
 
@@ -418,7 +696,7 @@ fn parse_tcp(
         if let Some((http_info, http_detail)) = parse_http(payload) {
             details.push(http_detail);
             let info = format!("{}:{} → {}:{} {}", src_ip, src_port, dst_ip, dst_port, http_info);
-            return ("HTTP".into(), Some(src_port), Some(dst_port), info, data_offset);
+            return ("HTTP".into(), Some(src_port), Some(dst_port), info, data_offset, Some(flags));
         }
     }
 
@@ -438,7 +716,7 @@ fn parse_tcp(
         "TCP".into()
     };
 
-    (proto, Some(src_port), Some(dst_port), info, data_offset)
+    (proto, Some(src_port), Some(dst_port), info, data_offset, Some(flags))
 }
 
 fn parse_udp(
@@ -466,7 +744,7 @@ fn parse_udp(
         if let Some((dns_info, dns_detail)) = parse_dns(payload) {
             details.push(dns_detail);
             let info = format!("{} → {} {}", src_ip, dst_ip, dns_info);
-            return (proto_name.into(), Some(src_port), Some(dst_port), info, 8);
+            return (proto_name.into(), Some(src_port), Some(dst_port), info, 8, None);
         }
     }
 
@@ -475,7 +753,7 @@ fn parse_udp(
         let dhcp_info = parse_dhcp(payload);
         details.push(format!("DHCP: {}", dhcp_info));
         let info = format!("{} → {} {}", src_ip, dst_ip, dhcp_info);
-        return ("DHCP".into(), Some(src_port), Some(dst_port), info, 8);
+        return ("DHCP".into(), Some(src_port), Some(dst_port), info, 8, None);
     }
 
     // NTP
@@ -483,7 +761,7 @@ fn parse_udp(
         let ntp_info = parse_ntp(payload);
         details.push(format!("NTP: {}", ntp_info));
         let info = format!("{} → {} {}", src_ip, dst_ip, ntp_info);
-        return ("NTP".into(), Some(src_port), Some(dst_port), info, 8);
+        return ("NTP".into(), Some(src_port), Some(dst_port), info, 8, None);
     }
 
     let svc = if dst_svc != "—" { dst_svc } else { src_svc };
@@ -494,7 +772,7 @@ fn parse_udp(
     );
 
     let proto = if svc != "—" { svc.to_string() } else { "UDP".into() };
-    (proto, Some(src_port), Some(dst_port), info, 8)
+    (proto, Some(src_port), Some(dst_port), info, 8, None)
 }
 
 fn parse_icmp(
@@ -791,6 +1069,7 @@ fn build_packet(
     payload: &[u8],
     raw: &[u8],
     dns: &DnsCache,
+    tcp_flags: Option<u8>,
 ) -> CapturedPacket {
     let mut cnt = counter.lock().unwrap();
     *cnt += 1;
@@ -835,6 +1114,8 @@ fn build_packet(
         details.push(format!("DNS: {} → {}", src_label, dst_label));
     }
 
+    let expert = classify_expert(protocol, info, tcp_flags);
+
     CapturedPacket {
         id,
         timestamp,
@@ -851,6 +1132,42 @@ fn build_packet(
         payload_text,
         raw_hex: hex_lines,
         raw_ascii: ascii_lines,
+        raw_bytes: raw.to_vec(),
+        stream_index: None,
+        tcp_flags,
+        expert,
+    }
+}
+
+fn extract_app_payload(raw: &[u8], proto: StreamProtocol) -> Vec<u8> {
+    if raw.len() < 14 {
+        return Vec::new();
+    }
+    let ethertype = u16::from_be_bytes([raw[12], raw[13]]);
+    let ip_start = 14;
+    let transport_start = match ethertype {
+        0x0800 => {
+            if raw.len() < ip_start + 20 { return Vec::new(); }
+            let ihl = ((raw[ip_start] & 0x0F) as usize) * 4;
+            ip_start + ihl
+        }
+        0x86DD => ip_start + 40,
+        _ => return Vec::new(),
+    };
+    if raw.len() <= transport_start {
+        return Vec::new();
+    }
+    match proto {
+        StreamProtocol::Tcp => {
+            if raw.len() < transport_start + 20 { return Vec::new(); }
+            let data_offset = ((raw[transport_start + 12] >> 4) as usize) * 4;
+            let payload_start = transport_start + data_offset;
+            if raw.len() > payload_start { raw[payload_start..].to_vec() } else { Vec::new() }
+        }
+        StreamProtocol::Udp => {
+            let payload_start = transport_start + 8;
+            if raw.len() > payload_start { raw[payload_start..].to_vec() } else { Vec::new() }
+        }
     }
 }
 
@@ -1053,4 +1370,243 @@ fn parse_arp(data: &[u8], details: &mut Vec<String>) -> String {
         }
     };
     info
+}
+
+// ── PCAP export ─────────────────────────────────────────────
+
+pub fn export_pcap(packets: &[CapturedPacket], path: &str) -> Result<usize, String> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)
+        .map_err(|e| format!("Failed to create {path}: {e}"))?;
+
+    // Global header: magic, version 2.4, thiszone=0, sigfigs=0, snaplen=65535, network=1 (Ethernet)
+    let global_header: [u8; 24] = [
+        0xd4, 0xc3, 0xb2, 0xa1, // magic (little-endian)
+        0x02, 0x00, 0x04, 0x00, // version 2.4
+        0x00, 0x00, 0x00, 0x00, // thiszone
+        0x00, 0x00, 0x00, 0x00, // sigfigs
+        0xff, 0xff, 0x00, 0x00, // snaplen 65535
+        0x01, 0x00, 0x00, 0x00, // network: Ethernet
+    ];
+    file.write_all(&global_header)
+        .map_err(|e| format!("Write error: {e}"))?;
+
+    let mut count = 0;
+    for pkt in packets {
+        if pkt.raw_bytes.is_empty() {
+            continue;
+        }
+        let len = pkt.raw_bytes.len() as u32;
+        // Use current time as a fallback; ideally we'd store capture timestamps
+        // Parse HH:MM:SS.mmm from pkt.timestamp
+        let (ts_sec, ts_usec) = parse_timestamp_for_pcap(&pkt.timestamp);
+
+        let mut rec_header = [0u8; 16];
+        rec_header[0..4].copy_from_slice(&ts_sec.to_le_bytes());
+        rec_header[4..8].copy_from_slice(&ts_usec.to_le_bytes());
+        rec_header[8..12].copy_from_slice(&len.to_le_bytes());
+        rec_header[12..16].copy_from_slice(&len.to_le_bytes());
+
+        file.write_all(&rec_header)
+            .map_err(|e| format!("Write error: {e}"))?;
+        file.write_all(&pkt.raw_bytes)
+            .map_err(|e| format!("Write error: {e}"))?;
+        count += 1;
+    }
+
+    file.flush().map_err(|e| format!("Flush error: {e}"))?;
+    Ok(count)
+}
+
+fn parse_timestamp_for_pcap(ts: &str) -> (u32, u32) {
+    // Format: "HH:MM:SS.mmm" → seconds since midnight, microseconds
+    let parts: Vec<&str> = ts.split(':').collect();
+    if parts.len() < 3 {
+        return (0, 0);
+    }
+    let hours: u32 = parts[0].parse().unwrap_or(0);
+    let minutes: u32 = parts[1].parse().unwrap_or(0);
+    let sec_parts: Vec<&str> = parts[2].split('.').collect();
+    let seconds: u32 = sec_parts[0].parse().unwrap_or(0);
+    let millis: u32 = sec_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let total_sec = hours * 3600 + minutes * 60 + seconds;
+    let usec = millis * 1000;
+    (total_sec, usec)
+}
+
+// ── Display filters ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum FilterExpr {
+    Protocol(String),
+    SrcIp(String),
+    DstIp(String),
+    Ip(String),
+    Port(u16),
+    Stream(u32),
+    Contains(String),
+    Not(Box<FilterExpr>),
+    And(Box<FilterExpr>, Box<FilterExpr>),
+    Or(Box<FilterExpr>, Box<FilterExpr>),
+}
+
+pub fn parse_filter(input: &str) -> Option<FilterExpr> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    let tokens = tokenize(input);
+    if tokens.is_empty() {
+        return None;
+    }
+    let (expr, rest) = parse_or(&tokens)?;
+    if rest.is_empty() { Some(expr) } else { None }
+}
+
+fn tokenize(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '!' {
+            tokens.push("!".to_string());
+            chars.next();
+            continue;
+        }
+        if ch == '=' {
+            chars.next();
+            if chars.peek() == Some(&'=') { chars.next(); }
+            tokens.push("==".to_string());
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            chars.next();
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == ch { chars.next(); break; }
+                s.push(c);
+                chars.next();
+            }
+            tokens.push(format!("\"{s}\""));
+            continue;
+        }
+        let mut word = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() || c == '=' || c == '!' { break; }
+            word.push(c);
+            chars.next();
+        }
+        tokens.push(word);
+    }
+    tokens
+}
+
+fn parse_or<'a>(tokens: &'a [String]) -> Option<(FilterExpr, &'a [String])> {
+    let (mut left, mut rest) = parse_and(tokens)?;
+    while !rest.is_empty() && rest[0].eq_ignore_ascii_case("or") {
+        let (right, r) = parse_and(&rest[1..])?;
+        left = FilterExpr::Or(Box::new(left), Box::new(right));
+        rest = r;
+    }
+    Some((left, rest))
+}
+
+fn parse_and<'a>(tokens: &'a [String]) -> Option<(FilterExpr, &'a [String])> {
+    let (mut left, mut rest) = parse_not(tokens)?;
+    while !rest.is_empty() && rest[0].eq_ignore_ascii_case("and") {
+        let (right, r) = parse_not(&rest[1..])?;
+        left = FilterExpr::And(Box::new(left), Box::new(right));
+        rest = r;
+    }
+    Some((left, rest))
+}
+
+fn parse_not<'a>(tokens: &'a [String]) -> Option<(FilterExpr, &'a [String])> {
+    if tokens.is_empty() { return None; }
+    if tokens[0] == "!" || tokens[0].eq_ignore_ascii_case("not") {
+        let (expr, rest) = parse_not(&tokens[1..])?;
+        return Some((FilterExpr::Not(Box::new(expr)), rest));
+    }
+    parse_atom(tokens)
+}
+
+fn parse_atom<'a>(tokens: &'a [String]) -> Option<(FilterExpr, &'a [String])> {
+    if tokens.is_empty() { return None; }
+
+    // ip.src == x
+    if tokens[0].eq_ignore_ascii_case("ip.src") && tokens.len() >= 3 && tokens[1] == "==" {
+        return Some((FilterExpr::SrcIp(tokens[2].to_lowercase()), &tokens[3..]));
+    }
+    // ip.dst == x
+    if tokens[0].eq_ignore_ascii_case("ip.dst") && tokens.len() >= 3 && tokens[1] == "==" {
+        return Some((FilterExpr::DstIp(tokens[2].to_lowercase()), &tokens[3..]));
+    }
+    // port [==] N
+    if tokens[0].eq_ignore_ascii_case("port") && tokens.len() >= 2 {
+        if tokens[1] == "==" && tokens.len() >= 3 {
+            if let Ok(p) = tokens[2].parse::<u16>() {
+                return Some((FilterExpr::Port(p), &tokens[3..]));
+            }
+        }
+        if let Ok(p) = tokens[1].parse::<u16>() {
+            return Some((FilterExpr::Port(p), &tokens[2..]));
+        }
+    }
+    // stream N
+    if tokens[0].eq_ignore_ascii_case("stream") && tokens.len() >= 2 {
+        if let Ok(n) = tokens[1].parse::<u32>() {
+            return Some((FilterExpr::Stream(n), &tokens[2..]));
+        }
+    }
+    // contains "x"
+    if tokens[0].eq_ignore_ascii_case("contains") && tokens.len() >= 2 {
+        let val = tokens[1].trim_matches('"').to_lowercase();
+        return Some((FilterExpr::Contains(val), &tokens[2..]));
+    }
+
+    let word = &tokens[0];
+
+    // Bare IP address (contains a dot and digits)
+    if word.contains('.') && word.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Some((FilterExpr::Ip(word.to_string()), &tokens[1..]));
+    }
+
+    // Known protocol names
+    let protocols = ["tcp", "udp", "dns", "mdns", "tls", "http", "arp", "icmp", "icmpv6",
+                     "dhcp", "ntp", "ssh", "https", "smtp", "ftp", "imap", "pop3"];
+    if protocols.iter().any(|p| word.eq_ignore_ascii_case(p)) {
+        return Some((FilterExpr::Protocol(word.to_uppercase()), &tokens[1..]));
+    }
+
+    // Bare word → text search
+    let val = word.trim_matches('"').to_lowercase();
+    Some((FilterExpr::Contains(val), &tokens[1..]))
+}
+
+pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
+    match expr {
+        FilterExpr::Protocol(p) => pkt.protocol.eq_ignore_ascii_case(p),
+        FilterExpr::SrcIp(ip) => pkt.src_ip.contains(ip.as_str()),
+        FilterExpr::DstIp(ip) => pkt.dst_ip.contains(ip.as_str()),
+        FilterExpr::Ip(ip) => pkt.src_ip.contains(ip.as_str()) || pkt.dst_ip.contains(ip.as_str()),
+        FilterExpr::Port(p) => pkt.src_port == Some(*p) || pkt.dst_port == Some(*p),
+        FilterExpr::Stream(n) => pkt.stream_index == Some(*n),
+        FilterExpr::Contains(s) => {
+            pkt.info.to_lowercase().contains(s)
+                || pkt.src_ip.to_lowercase().contains(s)
+                || pkt.dst_ip.to_lowercase().contains(s)
+                || pkt.protocol.to_lowercase().contains(s)
+                || pkt.payload_text.to_lowercase().contains(s)
+                || pkt.src_host.as_ref().map_or(false, |h| h.to_lowercase().contains(s))
+                || pkt.dst_host.as_ref().map_or(false, |h| h.to_lowercase().contains(s))
+        }
+        FilterExpr::Not(inner) => !matches_packet(inner, pkt),
+        FilterExpr::And(a, b) => matches_packet(a, pkt) && matches_packet(b, pkt),
+        FilterExpr::Or(a, b) => matches_packet(a, pkt) || matches_packet(b, pkt),
+    }
 }
