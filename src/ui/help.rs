@@ -146,6 +146,14 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(key_line("bare word", "Shorthand for contains"));
     lines.push(Line::raw(""));
 
+    // TCP HANDSHAKE TIMING
+    lines.push(section_header("TCP HANDSHAKE TIMING"));
+    lines.push(key_line("⏱ in stream header", "Total 3-way handshake time (SYN→ACK)"));
+    lines.push(key_line("SYN→SA", "Client→Server network RTT (SYN to SYN-ACK)"));
+    lines.push(key_line("SA→ACK", "Server→Client network RTT (SYN-ACK to ACK)"));
+    lines.push(key_line("Shown in:", "Stream view header, status bar, packet detail"));
+    lines.push(Line::raw(""));
+
     // EXPERT INFO INDICATORS
     lines.push(section_header("EXPERT INFO INDICATORS"));
     lines.push(key_line("● (red)", "Error: TCP RST, DNS NXDOMAIN/SERVFAIL"));

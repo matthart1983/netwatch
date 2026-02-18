@@ -311,6 +311,30 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
             detail_lines.extend(geo_lines);
             detail_lines.extend(whois_lines);
 
+            // TCP handshake timing (if this packet belongs to a stream with handshake data)
+            if let Some(stream_idx) = pkt.stream_index {
+                if let Some(stream) = app.packet_collector.get_stream(stream_idx) {
+                    if let Some(ref hs) = stream.handshake {
+                        let mut hs_parts = Vec::new();
+                        if let Some(syn_sa) = hs.syn_to_syn_ack_ms() {
+                            hs_parts.push(format!("SYN→SYN-ACK: {:.2}ms", syn_sa));
+                        }
+                        if let Some(sa_ack) = hs.syn_ack_to_ack_ms() {
+                            hs_parts.push(format!("SYN-ACK→ACK: {:.2}ms", sa_ack));
+                        }
+                        if let Some(total) = hs.total_ms() {
+                            hs_parts.push(format!("Total: {:.2}ms", total));
+                        }
+                        if !hs_parts.is_empty() {
+                            detail_lines.push(Line::from(Span::styled(
+                                format!("  ⏱ Handshake: {}", hs_parts.join("  │  ")),
+                                Style::default().fg(Color::Green),
+                            )));
+                        }
+                    }
+                }
+            }
+
             let proto_detail = Paragraph::new(detail_lines)
                 .block(
                     Block::default()
@@ -437,14 +461,35 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
         StreamDirectionFilter::BtoA => "[←] B→A",
     };
     let mode_label = if app.stream_hex_mode { "Hex" } else { "Text" };
-    let header = Paragraph::new(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(format!(" {proto_str} Stream #{stream_index} "), Style::default().fg(Color::Cyan).bold()),
         Span::raw(format!("── {a_ip}:{a_port} ↔ {b_ip}:{b_port}  ")),
         Span::styled(dir_label, Style::default().fg(Color::Yellow)),
         Span::raw("  "),
         Span::styled(format!("[h] {mode_label}"), Style::default().fg(Color::Yellow)),
-    ])).block(Block::default().borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray)));
+    ];
+    if let Some(ref hs) = stream.handshake {
+        header_spans.push(Span::raw("  "));
+        if let Some(total) = hs.total_ms() {
+            header_spans.push(Span::styled(
+                format!("⏱ {:.2}ms", total),
+                Style::default().fg(Color::Green).bold(),
+            ));
+        } else if let Some(syn_sa) = hs.syn_to_syn_ack_ms() {
+            header_spans.push(Span::styled(
+                format!("⏱ SYN→SA {:.2}ms", syn_sa),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else {
+            header_spans.push(Span::styled(
+                "⏱ SYN…",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    let header = Paragraph::new(Line::from(header_spans))
+        .block(Block::default().borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(header, chunks[0]);
 
     // Build content lines
@@ -526,7 +571,7 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(content, chunks[1]);
 
     // Status bar
-    let status = Paragraph::new(Line::from(vec![
+    let mut status_spans = vec![
         Span::styled(format!(" {} packets", stream.packet_count), Style::default().fg(Color::White)),
         Span::raw(format!(", {} segments", filtered_segments.len())),
         Span::raw(" │ "),
@@ -535,9 +580,32 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" │ "),
         Span::styled("B→A: ", Style::default().fg(Color::Magenta)),
         Span::raw(format_bytes(stream.total_bytes_b_to_a)),
-        Span::raw(format!(" │ Lines: {total_lines} ")),
-    ])).block(Block::default().borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray)));
+    ];
+    if let Some(ref hs) = stream.handshake {
+        status_spans.push(Span::raw(" │ "));
+        if let Some(syn_sa) = hs.syn_to_syn_ack_ms() {
+            status_spans.push(Span::styled(
+                format!("SYN→SA:{:.1}ms ", syn_sa),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if let Some(sa_ack) = hs.syn_ack_to_ack_ms() {
+            status_spans.push(Span::styled(
+                format!("SA→ACK:{:.1}ms ", sa_ack),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if let Some(total) = hs.total_ms() {
+            status_spans.push(Span::styled(
+                format!("Total:{:.1}ms", total),
+                Style::default().fg(Color::Green),
+            ));
+        }
+    }
+    status_spans.push(Span::raw(format!(" │ Lines: {total_lines} ")));
+    let status = Paragraph::new(Line::from(status_spans))
+        .block(Block::default().borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(status, chunks[2]);
 }
 

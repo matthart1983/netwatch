@@ -29,6 +29,7 @@ pub struct CapturedPacket {
     pub stream_index: Option<u32>,
     pub tcp_flags: Option<u8>,
     pub expert: ExpertSeverity,
+    pub timestamp_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +229,30 @@ pub struct StreamSegment {
 }
 
 #[derive(Debug, Clone)]
+pub struct TcpHandshake {
+    pub syn_ns: u64,
+    pub syn_ack_ns: Option<u64>,
+    pub ack_ns: Option<u64>,
+}
+
+impl TcpHandshake {
+    pub fn syn_to_syn_ack_ms(&self) -> Option<f64> {
+        self.syn_ack_ns.map(|sa| (sa.saturating_sub(self.syn_ns)) as f64 / 1_000_000.0)
+    }
+
+    pub fn syn_ack_to_ack_ms(&self) -> Option<f64> {
+        match (self.syn_ack_ns, self.ack_ns) {
+            (Some(sa), Some(a)) => Some((a.saturating_sub(sa)) as f64 / 1_000_000.0),
+            _ => None,
+        }
+    }
+
+    pub fn total_ms(&self) -> Option<f64> {
+        self.ack_ns.map(|a| (a.saturating_sub(self.syn_ns)) as f64 / 1_000_000.0)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Stream {
     #[allow(dead_code)]
     pub index: u32,
@@ -238,6 +263,7 @@ pub struct Stream {
     pub packet_count: u32,
     pub initiator: Option<(String, u16)>,
     total_payload_bytes: usize,
+    pub handshake: Option<TcpHandshake>,
 }
 
 pub struct StreamTracker {
@@ -266,6 +292,7 @@ impl StreamTracker {
         packet_id: u64,
         timestamp: &str,
         tcp_flags: Option<u8>,
+        timestamp_ns: u64,
     ) -> u32 {
         let key = StreamKey::new(protocol, src_ip, src_port, dst_ip, dst_port);
 
@@ -284,6 +311,7 @@ impl StreamTracker {
                 packet_count: 0,
                 initiator: None,
                 total_payload_bytes: 0,
+                handshake: None,
             });
             idx
         };
@@ -306,6 +334,38 @@ impl StreamTracker {
             }
             if stream.initiator.is_none() {
                 stream.initiator = Some((src_ip.to_string(), src_port));
+            }
+        }
+
+        // Track TCP handshake timing
+        if protocol == StreamProtocol::Tcp {
+            if let Some(flags) = tcp_flags {
+                let is_syn = flags & 0x02 != 0;
+                let is_ack = flags & 0x10 != 0;
+                if is_syn && !is_ack {
+                    // SYN — start of handshake
+                    if stream.handshake.is_none() {
+                        stream.handshake = Some(TcpHandshake {
+                            syn_ns: timestamp_ns,
+                            syn_ack_ns: None,
+                            ack_ns: None,
+                        });
+                    }
+                } else if is_syn && is_ack {
+                    // SYN-ACK
+                    if let Some(ref mut hs) = stream.handshake {
+                        if hs.syn_ack_ns.is_none() {
+                            hs.syn_ack_ns = Some(timestamp_ns);
+                        }
+                    }
+                } else if is_ack && !is_syn && stream.packet_count <= 3 {
+                    // ACK (completing handshake — only if early in connection)
+                    if let Some(ref mut hs) = stream.handshake {
+                        if hs.syn_ack_ns.is_some() && hs.ack_ns.is_none() {
+                            hs.ack_ns = Some(timestamp_ns);
+                        }
+                    }
+                }
             }
         }
 
@@ -465,6 +525,7 @@ impl PacketCollector {
                                     proto, &payload,
                                     parsed.id, &parsed.timestamp,
                                     parsed.tcp_flags,
+                                    parsed.timestamp_ns,
                                 );
                                 parsed.stream_index = Some(idx);
                             }
@@ -509,6 +570,10 @@ impl PacketCollector {
 
     pub fn get_stream(&self, index: u32) -> Option<Stream> {
         self.stream_tracker.lock().unwrap().get_stream(index).cloned()
+    }
+
+    pub fn get_all_streams(&self) -> Vec<Stream> {
+        self.stream_tracker.lock().unwrap().all_streams.clone()
     }
 }
 
@@ -1074,7 +1139,9 @@ fn build_packet(
     let mut cnt = counter.lock().unwrap();
     *cnt += 1;
     let id = *cnt;
-    let timestamp = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+    let now = chrono::Local::now();
+    let timestamp = now.format("%H:%M:%S%.3f").to_string();
+    let timestamp_ns = now.timestamp_nanos_opt().unwrap_or(0) as u64;
 
     // Queue reverse DNS lookups (non-blocking — results appear on next render)
     let src_host = dns.lookup(src_ip);
@@ -1136,6 +1203,7 @@ fn build_packet(
         stream_index: None,
         tcp_flags,
         expert,
+        timestamp_ns,
     }
 }
 

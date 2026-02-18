@@ -490,3 +490,10 @@ netwatch/
 | M14 | Capture Filters (BPF)             | Press `b` to set a BPF expression (e.g. `port 443`, `host 10.0.0.1`) applied via `pcap::set_filter()` before capture starts. Shown in header, editable when stopped |
 | M15 | Help Overlay                      | Press `?` for full-screen scrollable help popup with all keybindings by context, display filter syntax reference, expert info legend. Esc/?:close, ↑↓:scroll |
 | M16 | GeoIP Location                    | Background GeoIP lookup via ip-api.com for public IPs. Location column in Connections tab, Geo lines in packet detail. `g` key toggles on/off. Rate-limited, cached, skips private IPs |
+| M17 | Whois Lookup                      | On-demand RDAP whois via rdap.org. `W` key triggers lookup for selected IPs (Packets + Connections tabs). Results shown in packet detail pane. Background thread with rate limiting and caching |
+| M18 | Packet Bookmarks                  | `m` toggles bookmark (★) on selected packet. `n`/`N` jump to next/previous bookmark. Bookmark count in title. Cleared on `x` |
+| M19 | Interface Bandwidth Graph         | Full-width aggregate RX/TX sparklines on Dashboard replacing histogram. Shows current rate in title, aggregates across all active non-loopback interfaces |
+| M20 | Latency Heatmap                   | Color-coded RTT history (▁▂▃▄▅▆▇█) for gateway and DNS on Dashboard. Green→yellow→orange→red scaling, 60-sample history |
+| M21 | Consistent UI & Footer Polish     | All tabs show full tab bar [1-5] and all global keys (q, p, r, g, ?) in footers |
+| M22 | TCP Handshake Timing              | Automatic SYN→SYN-ACK→ACK measurement per stream. Shown in stream view header/status bar and packet detail pane. Nanosecond precision timestamps |
+| M23 | Handshake Histogram               | Latency distribution chart in Stats tab. 7 buckets (<1ms to >500ms) with color-coded bars and min/avg/median/p95/max summary |
