@@ -143,7 +143,7 @@ fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
-            .data(&iface.rx_history)
+            .data(iface.rx_history.as_slices().0)
             .style(Style::default().fg(Color::Green));
 
         let tx_spark = Sparkline::default()
@@ -153,7 +153,7 @@ fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
-            .data(&iface.tx_history)
+            .data(iface.tx_history.as_slices().0)
             .style(Style::default().fg(Color::Blue));
 
         f.render_widget(rx_spark, chunks[0]);
@@ -259,9 +259,8 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
     ])
     .height(1);
 
-    let rows: Vec<Row> = app
-        .connection_collector
-        .connections
+    let conns = app.connection_collector.connections.lock().unwrap();
+    let rows: Vec<Row> = conns
         .iter()
         .filter(|c| c.state == "ESTABLISHED")
         .take(5)
@@ -296,7 +295,7 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_health(f: &mut Frame, app: &App, area: Rect) {
-    let hs = &app.health_prober.status;
+    let hs = app.health_prober.status.lock().unwrap();
 
     let gw_rtt = hs
         .gateway_rtt_ms
@@ -426,13 +425,13 @@ fn render_latency_heatmap(f: &mut Frame, app: &App, area: Rect) {
 
     let avail_width = inner.width.saturating_sub(12) as usize; // reserve label space
 
-    let hs = &app.health_prober.status;
+    let hs = app.health_prober.status.lock().unwrap();
 
     // Gateway row
     let mut gw_spans: Vec<Span> = vec![
         Span::styled(" GW  ", Style::default().fg(Color::Cyan).bold()),
     ];
-    gw_spans.extend(rtt_heatmap_spans(&hs.gateway_rtt_history, avail_width));
+    gw_spans.extend(rtt_heatmap_spans(hs.gateway_rtt_history.as_slices().0, avail_width));
     if let Some(rtt) = hs.gateway_rtt_ms {
         gw_spans.push(Span::styled(
             format!(" {:.1}ms", rtt),
@@ -445,7 +444,7 @@ fn render_latency_heatmap(f: &mut Frame, app: &App, area: Rect) {
     let mut dns_spans: Vec<Span> = vec![
         Span::styled(" DNS ", Style::default().fg(Color::Cyan).bold()),
     ];
-    dns_spans.extend(rtt_heatmap_spans(&hs.dns_rtt_history, avail_width));
+    dns_spans.extend(rtt_heatmap_spans(hs.dns_rtt_history.as_slices().0, avail_width));
     if let Some(rtt) = hs.dns_rtt_ms {
         dns_spans.push(Span::styled(
             format!(" {:.1}ms", rtt),

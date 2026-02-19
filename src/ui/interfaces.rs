@@ -163,7 +163,7 @@ fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
-            .data(&iface.rx_history)
+            .data(iface.rx_history.as_slices().0)
             .style(Style::default().fg(Color::Green));
 
         let tx_spark = Sparkline::default()
@@ -173,7 +173,7 @@ fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
-            .data(&iface.tx_history)
+            .data(iface.tx_history.as_slices().0)
             .style(Style::default().fg(Color::Blue));
 
         f.render_widget(rx_spark, chunks[0]);

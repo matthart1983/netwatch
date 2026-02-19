@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,37 +24,18 @@ enum GeoEntry {
 #[derive(Clone)]
 pub struct GeoCache {
     cache: Arc<Mutex<HashMap<String, GeoEntry>>>,
-    pending: Arc<Mutex<Vec<String>>>,
+    tx: std_mpsc::Sender<String>,
 }
 
 impl GeoCache {
     pub fn new() -> Self {
-        let geo = Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(Vec::new())),
-        };
-        geo.start_resolver();
-        geo
-    }
-
-    fn start_resolver(&self) {
-        let cache = Arc::clone(&self.cache);
-        let pending = Arc::clone(&self.pending);
+        let (tx, rx) = std_mpsc::channel::<String>();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let resolver_cache = Arc::clone(&cache);
         thread::spawn(move || {
             let mut last_request = Instant::now() - Duration::from_millis(1500);
-            loop {
-                let ip = {
-                    let mut q = pending.lock().unwrap();
-                    if q.is_empty() {
-                        drop(q);
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                    q.pop().unwrap()
-                };
-
+            while let Ok(ip) = rx.recv() {
                 // Rate limit: ip-api.com allows 45 requests/minute
-                // We space requests at least 1.4s apart to stay well under
                 let elapsed = last_request.elapsed();
                 if elapsed < Duration::from_millis(1400) {
                     thread::sleep(Duration::from_millis(1400) - elapsed);
@@ -61,7 +43,7 @@ impl GeoCache {
                 last_request = Instant::now();
 
                 let result = lookup_geo(&ip);
-                let mut c = cache.lock().unwrap();
+                let mut c = resolver_cache.lock().unwrap();
                 match result {
                     Some(info) => { c.insert(ip, GeoEntry::Resolved(info)); }
                     None => { c.insert(ip, GeoEntry::Failed); }
@@ -72,23 +54,20 @@ impl GeoCache {
                 }
             }
         });
+        Self { cache, tx }
     }
 
     pub fn lookup(&self, ip: &str) -> Option<GeoInfo> {
         if ip == "—" || ip.is_empty() || is_private_ip(ip) {
             return None;
         }
-        let cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap();
         match cache.get(ip) {
             Some(GeoEntry::Resolved(info)) => Some(info.clone()),
             Some(GeoEntry::Failed) | Some(GeoEntry::Pending) => None,
             None => {
-                drop(cache);
-                let mut c = self.cache.lock().unwrap();
-                c.insert(ip.to_string(), GeoEntry::Pending);
-                drop(c);
-                let mut q = self.pending.lock().unwrap();
-                q.push(ip.to_string());
+                cache.insert(ip.to_string(), GeoEntry::Pending);
+                let _ = self.tx.send(ip.to_string());
                 None
             }
         }

@@ -1,5 +1,5 @@
 use crate::platform::{self, InterfaceStats};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 const SPARKLINE_HISTORY: usize = 60;
@@ -17,8 +17,8 @@ pub struct InterfaceTraffic {
     pub tx_errors: u64,
     pub rx_drops: u64,
     pub tx_drops: u64,
-    pub rx_history: Vec<u64>,
-    pub tx_history: Vec<u64>,
+    pub rx_history: VecDeque<u64>,
+    pub tx_history: VecDeque<u64>,
 }
 
 pub struct TrafficCollector {
@@ -68,14 +68,16 @@ impl TrafficCollector {
                 .map(|i| (i.rx_history.clone(), i.tx_history.clone()))
                 .unwrap_or_default();
 
-            rx_hist.push(rx_rate as u64);
-            tx_hist.push(tx_rate as u64);
+            rx_hist.push_back(rx_rate as u64);
+            tx_hist.push_back(tx_rate as u64);
             if rx_hist.len() > SPARKLINE_HISTORY {
-                rx_hist.remove(0);
+                rx_hist.pop_front();
             }
             if tx_hist.len() > SPARKLINE_HISTORY {
-                tx_hist.remove(0);
+                tx_hist.pop_front();
             }
+            rx_hist.make_contiguous();
+            tx_hist.make_contiguous();
 
             updated.push(InterfaceTraffic {
                 name: name.clone(),

@@ -1,4 +1,6 @@
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -11,26 +13,25 @@ pub struct Connection {
 }
 
 pub struct ConnectionCollector {
-    pub connections: Vec<Connection>,
+    pub connections: Arc<Mutex<Vec<Connection>>>,
 }
 
 impl ConnectionCollector {
     pub fn new() -> Self {
         Self {
-            connections: Vec::new(),
+            connections: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn update(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
-            self.connections = parse_lsof();
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            self.connections = parse_linux_connections();
-        }
+    pub fn update(&self) {
+        let connections = Arc::clone(&self.connections);
+        thread::spawn(move || {
+            #[cfg(target_os = "macos")]
+            let result = parse_lsof();
+            #[cfg(target_os = "linux")]
+            let result = parse_linux_connections();
+            *connections.lock().unwrap() = result;
+        });
     }
 }
 
