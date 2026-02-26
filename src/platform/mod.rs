@@ -2,6 +2,8 @@
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -37,7 +39,10 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     #[cfg(target_os = "macos")]
     return macos::collect_interface_stats();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    return windows::collect_interface_stats();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     anyhow::bail!("Unsupported platform")
 }
 
@@ -48,6 +53,9 @@ pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
     #[cfg(target_os = "macos")]
     return macos::collect_interface_info();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    return windows::collect_interface_info();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     anyhow::bail!("Unsupported platform")
 }

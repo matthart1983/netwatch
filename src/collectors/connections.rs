@@ -32,6 +32,8 @@ impl ConnectionCollector {
             let result = parse_lsof();
             #[cfg(target_os = "linux")]
             let result = parse_linux_connections();
+            #[cfg(target_os = "windows")]
+            let result = parse_windows_connections();
             *connections.lock().unwrap() = result;
         });
     }
@@ -256,4 +258,109 @@ fn parse_ss_process(field: &str) -> (Option<u32>, Option<String>) {
         .and_then(|s| s.parse().ok());
 
     (pid, name)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_pids(pids: &[u32]) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    if pids.is_empty() {
+        return map;
+    }
+
+    let output = match Command::new("tasklist").args(["/FO", "CSV", "/NH"]).output() {
+        Ok(o) => o,
+        Err(_) => return map,
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let pid_set: HashSet<u32> = pids.iter().copied().collect();
+
+    for line in text.lines() {
+        // Format: "process.exe","1234","Console","1","12,345 K"
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let name = fields[0].trim_matches('"');
+        let pid_str = fields[1].trim_matches('"');
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            if pid_set.contains(&pid) {
+                map.insert(pid, name.to_string());
+            }
+        }
+    }
+
+    map
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_connections() -> Vec<Connection> {
+    let output = match Command::new("netstat").args(["-ano"]).output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    struct RawConn {
+        protocol: String,
+        local_addr: String,
+        remote_addr: String,
+        state: String,
+        pid: Option<u32>,
+    }
+
+    let mut raw_connections = Vec::new();
+    let mut all_pids = HashSet::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("TCP") && !trimmed.starts_with("UDP") {
+            continue;
+        }
+
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+
+        let (protocol, local_addr, remote_addr, state, pid) = if cols[0] == "UDP" {
+            // UDP lines: Proto LocalAddr ForeignAddr PID (no state)
+            if cols.len() < 4 {
+                continue;
+            }
+            let pid: Option<u32> = cols[3].parse().ok();
+            (cols[0].to_string(), cols[1].to_string(), cols[2].to_string(), String::new(), pid)
+        } else {
+            // TCP lines: Proto LocalAddr ForeignAddr State PID
+            if cols.len() < 5 {
+                continue;
+            }
+            let pid: Option<u32> = cols[4].parse().ok();
+            (cols[0].to_string(), cols[1].to_string(), cols[2].to_string(), cols[3].to_string(), pid)
+        };
+
+        if let Some(p) = pid {
+            all_pids.insert(p);
+        }
+
+        raw_connections.push(RawConn {
+            protocol,
+            local_addr,
+            remote_addr,
+            state,
+            pid,
+        });
+    }
+
+    let pid_names = resolve_pids(&all_pids.into_iter().collect::<Vec<_>>());
+
+    raw_connections
+        .into_iter()
+        .map(|rc| Connection {
+            protocol: rc.protocol,
+            local_addr: rc.local_addr,
+            remote_addr: rc.remote_addr,
+            state: rc.state,
+            process_name: rc.pid.and_then(|p| pid_names.get(&p).cloned()),
+            pid: rc.pid,
+        })
+        .collect()
 }

@@ -5,7 +5,7 @@
 NetWatch is a lightweight, keyboard-driven TUI application that gives you instant visibility into network traffic, active connections, interface health, and live packet capture with deep protocol inspection. Built with Rust for speed and low overhead.
 
 ![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -49,7 +49,7 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 - **Connection → packet linking** — Jump from a connection to filtered packet view
 - **Help overlay** — Full scrollable keybinding reference with filter syntax and expert legend
 - **Network config** — Default gateway, DNS servers, hostname at a glance
-- **Cross-platform** — macOS and Linux with platform-specific collectors
+- **Cross-platform** — macOS, Linux, and Windows with platform-specific collectors
 
 ---
 
@@ -75,6 +75,7 @@ cargo build --release
 - **libpcap** (for packet capture):
   - macOS: included with Xcode Command Line Tools
   - Linux: `sudo apt install libpcap-dev` (Debian/Ubuntu) or `sudo dnf install libpcap-devel` (Fedora)
+  - Windows: install [Npcap](https://npcap.com/) with "Install Npcap in WinPcap API-compatible Mode" checked
 
 ### Run
 

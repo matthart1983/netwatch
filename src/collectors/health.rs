@@ -70,6 +70,9 @@ fn run_ping(target: &str) -> (Option<f64>, f64) {
     #[cfg(target_os = "linux")]
     let args = ["-c", "3", "-W", "1", target];
 
+    #[cfg(target_os = "windows")]
+    let args = ["-n", "3", "-w", "1000", target];
+
     let output = match Command::new("ping").args(args).output() {
         Ok(o) => o,
         Err(_) => return (None, 100.0),
@@ -126,6 +129,15 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
                 if parts.len() >= 2 {
                     return parts[1].trim().parse().ok();
                 }
+            }
+        }
+    }
+    // Windows format: "Minimum = 1ms, Maximum = 3ms, Average = 2ms"
+    for line in output.lines() {
+        if line.contains("Average =") {
+            if let Some(avg_part) = line.split("Average =").nth(1) {
+                let avg_str = avg_part.trim().trim_end_matches("ms").trim();
+                return avg_str.parse().ok();
             }
         }
     }
