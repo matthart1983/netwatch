@@ -107,7 +107,8 @@ fn parse_loss(output: &str) -> f64 {
                         }
                         // Handle "0.0% packet loss" - get last word before %
                         if let Some(last_word) = pct_str.split_whitespace().last() {
-                            if let Ok(val) = last_word.parse::<f64>() {
+                            let cleaned = last_word.trim_start_matches('(');
+                            if let Ok(val) = cleaned.parse::<f64>() {
                                 return val;
                             }
                         }
@@ -142,4 +143,123 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_loss tests ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_loss_linux_zero() {
+        let output = "\
+PING 192.168.1.1 (192.168.1.1) 56(84) bytes of data.
+64 bytes from 192.168.1.1: icmp_seq=1 ttl=64 time=1.23 ms
+64 bytes from 192.168.1.1: icmp_seq=2 ttl=64 time=1.10 ms
+64 bytes from 192.168.1.1: icmp_seq=3 ttl=64 time=1.05 ms
+
+--- 192.168.1.1 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+rtt min/avg/max/mdev = 1.050/1.126/1.230/0.075 ms";
+        assert_eq!(parse_loss(output), 0.0);
+    }
+
+    #[test]
+    fn parse_loss_linux_partial() {
+        let output = "3 packets transmitted, 1 received, 66.7% packet loss, time 2003ms";
+        assert_eq!(parse_loss(output), 66.7);
+    }
+
+    #[test]
+    fn parse_loss_macos_format() {
+        let output = "\
+PING 192.168.1.1 (192.168.1.1): 56 data bytes
+64 bytes from 192.168.1.1: icmp_seq=0 ttl=64 time=2.345 ms
+
+--- 192.168.1.1 ping statistics ---
+3 packets transmitted, 3 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 1.234/2.345/3.456/0.567 ms";
+        assert_eq!(parse_loss(output), 0.0);
+    }
+
+    #[test]
+    fn parse_loss_windows_format() {
+        let output = "\
+Ping statistics for 192.168.1.1:
+    Packets: Sent = 3, Received = 3, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 1ms, Maximum = 3ms, Average = 2ms";
+        assert_eq!(parse_loss(output), 0.0);
+    }
+
+    #[test]
+    fn parse_loss_full_loss() {
+        let output = "3 packets transmitted, 0 received, 100% packet loss, time 2003ms";
+        assert_eq!(parse_loss(output), 100.0);
+    }
+
+    #[test]
+    fn parse_loss_empty_input() {
+        assert_eq!(parse_loss(""), 100.0);
+    }
+
+    #[test]
+    fn parse_loss_gibberish() {
+        assert_eq!(parse_loss("not a ping output at all"), 100.0);
+    }
+
+    // ── parse_avg_rtt tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_avg_rtt_linux() {
+        let output = "rtt min/avg/max/mdev = 0.123/0.456/0.789/0.111 ms";
+        assert_eq!(parse_avg_rtt(output), Some(0.456));
+    }
+
+    #[test]
+    fn parse_avg_rtt_macos() {
+        let output = "round-trip min/avg/max/stddev = 1.234/2.345/3.456/0.567 ms";
+        assert_eq!(parse_avg_rtt(output), Some(2.345));
+    }
+
+    #[test]
+    fn parse_avg_rtt_full_linux_output() {
+        let output = "\
+PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.
+64 bytes from 8.8.8.8: icmp_seq=1 ttl=117 time=12.3 ms
+64 bytes from 8.8.8.8: icmp_seq=2 ttl=117 time=11.8 ms
+64 bytes from 8.8.8.8: icmp_seq=3 ttl=117 time=12.1 ms
+
+--- 8.8.8.8 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+rtt min/avg/max/mdev = 11.800/12.066/12.300/0.205 ms";
+        assert_eq!(parse_avg_rtt(output), Some(12.066));
+    }
+
+    #[test]
+    fn parse_avg_rtt_windows() {
+        let output = "\
+Ping statistics for 192.168.1.1:
+    Packets: Sent = 3, Received = 3, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 1ms, Maximum = 3ms, Average = 2ms";
+        assert_eq!(parse_avg_rtt(output), Some(2.0));
+    }
+
+    #[test]
+    fn parse_avg_rtt_windows_large() {
+        let output = "    Minimum = 10ms, Maximum = 50ms, Average = 25ms";
+        assert_eq!(parse_avg_rtt(output), Some(25.0));
+    }
+
+    #[test]
+    fn parse_avg_rtt_empty_input() {
+        assert_eq!(parse_avg_rtt(""), None);
+    }
+
+    #[test]
+    fn parse_avg_rtt_gibberish() {
+        assert_eq!(parse_avg_rtt("this is not ping output"), None);
+    }
 }

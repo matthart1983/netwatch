@@ -321,3 +321,189 @@ fn call_ollama(model: &str, prompt: &str) -> Result<String, Box<dyn std::error::
 
     Ok(content)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collectors::connections::Connection;
+    use crate::collectors::health::HealthStatus;
+    use crate::collectors::packets::{CapturedPacket, ExpertSeverity};
+    use std::collections::VecDeque;
+
+    fn make_health() -> HealthStatus {
+        HealthStatus {
+            gateway_rtt_ms: Some(5.0),
+            gateway_loss_pct: 0.0,
+            dns_rtt_ms: Some(10.0),
+            dns_loss_pct: 0.0,
+            gateway_rtt_history: VecDeque::new(),
+            dns_rtt_history: VecDeque::new(),
+        }
+    }
+
+    fn make_packet(proto: &str, src: &str, dst: &str, info: &str, expert: ExpertSeverity) -> CapturedPacket {
+        CapturedPacket {
+            id: 1,
+            timestamp: "00:00:00.000".into(),
+            src_ip: src.into(),
+            dst_ip: dst.into(),
+            src_host: None,
+            dst_host: None,
+            protocol: proto.into(),
+            length: 100,
+            src_port: None,
+            dst_port: None,
+            info: info.into(),
+            details: vec![],
+            payload_text: String::new(),
+            raw_hex: String::new(),
+            raw_ascii: String::new(),
+            raw_bytes: vec![],
+            stream_index: None,
+            tcp_flags: None,
+            expert,
+            timestamp_ns: 0,
+        }
+    }
+
+    fn make_conn(state: &str) -> Connection {
+        Connection {
+            protocol: "TCP".into(),
+            local_addr: "127.0.0.1:1234".into(),
+            remote_addr: "8.8.8.8:443".into(),
+            state: state.into(),
+            pid: None,
+            process_name: None,
+        }
+    }
+
+    #[test]
+    fn empty_snapshot() {
+        let snap = NetworkSnapshot::build(&[], &[], &make_health(), "0 B/s", "0 B/s");
+        assert_eq!(snap.total_packets, 0);
+        assert!(snap.protocol_counts.is_empty());
+        assert!(snap.top_talkers.is_empty());
+        assert!(snap.dns_queries.is_empty());
+        assert!(snap.expert_errors.is_empty());
+        assert!(snap.expert_warnings.is_empty());
+        assert_eq!(snap.connections_established, 0);
+        assert_eq!(snap.connections_other, 0);
+    }
+
+    #[test]
+    fn protocol_counting() {
+        let packets: Vec<CapturedPacket> = (0..3)
+            .map(|_| make_packet("TCP", "10.0.0.1", "10.0.0.2", "", ExpertSeverity::Chat))
+            .chain((0..2).map(|_| make_packet("DNS", "10.0.0.1", "8.8.8.8", "", ExpertSeverity::Chat)))
+            .collect();
+
+        let snap = NetworkSnapshot::build(&packets, &[], &make_health(), "0 B/s", "0 B/s");
+        assert_eq!(snap.protocol_counts.get("TCP"), Some(&3));
+        assert_eq!(snap.protocol_counts.get("DNS"), Some(&2));
+        assert_eq!(snap.total_packets, 5);
+    }
+
+    #[test]
+    fn top_talkers_sorted_and_truncated() {
+        // Create 12 distinct destinations with varying counts
+        let mut packets = Vec::new();
+        for i in 0..12 {
+            let dst = format!("10.0.0.{}", i);
+            let count = (i + 1) as usize; // 1, 2, 3, ... 12
+            for _ in 0..count {
+                packets.push(make_packet("TCP", "192.168.1.1", &dst, "", ExpertSeverity::Chat));
+            }
+        }
+
+        let snap = NetworkSnapshot::build(&packets, &[], &make_health(), "0 B/s", "0 B/s");
+        assert_eq!(snap.top_talkers.len(), 10);
+        // First entry should be the highest count destination
+        assert_eq!(snap.top_talkers[0].1, 12);
+        // Verify sorted descending
+        for w in snap.top_talkers.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    #[test]
+    fn dns_queries_extracted() {
+        let packets = vec![
+            make_packet("DNS", "10.0.0.1", "8.8.8.8", "Standard query A example.com", ExpertSeverity::Chat),
+            make_packet("DNS", "10.0.0.1", "8.8.8.8", "Standard query A test.org", ExpertSeverity::Chat),
+            // Response should NOT be included
+            make_packet("DNS", "8.8.8.8", "10.0.0.1", "Standard query response A example.com 1.2.3.4", ExpertSeverity::Note),
+        ];
+
+        let snap = NetworkSnapshot::build(&packets, &[], &make_health(), "0 B/s", "0 B/s");
+        assert_eq!(snap.dns_queries.len(), 2);
+        assert!(snap.dns_queries.contains(&"example.com".to_string()));
+        assert!(snap.dns_queries.contains(&"test.org".to_string()));
+    }
+
+    #[test]
+    fn expert_errors_and_warnings() {
+        let packets = vec![
+            make_packet("TCP", "10.0.0.1", "10.0.0.2", "RST", ExpertSeverity::Error),
+            make_packet("TCP", "10.0.0.1", "10.0.0.3", "Zero window", ExpertSeverity::Warn),
+            make_packet("TCP", "10.0.0.1", "10.0.0.4", "normal", ExpertSeverity::Chat),
+        ];
+
+        let snap = NetworkSnapshot::build(&packets, &[], &make_health(), "0 B/s", "0 B/s");
+        assert_eq!(snap.expert_errors.len(), 1);
+        assert!(snap.expert_errors[0].contains("RST"));
+        assert_eq!(snap.expert_warnings.len(), 1);
+        assert!(snap.expert_warnings[0].contains("Zero window"));
+    }
+
+    #[test]
+    fn connection_counting() {
+        let conns = vec![
+            make_conn("ESTABLISHED"),
+            make_conn("ESTABLISHED"),
+            make_conn("TIME_WAIT"),
+            make_conn("CLOSE_WAIT"),
+        ];
+
+        let snap = NetworkSnapshot::build(&[], &conns, &make_health(), "0 B/s", "0 B/s");
+        assert_eq!(snap.connections_established, 2);
+        assert_eq!(snap.connections_other, 2);
+    }
+
+    #[test]
+    fn to_prompt_contains_key_metrics() {
+        let packets = vec![
+            make_packet("TCP", "10.0.0.1", "10.0.0.2", "data", ExpertSeverity::Chat),
+        ];
+        let conns = vec![make_conn("ESTABLISHED")];
+        let snap = NetworkSnapshot::build(&packets, &conns, &make_health(), "1.5 MB/s", "200 KB/s");
+        let prompt = snap.to_prompt();
+
+        assert!(prompt.contains("Total packets captured: 1"));
+        assert!(prompt.contains("TCP: 1"));
+        assert!(prompt.contains("RX 1.5 MB/s"));
+        assert!(prompt.contains("TX 200 KB/s"));
+        assert!(prompt.contains("1 established"));
+        assert!(prompt.contains("Gateway: 5.0ms RTT"));
+        assert!(prompt.contains("DNS: 10.0ms RTT"));
+    }
+
+    #[test]
+    fn large_dataset_only_last_500() {
+        let packets: Vec<CapturedPacket> = (0..600)
+            .map(|i| {
+                if i < 500 {
+                    make_packet("OLD", "10.0.0.1", "10.0.0.2", "", ExpertSeverity::Chat)
+                } else {
+                    make_packet("NEW", "10.0.0.1", "10.0.0.3", "", ExpertSeverity::Chat)
+                }
+            })
+            .collect();
+
+        let snap = NetworkSnapshot::build(&packets, &[], &make_health(), "0 B/s", "0 B/s");
+        // total_packets reflects the full slice length
+        assert_eq!(snap.total_packets, 600);
+        // protocol_counts only reflect the last 500 (indices 100..600)
+        assert_eq!(snap.protocol_counts.get("OLD").copied().unwrap_or(0), 400);
+        assert_eq!(snap.protocol_counts.get("NEW").copied().unwrap_or(0), 100);
+    }
+}

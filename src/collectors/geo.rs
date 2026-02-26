@@ -113,3 +113,96 @@ fn lookup_geo(ip: &str) -> Option<GeoInfo> {
             .to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_class_a() {
+        assert!(is_private_ip("10.0.0.1"));
+        assert!(is_private_ip("10.255.255.255"));
+    }
+
+    #[test]
+    fn private_class_b() {
+        assert!(is_private_ip("172.16.0.1"));
+        assert!(is_private_ip("172.31.255.255"));
+    }
+
+    #[test]
+    fn not_private_class_b_boundary() {
+        assert!(!is_private_ip("172.15.0.1"));
+        assert!(!is_private_ip("172.32.0.1"));
+    }
+
+    #[test]
+    fn private_class_c() {
+        assert!(is_private_ip("192.168.1.1"));
+    }
+
+    #[test]
+    fn not_private_192() {
+        assert!(!is_private_ip("192.169.1.1"));
+    }
+
+    #[test]
+    fn loopback_v4() {
+        assert!(is_private_ip("127.0.0.1"));
+    }
+
+    #[test]
+    fn all_zeros() {
+        assert!(is_private_ip("0.0.0.0"));
+    }
+
+    #[test]
+    fn public_ips() {
+        assert!(!is_private_ip("8.8.8.8"));
+        assert!(!is_private_ip("1.1.1.1"));
+    }
+
+    #[test]
+    fn ipv6_unspecified_and_loopback() {
+        assert!(is_private_ip("::"));
+        assert!(is_private_ip("::1"));
+    }
+
+    #[test]
+    fn ipv6_link_local() {
+        assert!(is_private_ip("fe80::1"));
+    }
+
+    #[test]
+    fn ipv6_ula() {
+        assert!(is_private_ip("fc00::1"));
+        assert!(is_private_ip("fd00::1"));
+    }
+
+    #[test]
+    fn ipv6_multicast() {
+        assert!(is_private_ip("ff02::1"));
+    }
+
+    #[test]
+    fn link_local_v4() {
+        assert!(is_private_ip("169.254.1.1"));
+    }
+
+    #[test]
+    fn multicast_v4() {
+        assert!(is_private_ip("224.0.0.1"));
+        assert!(is_private_ip("239.255.255.255"));
+    }
+
+    #[test]
+    fn ipv6_documentation_prefix_not_caught() {
+        assert!(!is_private_ip("2001:db8::1"));
+    }
+
+    #[test]
+    fn empty_and_invalid() {
+        assert!(!is_private_ip(""));
+        assert!(!is_private_ip("not-an-ip"));
+    }
+}

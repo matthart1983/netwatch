@@ -364,3 +364,156 @@ fn parse_windows_connections() -> Vec<Connection> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_conn(proto: &str, local: &str, remote: &str, state: &str, pid: u32) -> Connection {
+        Connection {
+            protocol: proto.into(),
+            local_addr: local.into(),
+            remote_addr: remote.into(),
+            state: state.into(),
+            pid: Some(pid),
+            process_name: Some("test".into()),
+        }
+    }
+
+    #[test]
+    fn new_timeline_is_empty() {
+        let tl = ConnectionTimeline::new();
+        assert!(tl.tracked.is_empty());
+    }
+
+    #[test]
+    fn update_adds_new_connections() {
+        let mut tl = ConnectionTimeline::new();
+        let conns = vec![
+            make_conn("TCP", "127.0.0.1:8080", "10.0.0.1:443", "ESTABLISHED", 100),
+            make_conn("UDP", "0.0.0.0:53", "*:*", "", 200),
+        ];
+        tl.update(&conns);
+        assert_eq!(tl.tracked.len(), 2);
+        assert!(tl.tracked.iter().all(|t| t.is_active));
+    }
+
+    #[test]
+    fn update_marks_existing_connections_active() {
+        let mut tl = ConnectionTimeline::new();
+        let conns = vec![make_conn("TCP", "127.0.0.1:8080", "10.0.0.1:443", "ESTABLISHED", 100)];
+        tl.update(&conns);
+        tl.update(&conns);
+        assert_eq!(tl.tracked.len(), 1);
+        assert!(tl.tracked[0].is_active);
+    }
+
+    #[test]
+    fn update_marks_disappeared_connections_inactive() {
+        let mut tl = ConnectionTimeline::new();
+        let conns = vec![make_conn("TCP", "127.0.0.1:8080", "10.0.0.1:443", "ESTABLISHED", 100)];
+        tl.update(&conns);
+        tl.update(&[]);
+        assert_eq!(tl.tracked.len(), 1);
+        assert!(!tl.tracked[0].is_active);
+    }
+
+    #[test]
+    fn update_changes_state() {
+        let mut tl = ConnectionTimeline::new();
+        let c1 = vec![make_conn("TCP", "127.0.0.1:8080", "10.0.0.1:443", "ESTABLISHED", 100)];
+        tl.update(&c1);
+        assert_eq!(tl.tracked[0].state, "ESTABLISHED");
+
+        let c2 = vec![make_conn("TCP", "127.0.0.1:8080", "10.0.0.1:443", "TIME_WAIT", 100)];
+        tl.update(&c2);
+        assert_eq!(tl.tracked[0].state, "TIME_WAIT");
+    }
+
+    #[test]
+    fn connection_key_equality() {
+        let k1 = ConnectionKey {
+            protocol: "TCP".into(),
+            local_addr: "127.0.0.1:80".into(),
+            remote_addr: "10.0.0.1:443".into(),
+            pid: Some(42),
+        };
+        let k2 = ConnectionKey {
+            protocol: "TCP".into(),
+            local_addr: "127.0.0.1:80".into(),
+            remote_addr: "10.0.0.1:443".into(),
+            pid: Some(42),
+        };
+        assert_eq!(k1, k2);
+
+        let k3 = ConnectionKey {
+            protocol: "UDP".into(),
+            local_addr: "127.0.0.1:80".into(),
+            remote_addr: "10.0.0.1:443".into(),
+            pid: Some(42),
+        };
+        assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn connection_key_deduplicates_in_timeline() {
+        let mut tl = ConnectionTimeline::new();
+        let conn = make_conn("TCP", "127.0.0.1:8080", "10.0.0.1:443", "ESTABLISHED", 100);
+        tl.update(&[conn.clone(), conn.clone()]);
+        assert_eq!(tl.tracked.len(), 1);
+    }
+
+    #[test]
+    fn inactive_connection_becomes_active_on_reappearance() {
+        let mut tl = ConnectionTimeline::new();
+        let conns = vec![make_conn("TCP", "127.0.0.1:8080", "10.0.0.1:443", "ESTABLISHED", 100)];
+        tl.update(&conns);
+        tl.update(&[]);
+        assert!(!tl.tracked[0].is_active);
+        tl.update(&conns);
+        assert!(tl.tracked[0].is_active);
+    }
+
+    #[test]
+    fn eviction_removes_oldest_inactive_over_limit() {
+        let mut tl = ConnectionTimeline::new();
+
+        // Add MAX_TRACKED_CONNECTIONS active connections
+        let conns: Vec<Connection> = (0..MAX_TRACKED_CONNECTIONS as u32)
+            .map(|i| make_conn("TCP", &format!("127.0.0.1:{}", i), "10.0.0.1:443", "ESTABLISHED", i))
+            .collect();
+        tl.update(&conns);
+        assert_eq!(tl.tracked.len(), MAX_TRACKED_CONNECTIONS);
+
+        // Mark all as inactive, then add new ones to exceed the limit
+        tl.update(&[]);
+        let extra: Vec<Connection> = (0..10u32)
+            .map(|i| make_conn("TCP", &format!("192.168.0.1:{}", i), "10.0.0.1:443", "ESTABLISHED", 50000 + i))
+            .collect();
+        tl.update(&extra);
+
+        // Should have evicted enough inactive to get back to MAX_TRACKED_CONNECTIONS
+        assert_eq!(tl.tracked.len(), MAX_TRACKED_CONNECTIONS);
+        // All extra connections should still be present
+        for i in 0..10u32 {
+            let key = ConnectionKey {
+                protocol: "TCP".into(),
+                local_addr: format!("192.168.0.1:{}", i),
+                remote_addr: "10.0.0.1:443".into(),
+                pid: Some(50000 + i),
+            };
+            assert!(tl.known_keys.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn multiple_protocols_tracked_separately() {
+        let mut tl = ConnectionTimeline::new();
+        let conns = vec![
+            make_conn("TCP", "127.0.0.1:80", "10.0.0.1:443", "ESTABLISHED", 100),
+            make_conn("UDP", "127.0.0.1:80", "10.0.0.1:443", "", 100),
+        ];
+        tl.update(&conns);
+        assert_eq!(tl.tracked.len(), 2);
+    }
+}

@@ -1693,3 +1693,441 @@ fn resolve_device_name(friendly: &str) -> String {
         friendly.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_packet(proto: &str, src: &str, dst: &str, src_port: Option<u16>, dst_port: Option<u16>, info: &str) -> CapturedPacket {
+        CapturedPacket {
+            id: 1, timestamp: "00:00:00.000".into(),
+            src_ip: src.into(), dst_ip: dst.into(),
+            src_host: None, dst_host: None,
+            protocol: proto.into(), length: 100,
+            src_port, dst_port,
+            info: info.into(), details: vec![],
+            payload_text: String::new(),
+            raw_hex: String::new(), raw_ascii: String::new(), raw_bytes: vec![],
+            stream_index: None, tcp_flags: None,
+            expert: ExpertSeverity::Chat, timestamp_ns: 0,
+        }
+    }
+
+    // ── format_mac ──────────────────────────────────────────
+    #[test]
+    fn test_format_mac_normal() {
+        assert_eq!(format_mac(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]), "aa:bb:cc:dd:ee:ff");
+    }
+    #[test]
+    fn test_format_mac_zeros() {
+        assert_eq!(format_mac(&[0, 0, 0, 0, 0, 0]), "00:00:00:00:00:00");
+    }
+    #[test]
+    fn test_format_mac_broadcast() {
+        assert_eq!(format_mac(&[0xff; 6]), "ff:ff:ff:ff:ff:ff");
+    }
+
+    // ── format_ipv6 ─────────────────────────────────────────
+    #[test]
+    fn test_format_ipv6_loopback() {
+        let mut bytes = [0u8; 16];
+        bytes[15] = 1;
+        assert_eq!(format_ipv6(&bytes), "0:0:0:0:0:0:0:1");
+    }
+    #[test]
+    fn test_format_ipv6_all_zeros() {
+        assert_eq!(format_ipv6(&[0u8; 16]), "0:0:0:0:0:0:0:0");
+    }
+
+    // ── tcp_flags ───────────────────────────────────────────
+    #[test]
+    fn test_tcp_flags_none() { assert_eq!(tcp_flags(0), "NONE"); }
+    #[test]
+    fn test_tcp_flags_syn() { assert_eq!(tcp_flags(0x02), "SYN"); }
+    #[test]
+    fn test_tcp_flags_syn_ack() { assert_eq!(tcp_flags(0x12), "SYN,ACK"); }
+    #[test]
+    fn test_tcp_flags_fin_ack() { assert_eq!(tcp_flags(0x11), "FIN,ACK"); }
+    #[test]
+    fn test_tcp_flags_rst() { assert_eq!(tcp_flags(0x04), "RST"); }
+    #[test]
+    fn test_tcp_flags_all() { assert_eq!(tcp_flags(0x3F), "FIN,SYN,RST,PSH,ACK,URG"); }
+
+    // ── ip_protocol_name ────────────────────────────────────
+    #[test]
+    fn test_ip_proto_tcp() { assert_eq!(ip_protocol_name(6), "TCP"); }
+    #[test]
+    fn test_ip_proto_udp() { assert_eq!(ip_protocol_name(17), "UDP"); }
+    #[test]
+    fn test_ip_proto_icmp() { assert_eq!(ip_protocol_name(1), "ICMP"); }
+    #[test]
+    fn test_ip_proto_icmpv6() { assert_eq!(ip_protocol_name(58), "ICMPv6"); }
+    #[test]
+    fn test_ip_proto_unknown() { assert_eq!(ip_protocol_name(255), "Proto(255)"); }
+
+    // ── port_label ──────────────────────────────────────────
+    #[test]
+    fn test_port_label_known() {
+        assert_eq!(port_label(22), "SSH");
+        assert_eq!(port_label(53), "DNS");
+        assert_eq!(port_label(80), "HTTP");
+        assert_eq!(port_label(443), "HTTPS");
+    }
+    #[test]
+    fn test_port_label_unknown() { assert_eq!(port_label(12345), "—"); }
+
+    // ── icmp_type_name ──────────────────────────────────────
+    #[test]
+    fn test_icmp_echo_request() { assert_eq!(icmp_type_name(8, 0), "Echo Request"); }
+    #[test]
+    fn test_icmp_echo_reply() { assert_eq!(icmp_type_name(0, 0), "Echo Reply"); }
+    #[test]
+    fn test_icmp_dest_unreachable_port() {
+        assert!(icmp_type_name(3, 3).contains("Port Unreachable"));
+    }
+    #[test]
+    fn test_icmp_ttl_exceeded() {
+        assert!(icmp_type_name(11, 0).contains("TTL Exceeded"));
+    }
+
+    // ── icmpv6_type_name ────────────────────────────────────
+    #[test]
+    fn test_icmpv6_echo() {
+        assert_eq!(icmpv6_type_name(128), "Echo Request");
+        assert_eq!(icmpv6_type_name(129), "Echo Reply");
+    }
+    #[test]
+    fn test_icmpv6_neighbor() {
+        assert_eq!(icmpv6_type_name(135), "Neighbor Solicitation");
+        assert_eq!(icmpv6_type_name(136), "Neighbor Advertisement");
+    }
+
+    // ── classify_expert ─────────────────────────────────────
+    #[test]
+    fn test_expert_rst_is_error() {
+        assert_eq!(classify_expert("TCP", "", Some(0x04)), ExpertSeverity::Error);
+    }
+    #[test]
+    fn test_expert_syn_is_chat() {
+        assert_eq!(classify_expert("TCP", "", Some(0x02)), ExpertSeverity::Chat);
+    }
+    #[test]
+    fn test_expert_fin_is_note() {
+        assert_eq!(classify_expert("TCP", "", Some(0x01)), ExpertSeverity::Note);
+    }
+    #[test]
+    fn test_expert_dns_nxdomain() {
+        assert_eq!(classify_expert("DNS", "NXDOMAIN", None), ExpertSeverity::Error);
+    }
+    #[test]
+    fn test_expert_icmp_unreachable() {
+        assert_eq!(classify_expert("ICMP", "Dest Unreachable", None), ExpertSeverity::Warn);
+    }
+    #[test]
+    fn test_expert_http_error() {
+        assert_eq!(classify_expert("HTTP", "HTTP/1.1 404 Not Found", None), ExpertSeverity::Warn);
+    }
+    #[test]
+    fn test_expert_zero_window() {
+        assert_eq!(classify_expert("TCP", "Win=0 Len=0", Some(0x10)), ExpertSeverity::Warn);
+    }
+
+    // ── parse_timestamp_for_pcap ────────────────────────────
+    #[test]
+    fn test_pcap_timestamp_normal() {
+        let (sec, usec) = parse_timestamp_for_pcap("12:30:45.123");
+        assert_eq!(sec, 12 * 3600 + 30 * 60 + 45);
+        assert_eq!(usec, 123_000);
+    }
+    #[test]
+    fn test_pcap_timestamp_midnight() {
+        let (sec, usec) = parse_timestamp_for_pcap("00:00:00.000");
+        assert_eq!(sec, 0);
+        assert_eq!(usec, 0);
+    }
+    #[test]
+    fn test_pcap_timestamp_invalid() {
+        assert_eq!(parse_timestamp_for_pcap("garbage"), (0, 0));
+    }
+
+    // ── parse_dns_name ──────────────────────────────────────
+    #[test]
+    fn test_dns_name_simple() {
+        // "\x07example\x03com\x00"
+        let data = b"\x07example\x03com\x00";
+        assert_eq!(parse_dns_name(data, 0), Some("example.com".into()));
+    }
+    #[test]
+    fn test_dns_name_subdomain() {
+        let data = b"\x03www\x07example\x03com\x00";
+        assert_eq!(parse_dns_name(data, 0), Some("www.example.com".into()));
+    }
+    #[test]
+    fn test_dns_name_empty() {
+        let data = b"\x00";
+        assert_eq!(parse_dns_name(data, 0), None);
+    }
+    #[test]
+    fn test_dns_name_truncated() {
+        let data = b"\x07exam";
+        assert_eq!(parse_dns_name(data, 0), None);
+    }
+
+    // ── dns_query_type ──────────────────────────────────────
+    #[test]
+    fn test_dns_qtype_a() {
+        // name: "\x07example\x03com\x00" + qtype 1 (A)
+        let mut data = b"\x07example\x03com\x00".to_vec();
+        data.extend_from_slice(&[0x00, 0x01]); // A record
+        assert_eq!(dns_query_type(&data, 0, "example.com"), "A");
+    }
+    #[test]
+    fn test_dns_qtype_aaaa() {
+        let mut data = b"\x07example\x03com\x00".to_vec();
+        data.extend_from_slice(&[0x00, 28]); // AAAA
+        assert_eq!(dns_query_type(&data, 0, "example.com"), "AAAA");
+    }
+
+    // ── parse_arp ───────────────────────────────────────────
+    #[test]
+    fn test_arp_request() {
+        let mut data = [0u8; 28];
+        data[6] = 0; data[7] = 1; // op = request
+        data[8..14].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        data[14..18].copy_from_slice(&[192, 168, 1, 1]);
+        data[24..28].copy_from_slice(&[192, 168, 1, 2]);
+        let mut details = vec![];
+        let info = parse_arp(&data, &mut details);
+        assert!(info.contains("Who has 192.168.1.2"));
+        assert!(info.contains("Tell 192.168.1.1"));
+    }
+    #[test]
+    fn test_arp_reply() {
+        let mut data = [0u8; 28];
+        data[6] = 0; data[7] = 2; // op = reply
+        data[8..14].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        data[14..18].copy_from_slice(&[192, 168, 1, 1]);
+        let mut details = vec![];
+        let info = parse_arp(&data, &mut details);
+        assert!(info.contains("192.168.1.1 is at"));
+    }
+    #[test]
+    fn test_arp_truncated() {
+        let mut details = vec![];
+        let info = parse_arp(&[0; 10], &mut details);
+        assert!(info.contains("truncated"));
+    }
+
+    // ── parse_dhcp / parse_ntp ──────────────────────────────
+    #[test]
+    fn test_dhcp_discover() { assert!(parse_dhcp(&[1]).contains("Discover")); }
+    #[test]
+    fn test_dhcp_offer() { assert!(parse_dhcp(&[2]).contains("Offer")); }
+    #[test]
+    fn test_dhcp_empty() { assert_eq!(parse_dhcp(&[]), "DHCP"); }
+
+    #[test]
+    fn test_ntp_client() {
+        let data = [0x23]; // version 4, mode 3 (client)
+        assert!(parse_ntp(&data).contains("Client"));
+    }
+    #[test]
+    fn test_ntp_server() {
+        let data = [0x24]; // version 4, mode 4 (server)
+        assert!(parse_ntp(&data).contains("Server"));
+    }
+    #[test]
+    fn test_ntp_empty() { assert_eq!(parse_ntp(&[]), "NTP"); }
+
+    // ── parse_http ──────────────────────────────────────────
+    #[test]
+    fn test_http_get() {
+        let data = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n";
+        let (info, _detail) = parse_http(data).unwrap();
+        assert!(info.contains("GET /index.html"));
+    }
+    #[test]
+    fn test_http_response() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n";
+        let (info, _) = parse_http(data).unwrap();
+        assert!(info.contains("200 OK"));
+    }
+    #[test]
+    fn test_http_not_http() {
+        assert!(parse_http(b"\x16\x03\x01binary stuff").is_none());
+    }
+
+    // ── extract_readable_payload ────────────────────────────
+    #[test]
+    fn test_readable_text_payload() {
+        let payload = b"Hello, World! This is readable text.";
+        let result = extract_readable_payload(payload);
+        assert!(result.contains("Hello, World!"));
+    }
+    #[test]
+    fn test_readable_binary_payload() {
+        let payload: Vec<u8> = vec![0u8; 100];
+        let result = extract_readable_payload(&payload);
+        assert!(result.contains("binary data"));
+    }
+    #[test]
+    fn test_readable_empty_payload() {
+        assert_eq!(extract_readable_payload(&[]), String::new());
+    }
+
+    // ── parse_filter / matches_packet ───────────────────────
+    #[test]
+    fn test_filter_protocol() {
+        let f = parse_filter("tcp").unwrap();
+        assert!(matches!(f, FilterExpr::Protocol(ref p) if p == "TCP"));
+    }
+    #[test]
+    fn test_filter_src_ip() {
+        let f = parse_filter("ip.src == 1.2.3.4").unwrap();
+        assert!(matches!(f, FilterExpr::SrcIp(ref ip) if ip == "1.2.3.4"));
+    }
+    #[test]
+    fn test_filter_dst_ip() {
+        let f = parse_filter("ip.dst == 10.0.0.1").unwrap();
+        assert!(matches!(f, FilterExpr::DstIp(ref ip) if ip == "10.0.0.1"));
+    }
+    #[test]
+    fn test_filter_port() {
+        let f = parse_filter("port 80").unwrap();
+        assert!(matches!(f, FilterExpr::Port(80)));
+    }
+    #[test]
+    fn test_filter_port_eq() {
+        let f = parse_filter("port == 443").unwrap();
+        assert!(matches!(f, FilterExpr::Port(443)));
+    }
+    #[test]
+    fn test_filter_stream() {
+        let f = parse_filter("stream 5").unwrap();
+        assert!(matches!(f, FilterExpr::Stream(5)));
+    }
+    #[test]
+    fn test_filter_bare_ip() {
+        let f = parse_filter("192.168.1.1").unwrap();
+        assert!(matches!(f, FilterExpr::Ip(ref ip) if ip == "192.168.1.1"));
+    }
+    #[test]
+    fn test_filter_and() {
+        let f = parse_filter("tcp and port 80").unwrap();
+        assert!(matches!(f, FilterExpr::And(_, _)));
+    }
+    #[test]
+    fn test_filter_or() {
+        let f = parse_filter("dns or http").unwrap();
+        assert!(matches!(f, FilterExpr::Or(_, _)));
+    }
+    #[test]
+    fn test_filter_not() {
+        let f = parse_filter("! tcp").unwrap();
+        assert!(matches!(f, FilterExpr::Not(_)));
+    }
+    #[test]
+    fn test_filter_empty() { assert!(parse_filter("").is_none()); }
+
+    #[test]
+    fn test_matches_protocol() {
+        let pkt = make_packet("TCP", "1.1.1.1", "2.2.2.2", Some(1234), Some(80), "");
+        let f = parse_filter("tcp").unwrap();
+        assert!(matches_packet(&f, &pkt));
+        let f2 = parse_filter("udp").unwrap();
+        assert!(!matches_packet(&f2, &pkt));
+    }
+    #[test]
+    fn test_matches_port() {
+        let pkt = make_packet("TCP", "1.1.1.1", "2.2.2.2", Some(1234), Some(443), "");
+        assert!(matches_packet(&parse_filter("port 443").unwrap(), &pkt));
+        assert!(matches_packet(&parse_filter("port 1234").unwrap(), &pkt));
+        assert!(!matches_packet(&parse_filter("port 80").unwrap(), &pkt));
+    }
+    #[test]
+    fn test_matches_ip() {
+        let pkt = make_packet("TCP", "10.0.0.1", "8.8.8.8", None, None, "");
+        assert!(matches_packet(&parse_filter("10.0.0.1").unwrap(), &pkt));
+        assert!(matches_packet(&parse_filter("8.8.8.8").unwrap(), &pkt));
+        assert!(!matches_packet(&parse_filter("1.2.3.4").unwrap(), &pkt));
+    }
+    #[test]
+    fn test_matches_and() {
+        let pkt = make_packet("TCP", "1.1.1.1", "2.2.2.2", Some(1234), Some(80), "");
+        assert!(matches_packet(&parse_filter("tcp and port 80").unwrap(), &pkt));
+        assert!(!matches_packet(&parse_filter("udp and port 80").unwrap(), &pkt));
+    }
+    #[test]
+    fn test_matches_not() {
+        let pkt = make_packet("TCP", "1.1.1.1", "2.2.2.2", None, None, "");
+        assert!(matches_packet(&parse_filter("! udp").unwrap(), &pkt));
+        assert!(!matches_packet(&parse_filter("! tcp").unwrap(), &pkt));
+    }
+
+    // ── StreamKey ───────────────────────────────────────────
+    #[test]
+    fn test_stream_key_normalization() {
+        let k1 = StreamKey::new(StreamProtocol::Tcp, "1.1.1.1", 80, "2.2.2.2", 1234);
+        let k2 = StreamKey::new(StreamProtocol::Tcp, "2.2.2.2", 1234, "1.1.1.1", 80);
+        assert_eq!(k1, k2);
+    }
+    #[test]
+    fn test_stream_key_different_proto() {
+        let k1 = StreamKey::new(StreamProtocol::Tcp, "1.1.1.1", 80, "2.2.2.2", 1234);
+        let k2 = StreamKey::new(StreamProtocol::Udp, "1.1.1.1", 80, "2.2.2.2", 1234);
+        assert_ne!(k1, k2);
+    }
+
+    // ── TcpHandshake ────────────────────────────────────────
+    #[test]
+    fn test_handshake_timing() {
+        let hs = TcpHandshake { syn_ns: 1_000_000, syn_ack_ns: Some(2_000_000), ack_ns: Some(3_000_000) };
+        assert!((hs.syn_to_syn_ack_ms().unwrap() - 1.0).abs() < 0.001);
+        assert!((hs.syn_ack_to_ack_ms().unwrap() - 1.0).abs() < 0.001);
+        assert!((hs.total_ms().unwrap() - 2.0).abs() < 0.001);
+    }
+    #[test]
+    fn test_handshake_incomplete() {
+        let hs = TcpHandshake { syn_ns: 1_000_000, syn_ack_ns: None, ack_ns: None };
+        assert!(hs.syn_to_syn_ack_ms().is_none());
+        assert!(hs.total_ms().is_none());
+    }
+
+    // ── StreamTracker ───────────────────────────────────────
+    #[test]
+    fn test_stream_tracker_basic() {
+        let mut tracker = StreamTracker::new();
+        let idx = tracker.track_packet("1.1.1.1", 1234, "2.2.2.2", 80, StreamProtocol::Tcp, b"hello", 1, "00:00:00", Some(0x02), 1_000_000);
+        assert_eq!(idx, 0);
+        let stream = tracker.get_stream(0).unwrap();
+        assert_eq!(stream.packet_count, 1);
+        assert!(stream.handshake.is_some());
+    }
+    #[test]
+    fn test_stream_tracker_same_stream() {
+        let mut tracker = StreamTracker::new();
+        let i1 = tracker.track_packet("1.1.1.1", 1234, "2.2.2.2", 80, StreamProtocol::Tcp, b"", 1, "t", None, 0);
+        let i2 = tracker.track_packet("2.2.2.2", 80, "1.1.1.1", 1234, StreamProtocol::Tcp, b"", 2, "t", None, 0);
+        assert_eq!(i1, i2);
+        assert_eq!(tracker.get_stream(i1).unwrap().packet_count, 2);
+    }
+    #[test]
+    fn test_stream_tracker_handshake() {
+        let mut tracker = StreamTracker::new();
+        tracker.track_packet("1.1.1.1", 1234, "2.2.2.2", 80, StreamProtocol::Tcp, b"", 1, "t", Some(0x02), 1_000_000);
+        tracker.track_packet("2.2.2.2", 80, "1.1.1.1", 1234, StreamProtocol::Tcp, b"", 2, "t", Some(0x12), 2_000_000);
+        tracker.track_packet("1.1.1.1", 1234, "2.2.2.2", 80, StreamProtocol::Tcp, b"", 3, "t", Some(0x10), 3_000_000);
+        let hs = tracker.get_stream(0).unwrap().handshake.as_ref().unwrap();
+        assert_eq!(hs.syn_ns, 1_000_000);
+        assert_eq!(hs.syn_ack_ns, Some(2_000_000));
+        assert_eq!(hs.ack_ns, Some(3_000_000));
+    }
+    #[test]
+    fn test_stream_tracker_clear() {
+        let mut tracker = StreamTracker::new();
+        tracker.track_packet("1.1.1.1", 1234, "2.2.2.2", 80, StreamProtocol::Tcp, b"", 1, "t", None, 0);
+        tracker.clear();
+        assert!(tracker.all_streams.is_empty());
+        assert!(tracker.get_stream(0).is_none());
+    }
+}
