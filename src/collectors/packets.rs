@@ -449,7 +449,7 @@ impl PacketCollector {
         let counter = Arc::clone(&self.counter);
         let tracker = Arc::clone(&self.stream_tracker);
         let dns = self.dns_cache.clone();
-        let iface = interface.to_string();
+        let iface = resolve_device_name(interface);
         let bpf = bpf_filter.map(|s| s.to_string());
 
         self.handle = Some(thread::spawn(move || {
@@ -1653,5 +1653,43 @@ pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
         FilterExpr::Not(inner) => !matches_packet(inner, pkt),
         FilterExpr::And(a, b) => matches_packet(a, pkt) && matches_packet(b, pkt),
         FilterExpr::Or(a, b) => matches_packet(a, pkt) || matches_packet(b, pkt),
+    }
+}
+
+/// On Windows, pcap needs the `\Device\NPF_{GUID}` name rather than the
+/// friendly name (e.g. "Ethernet" or "Wi-Fi") that ipconfig reports.
+/// This maps friendly names to the pcap device name by matching descriptions.
+/// On non-Windows platforms this is a no-op.
+fn resolve_device_name(friendly: &str) -> String {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return friendly.to_string();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // If it already looks like an NPF path, use as-is.
+        if friendly.starts_with("\\Device\\") || friendly.starts_with("\\\\") {
+            return friendly.to_string();
+        }
+
+        let devices = match pcap::Device::list() {
+            Ok(d) => d,
+            Err(_) => return friendly.to_string(),
+        };
+
+        let friendly_lower = friendly.to_lowercase();
+
+        // Match against the device description (which contains the friendly name).
+        for dev in &devices {
+            if let Some(ref desc) = dev.desc {
+                if desc.to_lowercase().contains(&friendly_lower) {
+                    return dev.name.clone();
+                }
+            }
+        }
+
+        // Fallback: return original and let pcap produce its own error.
+        friendly.to_string()
     }
 }
