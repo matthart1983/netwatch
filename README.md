@@ -10,6 +10,16 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 
 ---
 
+## Demo
+
+<p align="center">
+  <img src="demo.gif" alt="NetWatch demo — Dashboard, Connections, Interfaces, and Help overlay" width="800">
+</p>
+
+> Dashboard with live interface stats, bandwidth graphs, top connections, health probes, and latency heatmap. Packet capture with deep protocol inspection available when run with `sudo`.
+
+---
+
 ## Features
 
 - **Live interface monitoring** — RX/TX rates, totals, and 60-second sparkline history for every network interface
