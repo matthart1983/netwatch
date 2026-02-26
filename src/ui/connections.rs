@@ -27,7 +27,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("│ "),
         Span::raw("[1] Dashboard  "),
         Span::styled("[2] Connections", Style::default().fg(Color::Yellow).bold()),
-        Span::raw("  [3] Interfaces"),
+        Span::raw("  [3] Interfaces  [4] Packets  [5] Stats"),
         Span::raw("  │ "),
         Span::styled(format!("{count} connections"), Style::default().fg(Color::Green)),
         Span::raw("  │ "),
@@ -149,10 +149,14 @@ fn render_footer(f: &mut Frame, area: Rect) {
         Span::raw(":Scroll  "),
         Span::styled("s", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Sort  "),
-        Span::styled("1-3", Style::default().fg(Color::Yellow).bold()),
+        Span::styled("Enter", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":→Packets  "),
+        Span::styled("1-5", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Tab  "),
         Span::styled("p", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Pause"),
+        Span::raw(":Pause  "),
+        Span::styled("?", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":Help"),
     ]))
     .block(
         Block::default()

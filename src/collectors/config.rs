@@ -3,6 +3,7 @@ use std::process::Command;
 pub struct NetworkConfig {
     pub gateway: Option<String>,
     pub dns_servers: Vec<String>,
+    #[allow(dead_code)]
     pub hostname: String,
 }
 
