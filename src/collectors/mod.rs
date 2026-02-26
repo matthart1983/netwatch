@@ -5,3 +5,4 @@ pub mod health;
 pub mod packets;
 pub mod geo;
 pub mod whois;
+pub mod insights;

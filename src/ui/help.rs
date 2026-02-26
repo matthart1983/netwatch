@@ -76,9 +76,10 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(section_header("GLOBAL KEYS"));
     lines.push(key_line("q", "Quit"));
     lines.push(key_line("Ctrl+C", "Quit"));
-    lines.push(key_line("1-5", "Switch tab (Dashboard/Connections/Interfaces/Packets/Stats)"));
+    lines.push(key_line("1-8", "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Insights)"));
     lines.push(key_line("p", "Pause/resume data collection"));
     lines.push(key_line("r", "Force refresh all data"));
+    lines.push(key_line("a", "Request AI analysis (from any tab)"));
     lines.push(key_line("?", "Toggle this help overlay"));
     lines.push(key_line("g", "Toggle GeoIP location display"));
     lines.push(Line::raw(""));
@@ -132,6 +133,25 @@ fn build_help_lines() -> Vec<Line<'static>> {
     // STATS
     lines.push(section_header("STATS (Tab 5)"));
     lines.push(key_line("↑↓", "Scroll protocol list"));
+    lines.push(Line::raw(""));
+
+    // TOPOLOGY
+    lines.push(section_header("TOPOLOGY (Tab 6)"));
+    lines.push(key_line("↑↓", "Scroll topology view"));
+    lines.push(key_line("Enter", "Jump to Connections tab"));
+    lines.push(Line::raw(""));
+
+    // TIMELINE
+    lines.push(section_header("TIMELINE (Tab 7)"));
+    lines.push(key_line("↑↓", "Scroll connection list"));
+    lines.push(key_line("t", "Cycle time window (30s/1m/5m/15m/1h)"));
+    lines.push(key_line("Enter", "Jump to Connections tab"));
+    lines.push(Line::raw(""));
+
+    // INSIGHTS
+    lines.push(section_header("INSIGHTS (Tab 8)"));
+    lines.push(key_line("a", "Trigger on-demand AI analysis"));
+    lines.push(key_line("↑↓", "Scroll insights"));
     lines.push(Line::raw(""));
 
     // DISPLAY FILTER SYNTAX

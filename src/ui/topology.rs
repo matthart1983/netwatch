@@ -31,6 +31,7 @@ fn render_header(f: &mut Frame, area: Rect) {
         Span::raw("│ "),
         Span::raw("[1] Dashboard  [2] Connections  [3] Interfaces  [4] Packets  [5] Stats  "),
         Span::styled("[6] Topology", Style::default().fg(Color::Yellow).bold()),
+        Span::raw("  [7] Timeline  [8] Insights"),
         Span::raw("  │ "),
         Span::styled(now, Style::default().fg(Color::DarkGray)),
     ]))
@@ -361,6 +362,8 @@ fn render_footer(f: &mut Frame, area: Rect) {
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" q", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Quit  "),
+        Span::styled("a", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":Analyze  "),
         Span::styled("↑↓", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Scroll  "),
         Span::styled("Enter", Style::default().fg(Color::Yellow).bold()),
@@ -369,7 +372,7 @@ fn render_footer(f: &mut Frame, area: Rect) {
         Span::raw(":Pause  "),
         Span::styled("r", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Refresh  "),
-        Span::styled("1-6", Style::default().fg(Color::Yellow).bold()),
+        Span::styled("1-8", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Tab  "),
         Span::styled("g", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Geo  "),

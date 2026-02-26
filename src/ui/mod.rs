@@ -5,5 +5,6 @@ pub mod packets;
 pub mod stats;
 pub mod timeline;
 pub mod topology;
+pub mod insights;
 pub mod widgets;
 pub mod help;

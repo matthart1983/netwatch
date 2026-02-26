@@ -2,7 +2,7 @@
 
 **Real-time network diagnostics in your terminal — like htop for your network.**
 
-NetWatch is a lightweight, keyboard-driven TUI application that gives you instant visibility into network traffic, active connections, interface health, and live packet capture with deep protocol inspection. Built with Rust for speed and low overhead.
+NetWatch is a lightweight, keyboard-driven TUI application that gives you instant visibility into network traffic, active connections, interface health, live packet capture with deep protocol inspection, network topology mapping, connection timelines, and AI-powered network insights. Built with Rust for speed and low overhead.
 
 ![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)
@@ -50,6 +50,9 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 - **Help overlay** — Full scrollable keybinding reference with filter syntax and expert legend
 - **Network config** — Default gateway, DNS servers, hostname at a glance
 - **Cross-platform** — macOS, Linux, and Windows with platform-specific collectors
+- **Network topology** — ASCII box diagram showing local machine, gateway, DNS servers, and top remote hosts with connection counts and health indicators
+- **Connection timeline** — Gantt-style bar chart of connection lifetimes, color-coded by state with adjustable time windows (30s to 1h)
+- **AI network insights** — Real-time AI analysis via Ollama (llama3.2). Auto-analyzes every 15s, on-demand with `a` key. Detects security concerns, performance issues, and anomalies
 
 ---
 
@@ -91,7 +94,7 @@ sudo netwatch
 
 ## Tabs
 
-NetWatch has five tabs, switched with number keys `1`–`5`:
+NetWatch has eight tabs, switched with number keys `1`–`8`:
 
 ### `1` Dashboard
 
@@ -155,6 +158,35 @@ Protocol statistics and performance analysis:
 - **Protocol hierarchy** — Table of all seen protocols with packet counts, byte totals, percentages, and distribution bars
 - **Handshake histogram** — TCP handshake latency distribution across 7 buckets (<1ms to >500ms) with min/avg/median/p95/max summary
 
+### `6` Topology
+
+ASCII network topology map showing your machine's network neighbourhood:
+
+- **Local machine** — Hostname, active interfaces, aggregate bandwidth
+- **Infrastructure** — Gateway and DNS servers with health indicators (RTT, loss)
+- **Remote hosts** — Top destinations sorted by connection count, with process names
+- **Health dots** — Color-coded `●` indicators (green/yellow/red) for latency and loss
+- Press `Enter` to jump to Connections tab filtered to the selected host
+
+### `7` Timeline
+
+Gantt-style connection timeline showing when connections were active:
+
+- **Horizontal bars** — Each row is a connection (process + remote), bar spans first-seen to last-seen
+- **Color-coded** — Green (ESTABLISHED), Yellow (LISTEN), Cyan (SYN), Red (closing states)
+- **Time windows** — Press `t` to cycle: 30s, 1m, 5m, 15m, 1h
+- Press `Enter` to jump to Connections tab for the selected entry
+
+### `8` Insights
+
+AI-powered network analysis via local Ollama:
+
+- **Auto-analysis** — Sends network snapshots to Ollama every 15 seconds
+- **On-demand** — Press `a` from any tab for immediate analysis
+- **Detects** — Security concerns, performance issues, anomalies, connection health
+- **Graceful fallback** — Shows setup instructions if Ollama is unavailable
+- Uses `llama3.2` model by default
+
 ---
 
 ## Keyboard Controls
@@ -163,7 +195,8 @@ Protocol statistics and performance analysis:
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` `4` `5` | Switch tab: Dashboard / Connections / Interfaces / Packets / Stats |
+| `1`–`8` | Switch tab: Dashboard / Connections / Interfaces / Packets / Stats / Topology / Timeline / Insights |
+| `a` | Request AI analysis (from any tab) |
 | `↑` `↓` | Scroll / select |
 | `p` | Pause / resume all data collection |
 | `r` | Force refresh all data |
@@ -207,6 +240,28 @@ Protocol statistics and performance analysis:
 | `a` | Show both directions |
 | `h` | Toggle hex / text mode |
 
+### Topology tab
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` | Scroll through remote hosts |
+| `Enter` | Jump to Connections tab for selected host |
+
+### Timeline tab
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` | Scroll through connections |
+| `t` | Cycle time window (30s / 1m / 5m / 15m / 1h) |
+| `Enter` | Jump to Connections tab for selected entry |
+
+### Insights tab
+
+| Key | Action |
+|-----|--------|
+| `a` | Trigger on-demand AI analysis |
+| `↑` `↓` | Scroll insights |
+
 ### Display filter syntax
 
 | Filter | Example | Matches |
@@ -234,6 +289,7 @@ NetWatch works in two modes:
 | Network configuration | ✅ | ✅ |
 | Health probes (ICMP ping) | ❌ Shows N/A | ✅ |
 | Packet capture | ❌ Permission denied | ✅ |
+| AI insights (Ollama) | ✅ (if Ollama running) | ✅ (if Ollama running) |
 
 The app degrades gracefully — features that require elevated privileges show a clear message rather than crashing.
 
@@ -269,6 +325,9 @@ netwatch/
 │   │   ├── interfaces.rs        # Interface detail view
 │   │   ├── packets.rs           # Packet capture & inspection view
 │   │   ├── stats.rs             # Protocol statistics & handshake histogram
+│   │   ├── topology.rs          # Network topology map view
+│   │   ├── timeline.rs          # Connection timeline view
+│   │   ├── insights.rs          # AI network insights view
 │   │   ├── help.rs              # Scrollable help overlay
 │   │   └── widgets.rs           # Formatting helpers
 │   ├── collectors/
@@ -278,6 +337,7 @@ netwatch/
 │   │   ├── health.rs            # ICMP ping probes + RTT history
 │   │   ├── packets.rs           # libpcap capture + protocol decoding + stream tracking
 │   │   ├── geo.rs               # Background GeoIP lookup (ip-api.com)
+│   │   ├── insights.rs          # AI insights via Ollama
 │   │   └── whois.rs             # Background RDAP whois lookup
 │   └── platform/
 │       ├── linux.rs             # Linux /proc, /sys collectors
@@ -327,7 +387,7 @@ Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → DNS/TLS/HTTP/DHCP/
 | [nix](https://crates.io/crates/nix) | Unix system call wrappers |
 | [chrono](https://crates.io/crates/chrono) | Timestamps |
 | [anyhow](https://crates.io/crates/anyhow) | Error handling |
-| [ureq](https://crates.io/crates/ureq) | HTTP client (GeoIP, Whois) |
+| [ureq](https://crates.io/crates/ureq) | HTTP client (GeoIP, Whois, Ollama AI) |
 | [serde_json](https://crates.io/crates/serde_json) | JSON parsing (API responses) |
 
 ---
@@ -343,6 +403,8 @@ Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → DNS/TLS/HTTP/DHCP/
 | Binary not found after build | Check `./target/release/netwatch` exists |
 | Blank screen | Ensure terminal supports 256 colors and is at least 80×24 |
 | GeoIP/Whois not loading | Requires internet access; results appear after a short delay |
+| AI insights shows "Ollama unavailable" | Install and start Ollama: `ollama serve`, then `ollama pull llama3.2` |
+| AI analysis is slow | Ollama runs locally — performance depends on your hardware. Consider a smaller model |
 
 ---
 

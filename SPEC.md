@@ -58,7 +58,8 @@ NetWatch is a terminal-based (TUI) application for real-time network diagnostics
 
 ```
 ┌─ NetWatch ──────────────────────────────── 15:04:32 ─┐
-│ [1] Dashboard  [2] Connections  [3] Interfaces  [?]  │
+│ [1] Dash [2] Conn [3] Iface [4] Pkt [5] Stats       │
+│ [6] Topo [7] Time [8] Insights                  [?]  │
 ├──────────────────────────────────────────────────────┤
 │ INTERFACES            RX rate    TX rate    Status    │
 │ ─────────────────────────────────────────────────     │
@@ -92,6 +93,10 @@ NetWatch is a terminal-based (TUI) application for real-time network diagnostics
 | **Connections**| Full scrollable table of all active sockets with PID, process name, protocol, state, local/remote addr, throughput |
 | **Interfaces** | Per-interface detail: IP (v4/v6), MAC, MTU, speed, RX/TX bytes/packets/errors/drops, sparkline history |
 | **Packets**    | Live packet capture with protocol decoding, hex/ASCII dump, and payload inspection |
+| **Stats**      | Protocol hierarchy table with packet counts, byte totals, and distribution bars. Handshake histogram |
+| **Topology**   | ASCII box diagram showing local machine, gateway, DNS servers, and top remote hosts with connection counts and health indicators |
+| **Timeline**   | Gantt-style bar chart of connection lifetimes, color-coded by state with adjustable time windows |
+| **Insights**   | AI-powered network analysis via Ollama with auto and on-demand analysis |
 
 ---
 
@@ -494,11 +499,12 @@ netwatch/
 | M18 | Packet Bookmarks                  | `m` toggles bookmark (★) on selected packet. `n`/`N` jump to next/previous bookmark. Bookmark count in title. Cleared on `x` |
 | M19 | Interface Bandwidth Graph         | Full-width aggregate RX/TX sparklines on Dashboard replacing histogram. Shows current rate in title, aggregates across all active non-loopback interfaces |
 | M20 | Latency Heatmap                   | Color-coded RTT history (▁▂▃▄▅▆▇█) for gateway and DNS on Dashboard. Green→yellow→orange→red scaling, 60-sample history |
-| M21 | Consistent UI & Footer Polish     | All tabs show full tab bar [1-5] and all global keys (q, p, r, g, ?) in footers |
+| M21 | Consistent UI & Footer Polish     | All tabs show full tab bar [1-8] and all global keys (q, p, r, g, a, ?) in footers |
 | M22 | TCP Handshake Timing              | Automatic SYN→SYN-ACK→ACK measurement per stream. Shown in stream view header/status bar and packet detail pane. Nanosecond precision timestamps |
 | M23 | Handshake Histogram               | Latency distribution chart in Stats tab. 7 buckets (<1ms to >500ms) with color-coded bars and min/avg/median/p95/max summary |
-| M24 | Connection Timeline               | `[6] Timeline` tab showing a Gantt-style horizontal bar chart of connection lifetimes. Each row is a connection (process + remote), bar spans first-seen→last-seen, color-coded by state. Scrollable, with `Enter` to jump to Connections tab filtered to that entry |
-| M25 | Network Topology Map              | `[7] Topology` tab showing an ASCII box diagram of local machine, gateway, DNS, and top remote hosts with connection counts on edges. Auto-laid-out, color-coded by health, scrollable |
+| M24 | Connection Timeline               | `[7] Timeline` tab showing a Gantt-style horizontal bar chart of connection lifetimes. Each row is a connection (process + remote), bar spans first-seen→last-seen, color-coded by state. Scrollable, with `Enter` to jump to Connections tab filtered to that entry |
+| M25 | Network Topology Map              | `[6] Topology` tab showing an ASCII box diagram of local machine, gateway, DNS, and top remote hosts with connection counts on edges. Auto-laid-out, color-coded by health, scrollable |
+| M26 | AI Network Insights               | `[8] Insights` tab with real-time AI analysis of captured traffic via Ollama. Auto-analyzes every 15s, on-demand with `a` key. Detects security concerns, performance issues, anomalies. Graceful degradation when Ollama unavailable |
 
 ---
 
@@ -506,7 +512,7 @@ netwatch/
 
 ### Overview
 
-The Timeline tab (`[6] Timeline`) provides a Gantt-style horizontal bar chart showing when connections were first observed and when they disappeared (or are still active). This gives at-a-glance visibility into connection storms, long-lived connections, and churn patterns over time.
+The Timeline tab (`[7] Timeline`) provides a Gantt-style horizontal bar chart showing when connections were first observed and when they disappeared (or are still active). This gives at-a-glance visibility into connection storms, long-lived connections, and churn patterns over time.
 
 ### Connection Tracking
 
@@ -617,7 +623,7 @@ Rows are sorted by `first_seen` (oldest at top). Active connections sort before 
 | `↑↓` | Scroll through connections |
 | `Enter` | Jump to Connections tab filtered to the selected connection's remote IP |
 | `t` | Cycle time window (1m → 5m → 15m → 30m → 1h) |
-| `1`–`6` | Switch tabs |
+| `1`–`8` | Switch tabs |
 
 ### App State
 
@@ -629,7 +635,7 @@ Rows are sorted by `first_seen` (oldest at top). Active connections sort before 
 
 ### Changes to Tab Enum
 
-Add `Timeline` variant to the `Tab` enum. Update tab switching to accept `6`.
+Add `Timeline` variant to the `Tab` enum. Update tab switching to accept `7`.
 
 ### Implementation Files
 
@@ -646,7 +652,7 @@ Add `Timeline` variant to the `Tab` enum. Update tab switching to accept `6`.
 
 ### Overview
 
-The Topology tab (`[7] Topology`) renders an ASCII box-and-line diagram showing the local machine at the centre, connected to the gateway, DNS servers, and the top remote hosts grouped by process. This provides an at-a-glance view of the network neighbourhood — who the machine is talking to, how many connections exist per remote, and the health of each link.
+The Topology tab (`[6] Topology`) renders an ASCII box-and-line diagram showing the local machine at the centre, connected to the gateway, DNS servers, and the top remote hosts grouped by process. This provides an at-a-glance view of the network neighbourhood — who the machine is talking to, how many connections exist per remote, and the health of each link.
 
 ### Data Sources
 
@@ -813,7 +819,7 @@ When there are more remote hosts than fit the terminal height, only the top N by
 |-----|--------|
 | `↑↓` | Scroll through remote hosts |
 | `Enter` | Jump to Connections tab filtered to selected remote host's IP |
-| `1`–`7` | Switch tabs |
+| `1`–`8` | Switch tabs |
 
 ### App State
 
@@ -823,7 +829,7 @@ When there are more remote hosts than fit the terminal height, only the top N by
 
 ### Changes to Tab Enum
 
-Add `Topology` variant to the `Tab` enum. Update tab switching to accept `7`.
+Add `Topology` variant to the `Tab` enum. Update tab switching to accept `6`.
 
 ### Implementation Files
 
@@ -832,3 +838,102 @@ Add `Topology` variant to the `Tab` enum. Update tab switching to accept `7`.
 | `src/ui/topology.rs` | New file. Build topology from app state, compute layout, render node boxes, edges, summary bar, footer. |
 | `src/ui/mod.rs` | Add `pub mod topology;`, wire `Tab::Topology` in render dispatch. |
 | `src/app.rs` | Add `Tab::Topology`, `topology_scroll` field. Wire `7`, `Enter`, `↑↓` keys for topology tab. |
+
+---
+
+## Feature: AI Network Insights
+
+### Overview
+
+The Insights tab (`[8] Insights`) provides real-time AI-powered analysis of captured network traffic using a local Ollama instance. Every 15 seconds, a background thread builds a structured snapshot of current network activity and sends it to the configured LLM (default: `llama3.2`) for analysis. Users can also press `a` from any tab for on-demand analysis.
+
+### Data Flow
+
+```
+PacketCollector + ConnectionCollector + HealthProber
+                    ↓
+            NetworkSnapshot::build()
+                    ↓
+         InsightsCollector.submit_snapshot()
+                    ↓
+     Background thread → call_ollama() → Insight
+                    ↓
+            InsightsCollector.insights (Arc<Mutex<Vec<Insight>>>)
+                    ↓
+              UI renders scrollable insight list
+```
+
+### NetworkSnapshot
+
+A `NetworkSnapshot` is built from existing collector data every analysis cycle:
+
+| Field | Source |
+|-------|--------|
+| `total_packets` | `PacketCollector.packets.len()` |
+| `protocol_counts` | Protocol distribution from last 500 packets |
+| `top_talkers` | Top 10 destination IPs by packet count |
+| `dns_queries` | Up to 20 unique DNS query domains |
+| `expert_errors` | Up to 10 error-severity expert info messages |
+| `expert_warnings` | Up to 10 warning-severity expert info messages |
+| `connections_established` | Count of ESTABLISHED connections |
+| `connections_other` | Count of non-ESTABLISHED connections |
+| `gateway_rtt_ms` | Gateway RTT from HealthProber |
+| `gateway_loss_pct` | Gateway packet loss percentage |
+| `dns_rtt_ms` | DNS RTT from HealthProber |
+| `dns_loss_pct` | DNS packet loss percentage |
+| `bandwidth_rx` | Current aggregate RX rate string |
+| `bandwidth_tx` | Current aggregate TX rate string |
+
+### Ollama Integration
+
+The collector calls `POST http://localhost:11434/api/chat` with:
+- Model: `llama3.2` (configurable)
+- System prompt: Network security and performance analyst persona
+- User prompt: Structured text from `NetworkSnapshot::to_prompt()`
+- Settings: `temperature: 0.3`, `num_predict: 512`, `stream: false`
+- Timeout: 30 seconds
+
+Uses `ureq` with `.send_string()` (ureq v2 API — no `send_json`).
+
+### Insight Format
+
+The AI is instructed to return 3-6 bullet points with emoji severity indicators:
+- 🔴 Critical
+- 🟡 Warning
+- 🟢 Healthy
+- 🔵 Info
+
+### Status States
+
+| Status | Meaning |
+|--------|---------|
+| `Idle` | No analysis performed yet |
+| `Analyzing` | Request in progress to Ollama |
+| `Available` | Insights ready to display |
+| `Error(msg)` | Ollama returned an error |
+| `OllamaUnavailable` | Cannot connect to Ollama (shows setup instructions) |
+
+### Controls
+
+| Key | Action |
+|-----|--------|
+| `a` | Trigger on-demand analysis (works from any tab) |
+| `↑↓` | Scroll through insights |
+| `1`–`8` | Switch tabs |
+
+### App State
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `insights_collector` | `InsightsCollector` | Manages background analysis thread and insight storage |
+| `insights_scroll` | `usize` | Scroll offset in insights view |
+| `last_insight_time` | `Option<Instant>` | Tracks when last auto-snapshot was sent |
+
+### Implementation Files
+
+| File | Change |
+|------|--------|
+| `src/collectors/insights.rs` | New file. `NetworkSnapshot`, `InsightsCollector`, `Insight`, `InsightsStatus`, `call_ollama()`, `analysis_loop()`. |
+| `src/ui/insights.rs` | New file. Render insights header, status bar, scrollable insight list, Ollama unavailable message, footer. |
+| `src/ui/mod.rs` | Add `pub mod insights;`, wire `Tab::Insights` in render dispatch. |
+| `src/app.rs` | Add `Tab::Insights`, `insights_collector`, `insights_scroll`, `last_insight_time` fields. Wire `8` key, `a` key (global), snapshot submission in tick handler. |
