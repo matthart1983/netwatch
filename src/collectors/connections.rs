@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -32,6 +34,115 @@ impl ConnectionCollector {
             let result = parse_linux_connections();
             *connections.lock().unwrap() = result;
         });
+    }
+}
+
+const MAX_TRACKED_CONNECTIONS: usize = 2000;
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct ConnectionKey {
+    pub protocol: String,
+    pub local_addr: String,
+    pub remote_addr: String,
+    pub pid: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrackedConnection {
+    pub key: ConnectionKey,
+    pub process_name: Option<String>,
+    pub state: String,
+    pub first_seen: Instant,
+    pub last_seen: Instant,
+    pub is_active: bool,
+}
+
+pub struct ConnectionTimeline {
+    pub tracked: Vec<TrackedConnection>,
+    known_keys: HashMap<ConnectionKey, usize>,
+}
+
+impl ConnectionTimeline {
+    pub fn new() -> Self {
+        Self {
+            tracked: Vec::new(),
+            known_keys: HashMap::new(),
+        }
+    }
+
+    pub fn update(&mut self, connections: &[Connection]) {
+        let now = Instant::now();
+
+        let mut current_keys: HashSet<ConnectionKey> = HashSet::new();
+
+        for conn in connections {
+            let key = ConnectionKey {
+                protocol: conn.protocol.clone(),
+                local_addr: conn.local_addr.clone(),
+                remote_addr: conn.remote_addr.clone(),
+                pid: conn.pid,
+            };
+
+            current_keys.insert(key.clone());
+
+            if let Some(&idx) = self.known_keys.get(&key) {
+                let tracked = &mut self.tracked[idx];
+                tracked.last_seen = now;
+                tracked.state = conn.state.clone();
+                tracked.is_active = true;
+            } else {
+                let idx = self.tracked.len();
+                self.tracked.push(TrackedConnection {
+                    key: key.clone(),
+                    process_name: conn.process_name.clone(),
+                    state: conn.state.clone(),
+                    first_seen: now,
+                    last_seen: now,
+                    is_active: true,
+                });
+                self.known_keys.insert(key, idx);
+            }
+        }
+
+        for tracked in &mut self.tracked {
+            if !current_keys.contains(&tracked.key) {
+                tracked.is_active = false;
+            }
+        }
+
+        // Evict oldest inactive connections if over limit
+        if self.tracked.len() > MAX_TRACKED_CONNECTIONS {
+            let mut inactive_indices: Vec<usize> = self.tracked.iter()
+                .enumerate()
+                .filter(|(_, t)| !t.is_active)
+                .map(|(i, _)| i)
+                .collect();
+            inactive_indices.sort_by_key(|&i| self.tracked[i].first_seen);
+
+            let to_remove = self.tracked.len() - MAX_TRACKED_CONNECTIONS;
+            let remove_set: HashSet<usize> = inactive_indices.into_iter().take(to_remove).collect();
+
+            if !remove_set.is_empty() {
+                let removed_keys: Vec<ConnectionKey> = remove_set.iter()
+                    .map(|&i| self.tracked[i].key.clone())
+                    .collect();
+                for key in &removed_keys {
+                    self.known_keys.remove(key);
+                }
+
+                let mut new_tracked = Vec::new();
+                let mut new_keys = HashMap::new();
+                for (i, t) in self.tracked.drain(..).enumerate() {
+                    if !remove_set.contains(&i) {
+                        let new_idx = new_tracked.len();
+                        new_keys.insert(t.key.clone(), new_idx);
+                        new_tracked.push(t);
+                    }
+                }
+                self.tracked = new_tracked;
+                self.known_keys = new_keys;
+            }
+        }
     }
 }
 

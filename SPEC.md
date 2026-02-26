@@ -497,3 +497,338 @@ netwatch/
 | M21 | Consistent UI & Footer Polish     | All tabs show full tab bar [1-5] and all global keys (q, p, r, g, ?) in footers |
 | M22 | TCP Handshake Timing              | Automatic SYN→SYN-ACK→ACK measurement per stream. Shown in stream view header/status bar and packet detail pane. Nanosecond precision timestamps |
 | M23 | Handshake Histogram               | Latency distribution chart in Stats tab. 7 buckets (<1ms to >500ms) with color-coded bars and min/avg/median/p95/max summary |
+| M24 | Connection Timeline               | `[6] Timeline` tab showing a Gantt-style horizontal bar chart of connection lifetimes. Each row is a connection (process + remote), bar spans first-seen→last-seen, color-coded by state. Scrollable, with `Enter` to jump to Connections tab filtered to that entry |
+| M25 | Network Topology Map              | `[7] Topology` tab showing an ASCII box diagram of local machine, gateway, DNS, and top remote hosts with connection counts on edges. Auto-laid-out, color-coded by health, scrollable |
+
+---
+
+## Feature: Connection Timeline
+
+### Overview
+
+The Timeline tab (`[6] Timeline`) provides a Gantt-style horizontal bar chart showing when connections were first observed and when they disappeared (or are still active). This gives at-a-glance visibility into connection storms, long-lived connections, and churn patterns over time.
+
+### Connection Tracking
+
+The existing `ConnectionCollector` polls every 2 seconds and replaces its entire `connections` vec each cycle. To support a timeline, a new `ConnectionTimeline` tracker wraps the collector and maintains historical state:
+
+```rust
+use std::time::Instant;
+
+/// Unique identity for a tracked connection
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct ConnectionKey {
+    pub protocol: String,
+    pub local_addr: String,
+    pub remote_addr: String,
+    pub pid: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrackedConnection {
+    pub key: ConnectionKey,
+    pub process_name: Option<String>,
+    pub state: String,
+    pub first_seen: Instant,
+    pub last_seen: Instant,
+    pub is_active: bool,
+}
+
+pub struct ConnectionTimeline {
+    pub tracked: Vec<TrackedConnection>,
+    known_keys: HashSet<ConnectionKey>,
+}
+```
+
+On each `ConnectionCollector::update()` cycle:
+1. Build a `HashSet<ConnectionKey>` from the current snapshot
+2. For each current connection:
+   - If the key exists in `tracked`, update `last_seen` to `Instant::now()`, update `state`, mark `is_active = true`
+   - If new, insert a `TrackedConnection` with `first_seen = last_seen = Instant::now()`, `is_active = true`
+3. For any previously-tracked key not in the current snapshot, set `is_active = false` (keep `last_seen` as-is — that was the last time it was observed)
+
+Memory is bounded: drop the oldest inactive connections when `tracked.len()` exceeds `MAX_TRACKED_CONNECTIONS` (default 2000).
+
+### UI: Timeline Tab
+
+```
+┌─ NetWatch ──────────────────────────────── 15:04:32 ─┐
+│ [1] Dashboard  [2] Connections  [3] Interfaces       │
+│ [4] Packets  [5] Stats  [6] Timeline        [?]      │
+├──────────────────────────────────────────────────────┤
+│ TIMELINE (last 5m)          ← 5m ago        now →    │
+│ ─────────────────────────────────────────────────     │
+│ ssh        10.0.0.5    ████████████████████████████▓  │
+│ firefox    142.250.1.1      ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  │
+│ curl       52.12.0.8             ██░░                 │
+│ node       127.0.0.1   ████████████████████████████▓  │
+│ DNS        8.8.8.8        █░ █░ █░  █░ █░ █░  █░     │
+│ chrome     172.217.0.4        ▓▓▓▓▓▓▓▓▓▓░░           │
+│ postgres   127.0.0.1   ████████████████████████████▓  │
+│                                                       │
+├──────────────────────────────────────────────────────┤
+│ Active: 5  │  Closed: 2  │  Total seen: 7            │
+├──────────────────────────────────────────────────────┤
+│ q:Quit  ↑↓:Scroll  Enter:→Connections  t:Timespan    │
+│ p:Pause  r:Refresh  1-6:Tab  g:Geo  ?:Help           │
+└──────────────────────────────────────────────────────┘
+```
+
+#### Bar Rendering
+
+The timeline area maps a time window onto the available terminal width. Each row is one `TrackedConnection`:
+
+| Symbol | Meaning |
+|--------|---------|
+| `█` (solid) | Connection was active during this time slice and in ESTABLISHED state |
+| `▓` (dense) | Connection is currently active (rightmost edge) |
+| `░` (light) | Connection was in a transient state (SYN_SENT, TIME_WAIT, CLOSE_WAIT, etc.) |
+| ` ` (blank) | Connection did not exist during this time slice |
+
+#### Color Coding
+
+| State | Color |
+|-------|-------|
+| ESTABLISHED | Green |
+| LISTEN | Yellow |
+| SYN_SENT / SYN_RECV | Cyan |
+| CLOSE_WAIT / TIME_WAIT / FIN_WAIT | Red |
+| Inactive (closed) | DarkGray |
+
+#### Time Window
+
+The default window is 5 minutes. Press `t` to cycle through:
+- 1 minute
+- 5 minutes (default)
+- 15 minutes
+- 30 minutes
+- 1 hour
+
+The window always ends at "now" and scrolls forward with each tick.
+
+#### Sorting
+
+Rows are sorted by `first_seen` (oldest at top). Active connections sort before inactive ones at the same start time.
+
+#### Controls
+
+| Key | Action |
+|-----|--------|
+| `↑↓` | Scroll through connections |
+| `Enter` | Jump to Connections tab filtered to the selected connection's remote IP |
+| `t` | Cycle time window (1m → 5m → 15m → 30m → 1h) |
+| `1`–`6` | Switch tabs |
+
+### App State
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `connection_timeline` | `ConnectionTimeline` | Tracks connection first/last seen times |
+| `timeline_scroll` | `usize` | Scroll offset in the timeline view |
+| `timeline_window` | `TimelineWindow` | Current time window (enum: Min1, Min5, Min15, Min30, Hour1) |
+
+### Changes to Tab Enum
+
+Add `Timeline` variant to the `Tab` enum. Update tab switching to accept `6`.
+
+### Implementation Files
+
+| File | Change |
+|------|--------|
+| `src/collectors/connections.rs` | Add `ConnectionKey`, `TrackedConnection`, `ConnectionTimeline` structs. Add `update_timeline()` method. |
+| `src/ui/timeline.rs` | New file. Render timeline header, Gantt chart, summary bar, footer. |
+| `src/ui/mod.rs` | Add `pub mod timeline;`, wire `Tab::Timeline` in render dispatch. |
+| `src/app.rs` | Add `Tab::Timeline`, `timeline_scroll`, `timeline_window`, `connection_timeline` fields. Wire `6`, `t`, `Enter`, `↑↓` keys. Call `connection_timeline.update()` alongside connection collector. |
+
+---
+
+## Feature: Network Topology Map
+
+### Overview
+
+The Topology tab (`[7] Topology`) renders an ASCII box-and-line diagram showing the local machine at the centre, connected to the gateway, DNS servers, and the top remote hosts grouped by process. This provides an at-a-glance view of the network neighbourhood — who the machine is talking to, how many connections exist per remote, and the health of each link.
+
+### Data Sources
+
+The topology is built from data already collected by existing collectors — no new system calls are needed:
+
+| Node type | Source |
+|-----------|--------|
+| **Local machine** | `ConfigCollector.config.hostname`, active interface IPs from `interface_info` |
+| **Gateway** | `ConfigCollector.config.gateway` |
+| **DNS servers** | `ConfigCollector.config.dns_servers` |
+| **Remote hosts** | Deduplicated remote IPs from `ConnectionCollector.connections` |
+| **Edge metadata** | Connection count per remote IP, process names, protocol |
+| **Health indicators** | `HealthProber.status` RTT/loss for gateway and DNS |
+| **GeoIP labels** | `GeoCache` lookups (when `show_geo` is enabled) |
+
+### Data Model
+
+```rust
+pub struct TopologyNode {
+    pub kind: NodeKind,
+    pub label: String,          // e.g. "192.168.1.1" or "myhost"
+    pub sublabel: Option<String>, // e.g. "GW 1.2ms" or "US, Cloudflare"
+    pub health: NodeHealth,
+}
+
+pub enum NodeKind {
+    LocalMachine,
+    Gateway,
+    DnsServer,
+    RemoteHost,
+}
+
+pub enum NodeHealth {
+    Good,       // green — reachable, low latency
+    Degraded,   // yellow — high latency or partial loss
+    Down,       // red — unreachable or 100% loss
+    Unknown,    // gray — no probe data available
+}
+
+pub struct TopologyEdge {
+    pub conn_count: usize,
+    pub processes: Vec<String>,   // deduplicated process names on this edge
+    pub protocols: Vec<String>,   // deduplicated protocols (TCP, UDP)
+}
+```
+
+The topology is recomputed on each render from existing collector state — no persistent data structure is needed.
+
+### Layout Algorithm
+
+The map uses a fixed 3-column layout that adapts to terminal width:
+
+```
+Column 1 (left)       Column 2 (centre)       Column 3 (right)
+─────────────────     ──────────────────       ─────────────────
+┌─────────────┐       ┌──────────────────┐
+│ DNS 8.8.8.8 │       │                  │     ┌───────────────┐
+│  12ms  0%   │───────│   myhost         │─────│ 52.12.0.8     │
+└─────────────┘       │   192.168.1.42   │     │ 3×TCP (curl)  │
+                      │   en0            │     └───────────────┘
+┌─────────────┐       │                  │     ┌───────────────┐
+│ GW          │───────│                  │─────│ 142.250.1.1   │
+│ 192.168.1.1 │       │                  │     │ 5×TCP (chrome)│
+│  1.2ms  0%  │       └──────────────────┘     └───────────────┘
+└─────────────┘              │                 ┌───────────────┐
+                             │─────────────────│ 10.0.0.5      │
+                                               │ 1×TCP (ssh)   │
+                                               └───────────────┘
+```
+
+**Column placement:**
+- **Centre**: Local machine (always one node)
+- **Left**: Infrastructure nodes — gateway and DNS servers (max 3 DNS)
+- **Right**: Remote hosts, sorted by connection count descending, limited to top N that fit the terminal height
+
+**Edge rendering:**
+- Horizontal lines using `─` connecting node boxes
+- Edge labels show connection count, e.g. `── 3×TCP ──`
+
+### UI: Topology Tab
+
+```
+┌─ NetWatch ──────────────────────────────────── 15:04:32 ─┐
+│ [1] Dashboard  [2] Connections  [3] Interfaces           │
+│ [4] Packets  [5] Stats  [6] Timeline  [7] Topology  [?]  │
+├──────────────────────────────────────────────────────────┤
+│                                                           │
+│  ┌──────────┐         ┌──────────────┐     ┌────────────┐ │
+│  │ DNS      │─── 0× ──│              │─ 3× │ 52.12.0.8  │ │
+│  │ 8.8.8.8  │         │   myhost     │     │ curl (TCP) │ │
+│  │ ●12ms 0% │         │ 192.168.1.42 │     │ US, AWS    │ │
+│  └──────────┘         │ en0 / utun3  │     └────────────┘ │
+│                       │              │     ┌────────────┐ │
+│  ┌──────────┐         │  ↑12.4 MB/s  │─ 5× │142.250.1.1 │ │
+│  │ Gateway  │── 0× ───│  ↓ 1.2 MB/s  │     │chrome (TCP)│ │
+│  │192.168.1 │         │              │     │ US, Google │ │
+│  │ ● 1.2ms  │         └──────────────┘     └────────────┘ │
+│  └──────────┘               │              ┌────────────┐ │
+│                             └────────── 1× │ 10.0.0.5   │ │
+│                                            │ ssh (TCP)  │ │
+│                                            └────────────┘ │
+│                                                           │
+├──────────────────────────────────────────────────────────┤
+│ Nodes: 6  │  Connections: 9  │  Remotes: 3               │
+├──────────────────────────────────────────────────────────┤
+│ q:Quit  ↑↓:Scroll  Enter:→Connections  1-7:Tab           │
+│ p:Pause  r:Refresh  g:Geo  ?:Help                        │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Node Rendering
+
+Each node is a bordered box built from `Paragraph` + `Block`:
+
+**Local machine node (centre):**
+```
+┌──────────────┐
+│   myhost     │  ← hostname
+│ 192.168.1.42 │  ← primary interface IP
+│ en0 / utun3  │  ← active interface names
+│  ↑12.4 MB/s  │  ← aggregate TX rate
+│  ↓ 1.2 MB/s  │  ← aggregate RX rate
+└──────────────┘
+```
+
+**Infrastructure node (gateway/DNS):**
+```
+┌──────────┐
+│ Gateway  │  ← role label
+│192.168.1 │  ← IP address
+│ ● 1.2ms  │  ← health dot + RTT (green/yellow/red)
+└──────────┘
+```
+
+**Remote host node:**
+```
+┌────────────┐
+│ 52.12.0.8  │  ← IP address
+│ curl (TCP) │  ← top process + protocol
+│ US, AWS    │  ← GeoIP location (if enabled)
+└────────────┘
+```
+
+### Health Dot Color
+
+The `●` dot on infrastructure nodes reflects probe health:
+
+| Condition | Color | Symbol |
+|-----------|-------|--------|
+| RTT < 10ms and loss = 0% | Green | `●` |
+| RTT < 100ms or loss < 50% | Yellow | `●` |
+| RTT ≥ 100ms or loss ≥ 50% | Red | `●` |
+| No probe data | DarkGray | `○` |
+
+Remote host nodes use the border color instead (Green for ESTABLISHED connections, DarkGray otherwise).
+
+### Scrolling
+
+When there are more remote hosts than fit the terminal height, only the top N by connection count are shown. `↑↓` scrolls through the remote host list, highlighting the selected node. The selected node's border turns Yellow.
+
+### Controls
+
+| Key | Action |
+|-----|--------|
+| `↑↓` | Scroll through remote hosts |
+| `Enter` | Jump to Connections tab filtered to selected remote host's IP |
+| `1`–`7` | Switch tabs |
+
+### App State
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `topology_scroll` | `usize` | Scroll offset for remote host list |
+
+### Changes to Tab Enum
+
+Add `Topology` variant to the `Tab` enum. Update tab switching to accept `7`.
+
+### Implementation Files
+
+| File | Change |
+|------|--------|
+| `src/ui/topology.rs` | New file. Build topology from app state, compute layout, render node boxes, edges, summary bar, footer. |
+| `src/ui/mod.rs` | Add `pub mod topology;`, wire `Tab::Topology` in render dispatch. |
+| `src/app.rs` | Add `Tab::Topology`, `topology_scroll` field. Wire `7`, `Enter`, `↑↓` keys for topology tab. |

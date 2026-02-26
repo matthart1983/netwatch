@@ -3,5 +3,7 @@ pub mod connections;
 pub mod interfaces;
 pub mod packets;
 pub mod stats;
+pub mod timeline;
+pub mod topology;
 pub mod widgets;
 pub mod help;

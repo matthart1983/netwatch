@@ -1,5 +1,5 @@
 use crate::collectors::config::ConfigCollector;
-use crate::collectors::connections::{Connection, ConnectionCollector};
+use crate::collectors::connections::{Connection, ConnectionCollector, ConnectionTimeline};
 use crate::collectors::geo::GeoCache;
 use crate::collectors::whois::WhoisCache;
 use crate::collectors::health::HealthProber;
@@ -10,8 +10,49 @@ use crate::platform::{self, InterfaceInfo};
 use crate::ui;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use ratatui::prelude::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineWindow {
+    Min1,
+    Min5,
+    Min15,
+    Min30,
+    Hour1,
+}
+
+impl TimelineWindow {
+    pub fn seconds(&self) -> u64 {
+        match self {
+            Self::Min1 => 60,
+            Self::Min5 => 300,
+            Self::Min15 => 900,
+            Self::Min30 => 1800,
+            Self::Hour1 => 3600,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Min1 => "1m",
+            Self::Min5 => "5m",
+            Self::Min15 => "15m",
+            Self::Min30 => "30m",
+            Self::Hour1 => "1h",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Min1 => Self::Min5,
+            Self::Min5 => Self::Min15,
+            Self::Min15 => Self::Min30,
+            Self::Min30 => Self::Hour1,
+            Self::Hour1 => Self::Min1,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamDirectionFilter {
@@ -27,6 +68,8 @@ pub enum Tab {
     Interfaces,
     Packets,
     Stats,
+    Topology,
+    Timeline,
 }
 
 pub struct App {
@@ -65,6 +108,10 @@ pub struct App {
     pub show_geo: bool,
     pub whois_cache: WhoisCache,
     pub bookmarks: HashSet<u64>,
+    pub topology_scroll: usize,
+    pub connection_timeline: ConnectionTimeline,
+    pub timeline_scroll: usize,
+    pub timeline_window: TimelineWindow,
     info_tick: u32,
     conn_tick: u32,
     health_tick: u32,
@@ -116,6 +163,10 @@ impl App {
             show_geo: true,
             whois_cache: WhoisCache::new(),
             bookmarks: HashSet::new(),
+            topology_scroll: 0,
+            connection_timeline: ConnectionTimeline::new(),
+            timeline_scroll: 0,
+            timeline_window: TimelineWindow::Min5,
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
@@ -182,6 +233,8 @@ impl App {
         if self.conn_tick >= 2 {
             self.conn_tick = 0;
             self.connection_collector.update();
+            let conns = self.connection_collector.connections.lock().unwrap();
+            self.connection_timeline.update(&conns);
         }
 
         // Refresh health every ~5 ticks (5s)
@@ -245,6 +298,10 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     // Initial data collection
     app.traffic.update();
     app.connection_collector.update();
+    {
+        let conns = app.connection_collector.connections.lock().unwrap();
+        app.connection_timeline.update(&conns);
+    }
     let gateway = app.config_collector.config.gateway.clone();
     let dns = app.config_collector.config.dns_servers.first().cloned();
     app.health_prober
@@ -259,6 +316,8 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 Tab::Interfaces => ui::interfaces::render(f, &app, area),
                 Tab::Packets => ui::packets::render(f, &app, area),
                 Tab::Stats => ui::stats::render(f, &app, area),
+                Tab::Topology => ui::topology::render(f, &app, area),
+                Tab::Timeline => ui::timeline::render(f, &app, area),
             }
             if app.show_help {
                 ui::help::render(f, &app, area);
@@ -362,6 +421,8 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 KeyCode::Char('3') => app.current_tab = Tab::Interfaces,
                 KeyCode::Char('4') => app.current_tab = Tab::Packets,
                 KeyCode::Char('5') => app.current_tab = Tab::Stats,
+                KeyCode::Char('6') => app.current_tab = Tab::Topology,
+                KeyCode::Char('7') => app.current_tab = Tab::Timeline,
                 // Stream view controls (intercept before other Packets keys)
                 KeyCode::Esc if app.current_tab == Tab::Packets && app.stream_view_open => {
                     app.stream_view_open = false;
@@ -519,6 +580,33 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                         app.sort_column = (app.sort_column + 1) % 6;
                     }
                 }
+                KeyCode::Char('t') if app.current_tab == Tab::Timeline => {
+                    app.timeline_window = app.timeline_window.next();
+                }
+                KeyCode::Enter if app.current_tab == Tab::Timeline => {
+                    let window_secs = app.timeline_window.seconds();
+                    let now = std::time::Instant::now();
+                    let window_start = now - std::time::Duration::from_secs(window_secs);
+                    let mut sorted: Vec<&crate::collectors::connections::TrackedConnection> =
+                        app.connection_timeline.tracked.iter()
+                            .filter(|t| t.last_seen >= window_start)
+                            .collect();
+                    sorted.sort_by(|a, b| {
+                        b.is_active.cmp(&a.is_active)
+                            .then_with(|| a.first_seen.cmp(&b.first_seen))
+                    });
+                    if let Some(tracked) = sorted.get(app.timeline_scroll) {
+                        let (remote_ip, _) = parse_addr_parts(&tracked.key.remote_addr);
+                        if let Some(ip) = remote_ip {
+                            app.packet_filter_text = ip.clone();
+                            app.packet_filter_active = Some(ip);
+                            app.packet_filter_input = false;
+                            app.packet_scroll = 0;
+                            app.packet_follow = false;
+                            app.current_tab = Tab::Connections;
+                        }
+                    }
+                }
                 KeyCode::Enter if app.current_tab == Tab::Connections => {
                     let mut conns = app.connection_collector.connections.lock().unwrap().clone();
                     match app.sort_column {
@@ -538,6 +626,27 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                         app.packet_scroll = 0;
                         app.packet_follow = false;
                         app.current_tab = Tab::Packets;
+                    }
+                }
+                KeyCode::Enter if app.current_tab == Tab::Topology => {
+                    let mut counts: HashMap<String, usize> = HashMap::new();
+                    let conns = app.connection_collector.connections.lock().unwrap();
+                    for conn in conns.iter() {
+                        let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
+                        if let Some(ip) = remote_ip {
+                            *counts.entry(ip).or_insert(0) += 1;
+                        }
+                    }
+                    drop(conns);
+                    let mut remote_ips: Vec<(String, usize)> = counts.into_iter().collect();
+                    remote_ips.sort_by(|a, b| b.1.cmp(&a.1));
+                    if let Some((ip, _)) = remote_ips.get(app.topology_scroll) {
+                        app.packet_filter_text = ip.clone();
+                        app.packet_filter_active = Some(ip.clone());
+                        app.packet_filter_input = false;
+                        app.packet_scroll = 0;
+                        app.packet_follow = false;
+                        app.current_tab = Tab::Connections;
                     }
                 }
                 KeyCode::Enter if app.current_tab == Tab::Packets => {
@@ -572,6 +681,12 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     Tab::Stats => {
                         app.stats_scroll = app.stats_scroll.saturating_sub(1);
                     }
+                    Tab::Topology => {
+                        app.topology_scroll = app.topology_scroll.saturating_sub(1);
+                    }
+                    Tab::Timeline => {
+                        app.timeline_scroll = app.timeline_scroll.saturating_sub(1);
+                    }
                     _ => {
                         app.selected_interface = match app.selected_interface {
                             Some(0) | None => None,
@@ -605,6 +720,12 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     }
                     Tab::Stats => {
                         app.stats_scroll += 1;
+                    }
+                    Tab::Topology => {
+                        app.topology_scroll += 1;
+                    }
+                    Tab::Timeline => {
+                        app.timeline_scroll += 1;
                     }
                     _ => {
                         let max = app.traffic.interfaces.len().saturating_sub(1);
