@@ -238,8 +238,27 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                     .split(area)
             };
 
+            // Geo info lines (if enabled)
+            let mut geo_lines: Vec<Line> = Vec::new();
+            if app.show_geo {
+                for (label, ip) in [("Src", &pkt.src_ip), ("Dst", &pkt.dst_ip)] {
+                    if let Some(geo) = app.geo_cache.lookup(ip) {
+                        let loc = if geo.city.is_empty() {
+                            format!("{} ({})", geo.country, geo.country_code)
+                        } else {
+                            format!("{}, {} ({})", geo.city, geo.country, geo.country_code)
+                        };
+                        let org = if geo.org.is_empty() { String::new() } else { format!(" — {}", geo.org) };
+                        geo_lines.push(Line::from(Span::styled(
+                            format!("  Geo {label}: {loc}{org}"),
+                            Style::default().fg(Color::LightBlue),
+                        )));
+                    }
+                }
+            }
+
             // Protocol detail lines with color per layer
-            let detail_lines: Vec<Line> = pkt.details.iter().map(|line| {
+            let mut detail_lines: Vec<Line> = pkt.details.iter().map(|line| {
                 let color = if line.starts_with("Frame:") {
                     Color::White
                 } else if line.starts_with("Ethernet:") {
@@ -255,6 +274,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 };
                 Line::from(Span::styled(format!("  {line}"), Style::default().fg(color)))
             }).collect();
+            detail_lines.extend(geo_lines);
 
             let proto_detail = Paragraph::new(detail_lines)
                 .block(

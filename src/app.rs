@@ -1,5 +1,6 @@
 use crate::collectors::config::ConfigCollector;
 use crate::collectors::connections::{Connection, ConnectionCollector};
+use crate::collectors::geo::GeoCache;
 use crate::collectors::health::HealthProber;
 use crate::collectors::packets::PacketCollector;
 use crate::collectors::traffic::TrafficCollector;
@@ -58,6 +59,8 @@ pub struct App {
     pub stats_scroll: usize,
     pub show_help: bool,
     pub help_scroll: usize,
+    pub geo_cache: GeoCache,
+    pub show_geo: bool,
     info_tick: u32,
     conn_tick: u32,
     health_tick: u32,
@@ -105,6 +108,8 @@ impl App {
             stats_scroll: 0,
             show_help: false,
             help_scroll: 0,
+            geo_cache: GeoCache::new(),
+            show_geo: true,
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
@@ -332,6 +337,7 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     app.show_help = !app.show_help;
                     app.help_scroll = 0;
                 }
+                KeyCode::Char('g') => app.show_geo = !app.show_geo,
                 KeyCode::Char('p') => app.paused = !app.paused,
                 KeyCode::Char('r') => {
                     app.traffic.update();
