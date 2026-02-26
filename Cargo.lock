@@ -536,8 +536,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "netwatch"
-version = "0.1.0"
+name = "netwatch-tui"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",

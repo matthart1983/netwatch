@@ -53,7 +53,21 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 
 ---
 
-## Quick Start
+## Install
+
+### From crates.io
+
+```bash
+cargo install netwatch-tui
+```
+
+### From source
+
+```bash
+git clone https://github.com/matthart1983/netwatch.git
+cd netwatch
+cargo build --release
+```
 
 ### Prerequisites
 
@@ -62,22 +76,14 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
   - macOS: included with Xcode Command Line Tools
   - Linux: `sudo apt install libpcap-dev` (Debian/Ubuntu) or `sudo dnf install libpcap-devel` (Fedora)
 
-### Build
-
-```bash
-git clone https://github.com/matthart1983/netwatch.git
-cd netwatch
-cargo build --release
-```
-
 ### Run
 
 ```bash
 # Basic mode — interface stats, connections, config
-./target/release/netwatch
+netwatch
 
 # Full mode — adds health probes + packet capture (requires root for BPF/ICMP)
-sudo ./target/release/netwatch
+sudo netwatch
 ```
 
 ---
