@@ -2,33 +2,35 @@ use crate::app::App;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Bar, BarChart, BarGroup, Block, Borders, Cell, Paragraph, Row, Sparkline, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table},
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let chart_height = if app.selected_interface.is_none() { 10 } else { 5 };
+    let chart_height = if app.selected_interface.is_some() { 5 } else { 10 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),            // header
             Constraint::Min(6),              // interface table
-            Constraint::Length(chart_height), // sparkline or histogram
+            Constraint::Length(chart_height), // bandwidth graph or per-iface sparkline
             Constraint::Length(7),            // top connections
             Constraint::Length(3),            // health status
+            Constraint::Length(4),            // latency heatmap
             Constraint::Length(3),            // footer
         ])
         .split(area);
 
     render_header(f, chunks[0]);
     render_interface_table(f, app, chunks[1]);
-    if app.selected_interface.is_none() {
-        render_histogram(f, app, chunks[2]);
-    } else {
+    if app.selected_interface.is_some() {
         render_sparkline(f, app, chunks[2]);
+    } else {
+        render_bandwidth_graph(f, app, chunks[2]);
     }
     render_top_connections(f, app, chunks[3]);
     render_health(f, app, chunks[4]);
-    render_footer(f, chunks[5]);
+    render_latency_heatmap(f, app, chunks[5]);
+    render_footer(f, chunks[6]);
 }
 
 fn render_header(f: &mut Frame, area: Rect) {
@@ -37,7 +39,7 @@ fn render_header(f: &mut Frame, area: Rect) {
         Span::styled(" NetWatch ", Style::default().fg(Color::Cyan).bold()),
         Span::raw("│ "),
         Span::styled("[1] Dashboard", Style::default().fg(Color::Yellow).bold()),
-        Span::raw("  [2] Connections  [3] Interfaces  [4] Packets"),
+        Span::raw("  [2] Connections  [3] Interfaces  [4] Packets  [5] Stats"),
         Span::raw("  │ "),
         Span::styled(now, Style::default().fg(Color::DarkGray)),
     ]))
@@ -163,28 +165,7 @@ fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-const IFACE_COLORS: [Color; 8] = [
-    Color::Green,
-    Color::Blue,
-    Color::Magenta,
-    Color::Cyan,
-    Color::Yellow,
-    Color::Red,
-    Color::LightGreen,
-    Color::LightBlue,
-];
-
-fn format_scale_label(value: u64) -> String {
-    if value >= 1_000_000 {
-        format!("{:.0}G", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.0}M", value as f64 / 1_000.0)
-    } else {
-        format!("{}K", value)
-    }
-}
-
-fn render_histogram(f: &mut Frame, app: &App, area: Rect) {
+fn render_bandwidth_graph(f: &mut Frame, app: &App, area: Rect) {
     let active: Vec<_> = app
         .traffic
         .interfaces
@@ -199,10 +180,11 @@ fn render_histogram(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     if active.is_empty() {
-        let empty = Paragraph::new("No active interfaces")
+        let empty = Paragraph::new(" No active interfaces")
+            .style(Style::default().fg(Color::DarkGray))
             .block(
                 Block::default()
-                    .title(" Throughput ")
+                    .title(" Bandwidth ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             );
@@ -210,130 +192,62 @@ fn render_histogram(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Build legend
-    let legend: Vec<Span> = active
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, iface)| {
-            vec![
-                Span::styled("■ ", Style::default().fg(IFACE_COLORS[idx % IFACE_COLORS.len()])),
-                Span::styled(
-                    format!("{} ", iface.name),
-                    Style::default().fg(Color::White),
-                ),
-            ]
-        })
-        .collect();
-
-    let title = Line::from(
-        std::iter::once(Span::raw(" Throughput (KB/s) "))
-            .chain(legend)
-            .collect::<Vec<Span>>(),
-    );
-
-    // Outer block for the whole widget (title, legend, border)
-    let outer_block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = outer_block.inner(area);
-    f.render_widget(outer_block, area);
-
-    // Split inner area: scale labels on the left, bar chart on the right
-    let scale_width = 7u16;
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(scale_width), Constraint::Min(1)])
-        .split(inner);
-
-    let scale_area = h_chunks[0];
-    let chart_area = h_chunks[1];
-
-    // Compute bar data and find max value for scale
-    let chart_inner_width = chart_area.width as usize;
-    let iface_count = active.len();
-    let group_width = iface_count + 1;
-    let num_slots = if group_width > 0 {
-        (chart_inner_width / group_width).max(1).min(30)
-    } else {
-        10
-    };
-
-    let history_len = active
-        .iter()
-        .map(|i| i.rx_history.len())
-        .max()
-        .unwrap_or(0);
-    let start = history_len.saturating_sub(num_slots);
-
-    let mut max_val: u64 = 0;
-    let groups: Vec<BarGroup> = (start..history_len)
-        .map(|t| {
-            let bars: Vec<Bar> = active
-                .iter()
-                .enumerate()
-                .map(|(idx, iface)| {
-                    let rx = iface.rx_history.get(t).copied().unwrap_or(0);
-                    let tx = iface.tx_history.get(t).copied().unwrap_or(0);
-                    let kbps = ((rx + tx) / 1024).max(if rx + tx > 0 { 1 } else { 0 });
-                    if kbps > max_val {
-                        max_val = kbps;
-                    }
-                    Bar::default()
-                        .value(kbps)
-                        .style(Style::default().fg(IFACE_COLORS[idx % IFACE_COLORS.len()]))
-                })
-                .collect();
-            BarGroup::default().bars(&bars)
-        })
-        .collect();
-
-    // Render Y-axis scale labels
-    // The bar chart height is chart_area.height (bars grow upward from bottom)
-    let bar_height = scale_area.height as usize;
-    if bar_height > 0 && max_val > 0 {
-        let num_labels = bar_height.min(5);
-        for i in 0..num_labels {
-            let frac = (num_labels - i) as f64 / num_labels as f64;
-            let value = (max_val as f64 * frac) as u64;
-            let label = format_scale_label(value);
-            let y = scale_area.y + (i as u16 * scale_area.height / num_labels as u16);
-            if y < scale_area.y + scale_area.height {
-                let label_span = Span::styled(
-                    format!("{:>6}", label),
-                    Style::default().fg(Color::DarkGray),
-                );
-                let label_area = Rect::new(scale_area.x, y, scale_width, 1);
-                f.render_widget(Paragraph::new(label_span), label_area);
-            }
+    // Aggregate RX and TX history across all active interfaces
+    let max_len = active.iter().map(|i| i.rx_history.len()).max().unwrap_or(0);
+    let mut agg_rx = vec![0u64; max_len];
+    let mut agg_tx = vec![0u64; max_len];
+    for iface in &active {
+        for (t, &val) in iface.rx_history.iter().enumerate() {
+            agg_rx[t] += val;
         }
-        // Bottom label (0)
-        let zero_area = Rect::new(
-            scale_area.x,
-            scale_area.y + scale_area.height.saturating_sub(1),
-            scale_width,
-            1,
-        );
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                format!("{:>6}", "0"),
-                Style::default().fg(Color::DarkGray),
-            )),
-            zero_area,
-        );
+        for (t, &val) in iface.tx_history.iter().enumerate() {
+            agg_tx[t] += val;
+        }
     }
 
-    // Render bar chart (no block — outer block already drawn)
-    let mut chart = BarChart::default()
-        .bar_width(1)
-        .bar_gap(0)
-        .group_gap(1);
+    // Current aggregate rates
+    let total_rx: f64 = active.iter().map(|i| i.rx_rate).sum();
+    let total_tx: f64 = active.iter().map(|i| i.tx_rate).sum();
 
-    for group in &groups {
-        chart = chart.data(group.clone());
-    }
+    let iface_names: String = active.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("+");
 
-    f.render_widget(chart, chart_area);
+    // Split into RX sparkline (top) and TX sparkline (bottom)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let rx_title = format!(
+        " ▼ RX {} — {} (last 60s) ",
+        iface_names,
+        widgets::format_bytes_rate(total_rx),
+    );
+    let rx_spark = Sparkline::default()
+        .block(
+            Block::default()
+                .title(rx_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .data(&agg_rx)
+        .style(Style::default().fg(Color::Green));
+    f.render_widget(rx_spark, chunks[0]);
+
+    let tx_title = format!(
+        " ▲ TX {} — {} (last 60s) ",
+        iface_names,
+        widgets::format_bytes_rate(total_tx),
+    );
+    let tx_spark = Sparkline::default()
+        .block(
+            Block::default()
+                .title(tx_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .data(&agg_tx)
+        .style(Style::default().fg(Color::Blue));
+    f.render_widget(tx_spark, chunks[1]);
 }
 
 fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
@@ -443,6 +357,105 @@ fn render_health(f: &mut Frame, app: &App, area: Rect) {
     );
 
     f.render_widget(health, area);
+}
+
+fn rtt_heatmap_spans(history: &[Option<f64>], width: usize) -> Vec<Span<'static>> {
+    if history.is_empty() {
+        return vec![Span::styled(
+            " No data yet".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+
+    // Find max RTT for scaling
+    let max_rtt = history
+        .iter()
+        .filter_map(|r| *r)
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+
+    // Use the last `width` samples
+    let start = history.len().saturating_sub(width);
+    let slice = &history[start..];
+
+    slice
+        .iter()
+        .map(|sample| {
+            match sample {
+                None => Span::styled("▮", Style::default().fg(Color::Red)),
+                Some(rtt) => {
+                    let ratio = (*rtt / max_rtt).min(1.0);
+                    let color = if ratio < 0.3 {
+                        Color::Green
+                    } else if ratio < 0.6 {
+                        Color::Yellow
+                    } else if ratio < 0.85 {
+                        Color::Rgb(255, 165, 0) // orange
+                    } else {
+                        Color::Red
+                    };
+                    // Use block characters with varying fill for fine granularity
+                    let block = match ((ratio * 7.0) as u8).min(7) {
+                        0 => '▁',
+                        1 => '▂',
+                        2 => '▃',
+                        3 => '▄',
+                        4 => '▅',
+                        5 => '▆',
+                        6 => '▇',
+                        _ => '█',
+                    };
+                    Span::styled(block.to_string(), Style::default().fg(color))
+                }
+            }
+        })
+        .collect()
+}
+
+fn render_latency_heatmap(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Latency Heatmap ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    let avail_width = inner.width.saturating_sub(12) as usize; // reserve label space
+
+    let hs = &app.health_prober.status;
+
+    // Gateway row
+    let mut gw_spans: Vec<Span> = vec![
+        Span::styled(" GW  ", Style::default().fg(Color::Cyan).bold()),
+    ];
+    gw_spans.extend(rtt_heatmap_spans(&hs.gateway_rtt_history, avail_width));
+    if let Some(rtt) = hs.gateway_rtt_ms {
+        gw_spans.push(Span::styled(
+            format!(" {:.1}ms", rtt),
+            Style::default().fg(Color::White),
+        ));
+    }
+    let gw_line = Line::from(gw_spans);
+
+    // DNS row
+    let mut dns_spans: Vec<Span> = vec![
+        Span::styled(" DNS ", Style::default().fg(Color::Cyan).bold()),
+    ];
+    dns_spans.extend(rtt_heatmap_spans(&hs.dns_rtt_history, avail_width));
+    if let Some(rtt) = hs.dns_rtt_ms {
+        dns_spans.push(Span::styled(
+            format!(" {:.1}ms", rtt),
+            Style::default().fg(Color::White),
+        ));
+    }
+    let dns_line = Line::from(dns_spans);
+
+    let content = Paragraph::new(vec![gw_line, dns_line]);
+    f.render_widget(content, inner);
 }
 
 fn render_footer(f: &mut Frame, area: Rect) {

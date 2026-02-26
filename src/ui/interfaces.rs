@@ -29,6 +29,7 @@ fn render_header(f: &mut Frame, area: Rect) {
         Span::raw("│ "),
         Span::raw("[1] Dashboard  [2] Connections  "),
         Span::styled("[3] Interfaces", Style::default().fg(Color::Yellow).bold()),
+        Span::raw("  [4] Packets  [5] Stats"),
         Span::raw("  │ "),
         Span::styled(now, Style::default().fg(Color::DarkGray)),
     ]))
@@ -193,12 +194,16 @@ fn render_footer(f: &mut Frame, area: Rect) {
         Span::raw(":Quit  "),
         Span::styled("↑↓", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Select  "),
-        Span::styled("1-3", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Tab  "),
         Span::styled("p", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Pause  "),
         Span::styled("r", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Refresh"),
+        Span::raw(":Refresh  "),
+        Span::styled("1-5", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":Tab  "),
+        Span::styled("g", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":Geo  "),
+        Span::styled("?", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(":Help"),
     ]))
     .block(
         Block::default()

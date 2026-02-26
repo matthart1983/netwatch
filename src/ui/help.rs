@@ -93,6 +93,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(key_line("↑↓", "Scroll connection list"));
     lines.push(key_line("s", "Cycle sort column"));
     lines.push(key_line("Enter", "Jump to Packets tab with filter for selected connection"));
+    lines.push(key_line("W (shift)", "Whois lookup for selected connection's remote IP"));
     lines.push(Line::raw(""));
 
     // INTERFACES
@@ -113,6 +114,10 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(key_line("w", "Export packets to .pcap file"));
     lines.push(key_line("f", "Toggle auto-follow"));
     lines.push(key_line("x", "Clear all captured packets"));
+    lines.push(key_line("m", "Toggle bookmark on selected packet"));
+    lines.push(key_line("n", "Jump to next bookmarked packet"));
+    lines.push(key_line("N (shift)", "Jump to previous bookmarked packet"));
+    lines.push(key_line("W (shift)", "Whois lookup for selected packet IPs"));
     lines.push(Line::raw(""));
 
     // STREAM VIEW

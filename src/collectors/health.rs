@@ -1,10 +1,14 @@
 use std::process::Command;
 
+const RTT_HISTORY_MAX: usize = 60;
+
 pub struct HealthStatus {
     pub gateway_rtt_ms: Option<f64>,
     pub gateway_loss_pct: f64,
     pub dns_rtt_ms: Option<f64>,
     pub dns_loss_pct: f64,
+    pub gateway_rtt_history: Vec<Option<f64>>,
+    pub dns_rtt_history: Vec<Option<f64>>,
 }
 
 pub struct HealthProber {
@@ -19,6 +23,8 @@ impl HealthProber {
                 gateway_loss_pct: 100.0,
                 dns_rtt_ms: None,
                 dns_loss_pct: 100.0,
+                gateway_rtt_history: Vec::new(),
+                dns_rtt_history: Vec::new(),
             },
         }
     }
@@ -28,12 +34,20 @@ impl HealthProber {
             let (rtt, loss) = run_ping(gw);
             self.status.gateway_rtt_ms = rtt;
             self.status.gateway_loss_pct = loss;
+            self.status.gateway_rtt_history.push(rtt);
+            if self.status.gateway_rtt_history.len() > RTT_HISTORY_MAX {
+                self.status.gateway_rtt_history.remove(0);
+            }
         }
 
         if let Some(dns) = dns_server {
             let (rtt, loss) = run_ping(dns);
             self.status.dns_rtt_ms = rtt;
             self.status.dns_loss_pct = loss;
+            self.status.dns_rtt_history.push(rtt);
+            if self.status.dns_rtt_history.len() > RTT_HISTORY_MAX {
+                self.status.dns_rtt_history.remove(0);
+            }
         }
     }
 }
