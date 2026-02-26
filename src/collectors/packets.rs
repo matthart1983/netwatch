@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 const MAX_PACKETS: usize = 5000;
+const DNS_CACHE_MAX: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct CapturedPacket {
@@ -9,6 +12,8 @@ pub struct CapturedPacket {
     pub timestamp: String,
     pub src_ip: String,
     pub dst_ip: String,
+    pub src_host: Option<String>,
+    pub dst_host: Option<String>,
     pub protocol: String,
     pub length: u32,
     pub src_port: Option<u16>,
@@ -20,10 +25,115 @@ pub struct CapturedPacket {
     pub raw_ascii: String,
 }
 
+#[derive(Clone)]
+pub struct DnsCache {
+    cache: Arc<Mutex<HashMap<String, DnsEntry>>>,
+    pending: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Debug)]
+enum DnsEntry {
+    Resolved(String),
+    Failed,
+    Pending,
+}
+
+impl DnsCache {
+    fn new() -> Self {
+        let dns = Self {
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(Vec::new())),
+        };
+        dns.start_resolver();
+        dns
+    }
+
+    fn start_resolver(&self) {
+        let cache = Arc::clone(&self.cache);
+        let pending = Arc::clone(&self.pending);
+        thread::spawn(move || {
+            loop {
+                let ip = {
+                    let mut q = pending.lock().unwrap();
+                    if q.is_empty() {
+                        drop(q);
+                        thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    q.pop().unwrap()
+                };
+
+                let hostname = resolve_ip(&ip);
+                let mut c = cache.lock().unwrap();
+                match hostname {
+                    Some(name) => { c.insert(ip, DnsEntry::Resolved(name)); }
+                    None => { c.insert(ip, DnsEntry::Failed); }
+                }
+                if c.len() > DNS_CACHE_MAX {
+                    let keys: Vec<String> = c.keys().take(DNS_CACHE_MAX / 4).cloned().collect();
+                    for k in keys { c.remove(&k); }
+                }
+            }
+        });
+    }
+
+    pub fn lookup(&self, ip: &str) -> Option<String> {
+        if ip == "—" || ip.is_empty() {
+            return None;
+        }
+        let cache = self.cache.lock().unwrap();
+        match cache.get(ip) {
+            Some(DnsEntry::Resolved(name)) => Some(name.clone()),
+            Some(DnsEntry::Failed) | Some(DnsEntry::Pending) => None,
+            None => {
+                drop(cache);
+                let mut c = self.cache.lock().unwrap();
+                c.insert(ip.to_string(), DnsEntry::Pending);
+                drop(c);
+                let mut q = self.pending.lock().unwrap();
+                q.push(ip.to_string());
+                None
+            }
+        }
+    }
+}
+
+fn resolve_ip(ip: &str) -> Option<String> {
+    // Use getaddrinfo reverse lookup via the system resolver
+    let addr = format!("{}:0", ip);
+    let socket_addr = addr.to_socket_addrs().ok()?.next()?;
+    // Use DNS PTR lookup via std
+    dns_lookup_reverse(&socket_addr.ip())
+}
+
+fn dns_lookup_reverse(ip: &std::net::IpAddr) -> Option<String> {
+    use std::process::Command;
+    // Use host command for reverse DNS (available on macOS and most Linux)
+    let output = Command::new("host")
+        .arg("-W")
+        .arg("1")
+        .arg(ip.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Parse "X.X.X.X.in-addr.arpa domain name pointer hostname."
+    let hostname = text.lines()
+        .find(|l| l.contains("domain name pointer"))?
+        .rsplit("pointer ")
+        .next()?
+        .trim_end_matches('.')
+        .to_string();
+    if hostname.is_empty() { None } else { Some(hostname) }
+}
+
 pub struct PacketCollector {
     pub packets: Arc<Mutex<Vec<CapturedPacket>>>,
     pub capturing: Arc<Mutex<bool>>,
     pub error: Arc<Mutex<Option<String>>>,
+    pub dns_cache: DnsCache,
     counter: Arc<Mutex<u64>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -34,6 +144,7 @@ impl PacketCollector {
             packets: Arc::new(Mutex::new(Vec::new())),
             capturing: Arc::new(Mutex::new(false)),
             error: Arc::new(Mutex::new(None)),
+            dns_cache: DnsCache::new(),
             counter: Arc::new(Mutex::new(0)),
             handle: None,
         }
@@ -53,6 +164,7 @@ impl PacketCollector {
         let capturing = Arc::clone(&self.capturing);
         let error = Arc::clone(&self.error);
         let counter = Arc::clone(&self.counter);
+        let dns = self.dns_cache.clone();
         let iface = interface.to_string();
 
         self.handle = Some(thread::spawn(move || {
@@ -82,7 +194,7 @@ impl PacketCollector {
             while *capturing.lock().unwrap() {
                 match cap.next_packet() {
                     Ok(packet) => {
-                        if let Some(parsed) = parse_packet(packet.data, &counter) {
+                        if let Some(parsed) = parse_packet(packet.data, &counter, &dns) {
                             let mut pkts = packets.lock().unwrap();
                             pkts.push(parsed);
                             if pkts.len() > MAX_PACKETS {
@@ -130,7 +242,7 @@ impl Drop for PacketCollector {
 
 // ── Packet parsing ──────────────────────────────────────────
 
-fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>) -> Option<CapturedPacket> {
+fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Option<CapturedPacket> {
     if data.len() < 14 {
         return None;
     }
@@ -149,12 +261,12 @@ fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>) -> Option<CapturedPacket
     details.push(format!("Ethernet: {} → {}, Type: {} (0x{:04x})", src_mac, dst_mac, ether_name, ethertype));
 
     match ethertype {
-        0x0800 => parse_ipv4_packet(data, &data[14..], &mut details, counter),
+        0x0800 => parse_ipv4_packet(data, &data[14..], &mut details, counter, dns),
         0x0806 => {
             let info = parse_arp(&data[14..], &mut details);
-            Some(build_packet(counter, "ARP", data.len() as u32, "—", "—", None, None, &info, details, &[], data))
+            Some(build_packet(counter, "ARP", data.len() as u32, "—", "—", None, None, &info, details, &[], data, dns))
         }
-        0x86DD => parse_ipv6_packet(data, &data[14..], &mut details, counter),
+        0x86DD => parse_ipv6_packet(data, &data[14..], &mut details, counter, dns),
         _ => None,
     }
 }
@@ -164,7 +276,7 @@ fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>) -> Option<CapturedPacket
 type TransportResult = (String, Option<u16>, Option<u16>, String, usize);
 
 fn parse_ipv4_packet(
-    raw: &[u8], data: &[u8], details: &mut Vec<String>, counter: &Arc<Mutex<u64>>,
+    raw: &[u8], data: &[u8], details: &mut Vec<String>, counter: &Arc<Mutex<u64>>, dns: &DnsCache,
 ) -> Option<CapturedPacket> {
     if data.len() < 20 {
         return None;
@@ -193,12 +305,12 @@ fn parse_ipv4_packet(
 
     Some(build_packet(
         counter, &protocol, raw.len() as u32,
-        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw,
+        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw, dns,
     ))
 }
 
 fn parse_ipv6_packet(
-    raw: &[u8], data: &[u8], details: &mut Vec<String>, counter: &Arc<Mutex<u64>>,
+    raw: &[u8], data: &[u8], details: &mut Vec<String>, counter: &Arc<Mutex<u64>>, dns: &DnsCache,
 ) -> Option<CapturedPacket> {
     if data.len() < 40 {
         return None;
@@ -226,7 +338,7 @@ fn parse_ipv6_packet(
 
     Some(build_packet(
         counter, &protocol, raw.len() as u32,
-        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw,
+        &src, &dst, src_port, dst_port, &info, details.clone(), app_payload, raw, dns,
     ))
 }
 
@@ -678,11 +790,16 @@ fn build_packet(
     details: Vec<String>,
     payload: &[u8],
     raw: &[u8],
+    dns: &DnsCache,
 ) -> CapturedPacket {
     let mut cnt = counter.lock().unwrap();
     *cnt += 1;
     let id = *cnt;
     let timestamp = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+
+    // Queue reverse DNS lookups (non-blocking — results appear on next render)
+    let src_host = dns.lookup(src_ip);
+    let dst_host = dns.lookup(dst_ip);
 
     let hex_lines = raw
         .chunks(16)
@@ -710,11 +827,21 @@ fn build_packet(
     // Extract readable text from the application payload
     let payload_text = extract_readable_payload(payload);
 
+    // Add resolved hostnames to the details
+    let mut details = details;
+    if src_host.is_some() || dst_host.is_some() {
+        let src_label = src_host.as_deref().unwrap_or(src_ip);
+        let dst_label = dst_host.as_deref().unwrap_or(dst_ip);
+        details.push(format!("DNS: {} → {}", src_label, dst_label));
+    }
+
     CapturedPacket {
         id,
         timestamp,
         src_ip: src_ip.to_string(),
         dst_ip: dst_ip.to_string(),
+        src_host,
+        dst_host,
         protocol: protocol.to_string(),
         length,
         src_port,

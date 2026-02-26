@@ -101,21 +101,30 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 Style::default()
             };
 
+            // Use stored hostname, or try live cache lookup for late-resolved IPs
+            let src_resolved = pkt.src_host.clone()
+                .or_else(|| app.packet_collector.dns_cache.lookup(&pkt.src_ip));
+            let dst_resolved = pkt.dst_host.clone()
+                .or_else(|| app.packet_collector.dns_cache.lookup(&pkt.dst_ip));
+
+            let src_label = src_resolved.as_deref().unwrap_or(&pkt.src_ip);
+            let dst_label = dst_resolved.as_deref().unwrap_or(&pkt.dst_ip);
+
             let src_display = match pkt.src_port {
                 Some(p) => {
                     let svc = port_label(p);
-                    if svc != "—" { format!("{}:{} ({})", pkt.src_ip, p, svc) }
-                    else { format!("{}:{}", pkt.src_ip, p) }
+                    if svc != "—" { format!("{}:{} ({})", src_label, p, svc) }
+                    else { format!("{}:{}", src_label, p) }
                 }
-                None => pkt.src_ip.clone(),
+                None => src_label.to_string(),
             };
             let dst_display = match pkt.dst_port {
                 Some(p) => {
                     let svc = port_label(p);
-                    if svc != "—" { format!("{}:{} ({})", pkt.dst_ip, p, svc) }
-                    else { format!("{}:{}", pkt.dst_ip, p) }
+                    if svc != "—" { format!("{}:{} ({})", dst_label, p, svc) }
+                    else { format!("{}:{}", dst_label, p) }
                 }
-                None => pkt.dst_ip.clone(),
+                None => dst_label.to_string(),
             };
 
             Row::new(vec![
@@ -136,8 +145,8 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
         [
             Constraint::Length(6),
             Constraint::Length(13),
-            Constraint::Length(22),
-            Constraint::Length(22),
+            Constraint::Length(30),
+            Constraint::Length(30),
             Constraint::Length(7),
             Constraint::Length(5),
             Constraint::Min(30),
