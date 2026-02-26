@@ -461,19 +461,21 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 KeyCode::Char('w') if app.current_tab == Tab::Packets => {
                     use crate::collectors::packets::{export_pcap, parse_filter, matches_packet};
                     let packets = app.packet_collector.get_packets();
-                    let to_export: Vec<_> = if let Some(ref ft) = app.packet_filter_active {
+                    let filtered: Vec<_>;
+                    let to_export: &[_] = if let Some(ref ft) = app.packet_filter_active {
                         if let Some(expr) = parse_filter(ft) {
-                            packets.iter().filter(|p| matches_packet(&expr, p)).cloned().collect()
+                            filtered = packets.iter().filter(|p| matches_packet(&expr, p)).cloned().collect();
+                            &filtered
                         } else {
-                            packets
+                            &*packets
                         }
                     } else {
-                        packets
+                        &*packets
                     };
                     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
                     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                     let path = format!("{home}/netwatch_capture_{ts}.pcap");
-                    match export_pcap(&to_export, &path) {
+                    match export_pcap(to_export, &path) {
                         Ok(n) => {
                             app.export_status = Some(format!("Saved {n} packets to {path}"));
                         }
@@ -495,7 +497,7 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 }
                 KeyCode::Char('W') if app.current_tab == Tab::Connections => {
                     // Trigger whois lookup for selected connection's remote IP
-                    let mut conns = app.connection_collector.connections.clone();
+                    let mut conns = app.connection_collector.connections.lock().unwrap().clone();
                     match app.sort_column {
                         0 => conns.sort_by(|a, b| a.process_name.as_deref().unwrap_or("").cmp(b.process_name.as_deref().unwrap_or(""))),
                         1 => conns.sort_by(|a, b| a.pid.cmp(&b.pid)),
@@ -518,7 +520,7 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     }
                 }
                 KeyCode::Enter if app.current_tab == Tab::Connections => {
-                    let mut conns = app.connection_collector.connections.clone();
+                    let mut conns = app.connection_collector.connections.lock().unwrap().clone();
                     match app.sort_column {
                         0 => conns.sort_by(|a, b| a.process_name.as_deref().unwrap_or("").cmp(b.process_name.as_deref().unwrap_or(""))),
                         1 => conns.sort_by(|a, b| a.pid.cmp(&b.pid)),
@@ -582,6 +584,8 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                         let max = app
                             .connection_collector
                             .connections
+                            .lock()
+                            .unwrap()
                             .len()
                             .saturating_sub(1);
                         if app.connection_scroll < max {
@@ -590,15 +594,11 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     }
                     Tab::Packets => {
                         app.packet_follow = false;
-                        let max = app
-                            .packet_collector
-                            .get_packets()
-                            .len()
-                            .saturating_sub(1);
+                        let packets = app.packet_collector.get_packets();
+                        let max = packets.len().saturating_sub(1);
                         if app.packet_scroll < max {
                             app.packet_scroll += 1;
                         }
-                        let packets = app.packet_collector.get_packets();
                         if let Some(pkt) = packets.get(app.packet_scroll) {
                             app.packet_selected = Some(pkt.id);
                         }

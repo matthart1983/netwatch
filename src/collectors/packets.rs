@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 const MAX_PACKETS: usize = 5000;
@@ -115,7 +117,7 @@ pub fn classify_expert(protocol: &str, info: &str, tcp_flags: Option<u8>) -> Exp
 #[derive(Clone)]
 pub struct DnsCache {
     cache: Arc<Mutex<HashMap<String, DnsEntry>>>,
-    pending: Arc<Mutex<Vec<String>>>,
+    tx: std_mpsc::Sender<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,31 +129,13 @@ enum DnsEntry {
 
 impl DnsCache {
     fn new() -> Self {
-        let dns = Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(Vec::new())),
-        };
-        dns.start_resolver();
-        dns
-    }
-
-    fn start_resolver(&self) {
-        let cache = Arc::clone(&self.cache);
-        let pending = Arc::clone(&self.pending);
+        let (tx, rx) = std_mpsc::channel::<String>();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let resolver_cache = Arc::clone(&cache);
         thread::spawn(move || {
-            loop {
-                let ip = {
-                    let mut q = pending.lock().unwrap();
-                    if q.is_empty() {
-                        drop(q);
-                        thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-                    q.pop().unwrap()
-                };
-
+            while let Ok(ip) = rx.recv() {
                 let hostname = resolve_ip(&ip);
-                let mut c = cache.lock().unwrap();
+                let mut c = resolver_cache.lock().unwrap();
                 match hostname {
                     Some(name) => { c.insert(ip, DnsEntry::Resolved(name)); }
                     None => { c.insert(ip, DnsEntry::Failed); }
@@ -162,23 +146,20 @@ impl DnsCache {
                 }
             }
         });
+        Self { cache, tx }
     }
 
     pub fn lookup(&self, ip: &str) -> Option<String> {
         if ip == "—" || ip.is_empty() {
             return None;
         }
-        let cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap();
         match cache.get(ip) {
             Some(DnsEntry::Resolved(name)) => Some(name.clone()),
             Some(DnsEntry::Failed) | Some(DnsEntry::Pending) => None,
             None => {
-                drop(cache);
-                let mut c = self.cache.lock().unwrap();
-                c.insert(ip.to_string(), DnsEntry::Pending);
-                drop(c);
-                let mut q = self.pending.lock().unwrap();
-                q.push(ip.to_string());
+                cache.insert(ip.to_string(), DnsEntry::Pending);
+                let _ = self.tx.send(ip.to_string());
                 None
             }
         }
@@ -434,8 +415,8 @@ fn dns_lookup_reverse(ip: &std::net::IpAddr) -> Option<String> {
 }
 
 pub struct PacketCollector {
-    pub packets: Arc<Mutex<Vec<CapturedPacket>>>,
-    pub capturing: Arc<Mutex<bool>>,
+    pub packets: Arc<RwLock<Vec<CapturedPacket>>>,
+    pub capturing: Arc<AtomicBool>,
     pub error: Arc<Mutex<Option<String>>>,
     pub dns_cache: DnsCache,
     pub stream_tracker: Arc<Mutex<StreamTracker>>,
@@ -446,8 +427,8 @@ pub struct PacketCollector {
 impl PacketCollector {
     pub fn new() -> Self {
         Self {
-            packets: Arc::new(Mutex::new(Vec::new())),
-            capturing: Arc::new(Mutex::new(false)),
+            packets: Arc::new(RwLock::new(Vec::new())),
+            capturing: Arc::new(AtomicBool::new(false)),
             error: Arc::new(Mutex::new(None)),
             dns_cache: DnsCache::new(),
             stream_tracker: Arc::new(Mutex::new(StreamTracker::new())),
@@ -457,12 +438,8 @@ impl PacketCollector {
     }
 
     pub fn start_capture(&mut self, interface: &str, bpf_filter: Option<&str>) {
-        {
-            let mut cap = self.capturing.lock().unwrap();
-            if *cap {
-                return;
-            }
-            *cap = true;
+        if self.capturing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return;
         }
         *self.error.lock().unwrap() = None;
 
@@ -494,7 +471,7 @@ impl PacketCollector {
                         format!("Capture failed: {e}")
                     };
                     *error.lock().unwrap() = Some(msg);
-                    *capturing.lock().unwrap() = false;
+                    capturing.store(false, Ordering::SeqCst);
                     return;
                 }
             };
@@ -503,12 +480,12 @@ impl PacketCollector {
             if let Some(filter) = bpf.as_deref() {
                 if let Err(e) = cap.filter(filter, true) {
                     *error.lock().unwrap() = Some(format!("BPF filter error: {e}"));
-                    *capturing.lock().unwrap() = false;
+                    capturing.store(false, Ordering::SeqCst);
                     return;
                 }
             }
 
-            while *capturing.lock().unwrap() {
+            while capturing.load(Ordering::Relaxed) {
                 match cap.next_packet() {
                     Ok(packet) => {
                         if let Some(mut parsed) = parse_packet(packet.data, &counter, &dns) {
@@ -529,7 +506,7 @@ impl PacketCollector {
                                 );
                                 parsed.stream_index = Some(idx);
                             }
-                            let mut pkts = packets.lock().unwrap();
+                            let mut pkts = packets.write().unwrap();
                             pkts.push(parsed);
                             if pkts.len() > MAX_PACKETS {
                                 let excess = pkts.len() - MAX_PACKETS;
@@ -545,27 +522,27 @@ impl PacketCollector {
     }
 
     pub fn stop_capture(&mut self) {
-        *self.capturing.lock().unwrap() = false;
+        self.capturing.store(false, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 
     pub fn clear(&self) {
-        self.packets.lock().unwrap().clear();
+        self.packets.write().unwrap().clear();
         self.stream_tracker.lock().unwrap().clear();
     }
 
     pub fn is_capturing(&self) -> bool {
-        *self.capturing.lock().unwrap()
+        self.capturing.load(Ordering::SeqCst)
     }
 
     pub fn get_error(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
     }
 
-    pub fn get_packets(&self) -> Vec<CapturedPacket> {
-        self.packets.lock().unwrap().clone()
+    pub fn get_packets(&self) -> std::sync::RwLockReadGuard<'_, Vec<CapturedPacket>> {
+        self.packets.read().unwrap()
     }
 
     pub fn get_stream(&self, index: u32) -> Option<Stream> {

@@ -16,8 +16,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    render_header(f, app, chunks[0]);
     let packets = app.packet_collector.get_packets();
+    render_header(f, app, chunks[0], packets.len());
     render_packet_list(f, app, &packets, chunks[1]);
     if app.stream_view_open {
         render_stream_view(f, app, chunks[2]);
@@ -27,7 +27,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     render_footer(f, app, chunks[3]);
 }
 
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
+fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
     let cap_status = if app.packet_collector.is_capturing() {
         Span::styled("● CAPTURING", Style::default().fg(Color::Red).bold())
@@ -36,8 +36,6 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let iface_name = app.capture_interface.as_str();
-
-    let pkt_count = app.packet_collector.get_packets().len();
 
     let mut line1_spans = vec![
         Span::styled(" NetWatch ", Style::default().fg(Color::Cyan).bold()),

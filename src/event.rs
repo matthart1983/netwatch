@@ -17,7 +17,10 @@ impl EventHandler {
         let (tx, rx) = mpsc::unbounded_channel();
         let tick_rate = Duration::from_millis(tick_rate_ms);
 
-        tokio::spawn(async move {
+        // Use a dedicated OS thread instead of tokio::spawn, since
+        // crossterm::event::poll() is a blocking call that would tie up
+        // a tokio worker thread permanently.
+        std::thread::spawn(move || {
             loop {
                 if event::poll(tick_rate).unwrap_or(false) {
                     if let Ok(Event::Key(key)) = event::read() {

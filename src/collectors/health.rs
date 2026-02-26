@@ -1,4 +1,7 @@
+use std::collections::VecDeque;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 const RTT_HISTORY_MAX: usize = 60;
 
@@ -7,48 +10,56 @@ pub struct HealthStatus {
     pub gateway_loss_pct: f64,
     pub dns_rtt_ms: Option<f64>,
     pub dns_loss_pct: f64,
-    pub gateway_rtt_history: Vec<Option<f64>>,
-    pub dns_rtt_history: Vec<Option<f64>>,
+    pub gateway_rtt_history: VecDeque<Option<f64>>,
+    pub dns_rtt_history: VecDeque<Option<f64>>,
 }
 
 pub struct HealthProber {
-    pub status: HealthStatus,
+    pub status: Arc<Mutex<HealthStatus>>,
 }
 
 impl HealthProber {
     pub fn new() -> Self {
         Self {
-            status: HealthStatus {
+            status: Arc::new(Mutex::new(HealthStatus {
                 gateway_rtt_ms: None,
                 gateway_loss_pct: 100.0,
                 dns_rtt_ms: None,
                 dns_loss_pct: 100.0,
-                gateway_rtt_history: Vec::new(),
-                dns_rtt_history: Vec::new(),
-            },
+                gateway_rtt_history: VecDeque::new(),
+                dns_rtt_history: VecDeque::new(),
+            })),
         }
     }
 
-    pub fn probe(&mut self, gateway: Option<&str>, dns_server: Option<&str>) {
-        if let Some(gw) = gateway {
-            let (rtt, loss) = run_ping(gw);
-            self.status.gateway_rtt_ms = rtt;
-            self.status.gateway_loss_pct = loss;
-            self.status.gateway_rtt_history.push(rtt);
-            if self.status.gateway_rtt_history.len() > RTT_HISTORY_MAX {
-                self.status.gateway_rtt_history.remove(0);
+    pub fn probe(&self, gateway: Option<&str>, dns_server: Option<&str>) {
+        let status = Arc::clone(&self.status);
+        let gw = gateway.map(|s| s.to_string());
+        let dns = dns_server.map(|s| s.to_string());
+        thread::spawn(move || {
+            if let Some(gw) = gw.as_deref() {
+                let (rtt, loss) = run_ping(gw);
+                let mut s = status.lock().unwrap();
+                s.gateway_rtt_ms = rtt;
+                s.gateway_loss_pct = loss;
+                s.gateway_rtt_history.push_back(rtt);
+                if s.gateway_rtt_history.len() > RTT_HISTORY_MAX {
+                    s.gateway_rtt_history.pop_front();
+                }
+                s.gateway_rtt_history.make_contiguous();
             }
-        }
-
-        if let Some(dns) = dns_server {
-            let (rtt, loss) = run_ping(dns);
-            self.status.dns_rtt_ms = rtt;
-            self.status.dns_loss_pct = loss;
-            self.status.dns_rtt_history.push(rtt);
-            if self.status.dns_rtt_history.len() > RTT_HISTORY_MAX {
-                self.status.dns_rtt_history.remove(0);
+            if let Some(dns) = dns.as_deref() {
+                let (rtt, loss) = run_ping(dns);
+                let mut s = status.lock().unwrap();
+                s.dns_rtt_ms = rtt;
+                s.dns_loss_pct = loss;
+                s.dns_rtt_history.push_back(rtt);
+                if s.dns_rtt_history.len() > RTT_HISTORY_MAX {
+                    s.dns_rtt_history.pop_front();
+                }
+                s.dns_rtt_history.make_contiguous();
             }
-        }
+        });
     }
 }
 

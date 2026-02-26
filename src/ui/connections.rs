@@ -21,7 +21,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
-    let count = app.connection_collector.connections.len();
+    let count = app.connection_collector.connections.lock().unwrap().len();
     let header = Paragraph::new(Line::from(vec![
         Span::styled(" NetWatch ", Style::default().fg(Color::Cyan).bold()),
         Span::raw("│ "),
@@ -68,7 +68,7 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     }
     let header = Row::new(header_cells).height(1);
 
-    let mut conns = app.connection_collector.connections.clone();
+    let mut conns = app.connection_collector.connections.lock().unwrap().clone();
     match app.sort_column {
         0 => conns.sort_by(|a, b| {
             a.process_name
