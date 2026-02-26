@@ -13,8 +13,10 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 ## Features
 
 - **Live interface monitoring** — RX/TX rates, totals, and 60-second sparkline history for every network interface
-- **Active connections** — See every open socket with process name, PID, protocol, state, and addresses (sortable)
-- **Network health** — ICMP ping probes to your gateway and DNS servers with RTT and packet loss
+- **Aggregate bandwidth graph** — Full-width RX/TX sparklines across all active interfaces on the Dashboard
+- **Active connections** — Every open socket with process name, PID, protocol, state, and addresses (sortable)
+- **Network health** — ICMP ping probes to gateway and DNS with RTT and packet loss
+- **Latency heatmap** — Color-coded RTT history for gateway and DNS on the Dashboard
 - **Packet capture** — Wireshark-style live capture with deep protocol decoding:
   - **DNS** — Query names, types (A, AAAA, CNAME…), response codes
   - **TLS** — Handshake type, version, SNI hostname extraction
@@ -23,6 +25,19 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
   - **ARP, DHCP, NTP, mDNS** — Decoded with meaningful summaries
   - **TCP payload** — Readable text content extracted and displayed
   - **25+ service labels** — Ports mapped to names (SSH, HTTPS, PostgreSQL, Redis…)
+- **TCP stream reassembly** — Follow TCP/UDP conversations with text and hex views
+- **TCP handshake timing** — Automatic SYN→SYN-ACK→ACK latency measurement per connection
+- **Display filters** — Wireshark-style filter bar with protocol, IP, port, stream, text search, and/or/not combinators
+- **BPF capture filters** — Set Berkeley Packet Filter expressions applied at capture time
+- **Expert info & coloring** — Automatic severity classification (Error/Warn/Note/Chat) with color-coded rows
+- **Packet bookmarks** — Mark packets of interest, jump between bookmarks
+- **PCAP export** — Save captured packets (or filtered subset) to standard .pcap files
+- **Protocol statistics** — Protocol hierarchy table with packet counts, byte totals, and distribution bars
+- **Handshake histogram** — Latency distribution chart with min/avg/median/p95/max stats
+- **GeoIP location** — Background IP geolocation with country, city, and org display
+- **Whois lookup** — On-demand RDAP whois for any IP address
+- **Connection → packet linking** — Jump from a connection to filtered packet view
+- **Help overlay** — Full scrollable keybinding reference with filter syntax and expert legend
 - **Network config** — Default gateway, DNS servers, hostname at a glance
 - **Cross-platform** — macOS and Linux with platform-specific collectors
 
@@ -59,46 +74,30 @@ sudo ./target/release/netwatch
 
 ## Tabs
 
-NetWatch has four tabs, switched with number keys:
+NetWatch has five tabs, switched with number keys `1`–`5`:
 
 ### `1` Dashboard
 
 The default view. Everything at a glance:
 
-```
-┌─ NetWatch ────────────────────────────────── 15:04:32 ─┐
-│ [1] Dashboard  [2] Connections  [3] Interfaces  [4] Packets │
-├────────────────────────────────────────────────────────┤
-│ Interfaces                                              │
-│ en0   192.168.1.42   ▆▆▆ 12.4 MB/s  ▃▃ 1.2 MB/s  UP   │
-│ lo0   127.0.0.1      ▁▁▁  0.1 KB/s  ▁▁ 0.1 KB/s  UP   │
-├────────────────────────────────────────────────────────┤
-│ Bandwidth (en0) ─ RX ▁▂▃▅▆█▇▅  TX ▁▁▂▂▃▃▂▂           │
-├────────────────────────────────────────────────────────┤
-│ Top Connections                                         │
-│ curl       TCP  ESTABLISHED  52.12.0.8:443              │
-│ firefox    TCP  ESTABLISHED  142.250.1.1:443            │
-├────────────────────────────────────────────────────────┤
-│ Health                                                  │
-│ GW 192.168.1.1: 1.2ms (0% loss)  │  DNS: 12ms (0%)    │
-└────────────────────────────────────────────────────────┘
-```
-
 - **Interfaces** — All network interfaces with live RX/TX rates and UP/DOWN status
-- **Sparklines** — Rolling 60-second bandwidth graph for the selected interface
-- **Top Connections** — The 5 most active established connections
+- **Bandwidth graph** — Full-width aggregate RX/TX sparklines across all active interfaces (last 60s)
+- **Top connections** — The 5 most active established connections
 - **Health** — Gateway and DNS latency with packet loss percentage
+- **Latency heatmap** — Color-coded RTT history bars for gateway and DNS (green→yellow→orange→red)
 
 ### `2` Connections
 
 Full scrollable list of every active network socket:
 
-| Process | PID | Protocol | State | Local Address | Remote Address |
-|---------|-----|----------|-------|---------------|----------------|
-| firefox | 1234 | TCP | ESTABLISHED | 192.168.1.42:54321 | 142.250.1.1:443 |
-| ssh | 5678 | TCP | ESTABLISHED | 192.168.1.42:22 | 10.0.0.5:49200 |
+| Process | PID | Proto | State | Local Address | Remote Address | Location |
+|---------|-----|-------|-------|---------------|----------------|----------|
+| firefox | 1234 | TCP | ESTABLISHED | 192.168.1.42:54321 | 142.250.1.1:443 | US Mountain View, Google |
 
-Press `s` to cycle the sort column.
+- Press `s` to cycle the sort column
+- Press `Enter` to jump to Packets tab with a filter matching the selected connection
+- Press `W` for whois lookup on the remote IP
+- Press `g` to toggle GeoIP location column
 
 ### `3` Interfaces
 
@@ -111,24 +110,14 @@ Detailed per-interface view with:
 
 Live packet capture with Wireshark-style protocol inspection:
 
-```
-┌─ Packets (247) ───────────────────────────────────────┐
-│ #    Time         Source              Dest        Proto│
-│ 42   15:04:32.123 192.168.1.42:54321  52.12.0.8:443 (HTTPS) TLS │
-│ 43   15:04:32.456 192.168.1.42:51234  8.8.8.8:53 (DNS)  DNS │
-├─ Protocol Detail ─────────────────────────────────────┤
-│  Frame: 74 bytes on wire                               │
-│  Ethernet: aa:bb:cc:dd:ee:ff → 11:22:33:44:55:66      │
-│  IPv4: 192.168.1.42 → 8.8.8.8, TTL: 64, Proto: UDP   │
-│  UDP: 51234 (—) → 53 (DNS), Len: 40                   │
-│  DNS: Query, Name: www.google.com, Type: A             │
-├─ Payload Content ─────────────────────────────────────┤
-│  GET /api/users HTTP/1.1                                │
-│  Host: example.com                                      │
-├─ Hex Dump ────────────────┬─ ASCII ───────────────────┤
-│ 0000  aa bb cc dd ee ff … │ 0000  ......               │
-└───────────────────────────┴───────────────────────────┘
-```
+- **Packet list** — Scrollable table with expert severity indicator, stream index, protocol coloring
+- **Protocol detail** — Layer-by-layer decode (Ethernet → IP → TCP/UDP → Application)
+- **GeoIP & Whois** — Location and network ownership in the detail pane
+- **Handshake timing** — `⏱ SYN→SYN-ACK: 5.2ms │ SYN-ACK→ACK: 3.1ms │ Total: 8.3ms`
+- **Payload content** — Readable text extracted from application data
+- **Hex/ASCII dump** — Raw packet bytes with side-by-side hex and ASCII
+- **Stream view** — Press `s` to follow the TCP/UDP conversation with direction arrows
+- **Bookmarks** — Press `m` to mark packets, `n`/`N` to jump between them
 
 **Decoded protocols:**
 
@@ -142,6 +131,13 @@ Live packet capture with Wireshark-style protocol inspection:
 | DHCP | Discover/Offer/Request/ACK |
 | NTP | Version and mode (Client/Server/Broadcast) |
 
+### `5` Stats
+
+Protocol statistics and performance analysis:
+
+- **Protocol hierarchy** — Table of all seen protocols with packet counts, byte totals, percentages, and distribution bars
+- **Handshake histogram** — TCP handshake latency distribution across 7 buckets (<1ms to >500ms) with min/avg/median/p95/max summary
+
 ---
 
 ## Keyboard Controls
@@ -150,19 +146,21 @@ Live packet capture with Wireshark-style protocol inspection:
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` `4` | Switch tab: Dashboard / Connections / Interfaces / Packets |
-| `↑` `↓` | Scroll / select interface |
+| `1` `2` `3` `4` `5` | Switch tab: Dashboard / Connections / Interfaces / Packets / Stats |
+| `↑` `↓` | Scroll / select |
 | `p` | Pause / resume all data collection |
 | `r` | Force refresh all data |
-| `q` | Quit |
-| `Ctrl+C` | Quit |
+| `g` | Toggle GeoIP location display |
+| `?` | Show help overlay |
+| `q` / `Ctrl+C` | Quit |
 
 ### Connections tab
 
 | Key | Action |
 |-----|--------|
 | `s` | Cycle sort column |
-| `↑` `↓` | Scroll through connections |
+| `Enter` | Jump to Packets tab with auto-filter for selected connection |
+| `W` | Whois lookup for selected connection's remote IP |
 
 ### Packets tab
 
@@ -170,9 +168,41 @@ Live packet capture with Wireshark-style protocol inspection:
 |-----|--------|
 | `c` | Start / stop packet capture |
 | `i` | Cycle capture interface (while stopped) |
-| `f` | Toggle auto-follow (scroll to newest packets) |
+| `b` | Set BPF capture filter (while stopped) |
+| `/` | Open display filter bar |
+| `Esc` | Clear display filter |
+| `Enter` | Select packet at cursor |
+| `s` | Open stream view for selected packet |
+| `w` | Export packets to .pcap file |
+| `f` | Toggle auto-follow (scroll to newest) |
 | `x` | Clear all captured packets |
-| `↑` `↓` | Scroll and select packets for inspection |
+| `m` | Toggle bookmark on selected packet |
+| `n` / `N` | Jump to next / previous bookmark |
+| `W` | Whois lookup for selected packet's IPs |
+
+### Stream view (within Packets tab)
+
+| Key | Action |
+|-----|--------|
+| `Esc` | Close stream view |
+| `↑` `↓` | Scroll stream content |
+| `→` `←` | Filter to A→B / B→A direction |
+| `a` | Show both directions |
+| `h` | Toggle hex / text mode |
+
+### Display filter syntax
+
+| Filter | Example | Matches |
+|--------|---------|---------|
+| Protocol | `tcp`, `udp`, `dns`, `icmp`, `arp` | Protocol field match |
+| IP address | `192.168.1.42` | Source or destination IP |
+| Directional IP | `ip.src == 10.0.0.1` | Source IP only |
+| Port | `port 443` | Source or destination port |
+| Stream | `stream 7` | Stream index match |
+| Text search | `contains "hello"` | Search info, payload, IPs |
+| Negation | `!dns`, `not arp` | Invert match |
+| Combinators | `tcp and port 443`, `dns or icmp` | Logical AND / OR |
+| Bare word | `google` | Shorthand for `contains "google"` |
 
 ---
 
@@ -221,13 +251,17 @@ netwatch/
 │   │   ├── connections.rs       # Connections table view
 │   │   ├── interfaces.rs        # Interface detail view
 │   │   ├── packets.rs           # Packet capture & inspection view
+│   │   ├── stats.rs             # Protocol statistics & handshake histogram
+│   │   ├── help.rs              # Scrollable help overlay
 │   │   └── widgets.rs           # Formatting helpers
 │   ├── collectors/
 │   │   ├── traffic.rs           # Interface RX/TX byte polling & rate calc
 │   │   ├── connections.rs       # Socket enumeration + PID mapping
 │   │   ├── config.rs            # Gateway, DNS, hostname discovery
-│   │   ├── health.rs            # ICMP ping probes
-│   │   └── packets.rs           # libpcap capture + protocol decoding
+│   │   ├── health.rs            # ICMP ping probes + RTT history
+│   │   ├── packets.rs           # libpcap capture + protocol decoding + stream tracking
+│   │   ├── geo.rs               # Background GeoIP lookup (ip-api.com)
+│   │   └── whois.rs             # Background RDAP whois lookup
 │   └── platform/
 │       ├── linux.rs             # Linux /proc, /sys collectors
 │       └── macos.rs             # macOS ifconfig, netstat collectors
@@ -249,14 +283,18 @@ netwatch/
 | Config | 10s | `netstat -rn`, `scutil --dns` | `ip route`, `/etc/resolv.conf` |
 | Health | 5s | `ping -c 3 -t 1` | `ping -c 3 -W 1` |
 | Packets | Real-time | libpcap (BPF) | libpcap |
+| GeoIP | On-demand | ip-api.com (HTTP) | ip-api.com (HTTP) |
+| Whois | On-demand | rdap.org (HTTPS) | rdap.org (HTTPS) |
 
 ### Packet Decoding Pipeline
 
 ```
 Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → DNS/TLS/HTTP/DHCP/NTP
-                                           ↓
-                                    Payload text extraction
-                                    (if >70% printable ASCII)
+                                            ↓
+                              Stream tracking (per 4-tuple)
+                              TCP handshake timing (SYN/SYN-ACK/ACK)
+                              Expert info classification
+                              Payload text extraction
 ```
 
 ---
@@ -272,6 +310,8 @@ Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → DNS/TLS/HTTP/DHCP/
 | [nix](https://crates.io/crates/nix) | Unix system call wrappers |
 | [chrono](https://crates.io/crates/chrono) | Timestamps |
 | [anyhow](https://crates.io/crates/anyhow) | Error handling |
+| [ureq](https://crates.io/crates/ureq) | HTTP client (GeoIP, Whois) |
+| [serde_json](https://crates.io/crates/serde_json) | JSON parsing (API responses) |
 
 ---
 
@@ -285,6 +325,7 @@ Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → DNS/TLS/HTTP/DHCP/
 | No connections listed | `lsof` (macOS) or `/proc` (Linux) access may be restricted |
 | Binary not found after build | Check `./target/release/netwatch` exists |
 | Blank screen | Ensure terminal supports 256 colors and is at least 80×24 |
+| GeoIP/Whois not loading | Requires internet access; results appear after a short delay |
 
 ---
 
