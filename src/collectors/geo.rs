@@ -33,7 +33,8 @@ impl GeoCache {
         let cache = Arc::new(Mutex::new(HashMap::new()));
         let resolver_cache = Arc::clone(&cache);
         thread::spawn(move || {
-            let mut last_request = Instant::now() - Duration::from_millis(1500);
+            let now = Instant::now();
+            let mut last_request = now.checked_sub(Duration::from_millis(1500)).unwrap_or(now);
             while let Ok(ip) = rx.recv() {
                 // Rate limit: ip-api.com allows 45 requests/minute
                 let elapsed = last_request.elapsed();

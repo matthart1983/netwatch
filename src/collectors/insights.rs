@@ -255,7 +255,8 @@ fn analysis_loop(
     status: Arc<Mutex<InsightsStatus>>,
     model: &str,
 ) {
-    let mut last_analysis = Instant::now() - ANALYSIS_INTERVAL;
+    let now = Instant::now();
+    let mut last_analysis = now.checked_sub(ANALYSIS_INTERVAL).unwrap_or(now);
 
     loop {
         // Drain to get the latest snapshot, waiting up to 1s
