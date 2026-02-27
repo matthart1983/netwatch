@@ -1,8 +1,8 @@
 [package]
 name = "netwatch-tui"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
-authors = ["Matt Hartley <matt@matthart.dev>"]
+authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal — like htop for your network"
 license = "MIT"
 repository = "https://github.com/matthart1983/netwatch"
@@ -11,6 +11,10 @@ readme = "README.md"
 keywords = ["network", "tui", "terminal", "packet-capture", "diagnostics"]
 categories = ["command-line-utilities", "network-programming"]
 exclude = ["demo.gif", "demo.tape", ".DS_Store"]
+
+[lib]
+name = "netwatch"
+path = "src/lib.rs"
 
 [[bin]]
 name = "netwatch"

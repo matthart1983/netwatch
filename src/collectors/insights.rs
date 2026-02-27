@@ -22,6 +22,7 @@ pub struct NetworkSnapshot {
     pub protocol_counts: HashMap<String, usize>,
     pub top_talkers: Vec<(String, usize)>,
     pub dns_queries: Vec<String>,
+    pub dns_resolutions: Vec<(String, String)>,
     pub expert_errors: Vec<String>,
     pub expert_warnings: Vec<String>,
     pub connections_established: usize,
@@ -47,6 +48,7 @@ impl NetworkSnapshot {
         let mut protocol_counts: HashMap<String, usize> = HashMap::new();
         let mut dst_counts: HashMap<String, usize> = HashMap::new();
         let mut dns_queries: Vec<String> = Vec::new();
+        let mut dns_resolutions: HashMap<String, String> = HashMap::new();
         let mut expert_errors: Vec<String> = Vec::new();
         let mut expert_warnings: Vec<String> = Vec::new();
 
@@ -62,6 +64,16 @@ impl NetworkSnapshot {
 
             if !pkt.dst_ip.is_empty() {
                 *dst_counts.entry(pkt.dst_ip.clone()).or_insert(0) += 1;
+            }
+
+            // Collect resolved hostnames for IP context
+            if dns_resolutions.len() < 50 {
+                if let Some(ref host) = pkt.dst_host {
+                    dns_resolutions.entry(pkt.dst_ip.clone()).or_insert_with(|| host.clone());
+                }
+                if let Some(ref host) = pkt.src_host {
+                    dns_resolutions.entry(pkt.src_ip.clone()).or_insert_with(|| host.clone());
+                }
             }
 
             if pkt.protocol == "DNS" && pkt.info.contains("Standard query") && !pkt.info.contains("response") {
@@ -94,11 +106,14 @@ impl NetworkSnapshot {
         let connections_established = connections.iter().filter(|c| c.state == "ESTABLISHED").count();
         let connections_other = connections.len() - connections_established;
 
+        let dns_resolutions: Vec<(String, String)> = dns_resolutions.into_iter().collect();
+
         NetworkSnapshot {
             total_packets,
             protocol_counts,
             top_talkers,
             dns_queries,
+            dns_resolutions,
             expert_errors,
             expert_warnings,
             connections_established,
@@ -145,6 +160,14 @@ impl NetworkSnapshot {
 
         if !self.dns_queries.is_empty() {
             parts.push(format!("Recent DNS lookups: {}", self.dns_queries.join(", ")));
+        }
+
+        if !self.dns_resolutions.is_empty() {
+            let mappings: Vec<String> = self.dns_resolutions.iter()
+                .take(30)
+                .map(|(ip, host)| format!("{} → {}", ip, host))
+                .collect();
+            parts.push(format!("DNS resolved addresses:\n  {}", mappings.join("\n  ")));
         }
 
         if !self.expert_errors.is_empty() {

@@ -162,23 +162,9 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
         .map(|i| i.tx_rate)
         .sum();
 
-    // Render centre node
+    // Centre node position (rendered later after calculating required height)
     let center_height = 7u16;
     let center_y = inner.y + 1;
-    let center_node = Paragraph::new(vec![
-        Line::from(Span::styled(format!(" {} ", hostname), Style::default().fg(Color::Cyan).bold())),
-        Line::from(Span::raw(format!(" {} ", primary_ip))),
-        Line::from(Span::styled(format!(" {} ", iface_str), Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(format!(" ↓{} ", widgets::format_bytes_rate(total_rx)), Style::default().fg(Color::Green))),
-        Line::from(Span::styled(format!(" ↑{} ", widgets::format_bytes_rate(total_tx)), Style::default().fg(Color::Blue))),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-    let center_rect = Rect::new(center_x, center_y, center_width, center_height);
-    f.render_widget(center_node, center_rect);
 
     // Build left-side nodes (gateway + DNS)
     let mut left_nodes: Vec<(String, String, Style)> = Vec::new();
@@ -220,9 +206,33 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
 
     drop(hs);
 
-    // Render left nodes
+    // Calculate how tall the left column needs and stretch center node to match
     let left_node_height = 4u16;
     let left_spacing = 1u16;
+    let left_total_height = if left_nodes.is_empty() {
+        0
+    } else {
+        (left_nodes.len() as u16) * left_node_height
+            + (left_nodes.len() as u16 - 1) * left_spacing
+    };
+    let center_height = center_height.max(left_total_height);
+    let center_rect = Rect::new(center_x, center_y, center_width, center_height);
+    // Re-render center node with adjusted height
+    let center_node = Paragraph::new(vec![
+        Line::from(Span::styled(format!(" {} ", hostname), Style::default().fg(Color::Cyan).bold())),
+        Line::from(Span::raw(format!(" {} ", primary_ip))),
+        Line::from(Span::styled(format!(" {} ", iface_str), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(format!(" ↓{} ", widgets::format_bytes_rate(total_rx)), Style::default().fg(Color::Green))),
+        Line::from(Span::styled(format!(" ↑{} ", widgets::format_bytes_rate(total_tx)), Style::default().fg(Color::Blue))),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(center_node, center_rect);
+
+    // Render left nodes
     let mut left_y = center_y;
 
     for (title, content, style) in &left_nodes {
@@ -259,7 +269,31 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
     // Render right-side nodes (remote hosts)
     let right_node_height = 4u16;
     let right_spacing = 1u16;
-    let max_right_nodes = ((inner.height.saturating_sub(2)) / (right_node_height + right_spacing)) as usize;
+    let max_right_nodes = ((inner.height.saturating_sub(2)) / (right_node_height + right_spacing)).max(1) as usize;
+
+    // Stretch center node further if the right column is taller
+    let visible_count = remotes.len().min(max_right_nodes) as u16;
+    let right_total_height = if visible_count == 0 {
+        0
+    } else {
+        visible_count * right_node_height + (visible_count - 1) * right_spacing
+    };
+    if right_total_height > center_height {
+        let center_rect = Rect::new(center_x, center_y, center_width, right_total_height);
+        let center_node = Paragraph::new(vec![
+            Line::from(Span::styled(format!(" {} ", hostname), Style::default().fg(Color::Cyan).bold())),
+            Line::from(Span::raw(format!(" {} ", primary_ip))),
+            Line::from(Span::styled(format!(" {} ", iface_str), Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(format!(" ↓{} ", widgets::format_bytes_rate(total_rx)), Style::default().fg(Color::Green))),
+            Line::from(Span::styled(format!(" ↑{} ", widgets::format_bytes_rate(total_tx)), Style::default().fg(Color::Blue))),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        f.render_widget(center_node, center_rect);
+    }
     let scroll = app.topology_scroll.min(remotes.len().saturating_sub(max_right_nodes.max(1)));
     let visible_remotes: Vec<&RemoteNode> = remotes.iter().skip(scroll).take(max_right_nodes).collect();
     let mut right_y = center_y;

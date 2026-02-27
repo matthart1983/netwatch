@@ -1,10 +1,5 @@
-mod app;
-mod collectors;
-mod event;
-mod platform;
-mod ui;
-
 use anyhow::Result;
+use netwatch::app;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
