@@ -73,6 +73,9 @@ fn run_ping(target: &str) -> (Option<f64>, f64) {
     #[cfg(target_os = "windows")]
     let args = ["-n", "3", "-w", "1000", target];
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let args = ["-c", "3", "-W", "1", target];
+
     let output = match Command::new("ping").args(args).output() {
         Ok(o) => o,
         Err(_) => return (None, 100.0),
