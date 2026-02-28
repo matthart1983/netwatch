@@ -76,6 +76,11 @@ fn collect_gateway() -> Option<String> {
     None
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn collect_gateway() -> Option<String> {
+    None
+}
+
 fn collect_dns() -> Vec<String> {
     let mut servers = Vec::new();
 

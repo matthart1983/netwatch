@@ -34,6 +34,8 @@ impl ConnectionCollector {
             let result = parse_linux_connections();
             #[cfg(target_os = "windows")]
             let result = parse_windows_connections();
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            let result: Vec<Connection> = Vec::new();
             *connections.lock().unwrap() = result;
         });
     }
