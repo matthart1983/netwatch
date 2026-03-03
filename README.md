@@ -7,6 +7,7 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 ![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Wiki](https://img.shields.io/badge/docs-Wiki-blue?logo=github)](https://github.com/matthart1983/netwatch/wiki)
 
 ---
 
