@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
 use crate::app::App;
+use crate::collectors::traceroute::TracerouteStatus;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -21,7 +22,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     render_header(f, chunks[0]);
     render_topology(f, app, chunks[1]);
     render_summary(f, app, chunks[2]);
-    render_footer(f, chunks[3]);
+    render_footer(f, app, chunks[3]);
+
+    if app.traceroute_view_open {
+        render_traceroute_overlay(f, app, area);
+    }
 }
 
 fn render_header(f: &mut Frame, area: Rect) {
@@ -319,8 +324,12 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
             format!("{} ({})", remote.processes[0], proto)
         };
 
+        let ip_prefix = if is_selected { "▶" } else { " " };
         let mut lines = vec![
-            Line::from(Span::raw(format!(" {} ", remote.ip))),
+            Line::from(Span::styled(
+                format!("{} {} ", ip_prefix, remote.ip),
+                if is_selected { Style::default().fg(Color::Yellow).bold() } else { Style::default() },
+            )),
             Line::from(Span::styled(
                 format!(" {}× {} ", remote.conn_count, proc_str),
                 Style::default().fg(Color::DarkGray),
@@ -392,27 +401,41 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(summary, area);
 }
 
-fn render_footer(f: &mut Frame, area: Rect) {
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" q", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Quit  "),
-        Span::styled("a", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Analyze  "),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Scroll  "),
-        Span::styled("Enter", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":→Connections  "),
-        Span::styled("p", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Pause  "),
-        Span::styled("r", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Refresh  "),
-        Span::styled("1-8", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Tab  "),
-        Span::styled("g", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Geo  "),
-        Span::styled("?", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(":Help"),
-    ]))
+fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    let spans = if app.traceroute_view_open {
+        vec![
+            Span::styled(" Esc", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Close  "),
+            Span::styled("↑↓", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Scroll  "),
+            Span::styled("q", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Quit"),
+        ]
+    } else {
+        vec![
+            Span::styled(" q", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Quit  "),
+            Span::styled("a", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Analyze  "),
+            Span::styled("↑↓", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Scroll  "),
+            Span::styled("T", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Traceroute  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":→Connections  "),
+            Span::styled("p", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Pause  "),
+            Span::styled("r", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Refresh  "),
+            Span::styled("1-8", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Tab  "),
+            Span::styled("g", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Geo  "),
+            Span::styled("?", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(":Help"),
+        ]
+    };
+    let footer = Paragraph::new(Line::from(spans))
     .block(
         Block::default()
             .borders(Borders::TOP)
@@ -436,6 +459,141 @@ fn health_indicator(rtt: Option<f64>, loss: f64) -> (String, Style) {
             ("○".to_string(), Style::default().fg(Color::DarkGray))
         }
     }
+}
+
+fn render_traceroute_overlay(f: &mut Frame, app: &App, area: Rect) {
+    let result = app.traceroute_runner.result.lock().unwrap();
+
+    // Centre overlay occupying ~70% of the screen
+    let overlay_width = (area.width * 70 / 100).max(50).min(area.width.saturating_sub(4));
+    let overlay_height = (area.height * 70 / 100).max(10).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+    let overlay = Rect::new(x, y, overlay_width, overlay_height);
+
+    f.render_widget(Clear, overlay);
+
+    let title = format!(" Traceroute → {} ", result.target);
+    let border_color = match result.status {
+        TracerouteStatus::Running => Color::Yellow,
+        TracerouteStatus::Done => Color::Cyan,
+        TracerouteStatus::Error(_) => Color::Red,
+        TracerouteStatus::Idle => Color::DarkGray,
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(overlay);
+    f.render_widget(block, overlay);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    match &result.status {
+        TracerouteStatus::Running => {
+            lines.push(Line::from(Span::styled(
+                " ⏳ Running traceroute...",
+                Style::default().fg(Color::Yellow),
+            )));
+            // Show hops collected so far
+            for hop in &result.hops {
+                lines.push(format_hop_line(hop));
+            }
+        }
+        TracerouteStatus::Error(msg) => {
+            lines.push(Line::from(Span::styled(
+                format!(" ✗ Error: {}", msg),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        TracerouteStatus::Done => {
+            // Header
+            lines.push(Line::from(vec![
+                Span::styled(" Hop", Style::default().fg(Color::Cyan).bold()),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<40}", "Host / IP"),
+                    Style::default().fg(Color::Cyan).bold(),
+                ),
+                Span::styled("RTT 1     ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled("RTT 2     ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled("RTT 3", Style::default().fg(Color::Cyan).bold()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                " ───────────────────────────────────────────────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            for hop in &result.hops {
+                lines.push(format_hop_line(hop));
+            }
+
+            if result.hops.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " No hops received",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        TracerouteStatus::Idle => {
+            lines.push(Line::from(Span::styled(
+                " No traceroute data",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let visible_height = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll = app.traceroute_scroll.min(max_scroll);
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible_height).collect();
+
+    let content = Paragraph::new(visible_lines);
+    f.render_widget(content, inner);
+}
+
+fn format_hop_line(hop: &crate::collectors::traceroute::TracerouteHop) -> Line<'static> {
+    let hop_num = format!(" {:>2} ", hop.hop_number);
+    let host_ip = match (&hop.host, &hop.ip) {
+        (Some(h), Some(ip)) => format!("{} ({})", h, ip),
+        (None, Some(ip)) => ip.clone(),
+        (Some(h), None) => h.clone(),
+        (None, None) => "*".to_string(),
+    };
+
+    let rtt_spans: Vec<String> = if hop.rtt_ms.is_empty() && hop.ip.is_none() {
+        vec!["*".to_string(); 3]
+    } else {
+        (0..3)
+            .map(|i| match hop.rtt_ms.get(i) {
+                Some(Some(ms)) => format!("{:>7.2}ms", ms),
+                _ => "      *  ".to_string(),
+            })
+            .collect()
+    };
+
+    let rtt_color = hop.rtt_ms.iter().filter_map(|r| r.as_ref()).next().map(|ms| {
+        if *ms < 10.0 {
+            Color::Green
+        } else if *ms < 50.0 {
+            Color::Yellow
+        } else if *ms < 100.0 {
+            Color::Rgb(255, 165, 0) // orange
+        } else {
+            Color::Red
+        }
+    }).unwrap_or(Color::DarkGray);
+
+    Line::from(vec![
+        Span::styled(hop_num, Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled(format!("{:<40}", host_ip), Style::default().fg(if hop.ip.is_some() { Color::White } else { Color::DarkGray })),
+        Span::styled(rtt_spans[0].clone(), Style::default().fg(rtt_color)),
+        Span::raw(" "),
+        Span::styled(rtt_spans[1].clone(), Style::default().fg(rtt_color)),
+        Span::raw(" "),
+        Span::styled(rtt_spans[2].clone(), Style::default().fg(rtt_color)),
+    ])
 }
 
 fn extract_ip(addr: &str) -> String {

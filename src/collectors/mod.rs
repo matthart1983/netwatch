@@ -6,3 +6,4 @@ pub mod packets;
 pub mod geo;
 pub mod whois;
 pub mod insights;
+pub mod traceroute;

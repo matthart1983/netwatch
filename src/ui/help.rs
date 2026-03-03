@@ -95,6 +95,8 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(key_line("s", "Cycle sort column"));
     lines.push(key_line("Enter", "Jump to Packets tab with filter for selected connection"));
     lines.push(key_line("W (shift)", "Whois lookup for selected connection's remote IP"));
+    lines.push(key_line("T", "Traceroute to selected connection's remote IP"));
+    lines.push(key_line("Esc", "Close traceroute overlay"));
     lines.push(Line::raw(""));
 
     // INTERFACES
@@ -139,6 +141,8 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(section_header("TOPOLOGY (Tab 6)"));
     lines.push(key_line("↑↓", "Scroll topology view"));
     lines.push(key_line("Enter", "Jump to Connections tab"));
+    lines.push(key_line("T", "Traceroute to selected remote host"));
+    lines.push(key_line("Esc", "Close traceroute overlay"));
     lines.push(Line::raw(""));
 
     // TIMELINE

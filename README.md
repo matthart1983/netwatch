@@ -51,6 +51,7 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 - **Network config** — Default gateway, DNS servers, hostname at a glance
 - **Cross-platform** — macOS, Linux, and Windows with platform-specific collectors
 - **Network topology** — ASCII box diagram showing local machine, gateway, DNS servers, and top remote hosts with connection counts and health indicators
+- **Traceroute** — Built-in hop-by-hop traceroute from Topology or Connections tab. Press `T` on any remote host to see the full path with color-coded RTT per hop
 - **Connection timeline** — Gantt-style bar chart of connection lifetimes, color-coded by state with adjustable time windows (30s to 1h)
 - **AI network insights** — Real-time AI analysis via Ollama (llama3.2). Auto-analyzes every 15s, on-demand with `a` key. Detects security concerns, performance issues, and anomalies
 
@@ -166,6 +167,7 @@ ASCII network topology map showing your machine's network neighbourhood:
 - **Infrastructure** — Gateway and DNS servers with health indicators (RTT, loss)
 - **Remote hosts** — Top destinations sorted by connection count, with process names
 - **Health dots** — Color-coded `●` indicators (green/yellow/red) for latency and loss
+- **Traceroute** — Press `T` on a selected host to run a traceroute overlay showing each hop with RTT
 - Press `Enter` to jump to Connections tab filtered to the selected host
 
 ### `7` Timeline
@@ -210,7 +212,9 @@ AI-powered network analysis via local Ollama:
 |-----|--------|
 | `s` | Cycle sort column |
 | `Enter` | Jump to Packets tab with auto-filter for selected connection |
+| `T` | Traceroute to selected connection's remote IP |
 | `W` | Whois lookup for selected connection's remote IP |
+| `Esc` | Close traceroute overlay |
 
 ### Packets tab
 
@@ -245,7 +249,9 @@ AI-powered network analysis via local Ollama:
 | Key | Action |
 |-----|--------|
 | `↑` `↓` | Scroll through remote hosts |
+| `T` | Traceroute to selected remote host |
 | `Enter` | Jump to Connections tab for selected host |
+| `Esc` | Close traceroute overlay |
 
 ### Timeline tab
 
