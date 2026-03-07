@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -12,21 +13,30 @@ pub struct Connection {
     pub state: String,
     pub pid: Option<u32>,
     pub process_name: Option<String>,
+    /// Kernel-measured smoothed RTT in microseconds (from eBPF tcp_probe).
+    pub kernel_rtt_us: Option<f64>,
 }
 
 pub struct ConnectionCollector {
     pub connections: Arc<Mutex<Vec<Connection>>>,
+    busy: Arc<AtomicBool>,
 }
 
 impl ConnectionCollector {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(Vec::new())),
+            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn update(&self) {
+        if self.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        self.busy.store(true, Ordering::SeqCst);
         let connections = Arc::clone(&self.connections);
+        let busy = Arc::clone(&self.busy);
         thread::spawn(move || {
             #[cfg(target_os = "macos")]
             let result = parse_lsof();
@@ -37,6 +47,7 @@ impl ConnectionCollector {
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             let result: Vec<Connection> = Vec::new();
             *connections.lock().unwrap() = result;
+            busy.store(false, Ordering::SeqCst);
         });
     }
 }
@@ -152,7 +163,10 @@ impl ConnectionTimeline {
 
 #[cfg(target_os = "macos")]
 fn parse_lsof() -> Vec<Connection> {
-    let output = match Command::new("lsof").args(["-i", "-n", "-P"]).output() {
+    let output = match Command::new("lsof")
+        .args(["-i", "-n", "-P", "-F", "pcPtTn"])
+        .output()
+    {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -160,52 +174,64 @@ fn parse_lsof() -> Vec<Connection> {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut connections = Vec::new();
 
-    for line in text.lines().skip(1) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        // COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-        if cols.len() < 9 {
+    let mut pid: Option<u32> = None;
+    let mut process_name: Option<String> = None;
+    let mut protocol = String::new();
+    let mut state = String::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
             continue;
         }
 
-        let process_name = cols[0].to_string();
-        let pid: Option<u32> = cols[1].parse().ok();
-        let protocol = cols[7].to_string(); // NODE column: TCP or UDP
+        let tag = line.as_bytes()[0];
+        let value = &line[1..];
 
-        let name_field = cols[8..].join(" ");
+        match tag {
+            b'p' => {
+                pid = value.parse().ok();
+                process_name = None;
+            }
+            b'c' => {
+                process_name = Some(value.to_string());
+            }
+            b'f' => {
+                protocol = String::new();
+                state = String::new();
+            }
+            b'P' => {
+                protocol = value.to_string();
+            }
+            b't' => {}
+            b'T' => {
+                if let Some(st) = value.strip_prefix("ST=") {
+                    state = st.to_string();
+                }
+            }
+            b'n' => {
+                let (local_addr, remote_addr) = if let Some(arrow_pos) = value.find("->") {
+                    let local = value[..arrow_pos].trim_matches(|c| c == '[' || c == ']').to_string();
+                    let remote = value[arrow_pos + 2..].trim_matches(|c| c == '[' || c == ']').to_string();
+                    (local, remote)
+                } else {
+                    (value.to_string(), "*:*".to_string())
+                };
 
-        let (local_addr, remote_addr, state) = parse_name_field(&name_field);
-
-        connections.push(Connection {
-            protocol,
-            local_addr,
-            remote_addr,
-            state,
-            pid,
-            process_name: Some(process_name),
-        });
+                connections.push(Connection {
+                    protocol: protocol.clone(),
+                    local_addr,
+                    remote_addr,
+                    state: state.clone(),
+                    pid,
+                    process_name: process_name.clone(),
+                    kernel_rtt_us: None,
+                });
+            }
+            _ => {}
+        }
     }
 
     connections
-}
-
-#[cfg(target_os = "macos")]
-fn parse_name_field(name: &str) -> (String, String, String) {
-    // Extract state from parentheses at end, e.g. "(ESTABLISHED)"
-    let (addr_part, state) = if let Some(paren_start) = name.rfind('(') {
-        let state = name[paren_start + 1..].trim_end_matches(')').to_string();
-        (name[..paren_start].trim(), state)
-    } else {
-        (name.trim(), String::new())
-    };
-
-    // Split on "->" for local->remote
-    if let Some(arrow_pos) = addr_part.find("->") {
-        let local = addr_part[..arrow_pos].to_string();
-        let remote = addr_part[arrow_pos + 2..].to_string();
-        (local, remote, state)
-    } else {
-        (addr_part.to_string(), "*:*".to_string(), state)
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -238,6 +264,7 @@ fn parse_linux_connections() -> Vec<Connection> {
                 state,
                 pid,
                 process_name,
+                kernel_rtt_us: None,
             });
         }
     }
@@ -379,6 +406,7 @@ mod tests {
             state: state.into(),
             pid: Some(pid),
             process_name: Some("test".into()),
+            kernel_rtt_us: None,
         }
     }
 

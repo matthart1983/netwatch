@@ -4,6 +4,23 @@
 
 NetWatch is a terminal-based (TUI) application for real-time network diagnostics and monitoring, inspired by `htop`. It provides a single-pane-of-glass view of network traffic, utilisation, configuration, and health on a local machine.
 
+### Audience
+
+NetWatch serves two audiences through **progressive disclosure** — the same tool, with depth revealed on demand:
+
+| Audience | Experience | What they see by default |
+|----------|-----------|--------------------------|
+| **Entry-level enthusiasts** | Learning networking, home labs, curious developers | Dashboard with clear labels, colour-coded health indicators, zero-config defaults. No jargon without tooltips. |
+| **Professionals** | SREs, network engineers, security analysts | Advanced tabs (Packets, Timeline, Topology), eBPF integration, display filters, stream reassembly, anomaly detection. |
+
+#### Design Principles
+
+1. **Useful in 5 seconds** — launch `netwatch` with no flags and immediately see interfaces, bandwidth, top connections, and health. No setup, no config file required.
+2. **Deep on demand** — advanced features (packet capture, eBPF, filters, stream follow) are discoverable via tab navigation and `?` help, but never forced on the user.
+3. **Progressive complexity** — tabs are ordered left-to-right from simple to advanced: Dashboard → Connections → Interfaces → Packets → Stats → Timeline → Topology.
+4. **No config required, but configurable** — sensible defaults everywhere. Professionals can tune refresh rates, filter expressions, eBPF feature flags, and capture buffer sizes.
+5. **Jargon budget** — the Dashboard and Connections tabs avoid raw protocol terminology where possible (e.g. "Gateway latency: 1.2ms ✓" not "ICMP echo RTT to default route nexthop"). Deeper tabs (Packets, Timeline) use standard networking terms professionals expect.
+
 ---
 
 ## Goals
@@ -14,12 +31,15 @@ NetWatch is a terminal-based (TUI) application for real-time network diagnostics
 - Provide at-a-glance health indicators (packet loss, errors, latency to gateway)
 - Keyboard-driven, responsive, and lightweight
 - Cross-platform: Linux and macOS
+- **Accessible by default**: zero-config launch with clear, jargon-light defaults for newcomers
+- **Professional-grade depth**: optional advanced features (eBPF, display filters, stream reassembly, anomaly detection) for users who need deeper observability
 
 ## Non-Goals
 
 - Remote host monitoring or agent-based collection
 - Historical data storage or alerting
 - Full protocol dissector plugin system (use Wireshark for custom/niche protocols)
+- Requiring advanced knowledge to use the default view
 
 ---
 
@@ -937,3 +957,204 @@ The AI is instructed to return 3-6 bullet points with emoji severity indicators:
 | `src/ui/insights.rs` | New file. Render insights header, status bar, scrollable insight list, Ollama unavailable message, footer. |
 | `src/ui/mod.rs` | Add `pub mod insights;`, wire `Tab::Insights` in render dispatch. |
 | `src/app.rs` | Add `Tab::Insights`, `insights_collector`, `insights_scroll`, `last_insight_time` fields. Wire `8` key, `a` key (global), snapshot submission in tick handler. |
+
+---
+
+## Feature: eBPF Integration (Linux-only)
+
+### Overview
+
+An optional, Linux-only module that uses eBPF to replace userspace polling with kernel-level event-driven collection. This provides two capabilities: **real-time connection tracking** (replacing `/proc/net` polling) and **kernel-level RTT measurement** (augmenting the Health Prober). Both are compile-time optional via a Cargo feature flag and require no changes to the TUI or app state layer — they plug into the existing collector interfaces.
+
+### Goals
+
+- Eliminate polling latency: detect new/closed connections instantly via kernel tracepoints instead of periodic `/proc/net` scans
+- Measure per-connection RTT at the TCP stack level with near-zero overhead, providing more accurate latency data than userspace ICMP probes
+- Remain fully optional: netwatch compiles and runs without eBPF on macOS and older Linux kernels
+
+### Non-Goals
+
+- Distributed tracing or cross-host correlation (remains out of scope per project non-goals)
+- Cloud/overlay network debugging (K8s, eBPF-based service mesh integration)
+- Replacing `pnet` for packet capture (eBPF augments, does not replace)
+
+### Requirements
+
+- Linux kernel ≥ 4.18 (BPF trampoline support)
+- `CAP_BPF` + `CAP_PERFMON` capabilities, or root
+- Rust eBPF framework: **Aya** (pure Rust, no libbpf/clang dependency)
+
+### Cargo Feature Flag
+
+```toml
+[features]
+default = []
+ebpf = ["aya", "aya-log"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.12", optional = true }
+aya-log = { version = "0.2", optional = true }
+```
+
+Build with eBPF support:
+```bash
+cargo build --features ebpf    # Linux only
+cargo build                     # macOS / Linux without eBPF — unchanged behaviour
+```
+
+### Feature 1: eBPF Connection Tracking
+
+#### Tracepoints
+
+| Tracepoint / kprobe | Event |
+|----------------------|-------|
+| `kprobe/tcp_v4_connect` | Outbound TCP connection initiated |
+| `kprobe/tcp_v6_connect` | Outbound TCP6 connection initiated |
+| `tracepoint/sock/inet_sock_set_state` | TCP state transitions (SYN_SENT → ESTABLISHED → CLOSE_WAIT → ...) |
+| `kprobe/tcp_close` | Connection closed |
+| `kprobe/udp_sendmsg` | Outbound UDP activity (used to detect UDP "connections") |
+
+#### Data Flow
+
+```
+Kernel eBPF programs
+        │
+        ▼
+  BPF_MAP_TYPE_PERF_EVENT_ARRAY
+        │
+        ▼
+  Userspace reader (async tokio task)
+        │
+        ▼
+  ConnectionCollector (existing)
+```
+
+eBPF programs emit connection events into a perf event array. A dedicated async task reads events and updates `ConnectionCollector` state, replacing the `/proc/net/tcp` polling loop.
+
+#### Event Structure (BPF → Userspace)
+
+```rust
+#[repr(C)]
+pub struct ConnEvent {
+    pub event_type: u32,    // 0=connect, 1=accept, 2=close, 3=state_change
+    pub pid: u32,
+    pub tgid: u32,
+    pub af: u16,            // AF_INET or AF_INET6
+    pub protocol: u8,       // IPPROTO_TCP or IPPROTO_UDP
+    pub sport: u16,
+    pub dport: u16,
+    pub saddr: [u8; 16],    // IPv4 stored in first 4 bytes, IPv6 full
+    pub daddr: [u8; 16],
+    pub old_state: u32,
+    pub new_state: u32,
+    pub timestamp_ns: u64,
+}
+```
+
+#### Fallback Behaviour
+
+When the `ebpf` feature is not enabled, or eBPF program loading fails at runtime (e.g. insufficient privileges, old kernel), netwatch falls back to the existing `/proc/net` polling with a warning in the status bar:
+
+```
+⚠ eBPF unavailable — falling back to /proc/net polling
+```
+
+### Feature 2: eBPF RTT Measurement
+
+#### Tracepoint
+
+| Tracepoint | Data |
+|------------|------|
+| `tracepoint/tcp/tcp_probe` | Per-ACK RTT measurement: `srtt_us`, `saddr`, `daddr`, `sport`, `dport` |
+
+This tracepoint fires on every TCP ACK and provides the kernel's smoothed RTT estimate (`srtt_us`) — the same value the kernel uses for retransmission decisions.
+
+#### Data Flow
+
+```
+tcp_probe tracepoint
+        │
+        ▼
+  BPF_MAP_TYPE_RINGBUF (RTT samples)
+        │
+        ▼
+  Userspace reader (async tokio task)
+        │
+        ▼
+  Per-connection RTT stored on ActiveConnection
+        │
+        ▼
+  Health Prober / Connections tab / Dashboard
+```
+
+#### Integration with Existing UI
+
+| Tab | Enhancement |
+|-----|-------------|
+| **Connections** | New `RTT` column showing kernel-measured smoothed RTT per connection |
+| **Dashboard** | Health section shows eBPF-sourced gateway RTT alongside ICMP probe RTT |
+| **Timeline** | RTT sparkline per connection (colour-coded: green < 10ms, yellow < 100ms, red ≥ 100ms) |
+| **Topology** | Remote host nodes show per-connection RTT instead of relying solely on ICMP probes |
+
+#### Anomaly Detection
+
+RTT samples are fed into a simple sliding-window anomaly detector:
+
+```rust
+pub struct RttMonitor {
+    pub window: VecDeque<f64>,       // last N RTT samples (default N=100)
+    pub mean: f64,
+    pub std_dev: f64,
+    pub threshold_sigma: f64,        // default 3.0
+}
+
+impl RttMonitor {
+    /// Returns true if the sample is > threshold_sigma standard deviations from the mean
+    pub fn is_anomalous(&self, sample_us: f64) -> bool;
+
+    /// Push a new sample, update rolling mean/stddev
+    pub fn push(&mut self, sample_us: f64);
+}
+```
+
+When an anomaly is detected, the connection's RTT cell in the Connections tab flashes red and a `⚠` indicator appears in the Dashboard health section. No alerts or notifications — visual indication only, consistent with the project's non-goal of alerting.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      TUI Renderer                        │
+│                 (ratatui / crossterm)                     │
+├──────────────────────────────────────────────────────────┤
+│                    App State Layer                        │
+│           (aggregation, sorting, filtering)               │
+├────────────┬────────────┬────────────┬────────┬─────────┤
+│  Traffic   │ Connection │  Config    │ Health │ Packet  │
+│  Collector │  Collector │  Collector │ Prober │Collector│
+└─────┬──────┴─────┬──────┴────────────┴───┬────┴─────────┘
+      │            │                       │
+      │     ┌──────┴──────┐          ┌─────┴─────┐
+      │     │ eBPF Conn   │          │ eBPF RTT  │
+      │     │ Tracker     │          │ Monitor   │
+      │     │ (optional)  │          │ (optional)│
+      │     └──────┬──────┘          └─────┬─────┘
+      │            │                       │
+   /proc/net   kprobes &              tcp_probe
+   (fallback)  tracepoints           tracepoint
+```
+
+### Implementation Files
+
+| File | Change |
+|------|--------|
+| `src/ebpf/mod.rs` | New module. Feature-gated with `#[cfg(all(target_os = "linux", feature = "ebpf"))]`. Re-exports `conn_tracker` and `rtt_monitor`. |
+| `src/ebpf/conn_tracker.rs` | New file. eBPF program loading (Aya), perf event reader task, `ConnEvent` struct, integration with `ConnectionCollector`. |
+| `src/ebpf/rtt_monitor.rs` | New file. `tcp_probe` tracepoint attachment, ring buffer reader, `RttMonitor` sliding-window anomaly detector. |
+| `src/ebpf/bpf/` | Directory for eBPF program source (compiled by Aya build step). Contains `conn_tracker.bpf.rs` and `rtt_probe.bpf.rs`. |
+| `Cargo.toml` | Add `ebpf` feature flag, conditional Aya dependencies. |
+| `src/main.rs` | Conditionally initialise eBPF subsystem; log fallback warning on failure. |
+| `src/collectors/connections.rs` | Add `set_ebpf_source()` method to accept events from eBPF instead of polling. Add `kernel_rtt_us: Option<f64>` to `ActiveConnection`. |
+| `src/collectors/health.rs` | Accept eBPF RTT data for gateway/DNS when available, prefer over ICMP. |
+| `src/ui/connections.rs` | Add optional `RTT` column when eBPF data is present. Highlight anomalous RTT in red. |
+| `src/ui/dashboard.rs` | Show eBPF RTT source indicator and anomaly warnings in health section. |
+| `src/app.rs` | Add `ebpf_available: bool` flag. Pass eBPF status to UI for status bar indicator. |

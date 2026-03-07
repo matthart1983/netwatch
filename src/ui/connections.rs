@@ -51,6 +51,9 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         if app.sort_column == col { " ▼" } else { "" }
     };
 
+    let mut conns = app.connection_collector.connections.lock().unwrap().clone();
+    let has_rtt_data = conns.iter().any(|c| c.kernel_rtt_us.is_some());
+
     let mut header_cells = vec![
         Cell::from(format!("Process{}", sort_indicator(0)))
             .style(Style::default().fg(Color::Cyan).bold()),
@@ -65,6 +68,12 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from(format!("Remote Address{}", sort_indicator(5)))
             .style(Style::default().fg(Color::Cyan).bold()),
     ];
+    if has_rtt_data {
+        header_cells.push(
+            Cell::from("RTT")
+                .style(Style::default().fg(Color::Cyan).bold()),
+        );
+    }
     if app.show_geo {
         header_cells.push(
             Cell::from("Location")
@@ -73,7 +82,6 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     }
     let header = Row::new(header_cells).height(1);
 
-    let mut conns = app.connection_collector.connections.lock().unwrap().clone();
     match app.sort_column {
         0 => conns.sort_by(|a, b| {
             a.process_name
@@ -122,6 +130,24 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(conn.local_addr.clone()),
                 Cell::from(conn.remote_addr.clone()),
             ];
+            if has_rtt_data {
+                let (rtt_text, rtt_style) = match conn.kernel_rtt_us {
+                    Some(rtt) if rtt > 100_000.0 => (
+                        format!("{:.1}ms", rtt / 1000.0),
+                        Style::default().fg(Color::Red),
+                    ),
+                    Some(rtt) if rtt > 10_000.0 => (
+                        format!("{:.1}ms", rtt / 1000.0),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Some(rtt) => (
+                        format!("{:.1}ms", rtt / 1000.0),
+                        Style::default().fg(Color::Green),
+                    ),
+                    None => ("—".to_string(), Style::default().fg(Color::DarkGray)),
+                };
+                cells.push(Cell::from(rtt_text).style(rtt_style));
+            }
             if app.show_geo {
                 let remote_ip = extract_ip(&conn.remote_addr);
                 let geo_label = remote_ip
@@ -148,6 +174,9 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(22),
         Constraint::Length(22),
     ];
+    if has_rtt_data {
+        widths.push(Constraint::Length(10));
+    }
     if app.show_geo {
         widths.push(Constraint::Min(20));
     }

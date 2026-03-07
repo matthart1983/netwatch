@@ -398,6 +398,7 @@ mod tests {
             state: state.into(),
             pid: None,
             process_name: None,
+            kernel_rtt_us: None,
         }
     }
 
