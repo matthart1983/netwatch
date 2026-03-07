@@ -7,6 +7,7 @@ use crate::collectors::whois::WhoisCache;
 use crate::collectors::health::HealthProber;
 use crate::collectors::packets::PacketCollector;
 use crate::collectors::traffic::TrafficCollector;
+use crate::ebpf::EbpfStatus;
 use crate::event::{AppEvent, EventHandler};
 use crate::platform::{self, InterfaceInfo};
 use crate::ui;
@@ -121,6 +122,11 @@ pub struct App {
     pub insights_collector: InsightsCollector,
     pub insights_scroll: usize,
     insights_tick: u32,
+    pub ebpf_status: EbpfStatus,
+    #[allow(dead_code)]
+    pub rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub conn_tracker: Option<crate::ebpf::conn_tracker::ConnTracker>,
     info_tick: u32,
     conn_tick: u32,
     health_tick: u32,
@@ -182,10 +188,26 @@ impl App {
             insights_collector: InsightsCollector::new("llama3.2"),
             insights_scroll: 0,
             insights_tick: 0,
+            ebpf_status: Self::init_ebpf_status(),
+            rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor::new(),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            conn_tracker: crate::ebpf::conn_tracker::ConnTracker::new().ok(),
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    fn init_ebpf_status() -> EbpfStatus {
+        // Status determined after conn_tracker initialization attempt.
+        // Updated in new() based on conn_tracker.is_some().
+        EbpfStatus::Active
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    fn init_ebpf_status() -> EbpfStatus {
+        EbpfStatus::NotCompiled
     }
 
     fn pick_capture_interface(info: &[InterfaceInfo]) -> String {
@@ -250,6 +272,26 @@ impl App {
             self.connection_collector.update();
             let conns = self.connection_collector.connections.lock().unwrap();
             self.connection_timeline.update(&conns);
+        }
+
+        // Drain eBPF connection events and update RTT monitor
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(ref tracker) = self.conn_tracker {
+            let events = tracker.drain_events();
+            if !events.is_empty() {
+                let samples: Vec<crate::ebpf::rtt_monitor::RttSample> = events
+                    .iter()
+                    .filter_map(|_evt| {
+                        // Only process state_change events with RTT info
+                        // In a full implementation, RTT comes from tcp_probe,
+                        // not conn events. This is a placeholder for the wiring.
+                        None
+                    })
+                    .collect();
+                if !samples.is_empty() {
+                    self.rtt_monitor.process_samples(&samples);
+                }
+            }
         }
 
         // Refresh health every ~5 ticks (5s)

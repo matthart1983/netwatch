@@ -9,6 +9,9 @@ const MAX_PACKETS: usize = 5000;
 const DNS_CACHE_MAX: usize = 4096;
 const MAX_STREAM_SEGMENTS: usize = 10_000;
 const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
+const CAPTURE_SNAPLEN: i32 = 65535;
+const CAPTURE_TIMEOUT_MS: i32 = 100;
+const CAPTURE_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct CapturedPacket {
@@ -456,10 +459,10 @@ impl PacketCollector {
             // Try with promiscuous mode first, fall back to non-promiscuous
             // (some interfaces like loopback don't support promisc on macOS)
             let cap = pcap::Capture::from_device(iface.as_str())
-                .and_then(|c| c.promisc(true).snaplen(65535).timeout(100).open())
+                .and_then(|c| c.promisc(true).snaplen(CAPTURE_SNAPLEN).timeout(CAPTURE_TIMEOUT_MS).open())
                 .or_else(|_| {
                     pcap::Capture::from_device(iface.as_str())
-                        .and_then(|c| c.promisc(false).snaplen(65535).timeout(100).open())
+                        .and_then(|c| c.promisc(false).snaplen(CAPTURE_SNAPLEN).timeout(CAPTURE_TIMEOUT_MS).open())
                 });
 
             let mut cap = match cap {
@@ -485,6 +488,8 @@ impl PacketCollector {
                 }
             }
 
+            let mut batch: Vec<CapturedPacket> = Vec::with_capacity(CAPTURE_BATCH_SIZE);
+
             while capturing.load(Ordering::Relaxed) {
                 match cap.next_packet() {
                     Ok(packet) => {
@@ -506,16 +511,40 @@ impl PacketCollector {
                                 );
                                 parsed.stream_index = Some(idx);
                             }
+                            batch.push(parsed);
+                            if batch.len() >= CAPTURE_BATCH_SIZE {
+                                let mut pkts = packets.write().unwrap();
+                                pkts.extend(batch.drain(..));
+                                if pkts.len() > MAX_PACKETS {
+                                    let excess = pkts.len() - MAX_PACKETS;
+                                    pkts.drain(0..excess);
+                                }
+                            }
+                        }
+                    }
+                    Err(pcap::Error::TimeoutExpired) => {
+                        // Flush any pending batch on timeout
+                        if !batch.is_empty() {
                             let mut pkts = packets.write().unwrap();
-                            pkts.push(parsed);
+                            pkts.extend(batch.drain(..));
                             if pkts.len() > MAX_PACKETS {
                                 let excess = pkts.len() - MAX_PACKETS;
                                 pkts.drain(0..excess);
                             }
                         }
+                        continue;
                     }
-                    Err(pcap::Error::TimeoutExpired) => continue,
                     Err(_) => break,
+                }
+            }
+
+            // Flush remaining batch on shutdown
+            if !batch.is_empty() {
+                let mut pkts = packets.write().unwrap();
+                pkts.extend(batch.drain(..));
+                if pkts.len() > MAX_PACKETS {
+                    let excess = pkts.len() - MAX_PACKETS;
+                    pkts.drain(0..excess);
                 }
             }
         }));
@@ -1506,9 +1535,11 @@ pub fn parse_filter(input: &str) -> Option<FilterExpr> {
     if tokens.is_empty() {
         return None;
     }
-    let (expr, rest) = parse_or(&tokens)?;
+    let (expr, rest) = parse_or(&tokens, 0)?;
     if rest.is_empty() { Some(expr) } else { None }
 }
+
+const MAX_FILTER_DEPTH: usize = 32;
 
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -1551,30 +1582,33 @@ fn tokenize(input: &str) -> Vec<String> {
     tokens
 }
 
-fn parse_or<'a>(tokens: &'a [String]) -> Option<(FilterExpr, &'a [String])> {
-    let (mut left, mut rest) = parse_and(tokens)?;
+fn parse_or<'a>(tokens: &'a [String], depth: usize) -> Option<(FilterExpr, &'a [String])> {
+    if depth > MAX_FILTER_DEPTH { return None; }
+    let (mut left, mut rest) = parse_and(tokens, depth + 1)?;
     while !rest.is_empty() && rest[0].eq_ignore_ascii_case("or") {
-        let (right, r) = parse_and(&rest[1..])?;
+        let (right, r) = parse_and(&rest[1..], depth + 1)?;
         left = FilterExpr::Or(Box::new(left), Box::new(right));
         rest = r;
     }
     Some((left, rest))
 }
 
-fn parse_and<'a>(tokens: &'a [String]) -> Option<(FilterExpr, &'a [String])> {
-    let (mut left, mut rest) = parse_not(tokens)?;
+fn parse_and<'a>(tokens: &'a [String], depth: usize) -> Option<(FilterExpr, &'a [String])> {
+    if depth > MAX_FILTER_DEPTH { return None; }
+    let (mut left, mut rest) = parse_not(tokens, depth + 1)?;
     while !rest.is_empty() && rest[0].eq_ignore_ascii_case("and") {
-        let (right, r) = parse_not(&rest[1..])?;
+        let (right, r) = parse_not(&rest[1..], depth + 1)?;
         left = FilterExpr::And(Box::new(left), Box::new(right));
         rest = r;
     }
     Some((left, rest))
 }
 
-fn parse_not<'a>(tokens: &'a [String]) -> Option<(FilterExpr, &'a [String])> {
+fn parse_not<'a>(tokens: &'a [String], depth: usize) -> Option<(FilterExpr, &'a [String])> {
+    if depth > MAX_FILTER_DEPTH { return None; }
     if tokens.is_empty() { return None; }
     if tokens[0] == "!" || tokens[0].eq_ignore_ascii_case("not") {
-        let (expr, rest) = parse_not(&tokens[1..])?;
+        let (expr, rest) = parse_not(&tokens[1..], depth + 1)?;
         return Some((FilterExpr::Not(Box::new(expr)), rest));
     }
     parse_atom(tokens)

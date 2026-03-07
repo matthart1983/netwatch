@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -16,6 +17,7 @@ pub struct HealthStatus {
 
 pub struct HealthProber {
     pub status: Arc<Mutex<HealthStatus>>,
+    busy: Arc<AtomicBool>,
 }
 
 impl HealthProber {
@@ -29,10 +31,16 @@ impl HealthProber {
                 gateway_rtt_history: VecDeque::new(),
                 dns_rtt_history: VecDeque::new(),
             })),
+            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn probe(&self, gateway: Option<&str>, dns_server: Option<&str>) {
+        if self.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        self.busy.store(true, Ordering::SeqCst);
+        let busy = Arc::clone(&self.busy);
         let status = Arc::clone(&self.status);
         let gw = gateway.map(|s| s.to_string());
         let dns = dns_server.map(|s| s.to_string());
@@ -59,6 +67,7 @@ impl HealthProber {
                 }
                 s.dns_rtt_history.make_contiguous();
             }
+            busy.store(false, Ordering::SeqCst);
         });
     }
 }

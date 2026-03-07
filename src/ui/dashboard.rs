@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::ebpf::EbpfStatus;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
@@ -337,6 +338,15 @@ fn render_health(f: &mut Frame, app: &App, area: Rect) {
         .map(|i| i.rx_errors + i.tx_errors)
         .sum();
 
+    let ebpf_span = match &app.ebpf_status {
+        EbpfStatus::Active => Span::styled("  │  eBPF: ● active", Style::default().fg(Color::Green)),
+        EbpfStatus::Unavailable(reason) => Span::styled(
+            format!("  │  eBPF: ⚠ {reason}"),
+            Style::default().fg(Color::Yellow),
+        ),
+        EbpfStatus::NotCompiled => Span::styled("  │  eBPF: off", Style::default().fg(Color::DarkGray)),
+    };
+
     let health = Paragraph::new(Line::from(vec![
         Span::raw(" GW "),
         Span::raw(gw_label),
@@ -347,6 +357,7 @@ fn render_health(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(dns_rtt, dns_style),
         Span::raw(format!(" ({:.0}% loss)", hs.dns_loss_pct)),
         Span::raw(format!("  │  Errors: {}", total_errors)),
+        ebpf_span,
     ]))
     .block(
         Block::default()
