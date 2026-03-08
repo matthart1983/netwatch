@@ -7,21 +7,48 @@ Set Height 800
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 50ms
 
-Type "./target/release/netwatch"
+Type "sudo ./target/release/netwatch"
 Enter
-Sleep 4s
+Sleep 5s
 
-# Show Connections tab
+# Dashboard tab - show live stats
+Sleep 2s
+
+# Switch to Connections tab
 Type "2"
 Sleep 3s
 
-# Show Interfaces tab
+# Switch to Interfaces tab
 Type "3"
 Sleep 3s
 
+# Switch to Packets tab
+Type "4"
+Sleep 2s
+
+# Start packet capture
+Type "c"
+Sleep 5s
+
+# Stop capture
+Type "c"
+Sleep 2s
+
+# Switch to Stats tab
+Type "5"
+Sleep 3s
+
+# Switch to Insights tab (AI/Ollama)
+Type "8"
+Sleep 2s
+
+# Trigger on-demand AI analysis
+Type "a"
+Sleep 8s
+
 # Back to Dashboard
 Type "1"
-Sleep 2s
+Sleep 3s
 
 # Show help overlay
 Type "?"
