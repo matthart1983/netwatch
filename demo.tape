@@ -11,40 +11,68 @@ Type "sudo ./target/release/netwatch"
 Enter
 Sleep 5s
 
-# Dashboard tab - show live stats
-Sleep 2s
+# Dashboard - live interface stats, bandwidth, health
+Sleep 3s
 
-# Switch to Connections tab
+# Connections tab
 Type "2"
 Sleep 3s
 
-# Switch to Interfaces tab
+# Interfaces tab
 Type "3"
 Sleep 3s
 
-# Switch to Packets tab
+# Packets tab
 Type "4"
 Sleep 2s
 
 # Start packet capture
 Type "c"
-Sleep 5s
+Sleep 6s
+
+# Scroll through captured packets
+Down
+Sleep 1s
+Down
+Sleep 1s
+Down
+Sleep 1s
+
+# Select a packet to see detail
+Enter
+Sleep 3s
+
+# Open stream view for selected packet
+Type "s"
+Sleep 3s
+
+# Close stream view
+Escape
+Sleep 1s
 
 # Stop capture
 Type "c"
 Sleep 2s
 
-# Switch to Stats tab
+# Stats tab - protocol hierarchy
 Type "5"
 Sleep 3s
 
-# Switch to Insights tab (AI/Ollama)
+# Topology tab
+Type "6"
+Sleep 3s
+
+# Timeline tab
+Type "7"
+Sleep 3s
+
+# Insights tab - AI analysis with minimax cloud
 Type "8"
 Sleep 2s
 
 # Trigger on-demand AI analysis
 Type "a"
-Sleep 8s
+Sleep 12s
 
 # Back to Dashboard
 Type "1"
@@ -54,10 +82,8 @@ Sleep 3s
 Type "?"
 Sleep 3s
 
-# Close help
+# Close help and quit
 Type "?"
 Sleep 1s
-
-# Quit
 Type "q"
 Sleep 1s

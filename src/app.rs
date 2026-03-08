@@ -185,7 +185,7 @@ impl App {
             connection_timeline: ConnectionTimeline::new(),
             timeline_scroll: 0,
             timeline_window: TimelineWindow::Min5,
-            insights_collector: InsightsCollector::new("llama3.2"),
+            insights_collector: InsightsCollector::new("minimax-m2.5:cloud"),
             insights_scroll: 0,
             insights_tick: 0,
             ebpf_status: Self::init_ebpf_status(),
