@@ -233,34 +233,7 @@ footer .links a:hover{color:var(--green)}
         <span>netwatch — sudo — 192×48</span>
       </div>
       <div class="demo-body">
-<pre>
-<span style="color:var(--text-bright)">┌─ NetWatch ──────────────────────────────────────────── 15:04:32 ─┐</span>
-<span style="color:var(--text-bright)">│</span> <span style="color:var(--green)">[1] Dash</span> [2] Conn [3] Iface [4] Pkt [5] Stats               <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span> [6] Topo [7] Time [8] Insights                          [?]  <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">├─────────────────────────────────────────────────────────────────┤</span>
-<span style="color:var(--text-bright)">│</span> INTERFACES            RX rate       TX rate       Status      <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span> ─────────────────────────────────────────────────────────      <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span> en0  192.168.1.42     <span style="color:var(--green)">▆▆▆ 12.4 MB/s</span>  <span style="color:var(--cyan)">▃▃ 1.2 MB/s</span>  <span style="color:var(--green)">UP</span>       <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span> lo0  127.0.0.1        <span style="color:var(--text-dim)">▁▁▁  0.1 KB/s</span>  <span style="color:var(--text-dim)">▁▁ 0.1 KB/s</span>  <span style="color:var(--green)">UP</span>       <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span> utun3 10.8.0.2        <span style="color:var(--yellow)">▂▂▂  0.8 MB/s</span>  <span style="color:var(--yellow)">▂▂ 0.3 MB/s</span>  <span style="color:var(--green)">UP</span>       <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">├─────────────────────────────────────────────────────────────────┤</span>
-<span style="color:var(--text-bright)">│</span> BANDWIDTH (en0)                       last 60s                <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span> RX <span style="color:var(--green)">▁▂▃▅▆█▇▅▃▂▁▂▃▅▇█▇▅▃▂▁▁▂▃▅▆█▇▅▃▂▁▂▃▅▇█▇▅▃▂▁</span>                <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span> TX <span style="color:var(--cyan)">▁▁▂▂▃▃▂▂▁▁▁▂▂▃▃▂▂▁▁▁▁▁▂▂▃▃▂▂▁▁▁▂▂▃▃▂▂▁▁▁</span>                <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">├─────────────────────────────────────────────────────────────────┤</span>
-<span style="color:var(--text-bright)">│</span> TOP CONNECTIONS         Proto  Local        Remote              <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span>  1  curl          TCP   :443   52.12.0.8    <span style="color:var(--green)">12 KB/s</span>            <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span>  2  firefox       TCP   :443   142.250.1.1   <span style="color:var(--green)">8 KB/s</span>            <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span>  3  ssh           TCP   :22    10.0.0.5      <span style="color:var(--cyan)">2 KB/s</span>            <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">├─────────────────────────────────────────────────────────────────┤</span>
-<span style="color:var(--text-bright)">│</span> HEALTH                                                         <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span>  Gateway 192.168.1.1   RTT <span style="color:var(--green)">1.2ms</span>   Loss <span style="color:var(--green)">0.0%</span>                   <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span>  DNS 8.8.8.8           RTT <span style="color:var(--green)">12ms</span>    Loss <span style="color:var(--green)">0.0%</span>                   <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">│</span>  Errors: RX 0  TX 0   Drops: 0   Collisions: 0                <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">├─────────────────────────────────────────────────────────────────┤</span>
-<span style="color:var(--text-bright)">│</span> <span style="color:var(--text-dim)">q:Quit  /:Filter  s:Sort  p:Pause  Tab:Next Panel</span>              <span style="color:var(--text-bright)">│</span>
-<span style="color:var(--text-bright)">└─────────────────────────────────────────────────────────────────┘</span>
-</pre>
+        <img src="demo.gif" alt="NetWatch demo — Dashboard, Connections, Interfaces, Packets, and Help overlay" loading="lazy">
       </div>
     </div>
   </div>
