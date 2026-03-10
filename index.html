@@ -544,23 +544,23 @@ Model: llama3.2 │ Analysis: 2.3s │ a:Analyze</div>
     <h2 class="section-title">Built for Speed. Designed for Clarity.</h2>
     <p class="section-sub">Three-layer architecture: collectors gather data, app state aggregates, and the TUI renders — all in Rust with zero garbage collection.</p>
     <div class="arch-diagram">
-┌──────────────────────────────────────────────────────┐
-│                    <span style="color:var(--text-bright)">TUI Renderer</span>                      │
-│               (ratatui / crossterm)                  │
-│  dashboard │ connections │ packets │ topology │ ...  │
-├──────────────────────────────────────────────────────┤
-│                   <span style="color:var(--text-bright)">App State Layer</span>                    │
-│          (aggregation, sorting, filtering)           │
-├────────┬────────┬────────┬────────┬──────────────────┤
-│<span style="color:var(--cyan)">Traffic</span> │<span style="color:var(--cyan)">Connect</span>│<span style="color:var(--cyan)">Config</span>  │<span style="color:var(--cyan)">Health</span>  │  <span style="color:var(--cyan)">Packets</span>          │
-│Collect │Collect │Collect │Prober  │  Collector       │
-├────────┤        ├────────┤        │                  │
-│ <span style="color:var(--yellow)">GeoIP</span>  │        │ <span style="color:var(--yellow)">Whois</span>  │        │  <span style="color:var(--yellow)">Stream Tracker</span>  │
-│ <span style="color:var(--yellow)">Trace</span>  │        │<span style="color:var(--yellow)">Insights</span>│        │  <span style="color:var(--yellow)">DNS Cache</span>      │
-└────────┴────────┴────────┴────────┴──────────────────┘
-    ▲         ▲         ▲        ▲          ▲
- /sys/class  ss/lsof  ip route  ICMP     libpcap
- /proc/net   netstat  resolv    ping     BPF filter</div>
+┌─────────────────────────────────────────────────────┐
+│                   <span style="color:var(--text-bright)">TUI Renderer</span>                      │
+│              (ratatui / crossterm)                   │
+│  dashboard │ connections │ packets │ topology │ …   │
+├─────────────────────────────────────────────────────┤
+│                  <span style="color:var(--text-bright)">App State Layer</span>                    │
+│         (aggregation, sorting, filtering)            │
+├─────────┬─────────┬─────────┬────────┬──────────────┤
+│ <span style="color:var(--cyan)">Traffic</span> │ <span style="color:var(--cyan)">Connect</span> │ <span style="color:var(--cyan)">Config</span>  │ <span style="color:var(--cyan)">Health</span> │ <span style="color:var(--cyan)">Packets</span>      │
+│ Collect │ Collect │ Collect │ Prober │ Collector    │
+├─────────┼─────────┼─────────┼────────┤              │
+│ <span style="color:var(--yellow)">GeoIP</span>   │ <span style="color:var(--yellow)">Whois</span>   │<span style="color:var(--yellow)">Insights</span> │ <span style="color:var(--yellow)">Trace</span>  │ <span style="color:var(--yellow)">Stream</span>       │
+│         │         │         │        │ <span style="color:var(--yellow)">Tracker</span>      │
+└─────────┴─────────┴─────────┴────────┴──────────────┘
+     ▲         ▲         ▲        ▲          ▲
+ /sys/class  ss/lsof  ip route   ICMP     libpcap
+ /proc/net   netstat  resolv.conf ping     BPF filter</div>
   </div>
 </section>
 
