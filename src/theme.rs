@@ -100,7 +100,7 @@ pub fn solarized() -> Theme {
     // Solarized Dark palette
     let base03 = Color::Rgb(0, 43, 54);
     let base01 = Color::Rgb(88, 110, 117);
-    let base00 = Color::Rgb(101, 123, 131);
+    let _base00 = Color::Rgb(101, 123, 131);
     let base0 = Color::Rgb(131, 148, 150);
     let base1 = Color::Rgb(147, 161, 161);
     let _base2 = Color::Rgb(238, 232, 213);
