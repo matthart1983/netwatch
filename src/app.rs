@@ -15,8 +15,10 @@ use crate::platform::{self, InterfaceInfo};
 use crate::ui;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind, MouseButton};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use ratatui::prelude::*;
+
+const RTT_SPARKLINE_SAMPLES: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimelineWindow {
@@ -136,6 +138,9 @@ pub struct App {
     health_tick: u32,
     pub user_config: NetwatchConfig,
     pub last_area: Rect,
+    /// Per-remote-IP RTT history for sparklines (keyed by remote IP string)
+    pub rtt_history: HashMap<String, VecDeque<f64>>,
+    rtt_sampled_streams: HashSet<u32>,
 }
 
 impl App {
@@ -219,6 +224,8 @@ impl App {
             health_tick: 0,
             user_config,
             last_area: Rect::default(),
+            rtt_history: HashMap::new(),
+            rtt_sampled_streams: HashSet::new(),
         }
     }
 
@@ -321,6 +328,9 @@ impl App {
         // Feed network intelligence from new packets
         self.feed_network_intel();
 
+        // Sample RTT from TCP handshakes for sparklines
+        self.sample_rtt_from_streams();
+
         // Feed interface rates to bandwidth alerts
         for iface in &self.traffic.interfaces {
             self.network_intel.on_interface_rate(InterfaceRateEvent {
@@ -366,6 +376,29 @@ impl App {
         );
         let snapshot = NetworkSnapshot::build(&packets, &conns, &health, &rx_rate, &tx_rate);
         self.insights_collector.submit_snapshot(snapshot);
+    }
+
+    fn sample_rtt_from_streams(&mut self) {
+        let streams = self.packet_collector.get_all_streams();
+        for stream in &streams {
+            if self.rtt_sampled_streams.contains(&stream.index) {
+                continue;
+            }
+            if let Some(ref hs) = stream.handshake {
+                if let Some(rtt_ms) = hs.syn_to_syn_ack_ms() {
+                    self.rtt_sampled_streams.insert(stream.index);
+                    // Key by the remote IP (addr_b is typically the server)
+                    let remote_ip = &stream.key.addr_b.0;
+                    let history = self.rtt_history
+                        .entry(remote_ip.clone())
+                        .or_insert_with(|| VecDeque::with_capacity(RTT_SPARKLINE_SAMPLES + 1));
+                    history.push_back(rtt_ms);
+                    if history.len() > RTT_SPARKLINE_SAMPLES {
+                        history.pop_front();
+                    }
+                }
+            }
+        }
     }
 
     fn feed_network_intel(&mut self) {

@@ -40,6 +40,7 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
 
     let mut conns = app.connection_collector.connections.lock().unwrap().clone();
     let has_rtt_data = conns.iter().any(|c| c.kernel_rtt_us.is_some());
+    let has_sparkline_data = !app.rtt_history.is_empty();
 
     let mut header_cells = vec![
         Cell::from(format!("Process{}", sort_indicator(0)))
@@ -58,6 +59,12 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     if has_rtt_data {
         header_cells.push(
             Cell::from("RTT")
+                .style(Style::default().fg(Color::Cyan).bold()),
+        );
+    }
+    if has_sparkline_data {
+        header_cells.push(
+            Cell::from("RTT Trend")
                 .style(Style::default().fg(Color::Cyan).bold()),
         );
     }
@@ -135,6 +142,20 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
                 };
                 cells.push(Cell::from(rtt_text).style(rtt_style));
             }
+            if has_sparkline_data {
+                let remote_ip = extract_ip(&conn.remote_addr);
+                let (spark_text, spark_style) = remote_ip
+                    .and_then(|ip| app.rtt_history.get(ip))
+                    .filter(|h| !h.is_empty())
+                    .map(|h| {
+                        let latest = h.back().copied().unwrap_or(0.0);
+                        let text = format!("{} {:.0}ms", rtt_sparkline(h), latest);
+                        let color = rtt_sparkline_color(h);
+                        (text, Style::default().fg(color))
+                    })
+                    .unwrap_or_else(|| ("—".to_string(), Style::default().fg(Color::DarkGray)));
+                cells.push(Cell::from(spark_text).style(spark_style));
+            }
             if app.show_geo {
                 let remote_ip = extract_ip(&conn.remote_addr);
                 let geo_label = remote_ip
@@ -163,6 +184,9 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     ];
     if has_rtt_data {
         widths.push(Constraint::Length(10));
+    }
+    if has_sparkline_data {
+        widths.push(Constraint::Length(28));
     }
     if app.show_geo {
         widths.push(Constraint::Min(20));
@@ -329,6 +353,112 @@ fn format_hop_line(hop: &crate::collectors::traceroute::TracerouteHop) -> Line<'
         Span::raw(" "),
         Span::styled(rtt_spans[2].clone(), Style::default().fg(rtt_color)),
     ])
+}
+
+const SPARKLINE_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+fn rtt_sparkline(history: &std::collections::VecDeque<f64>) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let min = history.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+
+    history
+        .iter()
+        .map(|&v| {
+            let idx = if range < 0.001 {
+                3 // middle block for flat line
+            } else {
+                let normalized = (v - min) / range;
+                (normalized * 7.0).round() as usize
+            };
+            SPARKLINE_BLOCKS[idx.min(7)]
+        })
+        .collect()
+}
+
+fn rtt_sparkline_color(history: &std::collections::VecDeque<f64>) -> Color {
+    match history.back() {
+        Some(&rtt) if rtt > 100.0 => Color::Red,
+        Some(&rtt) if rtt > 50.0 => Color::Yellow,
+        _ => Color::Green,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn sparkline_empty() {
+        let h = VecDeque::new();
+        assert_eq!(rtt_sparkline(&h), "");
+    }
+
+    #[test]
+    fn sparkline_single_sample() {
+        let h = VecDeque::from(vec![10.0]);
+        let s = rtt_sparkline(&h);
+        assert_eq!(s.chars().count(), 1);
+        // Single sample → flat line → middle block
+        assert_eq!(s, "▄");
+    }
+
+    #[test]
+    fn sparkline_flat_line() {
+        let h = VecDeque::from(vec![5.0, 5.0, 5.0, 5.0]);
+        let s = rtt_sparkline(&h);
+        assert_eq!(s.chars().count(), 4);
+        // All same → all middle blocks
+        assert!(s.chars().all(|c| c == '▄'));
+    }
+
+    #[test]
+    fn sparkline_ascending() {
+        let h = VecDeque::from(vec![0.0, 50.0, 100.0]);
+        let s = rtt_sparkline(&h);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 3);
+        assert_eq!(chars[0], '▁'); // min
+        assert_eq!(chars[2], '█'); // max
+    }
+
+    #[test]
+    fn sparkline_descending() {
+        let h = VecDeque::from(vec![100.0, 50.0, 0.0]);
+        let s = rtt_sparkline(&h);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars[0], '█'); // max
+        assert_eq!(chars[2], '▁'); // min
+    }
+
+    #[test]
+    fn sparkline_color_green_low() {
+        let h = VecDeque::from(vec![10.0, 15.0, 12.0]);
+        assert_eq!(rtt_sparkline_color(&h), Color::Green);
+    }
+
+    #[test]
+    fn sparkline_color_yellow_medium() {
+        let h = VecDeque::from(vec![10.0, 60.0]);
+        assert_eq!(rtt_sparkline_color(&h), Color::Yellow);
+    }
+
+    #[test]
+    fn sparkline_color_red_high() {
+        let h = VecDeque::from(vec![10.0, 150.0]);
+        assert_eq!(rtt_sparkline_color(&h), Color::Red);
+    }
+
+    #[test]
+    fn sparkline_twenty_samples() {
+        let h: VecDeque<f64> = (0..20).map(|i| i as f64 * 5.0).collect();
+        let s = rtt_sparkline(&h);
+        assert_eq!(s.chars().count(), 20);
+    }
 }
 
 fn extract_ip(addr: &str) -> Option<&str> {
