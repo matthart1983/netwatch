@@ -5,7 +5,7 @@ use crate::collectors::traceroute::TracerouteStatus;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -100,7 +100,9 @@ fn build_remote_nodes(app: &App) -> Vec<RemoteNode> {
 fn render_topology(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Network Topology ")
+        .title_style(Style::default().fg(Color::Cyan))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -218,6 +220,7 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan)),
     );
     f.render_widget(center_node, center_rect);
@@ -238,6 +241,7 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .title(format!(" {} ", title))
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(*style),
         );
         let rect = Rect::new(left_x, left_y, left_width, left_node_height);
@@ -247,7 +251,7 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
         let edge_y = left_y + left_node_height / 2;
         if edge_y >= inner.y && edge_y < inner.y + inner.height {
             let edge = Paragraph::new(Line::from(
-                Span::styled("────", Style::default().fg(Color::DarkGray)),
+                Span::styled("────", *style),
             ));
             let edge_rect = Rect::new(edge_left_x, edge_y, edge_left_width, 1);
             f.render_widget(edge, edge_rect);
@@ -280,6 +284,7 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan)),
         );
         f.render_widget(center_node, center_rect);
@@ -332,6 +337,7 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
         let node = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(border_style),
         );
         let actual_right_width = right_width.min(inner.x + inner.width - right_x);
@@ -341,9 +347,14 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
         // Draw edge line from centre to right node
         let edge_y = right_y + node_h / 2;
         if edge_y >= inner.y && edge_y < inner.y + inner.height {
-            let count_label = format!("{:>2}×", remote.conn_count);
+            let edge_style = if remote.has_established {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let edge_label = format!("─▶{}×", remote.conn_count);
             let edge = Paragraph::new(Line::from(
-                Span::styled(count_label, Style::default().fg(Color::DarkGray)),
+                Span::styled(edge_label, edge_style),
             ));
             let edge_rect = Rect::new(edge_right_x, edge_y, edge_right_width, 1);
             f.render_widget(edge, edge_rect);

@@ -73,7 +73,10 @@ fn render_chart(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let visible_rows = inner.height as usize;
+    // Build time axis
+    let time_axis = build_time_axis(app.timeline_window.seconds(), label_width as usize, bar_width);
+
+    let visible_rows = inner.height.saturating_sub(1) as usize;
     let scroll = app.timeline_scroll.min(sorted.len().saturating_sub(visible_rows.max(1)));
     let visible: Vec<&TrackedConnection> = sorted.iter().skip(scroll).take(visible_rows).copied().collect();
 
@@ -102,7 +105,9 @@ fn render_chart(f: &mut Frame, app: &App, area: Rect) {
         Line::from(spans)
     }).collect();
 
-    let content = Paragraph::new(lines);
+    let mut all_lines = vec![time_axis];
+    all_lines.extend(lines);
+    let content = Paragraph::new(all_lines);
     f.render_widget(content, inner);
 }
 
@@ -240,6 +245,59 @@ fn render_footer(f: &mut Frame, _app: &App, area: Rect) {
         Span::raw(":Pause"),
     ];
     widgets::render_footer(f, area, hints);
+}
+
+fn build_time_axis(window_secs: u64, label_width: usize, bar_width: usize) -> Line<'static> {
+    // Choose tick interval based on window size
+    let (tick_count, tick_label_fn): (usize, Box<dyn Fn(usize) -> String>) = match window_secs {
+        0..=60 => (6, Box::new(|i| format!("{}s", i * 10))),
+        61..=300 => (5, Box::new(|i| format!("{}m", i))),
+        301..=900 => (5, Box::new(|i| format!("{}m", i * 3))),
+        901..=1800 => (6, Box::new(|i| format!("{}m", i * 5))),
+        _ => (6, Box::new(|i| format!("{}m", i * 10))),
+    };
+
+    // Build the axis string
+    // Left side: label padding + "now"
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(
+            format!("{:>width$} ", "", width = label_width),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+
+    // The axis goes left=now, right=oldest
+    // Place "now" at position 0, then ticks at regular intervals
+    let mut axis = String::new();
+    let segment_width = if tick_count > 0 { bar_width / tick_count } else { bar_width };
+
+    // First label: "now"
+    axis.push_str("now");
+    let mut pos = 3; // length of "now"
+
+    for i in 1..=tick_count {
+        let target = segment_width * i;
+        let label = tick_label_fn(i);
+        let fill = target.saturating_sub(pos).saturating_sub(label.len());
+        for _ in 0..fill {
+            axis.push('─');
+        }
+        axis.push_str(&label);
+        pos = target;
+    }
+
+    // Pad or truncate to bar_width
+    if axis.len() < bar_width {
+        let remaining = bar_width - axis.len();
+        for _ in 0..remaining {
+            axis.push(' ');
+        }
+    } else if axis.len() > bar_width {
+        axis.truncate(bar_width);
+    }
+
+    spans.push(Span::styled(axis, Style::default().fg(Color::DarkGray)));
+    Line::from(spans)
 }
 
 fn extract_ip(addr: &str) -> String {
