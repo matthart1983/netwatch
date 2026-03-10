@@ -8,3 +8,4 @@ pub mod topology;
 pub mod insights;
 pub mod widgets;
 pub mod help;
+pub mod settings;

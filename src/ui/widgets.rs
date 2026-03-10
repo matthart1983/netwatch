@@ -47,29 +47,30 @@ fn tab_label(tab: Tab) -> (&'static str, &'static str) {
 }
 
 fn build_header_spans(app: &App, extra: Option<Vec<Span<'static>>>) -> Line<'static> {
+    let t = &app.theme;
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
 
     let mut spans: Vec<Span<'static>> = vec![
-        Span::styled("◉ NetWatch ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled("◉ NetWatch ", Style::default().fg(t.brand).bold()),
     ];
 
     for (i, &tab) in ALL_TABS.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" │ ", Style::default().fg(t.separator)));
         }
         let (num, name) = tab_label(tab);
         let label = format!("[{}] {}", num, name);
         if tab == app.current_tab {
-            spans.push(Span::styled(label, Style::default().fg(Color::Yellow).bold()));
+            spans.push(Span::styled(label, Style::default().fg(t.active_tab).bold()));
         } else {
-            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(label, Style::default().fg(t.inactive_tab)));
         }
     }
 
     if app.paused {
         spans.push(Span::styled(
             " ⏸ PAUSED ",
-            Style::default().fg(Color::Black).bg(Color::Yellow),
+            Style::default().fg(t.text_inverse).bg(t.status_warn),
         ));
     }
 
@@ -77,7 +78,7 @@ fn build_header_spans(app: &App, extra: Option<Vec<Span<'static>>>) -> Line<'sta
     if alert_count > 0 {
         spans.push(Span::styled(
             format!(" ⚠ {} ", alert_count),
-            Style::default().fg(Color::Black).bg(Color::Red),
+            Style::default().fg(t.text_inverse).bg(t.status_error),
         ));
     }
 
@@ -88,7 +89,7 @@ fn build_header_spans(app: &App, extra: Option<Vec<Span<'static>>>) -> Line<'sta
     }
 
     spans.push(Span::raw("  "));
-    spans.push(Span::styled(now, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(now, Style::default().fg(t.text_muted)));
 
     Line::from(spans)
 }
@@ -96,14 +97,14 @@ fn build_header_spans(app: &App, extra: Option<Vec<Span<'static>>>) -> Line<'sta
 pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let line = build_header_spans(app, None);
     let header = Paragraph::new(line)
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(app.theme.border)));
     f.render_widget(header, area);
 }
 
 pub fn render_header_with_extra(f: &mut Frame, app: &App, area: Rect, extra: Vec<Span<'static>>) {
     let line = build_header_spans(app, Some(extra));
     let header = Paragraph::new(line)
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(app.theme.border)));
     f.render_widget(header, area);
 }
 
@@ -191,7 +192,8 @@ mod tests {
     }
 }
 
-pub fn render_footer(f: &mut Frame, area: Rect, context_hints: Vec<Span<'static>>) {
+pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Span<'static>>) {
+    let t = &app.theme;
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
 
     for s in context_hints {
@@ -212,11 +214,11 @@ pub fn render_footer(f: &mut Frame, area: Rect, context_hints: Vec<Span<'static>
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(format!("{}", key), Style::default().fg(Color::Yellow).bold()));
+        spans.push(Span::styled(format!("{}", key), Style::default().fg(t.key_hint).bold()));
         spans.push(Span::raw(format!(":{}", desc)));
     }
 
     let footer = Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
+        .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(t.border)));
     f.render_widget(footer, area);
 }

@@ -173,7 +173,7 @@ fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_footer(f: &mut Frame, _app: &App, area: Rect) {
+fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = vec![
         Span::styled("a", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Analyze  "),
@@ -182,5 +182,5 @@ fn render_footer(f: &mut Frame, _app: &App, area: Rect) {
         Span::styled("r", Style::default().fg(Color::Yellow).bold()),
         Span::raw(":Refresh"),
     ];
-    widgets::render_footer(f, area, hints);
+    widgets::render_footer(f, app, area, hints);
 }
