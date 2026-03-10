@@ -107,6 +107,90 @@ pub fn render_header_with_extra(f: &mut Frame, app: &App, area: Rect, extra: Vec
     f.render_widget(header, area);
 }
 
+/// Given a click column within the header row, return which tab was clicked (if any).
+pub fn tab_at_column(col: u16) -> Option<Tab> {
+    // Reconstruct the column offsets matching build_header_spans layout:
+    // "◉ NetWatch " = 11 chars
+    let mut x = 11u16;
+    for (i, &tab) in ALL_TABS.iter().enumerate() {
+        if i > 0 {
+            x += 3; // " │ " separator
+        }
+        let (num, name) = tab_label(tab);
+        let label_len = format!("[{}] {}", num, name).len() as u16;
+        if col >= x && col < x + label_len {
+            return Some(tab);
+        }
+        x += label_len;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_first_col(target: Tab) -> Option<u16> {
+        (0..200).find(|&col| tab_at_column(col) == Some(target))
+    }
+
+    #[test]
+    fn tab_at_column_before_tabs_returns_none() {
+        assert!(tab_at_column(0).is_none());
+        assert!(tab_at_column(5).is_none());
+    }
+
+    #[test]
+    fn tab_at_column_hits_dashboard() {
+        let col = find_first_col(Tab::Dashboard).expect("Dashboard must be reachable");
+        assert_eq!(tab_at_column(col), Some(Tab::Dashboard));
+        // One column before should not be Dashboard
+        if col > 0 {
+            assert_ne!(tab_at_column(col - 1), Some(Tab::Dashboard));
+        }
+    }
+
+    #[test]
+    fn tab_at_column_hits_each_tab() {
+        for &tab in ALL_TABS {
+            let col = find_first_col(tab);
+            assert!(col.is_some(), "{:?} must be reachable by click", tab);
+        }
+    }
+
+    #[test]
+    fn tab_at_column_way_past_end_returns_none() {
+        assert!(tab_at_column(200).is_none());
+    }
+
+    #[test]
+    fn all_tabs_reachable() {
+        let mut found_tabs = std::collections::HashSet::new();
+        for col in 0..200 {
+            if let Some(tab) = tab_at_column(col) {
+                found_tabs.insert(format!("{:?}", tab));
+            }
+        }
+        assert_eq!(found_tabs.len(), 8);
+    }
+
+    #[test]
+    fn tabs_are_in_order() {
+        let positions: Vec<u16> = ALL_TABS
+            .iter()
+            .map(|&t| find_first_col(t).unwrap())
+            .collect();
+        for i in 1..positions.len() {
+            assert!(
+                positions[i] > positions[i - 1],
+                "Tab {:?} should come after {:?}",
+                ALL_TABS[i],
+                ALL_TABS[i - 1]
+            );
+        }
+    }
+}
+
 pub fn render_footer(f: &mut Frame, area: Rect, context_hints: Vec<Span<'static>>) {
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
 

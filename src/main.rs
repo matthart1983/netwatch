@@ -1,5 +1,6 @@
 use anyhow::Result;
 use netwatch::app;
+use netwatch::config::NetwatchConfig;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -10,6 +11,16 @@ use std::io;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle --generate-config before entering TUI mode
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--generate-config") {
+        let cfg = NetwatchConfig::default();
+        cfg.save()?;
+        let path = NetwatchConfig::path().unwrap();
+        println!("Config written to {}", path.display());
+        return Ok(());
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;

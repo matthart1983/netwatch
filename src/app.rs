@@ -8,12 +8,13 @@ use crate::collectors::whois::WhoisCache;
 use crate::collectors::health::HealthProber;
 use crate::collectors::packets::PacketCollector;
 use crate::collectors::traffic::TrafficCollector;
+use crate::config::NetwatchConfig;
 use crate::ebpf::EbpfStatus;
 use crate::event::{AppEvent, EventHandler};
 use crate::platform::{self, InterfaceInfo};
 use crate::ui;
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind, MouseButton};
 use std::collections::{HashMap, HashSet};
 use ratatui::prelude::*;
 
@@ -133,17 +134,33 @@ pub struct App {
     info_tick: u32,
     conn_tick: u32,
     health_tick: u32,
+    pub user_config: NetwatchConfig,
+    pub last_area: Rect,
 }
 
 impl App {
     fn new() -> Self {
+        let user_config = NetwatchConfig::load();
         let interface_info = platform::collect_interface_info().unwrap_or_default();
         let mut config_collector = ConfigCollector::new();
         config_collector.update();
 
-        // Pick the best default capture interface: first UP interface with an IPv4 address
-        // that isn't loopback
-        let capture_interface = Self::pick_capture_interface(&interface_info);
+        // Use config capture_interface if set, otherwise auto-detect
+        let capture_interface = if !user_config.capture_interface.is_empty() {
+            user_config.capture_interface.clone()
+        } else {
+            Self::pick_capture_interface(&interface_info)
+        };
+
+        // Apply BPF filter from config
+        let bpf_filter_active = if user_config.bpf_filter.is_empty() {
+            None
+        } else {
+            Some(user_config.bpf_filter.clone())
+        };
+
+        let mut network_intel = NetworkIntelCollector::new();
+        network_intel.set_bandwidth_threshold(user_config.alerts.bandwidth_threshold);
 
         Self {
             traffic: TrafficCollector::new(),
@@ -154,12 +171,12 @@ impl App {
             packet_collector: PacketCollector::new(),
             selected_interface: None,
             paused: false,
-            current_tab: Tab::Dashboard,
+            current_tab: user_config.tab(),
             connection_scroll: 0,
             sort_column: 0,
             packet_scroll: 0,
             packet_selected: None,
-            packet_follow: true,
+            packet_follow: user_config.packet_follow,
             capture_interface,
             stream_view_open: false,
             stream_view_index: None,
@@ -172,13 +189,13 @@ impl App {
             export_status: None,
             export_status_tick: 0,
             bpf_filter_input: false,
-            bpf_filter_text: String::new(),
-            bpf_filter_active: None,
+            bpf_filter_text: user_config.bpf_filter.clone(),
+            bpf_filter_active,
             stats_scroll: 0,
             show_help: false,
             help_scroll: 0,
-            geo_cache: GeoCache::new(),
-            show_geo: true,
+            geo_cache: GeoCache::with_mmdb(&user_config.geoip_db, &user_config.geoip_asn_db),
+            show_geo: user_config.show_geo,
             whois_cache: WhoisCache::new(),
             bookmarks: HashSet::new(),
             topology_scroll: 0,
@@ -187,11 +204,11 @@ impl App {
             traceroute_scroll: 0,
             connection_timeline: ConnectionTimeline::new(),
             timeline_scroll: 0,
-            timeline_window: TimelineWindow::Min5,
-            insights_collector: InsightsCollector::new("minimax-m2.5:cloud"),
+            timeline_window: user_config.timeline_window_enum(),
+            insights_collector: InsightsCollector::new(&user_config.insights_model),
             insights_scroll: 0,
             insights_tick: 0,
-            network_intel: NetworkIntelCollector::new(),
+            network_intel,
             intel_last_pkt_id: 0,
             ebpf_status: Self::init_ebpf_status(),
             rtt_monitor: crate::ebpf::rtt_monitor::RttMonitor::new(),
@@ -200,6 +217,8 @@ impl App {
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
+            user_config,
+            last_area: Rect::default(),
         }
     }
 
@@ -445,7 +464,8 @@ fn build_connection_filter(conn: &Connection) -> String {
 
 pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     let mut app = App::new();
-    let mut events = EventHandler::new(1000);
+    let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
+    let mut events = EventHandler::new(tick_rate);
 
     // Initial data collection
     app.traffic.update();
@@ -462,6 +482,7 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
     loop {
         terminal.draw(|f| {
             let area = f.size();
+            app.last_area = area;
             match app.current_tab {
                 Tab::Dashboard => ui::dashboard::render(f, &app, area),
                 Tab::Connections => ui::connections::render(f, &app, area),
@@ -972,9 +993,181 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 _ => {}
             }
             },
+            AppEvent::Mouse(mouse) => {
+                handle_mouse(&mut app, mouse);
+            }
             AppEvent::Tick => {
                 app.tick();
             }
         }
+    }
+}
+
+fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    let col = mouse.column;
+    let row = mouse.row;
+    let area = app.last_area;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Header row: click on tabs (row 0 or 1 within header area)
+            if row < 3 {
+                if let Some(tab) = ui::widgets::tab_at_column(col) {
+                    app.current_tab = tab;
+                    return;
+                }
+            }
+
+            // Content area: click to select a row
+            // Header is 3 rows, footer is 3 rows, content borders add 1+1
+            let content_top = 3 + 1; // header + table border top
+            let content_bottom = area.height.saturating_sub(3); // above footer
+            if row >= content_top && row < content_bottom {
+                let clicked_row = (row - content_top) as usize;
+                match app.current_tab {
+                    Tab::Connections if !app.traceroute_view_open => {
+                        // Account for table header row
+                        if clicked_row > 0 {
+                            let visible_row = clicked_row - 1;
+                            let max = app.connection_collector.connections.lock().unwrap().len().saturating_sub(1);
+                            let idx = (app.connection_scroll + visible_row).min(max);
+                            app.connection_scroll = idx;
+                        }
+                    }
+                    Tab::Packets if !app.stream_view_open => {
+                        if clicked_row > 0 {
+                            let visible_row = clicked_row - 1;
+                            let packets = app.packet_collector.get_packets();
+                            let scroll_base = if app.packet_follow {
+                                let visible_height = (content_bottom - content_top).saturating_sub(1) as usize;
+                                packets.len().saturating_sub(visible_height)
+                            } else {
+                                app.packet_scroll
+                            };
+                            let idx = scroll_base + visible_row;
+                            if let Some(pkt) = packets.get(idx) {
+                                app.packet_follow = false;
+                                app.packet_scroll = idx;
+                                app.packet_selected = Some(pkt.id);
+                            }
+                        }
+                    }
+                    Tab::Topology if !app.traceroute_view_open => {
+                        if clicked_row > 0 {
+                            app.topology_scroll = app.topology_scroll.saturating_sub(0).max(clicked_row - 1);
+                        }
+                    }
+                    Tab::Timeline => {
+                        if clicked_row > 0 {
+                            app.timeline_scroll = clicked_row - 1;
+                        }
+                    }
+                    Tab::Insights => {
+                        app.insights_scroll = clicked_row;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            match app.current_tab {
+                Tab::Connections => {
+                    if app.traceroute_view_open {
+                        app.traceroute_scroll = app.traceroute_scroll.saturating_sub(3);
+                    } else {
+                        app.connection_scroll = app.connection_scroll.saturating_sub(3);
+                    }
+                }
+                Tab::Packets => {
+                    if app.stream_view_open {
+                        app.stream_scroll = app.stream_scroll.saturating_sub(3);
+                    } else {
+                        app.packet_follow = false;
+                        app.packet_scroll = app.packet_scroll.saturating_sub(3);
+                        let packets = app.packet_collector.get_packets();
+                        if let Some(pkt) = packets.get(app.packet_scroll) {
+                            app.packet_selected = Some(pkt.id);
+                        }
+                    }
+                }
+                Tab::Stats => {
+                    app.stats_scroll = app.stats_scroll.saturating_sub(3);
+                }
+                Tab::Topology => {
+                    if app.traceroute_view_open {
+                        app.traceroute_scroll = app.traceroute_scroll.saturating_sub(3);
+                    } else {
+                        app.topology_scroll = app.topology_scroll.saturating_sub(3);
+                    }
+                }
+                Tab::Timeline => {
+                    app.timeline_scroll = app.timeline_scroll.saturating_sub(3);
+                }
+                Tab::Insights => {
+                    app.insights_scroll = app.insights_scroll.saturating_sub(3);
+                }
+                Tab::Dashboard | Tab::Interfaces => {
+                    app.selected_interface = match app.selected_interface {
+                        Some(0) | None => None,
+                        Some(i) => Some(i.saturating_sub(3)),
+                    };
+                }
+            }
+            if app.show_help {
+                app.help_scroll = app.help_scroll.saturating_sub(3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            match app.current_tab {
+                Tab::Connections => {
+                    if app.traceroute_view_open {
+                        app.traceroute_scroll += 3;
+                    } else {
+                        let max = app.connection_collector.connections.lock().unwrap().len().saturating_sub(1);
+                        app.connection_scroll = (app.connection_scroll + 3).min(max);
+                    }
+                }
+                Tab::Packets => {
+                    if app.stream_view_open {
+                        app.stream_scroll += 3;
+                    } else {
+                        app.packet_follow = false;
+                        let packets = app.packet_collector.get_packets();
+                        let max = packets.len().saturating_sub(1);
+                        app.packet_scroll = (app.packet_scroll + 3).min(max);
+                        if let Some(pkt) = packets.get(app.packet_scroll) {
+                            app.packet_selected = Some(pkt.id);
+                        }
+                    }
+                }
+                Tab::Stats => {
+                    app.stats_scroll += 3;
+                }
+                Tab::Topology => {
+                    if app.traceroute_view_open {
+                        app.traceroute_scroll += 3;
+                    } else {
+                        app.topology_scroll += 3;
+                    }
+                }
+                Tab::Timeline => {
+                    app.timeline_scroll += 3;
+                }
+                Tab::Insights => {
+                    app.insights_scroll += 3;
+                }
+                Tab::Dashboard | Tab::Interfaces => {
+                    let max = app.traffic.interfaces.len().saturating_sub(1);
+                    app.selected_interface = match app.selected_interface {
+                        None => Some(0.min(max)),
+                        Some(i) => Some((i + 3).min(max)),
+                    };
+                }
+            }
+            if app.show_help {
+                app.help_scroll += 3;
+            }
+        }
+        _ => {}
     }
 }

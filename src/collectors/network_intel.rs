@@ -250,6 +250,10 @@ impl NetworkIntelCollector {
         self.active_alerts.len()
     }
 
+    pub fn set_bandwidth_threshold(&mut self, threshold: u64) {
+        self.bw_default_threshold = threshold;
+    }
+
     /// Call periodically (e.g., every tick) to expire stale state
     pub fn tick(&mut self) {
         let now = Instant::now();
