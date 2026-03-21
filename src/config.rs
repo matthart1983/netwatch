@@ -136,6 +136,7 @@ impl NetwatchConfig {
             "topology" => Tab::Topology,
             "timeline" => Tab::Timeline,
             "insights" => Tab::Insights,
+            "processes" => Tab::Processes,
             _ => Tab::Dashboard,
         }
     }

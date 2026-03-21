@@ -30,7 +30,7 @@ pub fn format_bytes_total(bytes: u64) -> String {
 
 const ALL_TABS: &[Tab] = &[
     Tab::Dashboard, Tab::Connections, Tab::Interfaces, Tab::Packets,
-    Tab::Stats, Tab::Topology, Tab::Timeline, Tab::Insights,
+    Tab::Stats, Tab::Topology, Tab::Timeline, Tab::Insights, Tab::Processes,
 ];
 
 fn tab_label(tab: Tab) -> (&'static str, &'static str) {
@@ -43,6 +43,7 @@ fn tab_label(tab: Tab) -> (&'static str, &'static str) {
         Tab::Topology => ("6", "Topology"),
         Tab::Timeline => ("7", "Timeline"),
         Tab::Insights => ("8", "Insights"),
+        Tab::Processes => ("9", "Processes"),
     }
 }
 
@@ -172,7 +173,7 @@ mod tests {
                 found_tabs.insert(format!("{:?}", tab));
             }
         }
-        assert_eq!(found_tabs.len(), 8);
+        assert_eq!(found_tabs.len(), 9);
     }
 
     #[test]
@@ -207,7 +208,7 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Sp
     let standard_hints: &[(&str, &str)] = &[
         ("q", "Quit"),
         ("↑↓", "Scroll"),
-        ("1-8", "Tab"),
+        ("1-9", "Tab"),
         ("?", "Help"),
     ];
     for (i, (key, desc)) in standard_hints.iter().enumerate() {

@@ -67,6 +67,31 @@ NetWatch is a lightweight, keyboard-driven TUI application that gives you instan
 
 ## Install
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install matthart1983/tap/netwatch
+```
+
+### Pre-built binaries
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/matthart1983/netwatch/releases/latest):
+
+| Platform | Download |
+|----------|----------|
+| Linux (x86_64) | `netwatch-linux-x86_64.tar.gz` |
+| Linux (aarch64) | `netwatch-linux-aarch64.tar.gz` |
+| macOS (Intel) | `netwatch-macos-x86_64.tar.gz` |
+| macOS (Apple Silicon) | `netwatch-macos-aarch64.tar.gz` |
+| Windows (x86_64) | `netwatch-windows-x86_64.exe.zip` |
+
+```bash
+# Example: macOS Apple Silicon
+curl -LO https://github.com/matthart1983/netwatch/releases/latest/download/netwatch-macos-aarch64.tar.gz
+tar xzf netwatch-macos-aarch64.tar.gz
+sudo mv netwatch-macos-aarch64 /usr/local/bin/netwatch
+```
+
 ### From crates.io
 
 ```bash

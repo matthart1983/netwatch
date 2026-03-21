@@ -3,6 +3,7 @@ use crate::collectors::connections::{Connection, ConnectionCollector, Connection
 use crate::collectors::geo::GeoCache;
 use crate::collectors::insights::{InsightsCollector, NetworkSnapshot};
 use crate::collectors::network_intel::{NetworkIntelCollector, ConnAttemptEvent, InterfaceRateEvent};
+use crate::collectors::process_bandwidth::ProcessBandwidthCollector;
 use crate::collectors::traceroute::TracerouteRunner;
 use crate::collectors::whois::WhoisCache;
 use crate::collectors::health::HealthProber;
@@ -79,6 +80,7 @@ pub enum Tab {
     Topology,
     Timeline,
     Insights,
+    Processes,
 }
 
 pub struct App {
@@ -143,6 +145,8 @@ pub struct App {
     pub rtt_history: HashMap<String, VecDeque<f64>>,
     rtt_sampled_streams: HashSet<u32>,
     pub theme: Theme,
+    pub process_bandwidth: ProcessBandwidthCollector,
+    pub process_scroll: usize,
     pub show_settings: bool,
     pub settings_cursor: usize,
     pub settings_editing: bool,
@@ -237,6 +241,8 @@ impl App {
             rtt_history: HashMap::new(),
             rtt_sampled_streams: HashSet::new(),
             theme,
+            process_bandwidth: ProcessBandwidthCollector::new(),
+            process_scroll: 0,
             show_settings: false,
             settings_cursor: 0,
             settings_editing: false,
@@ -328,6 +334,7 @@ impl App {
             self.connection_collector.update();
             let conns = self.connection_collector.connections.lock().unwrap();
             self.connection_timeline.update(&conns);
+            self.process_bandwidth.update(&conns, &self.traffic.interfaces);
         }
 
         // Drain eBPF connection events and update RTT monitor
@@ -550,6 +557,7 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 Tab::Topology => ui::topology::render(f, &app, area),
                 Tab::Timeline => ui::timeline::render(f, &app, area),
                 Tab::Insights => ui::insights::render(f, &app, area),
+                Tab::Processes => ui::processes::render(f, &app, area),
             }
             if app.show_help {
                 ui::help::render(f, &app, area);
@@ -761,6 +769,7 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                 KeyCode::Char('6') => app.current_tab = Tab::Topology,
                 KeyCode::Char('7') => app.current_tab = Tab::Timeline,
                 KeyCode::Char('8') => app.current_tab = Tab::Insights,
+                KeyCode::Char('9') => app.current_tab = Tab::Processes,
                 // Stream view controls (intercept before other Packets keys)
                 KeyCode::Esc if app.current_tab == Tab::Packets && app.stream_view_open => {
                     app.stream_view_open = false;
@@ -937,6 +946,23 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     app.traceroute_view_open = false;
                     app.traceroute_runner.clear();
                 }
+                KeyCode::Char('e') if app.current_tab == Tab::Connections || app.current_tab == Tab::Processes => {
+                    let conns = app.connection_collector.connections.lock().unwrap().clone();
+                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    let json_path = format!("{home}/netwatch_connections_{ts}.json");
+                    let csv_path = format!("{home}/netwatch_connections_{ts}.csv");
+                    match crate::collectors::connections::export_json(&conns, &json_path) {
+                        Ok(n) => {
+                            let _ = crate::collectors::connections::export_csv(&conns, &csv_path);
+                            app.export_status = Some(format!("Exported {n} connections to JSON + CSV"));
+                        }
+                        Err(e) => {
+                            app.export_status = Some(format!("Export failed: {e}"));
+                        }
+                    }
+                    app.export_status_tick = 0;
+                }
                 KeyCode::Char('s') => {
                     if app.current_tab == Tab::Connections {
                         app.sort_column = (app.sort_column + 1) % 6;
@@ -1082,6 +1108,9 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     Tab::Insights => {
                         app.insights_scroll = app.insights_scroll.saturating_sub(1);
                     }
+                    Tab::Processes => {
+                        app.process_scroll = app.process_scroll.saturating_sub(1);
+                    }
                     _ => {
                         app.selected_interface = match app.selected_interface {
                             Some(0) | None => None,
@@ -1132,6 +1161,12 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     }
                     Tab::Insights => {
                         app.insights_scroll += 1;
+                    }
+                    Tab::Processes => {
+                        let max = app.process_bandwidth.ranked().len().saturating_sub(1);
+                        if app.process_scroll < max {
+                            app.process_scroll += 1;
+                        }
                     }
                     _ => {
                         let max = app.traffic.interfaces.len().saturating_sub(1);
@@ -1225,6 +1260,14 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     Tab::Insights => {
                         app.insights_scroll = clicked_row;
                     }
+                    Tab::Processes => {
+                        if clicked_row > 0 {
+                            let visible_row = clicked_row - 1;
+                            let max = app.process_bandwidth.ranked().len().saturating_sub(1);
+                            let idx = (app.process_scroll + visible_row).min(max);
+                            app.process_scroll = idx;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1265,6 +1308,9 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
                 Tab::Insights => {
                     app.insights_scroll = app.insights_scroll.saturating_sub(3);
+                }
+                Tab::Processes => {
+                    app.process_scroll = app.process_scroll.saturating_sub(3);
                 }
                 Tab::Dashboard | Tab::Interfaces => {
                     app.selected_interface = match app.selected_interface {
@@ -1315,6 +1361,10 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
                 Tab::Insights => {
                     app.insights_scroll += 3;
+                }
+                Tab::Processes => {
+                    let max = app.process_bandwidth.ranked().len().saturating_sub(1);
+                    app.process_scroll = (app.process_scroll + 3).min(max);
                 }
                 Tab::Dashboard | Tab::Interfaces => {
                     let max = app.traffic.interfaces.len().saturating_sub(1);

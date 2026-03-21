@@ -76,7 +76,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(section_header("GLOBAL KEYS"));
     lines.push(key_line("q", "Quit"));
     lines.push(key_line("Ctrl+C", "Quit"));
-    lines.push(key_line("1-8", "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Insights)"));
+    lines.push(key_line("1-9", "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Insights/Proc)"));
     lines.push(key_line("p", "Pause/resume data collection"));
     lines.push(key_line("r", "Force refresh all data"));
     lines.push(key_line("a", "Request AI analysis (from any tab)"));
@@ -158,6 +158,13 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines.push(section_header("INSIGHTS (Tab 8)"));
     lines.push(key_line("a", "Trigger on-demand AI analysis"));
     lines.push(key_line("↑↓", "Scroll insights"));
+    lines.push(Line::raw(""));
+
+    // PROCESSES
+    lines.push(section_header("PROCESSES (Tab 9)"));
+    lines.push(key_line("↑↓", "Scroll process list"));
+    lines.push(key_line("s", "Cycle sort column"));
+    lines.push(key_line("e", "Export connections to JSON + CSV"));
     lines.push(Line::raw(""));
 
     // DISPLAY FILTER SYNTAX

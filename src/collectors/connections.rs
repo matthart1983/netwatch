@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Connection {
     pub protocol: String,
     pub local_addr: String,
@@ -419,6 +420,49 @@ fn parse_windows_connections() -> Vec<Connection> {
         .collect()
 }
 
+/// Export connections to JSON file
+pub fn export_json(connections: &[Connection], path: &str) -> Result<usize, String> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path).map_err(|e| format!("Create error: {e}"))?;
+
+    let entries: Vec<serde_json::Value> = connections.iter().map(|c| {
+        serde_json::json!({
+            "process": c.process_name.as_deref().unwrap_or("—"),
+            "pid": c.pid,
+            "protocol": c.protocol,
+            "state": c.state,
+            "local_address": c.local_addr,
+            "remote_address": c.remote_addr,
+        })
+    }).collect();
+
+    let json = serde_json::to_string_pretty(&entries).map_err(|e| format!("JSON error: {e}"))?;
+    file.write_all(json.as_bytes()).map_err(|e| format!("Write error: {e}"))?;
+    Ok(connections.len())
+}
+
+/// Export connections to CSV file
+pub fn export_csv(connections: &[Connection], path: &str) -> Result<usize, String> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path).map_err(|e| format!("Create error: {e}"))?;
+
+    writeln!(file, "process,pid,protocol,state,local_address,remote_address")
+        .map_err(|e| format!("Write error: {e}"))?;
+
+    for c in connections {
+        writeln!(file, "{},{},{},{},{},{}",
+            c.process_name.as_deref().unwrap_or("—"),
+            c.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+            c.protocol,
+            c.state,
+            c.local_addr,
+            c.remote_addr,
+        ).map_err(|e| format!("Write error: {e}"))?;
+    }
+
+    Ok(connections.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +614,46 @@ mod tests {
         ];
         tl.update(&conns);
         assert_eq!(tl.tracked.len(), 2);
+    }
+
+    #[test]
+    fn export_json_creates_valid_file() {
+        let dir = std::env::temp_dir().join("netwatch_test_export");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.json");
+
+        let conns = vec![make_conn("TCP", "127.0.0.1:80", "10.0.0.1:443", "ESTABLISHED", 100)];
+        let count = export_json(&conns, path.to_str().unwrap()).unwrap();
+        assert_eq!(count, 1);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_csv_creates_valid_file() {
+        let dir = std::env::temp_dir().join("netwatch_test_export_csv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.csv");
+
+        let conns = vec![
+            make_conn("TCP", "127.0.0.1:80", "10.0.0.1:443", "ESTABLISHED", 100),
+            make_conn("UDP", "0.0.0.0:53", "*:*", "", 200),
+        ];
+        let count = export_csv(&conns, path.to_str().unwrap()).unwrap();
+        assert_eq!(count, 2);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3); // header + 2 data rows
+        assert!(lines[0].contains("process,pid,protocol"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

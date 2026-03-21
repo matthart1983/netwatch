@@ -1,5 +1,6 @@
 pub mod dashboard;
 pub mod connections;
+pub mod processes;
 pub mod interfaces;
 pub mod packets;
 pub mod stats;
