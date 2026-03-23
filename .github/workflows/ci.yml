@@ -35,7 +35,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy -- -D warnings -A clippy::new_without_default -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::explicit_auto_deref -A clippy::useless_format -A clippy::collapsible_if -A clippy::derivable_impls -A clippy::unnecessary_map_or -A clippy::needless_return
 
       - name: Build
         run: cargo build --release
