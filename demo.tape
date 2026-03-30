@@ -9,7 +9,7 @@ Set TypingSpeed 40ms
 Set Padding 10
 
 # Launch — instant visibility
-Type "netwatch"
+Type "./target/release/netwatch"
 Enter
 Sleep 4s
 
