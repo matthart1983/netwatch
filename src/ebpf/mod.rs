@@ -1,3 +1,10 @@
+//! eBPF subsystem for enhanced kernel-level network monitoring.
+//!
+//! This module is optional and only active on Linux with the `ebpf` feature flag:
+//! `cargo build --features ebpf`
+//!
+//! When not compiled, stubs are provided so the rest of the app works unchanged.
+
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 pub mod conn_tracker;
 pub mod rtt_monitor;
