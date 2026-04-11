@@ -5,9 +5,13 @@ activity — protocol mix, top talkers, DNS queries, connection state counts,
 gateway/DNS health, and expert warnings/errors — to a local LLM every 15
 seconds and renders the model's analysis in the TUI.
 
-Insights is **opt-in** and **off by default**. When enabled, NetWatch currently
-talks to a local [Ollama](https://ollama.com) server. Cloud providers (OpenAI,
-Anthropic, etc.) are **not yet supported** — see [Cloud providers](#cloud-providers-not-yet-supported).
+Insights is **opt-in** and **off by default**. When enabled, NetWatch talks to
+an [Ollama](https://ollama.com) server — either the local daemon on your own
+machine, a remote Ollama host on your network, or Ollama's hosted **cloud
+models** (see [Using cloud models](#using-cloud-models)). The local Ollama
+daemon is always the HTTP target; for cloud models it simply proxies your
+request through to Ollama's infrastructure, so netwatch itself never needs
+to handle API keys directly.
 
 ---
 
@@ -52,7 +56,7 @@ endpoint.
 ### Choosing a model
 
 Any Ollama-compatible model works. Smaller models give faster responses and
-use less RAM; larger models give better analysis. Reasonable picks:
+use less RAM; larger models give better analysis. Reasonable local picks:
 
 | Model          | Size   | Notes                                         |
 |----------------|--------|-----------------------------------------------|
@@ -64,6 +68,47 @@ use less RAM; larger models give better analysis. Reasonable picks:
 
 Pull whichever you want and set `insights_model` to the exact tag Ollama uses
 (`ollama list` shows installed models).
+
+If you'd rather not run a model locally, use a **cloud model** instead —
+any tag ending in `:cloud` is served by Ollama's hosted infrastructure and
+needs no local GPU or RAM. See the next section.
+
+### Using cloud models
+
+Ollama's hosted cloud lets you run larger models than your machine could
+handle locally. The local Ollama daemon still answers on `localhost:11434`;
+it just forwards your chat request to Ollama's servers and streams the
+response back. From NetWatch's perspective, nothing changes — you point
+`insights_model` at a `:cloud` tag and leave `insights_endpoint = "local"`.
+
+Setup:
+
+1. Sign in to your Ollama account from the CLI:
+   ```sh
+   ollama signin
+   ```
+   This opens a browser to authenticate and stores the credentials in
+   `~/.ollama/`. NetWatch never sees them — the daemon handles auth.
+2. List available cloud models:
+   ```sh
+   ollama ls
+   ```
+   Cloud models appear with the `:cloud` suffix (e.g. `minimax-2.5:cloud`,
+   `gpt-oss:cloud`, `qwen3-coder:cloud`, `deepseek-v3.1:cloud`). Check
+   <https://ollama.com/cloud> for the current catalog and any account
+   requirements.
+3. Set the model in NetWatch's config:
+   ```toml
+   insights_enabled = true
+   insights_model = "minimax-2.5:cloud"
+   insights_endpoint = "local"
+   ```
+   Or edit it live from the settings menu (`,`).
+
+Cloud models generally return faster than running a large model locally on
+CPU-only hardware, and you avoid the 10–30 second warm-up while a local
+model loads into RAM. The tradeoff is that snapshot data leaves your machine
+— see [Privacy](#privacy) below.
 
 ### Pointing at a remote Ollama host
 
@@ -83,9 +128,7 @@ a VPN or a reverse proxy on an internal network only.
 
 ## Privacy
 
-Because NetWatch only talks to Ollama, **every byte of snapshot data stays on
-the machine running Ollama**. Nothing is sent to Anthropic, OpenAI, or any
-other third party. The snapshot itself contains:
+The snapshot NetWatch sends to the model contains:
 
 - aggregated protocol counts
 - top destination IPs with packet counts
@@ -95,6 +138,19 @@ other third party. The snapshot itself contains:
 - current bandwidth rates
 
 It does **not** include raw packet payloads.
+
+**Where that data goes depends on which model you pick:**
+
+- **Local models** (e.g. `llama3.2`, `mistral`) — every byte stays on the
+  machine running Ollama. Nothing leaves your network.
+- **Remote self-hosted Ollama** (a VPS, home server, etc.) — data travels
+  over whatever network path you set up. Prefer a VPN or internal network.
+- **Cloud models** (`*:cloud` tags) — the local Ollama daemon forwards
+  each snapshot to Ollama's hosted infrastructure for inference. Review
+  Ollama's privacy policy at <https://ollama.com/privacy> before using
+  cloud models for traffic you consider sensitive.
+
+If privacy is the priority, stick to a local model.
 
 ---
 
@@ -119,6 +175,20 @@ Ollama hasn't pulled that model yet. Run `ollama pull <model>` and make sure
 installed tags — note that `llama3.2` and `llama3.2:latest` are the same thing,
 but `llama3.1` and `llama3.2` are not).
 
+### Cloud model returns an auth error
+
+If you set a `:cloud` model but see an error mentioning auth, unauthorized,
+or a 401/403 response, the local Ollama daemon isn't signed in. Run
+`ollama signin` and try again. You can sanity-check the daemon directly with:
+
+```sh
+curl http://localhost:11434/api/chat \
+  -d '{"model":"minimax-2.5:cloud","messages":[{"role":"user","content":"ping"}],"stream":false}'
+```
+
+If that curl succeeds but NetWatch still errors, the model name in your
+config probably doesn't match the tag exactly.
+
 ### Insights are slow or stale
 
 - The first response after enabling can take 10–30 seconds while the model
@@ -140,13 +210,14 @@ but `llama3.1` and `llama3.2` are not).
 
 ---
 
-## Cloud providers (not yet supported)
+## Non-Ollama cloud providers (not supported)
 
-The codebase currently only speaks the Ollama `/api/chat` protocol. There is
-no API-key handling for OpenAI, Anthropic, or any other cloud LLM. If you need
-cloud provider support, please open an issue describing your use case — it's
-a reasonable addition but intentionally hasn't shipped yet because the
-privacy story of "data stays on your machine" is a feature, not a limitation.
+NetWatch speaks the Ollama `/api/chat` protocol only. Direct integrations
+with OpenAI, Anthropic, Gemini, etc. are not supported — but because Ollama
+itself offers a wide range of hosted `:cloud` models (see
+[Using cloud models](#using-cloud-models)), you can usually get a
+comparable experience without needing a direct provider integration. If
+you specifically need a non-Ollama provider, please open an issue.
 
 ---
 
