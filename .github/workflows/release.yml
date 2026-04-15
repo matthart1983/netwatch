@@ -98,6 +98,7 @@ jobs:
           CC="$PCAP_CC" ./configure \
             --host="$PCAP_HOST" \
             --prefix="$PREFIX" \
+            --with-pcap=linux \
             --disable-shared \
             --disable-dbus \
             --disable-bluetooth \
