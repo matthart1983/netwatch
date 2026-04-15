@@ -11,11 +11,7 @@
     <a href="https://github.com/matthart1983/netwatch/wiki"><img src="https://img.shields.io/badge/docs-Wiki-blue?logo=github" alt="Wiki"></a>
   </p>
   <p align="center">
-    <a title="Tool of The Week on Terminal Trove" href="https://terminaltrove.com/netwatch/">
-      <table align="center"><tr><td bgcolor="#000000" align="center">
-        <img src="https://cdn.terminaltrove.com/media/badges/tool_of_the_week/svg/terminal_trove_tool_of_the_week_gold_transparent.svg" alt="Terminal Trove Tool of The Week" height="54" />
-      </td></tr></table>
-    </a>
+    <a title="Tool of The Week on Terminal Trove" href="https://terminaltrove.com/netwatch/"><img src="terminal_trove_totw_badge.svg" alt="Terminal Trove Tool of The Week" height="54" /></a>
   </p>
 </p>
 
