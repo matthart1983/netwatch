@@ -69,28 +69,31 @@ jobs:
           echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
           echo "LIBPCAP_LIBDIR=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
 
-      - name: Install musl cross toolchain (Linux musl)
+      - name: Install zig + cargo-zigbuild (Linux musl)
         if: contains(matrix.target, 'linux-musl')
         run: |
+          python3 -m pip install --user ziglang cargo-zigbuild
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-musl)  TRIPLE=x86_64-linux-musl ;;
             aarch64-unknown-linux-musl) TRIPLE=aarch64-linux-musl ;;
           esac
-          for i in 1 2 3 4 5; do
-            if wget --tries=2 --timeout=120 --retry-connrefused \
-                 "https://musl.cc/${TRIPLE}-cross.tgz" -O "${TRIPLE}-cross.tgz"; then
-              break
-            fi
-            echo "musl.cc download attempt $i failed, retrying..."
-            sleep 10
-          done
-          test -s "${TRIPLE}-cross.tgz" || { echo "Failed to download musl toolchain"; exit 1; }
-          sudo tar xzf "${TRIPLE}-cross.tgz" -C /opt
-          echo "/opt/${TRIPLE}-cross/bin" >> $GITHUB_PATH
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/${TRIPLE}-gcc" <<EOF
+          #!/bin/sh
+          exec python3 -m ziglang cc -target ${TRIPLE} "\$@"
+          EOF
+          cat > "$HOME/.local/bin/${TRIPLE}-ar" <<EOF
+          #!/bin/sh
+          exec python3 -m ziglang ar "\$@"
+          EOF
+          cat > "$HOME/.local/bin/${TRIPLE}-ranlib" <<EOF
+          #!/bin/sh
+          exec python3 -m ziglang ranlib "\$@"
+          EOF
+          chmod +x "$HOME/.local/bin/${TRIPLE}"-*
           echo "PCAP_CC=${TRIPLE}-gcc" >> $GITHUB_ENV
           echo "PCAP_HOST=${TRIPLE}" >> $GITHUB_ENV
-          CARGO_VAR="CARGO_TARGET_$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')_LINKER"
-          echo "${CARGO_VAR}=${TRIPLE}-gcc" >> $GITHUB_ENV
 
       - name: Build static libpcap (Linux musl)
         if: contains(matrix.target, 'linux-musl')
@@ -126,7 +129,13 @@ jobs:
           echo "LIB=${{ github.workspace }}\npcap-sdk\Lib\x64" >> $env:GITHUB_ENV
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *"linux-musl" ]]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
