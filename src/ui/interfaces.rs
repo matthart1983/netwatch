@@ -42,9 +42,8 @@ fn render_detail_table(f: &mut Frame, app: &App, area: Rect) {
     ])
     .height(1);
 
-    let rows: Vec<Row> = app
-        .traffic
-        .interfaces
+    let interfaces = app.traffic.interfaces();
+    let rows: Vec<Row> = interfaces
         .iter()
         .enumerate()
         .map(|(i, iface)| {
@@ -135,7 +134,7 @@ fn render_detail_table(f: &mut Frame, app: &App, area: Rect) {
 fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
     let selected = app
         .selected_interface
-        .and_then(|i| app.traffic.interfaces.get(i));
+        .and_then(|i| app.traffic.interface_at(i));
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)

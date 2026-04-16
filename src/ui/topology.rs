@@ -151,9 +151,8 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
         format!("{} +{}", iface_names[0], iface_names.len() - 1)
     };
 
-    let total_rx: f64 = app
-        .traffic
-        .interfaces
+    let interfaces = app.traffic.interfaces();
+    let total_rx: f64 = interfaces
         .iter()
         .filter(|i| {
             app.interface_info.iter().any(|info| {
@@ -162,9 +161,7 @@ fn render_topology(f: &mut Frame, app: &App, area: Rect) {
         })
         .map(|i| i.rx_rate)
         .sum();
-    let total_tx: f64 = app
-        .traffic
-        .interfaces
+    let total_tx: f64 = interfaces
         .iter()
         .filter(|i| {
             app.interface_info.iter().any(|info| {

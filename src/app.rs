@@ -425,11 +425,12 @@ impl App {
         let dns = self.network_intel.dns_analytics();
         let alert_history: Vec<_> = self.network_intel.alert_history().iter().cloned().collect();
 
+        let interfaces = self.traffic.interfaces();
         self.incident_recorder.record(
             &packets,
             &connections,
             &health,
-            &self.traffic.interfaces,
+            &interfaces,
             self.process_bandwidth.ranked(),
             &dns,
             &alert_history,
@@ -488,8 +489,8 @@ impl App {
             self.connection_collector.update();
             let conns = self.connection_collector.connections.lock().unwrap();
             self.connection_timeline.update(&conns);
-            self.process_bandwidth
-                .update(&conns, &self.traffic.interfaces);
+            let interfaces = self.traffic.interfaces();
+            self.process_bandwidth.update(&conns, &interfaces);
         }
 
         // Drain eBPF connection events and update RTT monitor
@@ -519,7 +520,8 @@ impl App {
         self.sample_rtt_from_streams();
 
         // Feed interface rates to bandwidth alerts
-        for iface in &self.traffic.interfaces {
+        let interfaces = self.traffic.interfaces();
+        for iface in &interfaces {
             self.network_intel.on_interface_rate(InterfaceRateEvent {
                 iface: iface.name.clone(),
                 rx_bps: iface.rx_rate as u64,
@@ -554,13 +556,10 @@ impl App {
                 .unwrap()
                 .clone();
             let health = self.health_prober.status.lock().unwrap().clone();
-            let (rx_bps, tx_bps) = self
-                .traffic
-                .interfaces
-                .iter()
-                .fold((0.0f64, 0.0f64), |(rx, tx), i| {
-                    (rx + i.rx_rate, tx + i.tx_rate)
-                });
+            let interfaces = self.traffic.interfaces();
+            let (rx_bps, tx_bps) = interfaces.iter().fold((0.0f64, 0.0f64), |(rx, tx), i| {
+                (rx + i.rx_rate, tx + i.tx_rate)
+            });
             let rx_str = crate::ui::widgets::format_bytes_rate(rx_bps);
             let tx_str = crate::ui::widgets::format_bytes_rate(tx_bps);
             let snapshot = crate::collectors::insights::NetworkSnapshot::build(
@@ -932,7 +931,7 @@ fn scroll_tab(app: &mut App, delta: isize) {
                 clamp_scroll(app.scroll.insights_scroll, delta, usize::MAX);
         }
         Tab::Dashboard | Tab::Interfaces => {
-            let max = app.traffic.interfaces.len().saturating_sub(1);
+            let max = app.traffic.interface_count().saturating_sub(1);
             app.selected_interface = match (app.selected_interface, delta < 0) {
                 (Some(0) | None, true) => None,
                 (None, false) => Some(0_usize.min(max)),
@@ -1247,13 +1246,10 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 let packets = app.packet_collector.get_packets();
                 let conns = app.connection_collector.connections.lock().unwrap().clone();
                 let health = app.health_prober.status.lock().unwrap().clone();
-                let (rx_bps, tx_bps) = app
-                    .traffic
-                    .interfaces
-                    .iter()
-                    .fold((0.0f64, 0.0f64), |(rx, tx), i| {
-                        (rx + i.rx_rate, tx + i.tx_rate)
-                    });
+                let interfaces = app.traffic.interfaces();
+                let (rx_bps, tx_bps) = interfaces.iter().fold((0.0f64, 0.0f64), |(rx, tx), i| {
+                    (rx + i.rx_rate, tx + i.tx_rate)
+                });
                 let rx_str = crate::ui::widgets::format_bytes_rate(rx_bps);
                 let tx_str = crate::ui::widgets::format_bytes_rate(tx_bps);
                 let snapshot = crate::collectors::insights::NetworkSnapshot::build(
