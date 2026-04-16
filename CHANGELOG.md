@@ -2,6 +2,9 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+- Move interface stat collection to a background thread so that netwatch is more responsive on Windows.
+
 ## [0.10.0] - 2026-04-11
 
 ### Added
