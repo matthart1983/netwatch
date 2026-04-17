@@ -702,7 +702,7 @@ fn build_connection_filter(conn: &Connection) -> String {
     parts.join(" and ")
 }
 
-pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
+pub async fn run<B: Backend>(terminal: &mut Terminal<B>, remote: Option<&crate::remote::RemotePublisher>) -> Result<()> {
     let mut app = App::new();
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
     let mut events = EventHandler::new(tick_rate);
@@ -760,6 +760,11 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
             }
             AppEvent::Tick => {
                 app.tick();
+                if let Some(publisher) = remote {
+                    let conn_count = app.connection_collector.connections.lock()
+                        .map(|c| c.len()).unwrap_or(0);
+                    publisher.update(&app.traffic.interfaces, &app.health_prober, conn_count);
+                }
             }
         }
     }
