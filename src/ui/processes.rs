@@ -63,13 +63,13 @@ fn render_process_table(f: &mut Frame, app: &App, area: Rect) {
                         .unwrap_or_else(|| "—".into()),
                 ),
                 Cell::from(proc.connection_count.to_string()),
-                Cell::from(widgets::format_bytes_rate(proc.rx_rate))
+                Cell::from(widgets::format_bytes_rate_padded(proc.rx_rate))
                     .style(Style::default().fg(app.theme.rx_rate)),
-                Cell::from(widgets::format_bytes_rate(proc.tx_rate))
+                Cell::from(widgets::format_bytes_rate_padded(proc.tx_rate))
                     .style(Style::default().fg(app.theme.tx_rate)),
-                Cell::from(widgets::format_bytes_rate(proc.rx_rate + proc.tx_rate)),
-                Cell::from(widgets::format_bytes_total(proc.rx_bytes)),
-                Cell::from(widgets::format_bytes_total(proc.tx_bytes)),
+                Cell::from(widgets::format_bytes_rate_padded(proc.rx_rate + proc.tx_rate)),
+                Cell::from(widgets::format_bytes_total_padded(proc.rx_bytes)),
+                Cell::from(widgets::format_bytes_total_padded(proc.tx_bytes)),
             ])
             .style(row_style)
         })

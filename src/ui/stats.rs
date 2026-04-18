@@ -122,10 +122,10 @@ fn render_protocol_table(f: &mut Frame, app: &App, stats: &Stats, area: Rect) {
 
             Row::new(vec![
                 Cell::from(ps.protocol.clone()).style(proto_style),
-                Cell::from(format!("{}", ps.packets)),
-                Cell::from(format!("{:.1}%", pkt_pct)),
-                Cell::from(widgets::format_bytes_total(ps.bytes)),
-                Cell::from(format!("{:.1}%", byte_pct)),
+                Cell::from(format!("{:>8}", ps.packets)),
+                Cell::from(format!("{:>4}%", pkt_pct.round() as u64)),
+                Cell::from(widgets::format_bytes_total_padded(ps.bytes)),
+                Cell::from(format!("{:>4}%", byte_pct.round() as u64)),
                 Cell::from(bar_visual(pkt_pct)).style(proto_style),
             ])
         })

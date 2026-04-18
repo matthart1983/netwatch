@@ -147,12 +147,12 @@ fn render_interface_table(f: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 name_cell,
                 Cell::from(ip),
-                Cell::from(widgets::format_bytes_rate(iface.rx_rate))
+                Cell::from(widgets::format_bytes_rate_padded(iface.rx_rate))
                     .style(Style::default().fg(app.theme.rx_rate)),
-                Cell::from(widgets::format_bytes_rate(iface.tx_rate))
+                Cell::from(widgets::format_bytes_rate_padded(iface.tx_rate))
                     .style(Style::default().fg(app.theme.tx_rate)),
-                Cell::from(widgets::format_bytes_total(iface.rx_bytes_total)),
-                Cell::from(widgets::format_bytes_total(iface.tx_bytes_total)),
+                Cell::from(widgets::format_bytes_total_padded(iface.rx_bytes_total)),
+                Cell::from(widgets::format_bytes_total_padded(iface.tx_bytes_total)),
                 Cell::from(if is_up { "UP" } else { "DOWN" }).style(status_style),
             ])
             .style(row_style)

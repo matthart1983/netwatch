@@ -48,7 +48,7 @@ pub struct NetwatchConfig {
     /// AI insights endpoint: "local" → http://localhost:11434, or a full base URL
     pub insights_endpoint: String,
 
-    /// Color theme (dark, light, solarized, dracula, nord)
+    /// Color theme (dark, light, ocean, solarized, dracula, nord)
     pub theme: String,
 }
 

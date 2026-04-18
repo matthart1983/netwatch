@@ -29,28 +29,56 @@ pub fn frame_layout(area: Rect) -> FrameChunks {
     }
 }
 
+/// Fixed column width for rate strings (e.g. "999 MB/s"). Right-aligned.
+pub const RATE_WIDTH: usize = 8;
+
+/// Fixed column width for total byte strings (e.g. "999 MB"). Right-aligned.
+pub const TOTAL_WIDTH: usize = 6;
+
+/// Unpadded rate for inline use. Zero → "-", integers only.
 pub fn format_bytes_rate(bytes_per_sec: f64) -> String {
-    if bytes_per_sec >= 1_000_000_000.0 {
-        format!("{:.1} GB/s", bytes_per_sec / 1_000_000_000.0)
-    } else if bytes_per_sec >= 1_000_000.0 {
-        format!("{:.1} MB/s", bytes_per_sec / 1_000_000.0)
-    } else if bytes_per_sec >= 1_000.0 {
-        format!("{:.1} KB/s", bytes_per_sec / 1_000.0)
-    } else {
-        format!("{:.0}  B/s", bytes_per_sec)
+    if bytes_per_sec < 1.0 {
+        return "-".to_string();
     }
+    let (val, unit) = if bytes_per_sec >= 1_000_000_000.0 {
+        (bytes_per_sec / 1_000_000_000.0, "GB/s")
+    } else if bytes_per_sec >= 1_000_000.0 {
+        (bytes_per_sec / 1_000_000.0, "MB/s")
+    } else if bytes_per_sec >= 1_000.0 {
+        (bytes_per_sec / 1_000.0, "KB/s")
+    } else {
+        (bytes_per_sec, "B/s")
+    };
+    let rounded = val.round().max(1.0) as u64;
+    format!("{} {}", rounded, unit)
 }
 
+/// Right-aligned rate for table cells. Fixed width [`RATE_WIDTH`].
+pub fn format_bytes_rate_padded(bytes_per_sec: f64) -> String {
+    format!("{:>width$}", format_bytes_rate(bytes_per_sec), width = RATE_WIDTH)
+}
+
+/// Unpadded byte total for inline use. Zero → "-", integers only.
 pub fn format_bytes_total(bytes: u64) -> String {
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
-    } else if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
-    } else if bytes >= 1_000 {
-        format!("{:.1} KB", bytes as f64 / 1_000.0)
-    } else {
-        format!("{} B", bytes)
+    if bytes == 0 {
+        return "-".to_string();
     }
+    let (val, unit) = if bytes >= 1_000_000_000 {
+        (bytes as f64 / 1_000_000_000.0, "GB")
+    } else if bytes >= 1_000_000 {
+        (bytes as f64 / 1_000_000.0, "MB")
+    } else if bytes >= 1_000 {
+        (bytes as f64 / 1_000.0, "KB")
+    } else {
+        (bytes as f64, "B")
+    };
+    let rounded = val.round().max(1.0) as u64;
+    format!("{} {}", rounded, unit)
+}
+
+/// Right-aligned byte total for table cells. Fixed width [`TOTAL_WIDTH`].
+pub fn format_bytes_total_padded(bytes: u64) -> String {
+    format!("{:>width$}", format_bytes_total(bytes), width = TOTAL_WIDTH)
 }
 
 const BASE_TABS: &[Tab] = &[

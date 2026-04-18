@@ -36,11 +36,12 @@ pub struct Theme {
 
 // ── Built-in themes ────────────────────────────────────────
 
-pub const THEME_NAMES: &[&str] = &["dark", "light", "solarized", "dracula", "nord"];
+pub const THEME_NAMES: &[&str] = &["dark", "light", "ocean", "solarized", "dracula", "nord"];
 
 pub fn by_name(name: &str) -> Theme {
     match name.to_lowercase().as_str() {
         "light" => light(),
+        "ocean" => ocean(),
         "solarized" => solarized(),
         "dracula" => dracula(),
         "nord" => nord(),
@@ -93,6 +94,44 @@ pub fn light() -> Theme {
         key_hint: Color::Rgb(180, 100, 0),
         selection_bg: Color::Rgb(220, 230, 240),
         highlight_bg: Color::Rgb(200, 215, 230),
+    }
+}
+
+/// For Terminal.app's "Ocean" profile (bg #224FBC).
+/// Colors are taken from Apple's Terminal.app default ANSI palette (Ocean
+/// inherits it — the profile plist only overrides bg, text, and selection).
+/// Bright variants are preferred for legibility on the deep blue bg.
+/// Blue/magenta ANSI slots are avoided since they clash with the bg.
+pub fn ocean() -> Theme {
+    // Apple Terminal.app default ANSI palette
+    let bright_black = Color::Rgb(0x81, 0x83, 0x83);
+    let white = Color::Rgb(0xCB, 0xCC, 0xCD);
+    let bright_white = Color::Rgb(0xFF, 0xFF, 0xFF); // Ocean's TextColor
+    let bright_red = Color::Rgb(0xFC, 0x39, 0x1F);
+    let bright_green = Color::Rgb(0x31, 0xE7, 0x22);
+    let bright_yellow = Color::Rgb(0xEA, 0xEC, 0x23);
+    let bright_cyan = Color::Rgb(0x14, 0xF0, 0xF0);
+
+    Theme {
+        name: "ocean",
+        brand: bright_cyan,
+        active_tab: bright_white,
+        inactive_tab: white,
+        border: bright_black,
+        separator: bright_black,
+        text_primary: bright_white,
+        text_secondary: white,
+        text_muted: bright_black,
+        text_inverse: Color::Rgb(0, 0, 0),
+        status_good: bright_green,
+        status_warn: bright_yellow,
+        status_error: bright_red,
+        status_info: bright_cyan,
+        rx_rate: bright_green,
+        tx_rate: bright_cyan,
+        key_hint: bright_yellow,
+        selection_bg: Color::Rgb(0x21, 0x6D, 0xFF), // Ocean's SelectionColor
+        highlight_bg: Color::Rgb(0x3A, 0x6B, 0xE8),
     }
 }
 
@@ -234,7 +273,7 @@ mod tests {
 
     #[test]
     fn theme_names_count() {
-        assert_eq!(THEME_NAMES.len(), 5);
+        assert_eq!(THEME_NAMES.len(), 6);
     }
 
     #[test]

@@ -91,9 +91,9 @@ fn render_detail_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(ipv6),
                 Cell::from(mac),
                 Cell::from(mtu),
-                Cell::from(widgets::format_bytes_rate(iface.rx_rate))
+                Cell::from(widgets::format_bytes_rate_padded(iface.rx_rate))
                     .style(Style::default().fg(Color::Green)),
-                Cell::from(widgets::format_bytes_rate(iface.tx_rate))
+                Cell::from(widgets::format_bytes_rate_padded(iface.tx_rate))
                     .style(Style::default().fg(Color::Blue)),
                 Cell::from(iface.rx_packets.to_string()),
                 Cell::from(iface.tx_packets.to_string()),
