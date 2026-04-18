@@ -2,6 +2,12 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.12.2] - 2026-04-18
+
+### Changed
+- **Ocean theme — readable muted text** — `text_muted` in the Ocean theme is now a lighter neutral (#B5B6B7) so secondary labels (group headers, units, etc.) are legible against the `#224FBC` background. The previous value (Apple's bright-black slot, #818383) failed WCAG AA contrast.
+- **Dashboard hides Interfaces panel when only one interface exists** — On single-interface systems, the Interfaces table collapses and Top Connections expands to fill the reclaimed space, showing more rows.
+
 ## [0.12.1] - 2026-04-18
 
 ### Added

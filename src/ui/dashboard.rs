@@ -19,14 +19,27 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     } else {
         0
     };
+    // Hide the Interfaces table when there's only one — reclaim the space
+    // for Top Connections so it expands to fit more rows.
+    let single_interface = app.traffic.interfaces().len() <= 1;
+    let interface_height = if single_interface {
+        Constraint::Length(0)
+    } else {
+        Constraint::Min(6)
+    };
+    let top_connections_height = if single_interface {
+        Constraint::Min(7)
+    } else {
+        Constraint::Length(7)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),            // header
             Constraint::Length(alert_height), // alerts (0 if none)
-            Constraint::Min(6),               // interface table
+            interface_height,                 // interface table (hidden if only one iface)
             Constraint::Length(chart_height), // bandwidth graph or per-iface sparkline
-            Constraint::Length(7),            // top connections
+            top_connections_height,           // top connections
             Constraint::Length(4),            // health status
             Constraint::Length(4),            // latency heatmap
             Constraint::Length(3),            // footer
@@ -37,7 +50,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     if alert_count > 0 {
         render_alerts(f, app, chunks[1]);
     }
-    render_interface_table(f, app, chunks[2]);
+    if !single_interface {
+        render_interface_table(f, app, chunks[2]);
+    }
     if app.selected_interface.is_some() {
         render_sparkline(f, app, chunks[3]);
     } else {
@@ -322,11 +337,12 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
     ])
     .height(1);
 
+    let max_rows = (area.height as usize).saturating_sub(3).max(1);
     let conns = app.connection_collector.connections.lock().unwrap();
     let rows: Vec<Row> = conns
         .iter()
         .filter(|c| c.state == "ESTABLISHED")
-        .take(5)
+        .take(max_rows)
         .map(|conn| {
             Row::new(vec![
                 Cell::from(conn.process_name.as_deref().unwrap_or("—").to_string()),

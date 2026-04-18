@@ -111,6 +111,10 @@ pub fn ocean() -> Theme {
     let bright_green = Color::Rgb(0x31, 0xE7, 0x22);
     let bright_yellow = Color::Rgb(0xEA, 0xEC, 0x23);
     let bright_cyan = Color::Rgb(0x14, 0xF0, 0xF0);
+    // bright_black (#818383) on the Ocean bg (#224FBC) is below WCAG AA;
+    // use a lighter neutral for muted text. Chrome (borders/separators)
+    // keeps bright_black since low contrast is desirable there.
+    let muted_readable = Color::Rgb(0xB5, 0xB6, 0xB7);
 
     Theme {
         name: "ocean",
@@ -121,7 +125,7 @@ pub fn ocean() -> Theme {
         separator: bright_black,
         text_primary: bright_white,
         text_secondary: white,
-        text_muted: bright_black,
+        text_muted: muted_readable,
         text_inverse: Color::Rgb(0, 0, 0),
         status_good: bright_green,
         status_warn: bright_yellow,
