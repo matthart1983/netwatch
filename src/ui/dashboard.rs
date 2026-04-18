@@ -19,27 +19,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     } else {
         0
     };
-    // Hide the Interfaces table when there's only one — reclaim the space
-    // for Top Connections so it expands to fit more rows.
-    let single_interface = app.traffic.interfaces().len() <= 1;
-    let interface_height = if single_interface {
-        Constraint::Length(0)
-    } else {
-        Constraint::Min(6)
-    };
-    let top_connections_height = if single_interface {
-        Constraint::Min(7)
-    } else {
-        Constraint::Length(7)
-    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),            // header
             Constraint::Length(alert_height), // alerts (0 if none)
-            interface_height,                 // interface table (hidden if only one iface)
+            Constraint::Min(6),               // interface table
             Constraint::Length(chart_height), // bandwidth graph or per-iface sparkline
-            top_connections_height,           // top connections
+            Constraint::Length(7),            // top connections
             Constraint::Length(4),            // health status
             Constraint::Length(4),            // latency heatmap
             Constraint::Length(3),            // footer
@@ -50,9 +37,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     if alert_count > 0 {
         render_alerts(f, app, chunks[1]);
     }
-    if !single_interface {
-        render_interface_table(f, app, chunks[2]);
-    }
+    render_interface_table(f, app, chunks[2]);
     if app.selected_interface.is_some() {
         render_sparkline(f, app, chunks[3]);
     } else {

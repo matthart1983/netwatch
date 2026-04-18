@@ -104,7 +104,6 @@ pub fn light() -> Theme {
 /// Blue/magenta ANSI slots are avoided since they clash with the bg.
 pub fn ocean() -> Theme {
     // Apple Terminal.app default ANSI palette
-    let bright_black = Color::Rgb(0x81, 0x83, 0x83);
     let white = Color::Rgb(0xCB, 0xCC, 0xCD);
     let bright_white = Color::Rgb(0xFF, 0xFF, 0xFF); // Ocean's TextColor
     let bright_red = Color::Rgb(0xFC, 0x39, 0x1F);
@@ -112,8 +111,8 @@ pub fn ocean() -> Theme {
     let bright_yellow = Color::Rgb(0xEA, 0xEC, 0x23);
     let bright_cyan = Color::Rgb(0x14, 0xF0, 0xF0);
     // bright_black (#818383) on the Ocean bg (#224FBC) is below WCAG AA;
-    // use a lighter neutral for muted text. Chrome (borders/separators)
-    // keeps bright_black since low contrast is desirable there.
+    // use a lighter neutral for muted text and chrome (borders, separators)
+    // so group-box outlines stay legible.
     let muted_readable = Color::Rgb(0xB5, 0xB6, 0xB7);
 
     Theme {
@@ -121,8 +120,8 @@ pub fn ocean() -> Theme {
         brand: bright_cyan,
         active_tab: bright_white,
         inactive_tab: white,
-        border: bright_black,
-        separator: bright_black,
+        border: muted_readable,
+        separator: muted_readable,
         text_primary: bright_white,
         text_secondary: white,
         text_muted: muted_readable,

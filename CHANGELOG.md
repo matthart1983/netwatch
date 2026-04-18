@@ -2,6 +2,14 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.12.3] - 2026-04-19
+
+### Changed
+- **Ocean theme — readable group-box borders** — In addition to muted text, group-box borders and separators now use the lighter `#B5B6B7` neutral so panel outlines stay legible on the `#224FBC` background.
+
+### Reverted
+- **Dashboard single-interface collapse** — The v0.12.2 behaviour that hid the Interfaces table on single-interface systems is reverted. In practice almost every machine has `lo0` and other virtual interfaces alongside the physical one, which are useful for diagnostics, so hiding the table was rarely correct.
+
 ## [0.12.2] - 2026-04-18
 
 ### Changed
