@@ -937,10 +937,7 @@ mod tests {
     fn parse_host_port_ipv6_unbracketed() {
         // ss -n occasionally emits unbracketed IPv6 with the last colon as
         // the port separator.
-        assert_eq!(
-            parse_host_port("fe80::1:22"),
-            Some(("fe80::1".into(), 22))
-        );
+        assert_eq!(parse_host_port("fe80::1:22"), Some(("fe80::1".into(), 22)));
     }
 
     #[test]
@@ -960,13 +957,7 @@ mod tests {
 
     #[test]
     fn connection_stream_key_orients_local() {
-        let conn = make_conn(
-            "TCP",
-            "10.0.0.2:50000",
-            "1.1.1.1:443",
-            "ESTABLISHED",
-            42,
-        );
+        let conn = make_conn("TCP", "10.0.0.2:50000", "1.1.1.1:443", "ESTABLISHED", 42);
         let (key, side) = connection_stream_key(&conn).expect("canonicalized");
         // StreamKey sorts addr_a <= addr_b. 1.1.1.1 < 10.0.0.2 alphabetically,
         // so 1.1.1.1 is addr_a and our local (10.0.0.2) is addr_b.

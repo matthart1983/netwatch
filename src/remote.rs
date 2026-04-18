@@ -5,9 +5,9 @@ use std::time::Duration;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::collectors::connections::ConnectionCollector;
 use crate::collectors::health::HealthProber;
 use crate::collectors::traffic::InterfaceTraffic;
-use crate::collectors::connections::ConnectionCollector;
 
 pub struct RemoteConfig {
     pub url: String,
@@ -99,7 +99,9 @@ impl RemotePublisher {
             })
         };
 
-        let conn_count = connections.connections.lock()
+        let conn_count = connections
+            .connections
+            .lock()
             .map(|c| c.len() as u32)
             .unwrap_or(0);
 
@@ -129,24 +131,30 @@ fn collect_host_info(host_id: Uuid) -> serde_json::Value {
     let (os, cpu_model, cpu_cores, memory_total) = if cfg!(target_os = "macos") {
         let os = Some("macOS".to_string());
         let cpu = run_cmd("sysctl", &["-n", "machdep.cpu.brand_string"]);
-        let cores: Option<u32> = run_cmd("sysctl", &["-n", "hw.ncpu"])
-            .and_then(|s| s.parse().ok());
-        let mem: Option<u64> = run_cmd("sysctl", &["-n", "hw.memsize"])
-            .and_then(|s| s.parse().ok());
+        let cores: Option<u32> = run_cmd("sysctl", &["-n", "hw.ncpu"]).and_then(|s| s.parse().ok());
+        let mem: Option<u64> =
+            run_cmd("sysctl", &["-n", "hw.memsize"]).and_then(|s| s.parse().ok());
         (os, cpu, cores, mem)
     } else {
-        let os = std::fs::read_to_string("/etc/os-release").ok().and_then(|s| {
-            s.lines().find(|l| l.starts_with("PRETTY_NAME="))
-                .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
-        });
+        let os = std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|s| {
+                s.lines().find(|l| l.starts_with("PRETTY_NAME=")).map(|l| {
+                    l.trim_start_matches("PRETTY_NAME=")
+                        .trim_matches('"')
+                        .to_string()
+                })
+            });
         let cpu = std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| {
-            s.lines().find(|l| l.starts_with("model name"))
+            s.lines()
+                .find(|l| l.starts_with("model name"))
                 .and_then(|l| l.split(':').nth(1))
                 .map(|s| s.trim().to_string())
         });
         let cores: Option<u32> = run_cmd("nproc", &[]).and_then(|s| s.parse().ok());
         let mem = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
-            s.lines().find(|l| l.starts_with("MemTotal:"))
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(|kb| kb * 1024)
@@ -175,13 +183,14 @@ fn collect_system_metrics() -> serde_json::Value {
 
 fn collect_system_macos() -> serde_json::Value {
     let load = run_cmd("sysctl", &["-n", "vm.loadavg"]).unwrap_or_default();
-    let loads: Vec<f64> = load.trim_matches(|c: char| c == '{' || c == '}')
+    let loads: Vec<f64> = load
+        .trim_matches(|c: char| c == '{' || c == '}')
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    let mem_total: Option<u64> = run_cmd("sysctl", &["-n", "hw.memsize"])
-        .and_then(|s| s.parse().ok());
+    let mem_total: Option<u64> =
+        run_cmd("sysctl", &["-n", "hw.memsize"]).and_then(|s| s.parse().ok());
 
     let vm_stat = run_cmd("vm_stat", &[]).unwrap_or_default();
     let page_size: u64 = 16384; // Apple Silicon default
@@ -193,29 +202,54 @@ fn collect_system_macos() -> serde_json::Value {
 
     for line in vm_stat.lines() {
         let val = || -> Option<u64> {
-            line.split(':').nth(1)?.trim().trim_end_matches('.').parse().ok()
+            line.split(':')
+                .nth(1)?
+                .trim()
+                .trim_end_matches('.')
+                .parse()
+                .ok()
         };
-        if line.starts_with("Pages free") { free_pages = val().unwrap_or(0); }
-        if line.starts_with("Pages active") { active_pages = val().unwrap_or(0); }
-        if line.starts_with("Pages inactive") { inactive_pages = val().unwrap_or(0); }
-        if line.starts_with("Pages speculative") { speculative_pages = val().unwrap_or(0); }
-        if line.starts_with("Pages wired") { wired_pages = val().unwrap_or(0); }
+        if line.starts_with("Pages free") {
+            free_pages = val().unwrap_or(0);
+        }
+        if line.starts_with("Pages active") {
+            active_pages = val().unwrap_or(0);
+        }
+        if line.starts_with("Pages inactive") {
+            inactive_pages = val().unwrap_or(0);
+        }
+        if line.starts_with("Pages speculative") {
+            speculative_pages = val().unwrap_or(0);
+        }
+        if line.starts_with("Pages wired") {
+            wired_pages = val().unwrap_or(0);
+        }
     }
 
     let available = (free_pages + inactive_pages + speculative_pages) * page_size;
     let used = (active_pages + wired_pages) * page_size;
 
-    let cpu_pct = run_cmd("sh", &["-c", "top -l 1 -n 0 2>/dev/null | grep 'CPU usage' | awk '{print $3}' | tr -d '%'"])
-        .and_then(|s| s.parse::<f64>().ok());
+    let cpu_pct = run_cmd(
+        "sh",
+        &[
+            "-c",
+            "top -l 1 -n 0 2>/dev/null | grep 'CPU usage' | awk '{print $3}' | tr -d '%'",
+        ],
+    )
+    .and_then(|s| s.parse::<f64>().ok());
 
     let swap = run_cmd("sysctl", &["-n", "vm.swapusage"]).unwrap_or_default();
-    let swap_total: Option<u64> = swap.split_whitespace()
+    let swap_total: Option<u64> = swap
+        .split_whitespace()
         .zip(swap.split_whitespace().skip(1))
         .find(|(_, v)| v.contains('M') || v.contains('G'))
         .and_then(|(_, v)| parse_size(v));
     let swap_used: Option<u64> = {
         let parts: Vec<&str> = swap.split("used =").collect();
-        parts.get(1).and_then(|s| s.split_whitespace().next()).and_then(|v| parse_size(v))
+        parts
+            .get(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|v| parse_size(v))
     };
 
     json!({
@@ -233,14 +267,16 @@ fn collect_system_macos() -> serde_json::Value {
 
 fn collect_system_linux() -> serde_json::Value {
     let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
-    let loads: Vec<f64> = loadavg.split_whitespace()
+    let loads: Vec<f64> = loadavg
+        .split_whitespace()
         .take(3)
         .filter_map(|s| s.parse().ok())
         .collect();
 
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let mem_val = |key: &str| -> Option<u64> {
-        meminfo.lines()
+        meminfo
+            .lines()
             .find(|l| l.starts_with(key))
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse::<u64>().ok())
@@ -262,13 +298,22 @@ fn collect_system_linux() -> serde_json::Value {
 
     let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
     let cpu_pct = stat.lines().next().and_then(|line| {
-        let vals: Vec<u64> = line.split_whitespace().skip(1)
-            .filter_map(|s| s.parse().ok()).collect();
+        let vals: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|s| s.parse().ok())
+            .collect();
         if vals.len() >= 4 {
             let total: u64 = vals.iter().sum();
             let idle = vals[3];
-            if total > 0 { Some(((total - idle) as f64 / total as f64) * 100.0) } else { None }
-        } else { None }
+            if total > 0 {
+                Some(((total - idle) as f64 / total as f64) * 100.0)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     });
 
     json!({
@@ -286,32 +331,47 @@ fn collect_system_linux() -> serde_json::Value {
 
 fn collect_disk_usage() -> Vec<serde_json::Value> {
     let output = run_cmd("df", &["-k"]).unwrap_or_default();
-    output.lines().skip(1).filter_map(|line| {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 { return None; }
-        let device = parts[0];
-        if device.starts_with("devfs") || device == "map" || device.starts_with("none") { return None; }
-        let mount_hint = parts.last().unwrap_or(&"");
-        if mount_hint.starts_with("/Volumes/") || mount_hint.starts_with("/System/Volumes/") || mount_hint.starts_with("/private/") { return None; }
-        let total: u64 = parts[1].parse::<u64>().ok()? * 1024;
-        let used: u64 = parts[2].parse::<u64>().ok()? * 1024;
-        let available: u64 = parts[3].parse::<u64>().ok()? * 1024;
-        let mount = if cfg!(target_os = "macos") && parts.len() >= 9 {
-            parts[8..].join(" ")
-        } else {
-            parts.last()?.to_string()
-        };
-        if total == 0 { return None; }
-        let pct = (used as f64 / total as f64) * 100.0;
-        Some(json!({
-            "mount_point": mount,
-            "device": device,
-            "total_bytes": total,
-            "used_bytes": used,
-            "available_bytes": available,
-            "usage_pct": pct,
-        }))
-    }).collect()
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 6 {
+                return None;
+            }
+            let device = parts[0];
+            if device.starts_with("devfs") || device == "map" || device.starts_with("none") {
+                return None;
+            }
+            let mount_hint = parts.last().unwrap_or(&"");
+            if mount_hint.starts_with("/Volumes/")
+                || mount_hint.starts_with("/System/Volumes/")
+                || mount_hint.starts_with("/private/")
+            {
+                return None;
+            }
+            let total: u64 = parts[1].parse::<u64>().ok()? * 1024;
+            let used: u64 = parts[2].parse::<u64>().ok()? * 1024;
+            let available: u64 = parts[3].parse::<u64>().ok()? * 1024;
+            let mount = if cfg!(target_os = "macos") && parts.len() >= 9 {
+                parts[8..].join(" ")
+            } else {
+                parts.last()?.to_string()
+            };
+            if total == 0 {
+                return None;
+            }
+            let pct = (used as f64 / total as f64) * 100.0;
+            Some(json!({
+                "mount_point": mount,
+                "device": device,
+                "total_bytes": total,
+                "used_bytes": used,
+                "available_bytes": available,
+                "usage_pct": pct,
+            }))
+        })
+        .collect()
 }
 
 fn collect_tcp_states(connections: &ConnectionCollector) -> (u32, u32) {
@@ -342,7 +402,9 @@ fn parse_size(s: &str) -> Option<u64> {
     if let Some(v) = s.strip_suffix('M') {
         v.parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0) as u64)
     } else if let Some(v) = s.strip_suffix('G') {
-        v.parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0 * 1024.0) as u64)
+        v.parse::<f64>()
+            .ok()
+            .map(|v| (v * 1024.0 * 1024.0 * 1024.0) as u64)
     } else {
         s.parse().ok()
     }

@@ -20,9 +20,9 @@ use crate::ui;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::prelude::*;
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 
 const RTT_SPARKLINE_SAMPLES: usize = 20;
 const PAGE_SCROLL: usize = 10;
@@ -707,7 +707,10 @@ fn build_connection_filter(conn: &Connection) -> String {
     parts.join(" and ")
 }
 
-pub async fn run<B: Backend>(terminal: &mut Terminal<B>, remote: Option<&crate::remote::RemotePublisher>) -> Result<()> {
+pub async fn run<B: Backend>(
+    terminal: &mut Terminal<B>,
+    remote: Option<&crate::remote::RemotePublisher>,
+) -> Result<()> {
     let mut app = App::new();
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
     let mut events = EventHandler::new(tick_rate);
@@ -766,7 +769,11 @@ pub async fn run<B: Backend>(terminal: &mut Terminal<B>, remote: Option<&crate::
             AppEvent::Tick => {
                 app.tick();
                 if let Some(publisher) = remote {
-                    publisher.update(&app.traffic.interfaces(), &app.health_prober, &app.connection_collector);
+                    publisher.update(
+                        &app.traffic.interfaces(),
+                        &app.health_prober,
+                        &app.connection_collector,
+                    );
                 }
             }
         }

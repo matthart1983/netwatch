@@ -42,14 +42,22 @@ async fn main() -> Result<()> {
     }
 
     // Parse --remote and --api-key for optional metrics streaming
-    let remote_url = args.windows(2).find(|w| w[0] == "--remote").map(|w| w[1].clone());
-    let api_key = args.windows(2).find(|w| w[0] == "--api-key").map(|w| w[1].clone());
+    let remote_url = args
+        .windows(2)
+        .find(|w| w[0] == "--remote")
+        .map(|w| w[1].clone());
+    let api_key = args
+        .windows(2)
+        .find(|w| w[0] == "--api-key")
+        .map(|w| w[1].clone());
 
     let remote_publisher = match (remote_url, api_key) {
         (Some(url), Some(key)) => {
-            let publisher = netwatch::remote::RemotePublisher::new(
-                netwatch::remote::RemoteConfig { url, api_key: key },
-            );
+            let publisher =
+                netwatch::remote::RemotePublisher::new(netwatch::remote::RemoteConfig {
+                    url,
+                    api_key: key,
+                });
             publisher.start();
             Some(publisher)
         }
