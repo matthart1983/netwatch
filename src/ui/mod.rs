@@ -6,6 +6,7 @@ pub mod interfaces;
 pub mod packets;
 pub mod processes;
 pub mod settings;
+pub mod sort_picker;
 pub mod stats;
 pub mod timeline;
 pub mod topology;

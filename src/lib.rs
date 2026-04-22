@@ -5,6 +5,7 @@ pub mod ebpf;
 pub mod event;
 pub mod platform;
 pub mod remote;
+pub mod sort;
 pub mod theme;
 pub mod ui;
 
