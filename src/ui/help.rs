@@ -104,13 +104,16 @@ fn build_help_lines() -> Vec<Line<'static>> {
         "t",
         "Cycle theme (dark/light/solarized/dracula/nord)",
     ));
-    lines.push(key_line(",", "Open settings menu (←→ to cycle theme)"));
+    lines.push(key_line(
+        ",",
+        "Open settings menu (←→ / h/l to cycle theme)",
+    ));
     lines.push(key_line("PgUp/PgDn", "Scroll lists by a page"));
     lines.push(Line::raw(""));
 
     // DASHBOARD
     lines.push(section_header("DASHBOARD (Tab 1)"));
-    lines.push(key_line("↑↓", "Select interface"));
+    lines.push(key_line("↑↓ / j/k", "Select interface"));
     lines.push(key_line("s", "Open sort picker"));
     lines.push(Line::raw(""));
 
@@ -125,7 +128,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
 
     // CONNECTIONS
     lines.push(section_header("CONNECTIONS (Tab 2)"));
-    lines.push(key_line("↑↓", "Scroll connection list"));
+    lines.push(key_line("↑↓ / j/k", "Scroll connection list"));
     lines.push(key_line("s", "Open sort picker"));
     lines.push(key_line(
         "/",
@@ -149,13 +152,13 @@ fn build_help_lines() -> Vec<Line<'static>> {
 
     // INTERFACES
     lines.push(section_header("INTERFACES (Tab 3)"));
-    lines.push(key_line("↑↓", "Select interface"));
+    lines.push(key_line("↑↓ / j/k", "Select interface"));
     lines.push(key_line("s", "Open sort picker"));
     lines.push(Line::raw(""));
 
     // PACKETS
     lines.push(section_header("PACKETS (Tab 4)"));
-    lines.push(key_line("↑↓", "Scroll packet list"));
+    lines.push(key_line("↑↓ / j/k", "Scroll packet list"));
     lines.push(key_line("Enter", "Select packet at cursor"));
     lines.push(key_line("c", "Start/stop capture"));
     lines.push(key_line(
@@ -181,7 +184,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     // STREAM VIEW
     lines.push(section_header("STREAM VIEW (in Packets tab)"));
     lines.push(key_line("Esc", "Close stream view"));
-    lines.push(key_line("↑↓", "Scroll stream content"));
+    lines.push(key_line("↑↓ / j/k", "Scroll stream content"));
     lines.push(key_line("→←", "Filter direction (A→B / B→A)"));
     lines.push(key_line("a", "Show both directions"));
     lines.push(key_line("h", "Toggle hex/text mode"));
@@ -189,12 +192,12 @@ fn build_help_lines() -> Vec<Line<'static>> {
 
     // STATS
     lines.push(section_header("STATS (Tab 5)"));
-    lines.push(key_line("↑↓", "Scroll protocol list"));
+    lines.push(key_line("↑↓ / j/k", "Scroll protocol list"));
     lines.push(Line::raw(""));
 
     // TOPOLOGY
     lines.push(section_header("TOPOLOGY (Tab 6)"));
-    lines.push(key_line("↑↓", "Scroll topology view"));
+    lines.push(key_line("↑↓ / j/k", "Scroll topology view"));
     lines.push(key_line("Enter", "Jump to Connections tab"));
     lines.push(key_line("T", "Traceroute to selected remote host"));
     lines.push(key_line("Esc", "Close traceroute overlay"));
@@ -202,14 +205,14 @@ fn build_help_lines() -> Vec<Line<'static>> {
 
     // TIMELINE
     lines.push(section_header("TIMELINE (Tab 7)"));
-    lines.push(key_line("↑↓", "Scroll connection list"));
+    lines.push(key_line("↑↓ / j/k", "Scroll connection list"));
     lines.push(key_line("t", "Cycle time window (1m/5m/15m/30m/1h)"));
     lines.push(key_line("Enter", "Jump to Connections tab"));
     lines.push(Line::raw(""));
 
     // PROCESSES
     lines.push(section_header("PROCESSES (Tab 8)"));
-    lines.push(key_line("↑↓", "Scroll process list"));
+    lines.push(key_line("↑↓ / j/k", "Scroll process list"));
     lines.push(key_line("s", "Open sort picker"));
     lines.push(key_line("e", "Export connections to JSON + CSV"));
     lines.push(Line::raw(""));

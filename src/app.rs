@@ -1066,10 +1066,10 @@ fn handle_help_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.show_help = false;
             app.scroll.help_scroll = 0;
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             app.scroll.help_scroll = app.scroll.help_scroll.saturating_sub(1);
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Char('j') => {
             app.scroll.help_scroll += 1;
         }
         KeyCode::Char('q') => return true,
@@ -1133,15 +1133,15 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.show_settings = false;
             }
             KeyCode::Char('q') => return true,
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 app.settings_cursor = app.settings_cursor.saturating_sub(1);
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 if app.settings_cursor + 1 < ui::settings::SETTINGS_COUNT {
                     app.settings_cursor += 1;
                 }
             }
-            KeyCode::Left | KeyCode::Right
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
                 if app.settings_cursor == ui::settings::cursor::THEME =>
             {
                 let names = crate::theme::THEME_NAMES;
@@ -1149,7 +1149,8 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                     .iter()
                     .position(|&n| n == app.user_config.theme)
                     .unwrap_or(0);
-                let next = if key.code == KeyCode::Right {
+                let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                let next = if forward {
                     (current + 1) % names.len()
                 } else {
                     (current + names.len() - 1) % names.len()
@@ -1159,7 +1160,7 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.settings_status = Some(format!("Theme: {}", names[next]));
                 app.settings_status_tick = 0;
             }
-            KeyCode::Left | KeyCode::Right
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
                 if app.settings_cursor == ui::settings::cursor::DEFAULT_TAB =>
             {
                 let names = ui::settings::TAB_NAMES;
@@ -1167,7 +1168,8 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                     .iter()
                     .position(|&n| n == app.user_config.default_tab)
                     .unwrap_or(0);
-                let next = if key.code == KeyCode::Right {
+                let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                let next = if forward {
                     (current + 1) % names.len()
                 } else {
                     (current + names.len() - 1) % names.len()
@@ -1349,10 +1351,14 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Left if app.current_tab == Tab::Packets && app.stream_view_open => {
             app.stream_direction_filter = StreamDirectionFilter::BtoA;
         }
-        KeyCode::Up if app.current_tab == Tab::Packets && app.stream_view_open => {
+        KeyCode::Up | KeyCode::Char('k')
+            if app.current_tab == Tab::Packets && app.stream_view_open =>
+        {
             app.scroll.stream_scroll = app.scroll.stream_scroll.saturating_sub(1);
         }
-        KeyCode::Down if app.current_tab == Tab::Packets && app.stream_view_open => {
+        KeyCode::Down | KeyCode::Char('j')
+            if app.current_tab == Tab::Packets && app.stream_view_open =>
+        {
             app.scroll.stream_scroll += 1;
         }
         KeyCode::Char('s') if app.current_tab == Tab::Packets && !app.stream_view_open => {
@@ -1636,8 +1642,8 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
         }
-        KeyCode::Up => scroll_tab(app, -1),
-        KeyCode::Down => scroll_tab(app, 1),
+        KeyCode::Up | KeyCode::Char('k') => scroll_tab(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => scroll_tab(app, 1),
         KeyCode::PageUp => scroll_tab(app, -(PAGE_SCROLL as isize)),
         KeyCode::PageDown => scroll_tab(app, PAGE_SCROLL as isize),
         KeyCode::Char('/') if app.current_tab == Tab::Packets && !app.stream_view_open => {
