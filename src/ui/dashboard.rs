@@ -1,10 +1,26 @@
 use crate::app::App;
 use crate::ebpf::EbpfStatus;
+use crate::sort::{SortColumn, TabSortState};
 use crate::theme::Theme;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table},
+};
+
+pub const COLUMNS: &[SortColumn] = &[
+    SortColumn { name: "Interface" },
+    SortColumn { name: "IP Address" },
+    SortColumn { name: "Rx Rate" },
+    SortColumn { name: "Tx Rate" },
+    SortColumn { name: "Rx Total" },
+    SortColumn { name: "Tx Total" },
+    SortColumn { name: "Status" },
+];
+
+pub const DEFAULT_SORT: TabSortState = TabSortState {
+    column: 0,
+    ascending: true,
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -33,13 +49,27 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
+    // sort interfaces once, share between table and sparkline so
+    // selected_interface index refers to the same sorted order
+    let mut sorted_interfaces = app.traffic.interfaces();
+    let sort_state = app.sort_states.get(&crate::app::Tab::Dashboard);
+    if let Some(state) = sort_state {
+        crate::ui::interfaces::sort_interfaces(
+            &mut sorted_interfaces,
+            crate::app::Tab::Dashboard,
+            state.column,
+            state.ascending,
+            &app.interface_info,
+        );
+    }
+
     render_header(f, app, chunks[0]);
     if alert_count > 0 {
         render_alerts(f, app, chunks[1]);
     }
-    render_interface_table(f, app, chunks[2]);
+    render_interface_table(f, app, &sorted_interfaces, chunks[2]);
     if app.selected_interface.is_some() {
-        render_sparkline(f, app, chunks[3]);
+        render_sparkline(f, app, &sorted_interfaces, chunks[3]);
     } else {
         render_bandwidth_graph(f, app, chunks[3]);
     }
@@ -94,19 +124,15 @@ fn render_alerts(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(alert_widget, area);
 }
 
-fn render_interface_table(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec![
-        Cell::from("Interface").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("IP Address").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("RX Rate").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("TX Rate").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("RX Total").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("TX Total").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Status").style(Style::default().fg(app.theme.brand).bold()),
-    ])
-    .height(1);
+fn render_interface_table(
+    f: &mut Frame,
+    app: &App,
+    interfaces: &[crate::collectors::traffic::InterfaceTraffic],
+    area: Rect,
+) {
+    let tab = crate::app::Tab::Dashboard;
+    let header = widgets::sort_header_row(app, tab, COLUMNS);
 
-    let interfaces = app.traffic.interfaces();
     let rows: Vec<Row> = interfaces
         .iter()
         .enumerate()
@@ -182,10 +208,16 @@ fn render_interface_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn render_sparkline(f: &mut Frame, app: &App, area: Rect) {
+fn render_sparkline(
+    f: &mut Frame,
+    app: &App,
+    sorted_interfaces: &[crate::collectors::traffic::InterfaceTraffic],
+    area: Rect,
+) {
+    // look up from the sorted list so the sparkline matches the highlighted row
     let selected = app
         .selected_interface
-        .and_then(|i| app.traffic.interface_at(i));
+        .and_then(|i| sorted_interfaces.get(i));
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -556,6 +588,8 @@ fn render_latency_heatmap(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = vec![
+        Span::styled("s", Style::default().fg(app.theme.key_hint).bold()),
+        Span::raw(":Sort  "),
         Span::styled("p", Style::default().fg(app.theme.key_hint).bold()),
         Span::raw(":Pause  "),
         Span::styled("r", Style::default().fg(app.theme.key_hint).bold()),

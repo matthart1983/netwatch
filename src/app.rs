@@ -75,7 +75,7 @@ pub enum StreamDirectionFilter {
     BtoA,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     Dashboard,
     Connections,
@@ -86,6 +86,27 @@ pub enum Tab {
     Timeline,
     Processes,
     Insights,
+}
+
+use crate::sort::{SortColumn, TabSortState};
+
+pub fn sort_columns_for_tab(tab: Tab) -> &'static [SortColumn] {
+    match tab {
+        Tab::Dashboard => crate::ui::dashboard::COLUMNS,
+        Tab::Connections => crate::ui::connections::COLUMNS,
+        Tab::Interfaces => crate::ui::interfaces::COLUMNS,
+        Tab::Processes => crate::ui::processes::COLUMNS,
+        _ => &[],
+    }
+}
+
+pub fn default_sort_states() -> HashMap<Tab, TabSortState> {
+    let mut m = HashMap::new();
+    m.insert(Tab::Dashboard, crate::ui::dashboard::DEFAULT_SORT);
+    m.insert(Tab::Connections, crate::ui::connections::DEFAULT_SORT);
+    m.insert(Tab::Interfaces, crate::ui::interfaces::DEFAULT_SORT);
+    m.insert(Tab::Processes, crate::ui::processes::DEFAULT_SORT);
+    m
 }
 
 /// Per-tab scroll positions and selection state.
@@ -132,7 +153,7 @@ pub struct App {
     pub paused: bool,
     pub current_tab: Tab,
     pub scroll: UiScrollState,
-    pub sort_column: usize,
+    pub sort_states: HashMap<Tab, TabSortState>,
     pub packet_follow: bool,
     pub capture_interface: String,
     pub stream_view_open: bool,
@@ -176,6 +197,7 @@ pub struct App {
     pub theme: Theme,
     pub process_bandwidth: ProcessBandwidthCollector,
     pub insights_collector: Option<crate::collectors::insights::InsightsCollector>,
+    pub sort_picker: crate::ui::sort_picker::SortPickerState,
     pub show_settings: bool,
     pub settings_cursor: usize,
     pub settings_editing: bool,
@@ -239,7 +261,7 @@ impl App {
             paused: false,
             current_tab: user_config.tab(),
             scroll: UiScrollState::default(),
-            sort_column: 0,
+            sort_states: default_sort_states(),
             packet_follow: user_config.packet_follow,
             capture_interface,
             stream_view_open: false,
@@ -288,6 +310,28 @@ impl App {
             settings_status: None,
             settings_status_tick: 0,
             incident_capture_started: false,
+            sort_picker: Default::default(),
+        }
+    }
+
+    pub fn sort_column_index(&self, tab: Tab) -> Option<usize> {
+        self.sort_states.get(&tab).map(|s| s.column)
+    }
+
+    pub fn sort_indicator(&self, tab: Tab, col: usize) -> &str {
+        if self.sort_column_index(tab) == Some(col) {
+            let ascending = self
+                .sort_states
+                .get(&tab)
+                .map(|s| s.ascending)
+                .unwrap_or(true);
+            if ascending {
+                " ▲"
+            } else {
+                " ▼"
+            }
+        } else {
+            ""
         }
     }
 
@@ -749,6 +793,16 @@ pub async fn run<B: Backend>(
             if app.show_settings {
                 ui::settings::render(f, &app, area);
             }
+            if app.sort_picker.is_open() {
+                ui::sort_picker::render(
+                    f,
+                    &app.sort_picker,
+                    sort_columns_for_tab(app.current_tab),
+                    app.sort_states.get(&app.current_tab),
+                    &app.theme,
+                    area,
+                );
+            }
         })?;
 
         match events.next().await? {
@@ -964,6 +1018,35 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     }
     if app.show_settings {
         return handle_settings_key(app, key);
+    }
+    if app.sort_picker.is_open() {
+        // auto-close if tab changed to a non-sortable tab (e.g. via mouse)
+        if sort_columns_for_tab(app.current_tab).is_empty() {
+            app.sort_picker.close();
+        } else {
+            let cols = sort_columns_for_tab(app.current_tab);
+            let action = app.sort_picker.handle_key(key, cols);
+            match action {
+                ui::sort_picker::PickerAction::Select(col_idx) => {
+                    let tab = app.current_tab;
+                    app.sort_states
+                        .entry(tab)
+                        .and_modify(|s| s.column = col_idx)
+                        .or_insert(TabSortState {
+                            column: col_idx,
+                            ascending: true,
+                        });
+                }
+                ui::sort_picker::PickerAction::ToggleDirection => {
+                    let tab = app.current_tab;
+                    if let Some(state) = app.sort_states.get_mut(&tab) {
+                        state.ascending = !state.ascending;
+                    }
+                }
+                ui::sort_picker::PickerAction::Close | ui::sort_picker::PickerAction::None => {}
+            }
+            return false;
+        }
     }
     // Text input modes
     if app.packet_filter_input && app.current_tab == Tab::Packets {
@@ -1385,7 +1468,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Char('W') if app.current_tab == Tab::Connections => {
             let mut conns = app.connection_collector.connections.lock().unwrap().clone();
-            sort_connections(&mut conns, app.sort_column);
+            let sort_st = app.sort_states.get(&Tab::Connections);
+            crate::ui::connections::sort(
+                &mut conns,
+                sort_st.map(|s| s.column).unwrap_or(0),
+                sort_st.map(|s| s.ascending).unwrap_or(true),
+            );
             if let Some(conn) = conns.get(app.scroll.connection_scroll) {
                 let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
                 if let Some(ip) = remote_ip {
@@ -1395,7 +1483,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Char('T') if app.current_tab == Tab::Connections && !app.traceroute_view_open => {
             let mut conns = app.connection_collector.connections.lock().unwrap().clone();
-            sort_connections(&mut conns, app.sort_column);
+            let sort_st = app.sort_states.get(&Tab::Connections);
+            crate::ui::connections::sort(
+                &mut conns,
+                sort_st.map(|s| s.column).unwrap_or(0),
+                sort_st.map(|s| s.ascending).unwrap_or(true),
+            );
             if let Some(conn) = conns.get(app.scroll.connection_scroll) {
                 let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
                 if let Some(ip) = remote_ip {
@@ -1442,16 +1535,17 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.export_status_tick = 0;
         }
         KeyCode::Char('s') => {
-            if app.current_tab == Tab::Connections {
-                // Include the Down/Up sort column (6) only when any
-                // connection has rate data; otherwise wrap back to 0 after 5.
-                let conns = app.connection_collector.connections.lock().unwrap();
-                let has_rate = conns
-                    .iter()
-                    .any(|c| c.rx_rate.is_some() || c.tx_rate.is_some());
-                drop(conns);
-                let modulo = if has_rate { 7 } else { 6 };
-                app.sort_column = (app.sort_column + 1) % modulo;
+            let tab = app.current_tab;
+            let keys = sort_columns_for_tab(tab);
+            if !keys.is_empty() {
+                let current_col = app.sort_states.get(&tab).map(|s| s.column).unwrap_or(0);
+                app.sort_picker.open(current_col, keys.len());
+            }
+        }
+        KeyCode::Char('S') => {
+            let tab = app.current_tab;
+            if let Some(state) = app.sort_states.get_mut(&tab) {
+                state.ascending = !state.ascending;
             }
         }
         KeyCode::Char('t') if app.current_tab == Tab::Timeline => {
@@ -1486,7 +1580,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Enter if app.current_tab == Tab::Connections => {
             let mut conns = app.connection_collector.connections.lock().unwrap().clone();
-            sort_connections(&mut conns, app.sort_column);
+            let sort_st = app.sort_states.get(&Tab::Connections);
+            crate::ui::connections::sort(
+                &mut conns,
+                sort_st.map(|s| s.column).unwrap_or(0),
+                sort_st.map(|s| s.ascending).unwrap_or(true),
+            );
             if let Some(conn) = conns.get(app.scroll.connection_scroll) {
                 let filter = build_connection_filter(conn);
                 app.packet_filter_text = filter.clone();
@@ -1558,32 +1657,6 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     false
 }
 
-/// Returns connections sorted by `sort_column`:
-/// 0=process, 1=pid, 2=proto, 3=state, 4=local, 5=remote, 6=rate (rx+tx, descending).
-pub(crate) fn sort_connections(conns: &mut [Connection], sort_column: usize) {
-    match sort_column {
-        0 => conns.sort_by(|a, b| {
-            let an = a.process_name.as_deref().unwrap_or("");
-            let bn = b.process_name.as_deref().unwrap_or("");
-            an.to_lowercase()
-                .cmp(&bn.to_lowercase())
-                .then_with(|| an.cmp(bn))
-        }),
-        1 => conns.sort_by(|a, b| a.pid.cmp(&b.pid)),
-        2 => conns.sort_by(|a, b| a.protocol.cmp(&b.protocol)),
-        3 => conns.sort_by(|a, b| a.state.cmp(&b.state)),
-        4 => conns.sort_by(|a, b| a.local_addr.cmp(&b.local_addr)),
-        5 => conns.sort_by(|a, b| a.remote_addr.cmp(&b.remote_addr)),
-        6 => conns.sort_by(|a, b| {
-            let total = |c: &Connection| c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0);
-            total(b)
-                .partial_cmp(&total(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        _ => {}
-    }
-}
-
 /// Returns remote IPs ranked by connection count, used by Topology tab actions.
 fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -1597,57 +1670,4 @@ fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
     let mut remote_ips: Vec<(String, usize)> = counts.into_iter().collect();
     remote_ips.sort_by(|a, b| b.1.cmp(&a.1));
     remote_ips
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn conn(process: Option<&str>) -> Connection {
-        Connection {
-            protocol: "TCP".into(),
-            local_addr: "127.0.0.1:0".into(),
-            remote_addr: "0.0.0.0:0".into(),
-            state: "ESTABLISHED".into(),
-            pid: None,
-            process_name: process.map(|s| s.to_string()),
-            kernel_rtt_us: None,
-            rx_rate: None,
-            tx_rate: None,
-        }
-    }
-
-    #[test]
-    fn process_name_sort_is_case_insensitive() {
-        // Mixed-case names should interleave in dictionary order regardless of
-        // case — on macOS this is the common case ("Finder", "facetime",
-        // "kernel_task") and byte-wise sort scatters them.
-        let mut conns = vec![
-            conn(Some("finder")),
-            conn(Some("Apple")),
-            conn(Some("zoom")),
-            conn(Some("Brave")),
-        ];
-        sort_connections(&mut conns, 0);
-        let order: Vec<_> = conns
-            .iter()
-            .map(|c| c.process_name.as_deref().unwrap())
-            .collect();
-        assert_eq!(order, vec!["Apple", "Brave", "finder", "zoom"]);
-    }
-
-    #[test]
-    fn process_name_sort_is_stable_on_case_only_difference() {
-        // When two names differ only in case, lowercase wins the tiebreaker
-        // (byte-wise cmp: 'A' < 'a'), but the important property is that the
-        // order is deterministic frame-to-frame.
-        let mut a = vec![conn(Some("finder")), conn(Some("Finder"))];
-        let mut b = vec![conn(Some("Finder")), conn(Some("finder"))];
-        sort_connections(&mut a, 0);
-        sort_connections(&mut b, 0);
-        let names = |v: &[Connection]| -> Vec<String> {
-            v.iter().map(|c| c.process_name.clone().unwrap()).collect()
-        };
-        assert_eq!(names(&a), names(&b));
-    }
 }

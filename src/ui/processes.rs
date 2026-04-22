@@ -1,9 +1,51 @@
 use crate::app::App;
+use crate::sort::{apply_direction, cmp_case_insensitive, cmp_f64, SortColumn};
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Row, Table},
 };
+
+use crate::sort::TabSortState;
+
+pub const COLUMNS: &[SortColumn] = &[
+    SortColumn { name: "Process" },
+    SortColumn { name: "PID" },
+    SortColumn { name: "Conns" },
+    SortColumn { name: "Rx Rate" },
+    SortColumn { name: "Tx Rate" },
+    SortColumn { name: "Total Rate" },
+    SortColumn { name: "Rx Total" },
+    SortColumn { name: "Tx Total" },
+];
+
+// top bandwidth first — matches prior behavior before sort picker
+pub const DEFAULT_SORT: TabSortState = TabSortState {
+    column: 5, // "Total Rate"
+    ascending: false,
+};
+
+pub fn sort(
+    procs: &mut [crate::collectors::process_bandwidth::ProcessBandwidth],
+    column: usize,
+    ascending: bool,
+) {
+    let col_name = COLUMNS.get(column).map(|c| c.name).unwrap_or("");
+    procs.sort_by(|a, b| {
+        let ord = match col_name {
+            "Process" => cmp_case_insensitive(&a.process_name, &b.process_name),
+            "PID" => a.pid.cmp(&b.pid),
+            "Conns" => a.connection_count.cmp(&b.connection_count),
+            "Rx Rate" => cmp_f64(a.rx_rate, b.rx_rate),
+            "Tx Rate" => cmp_f64(a.tx_rate, b.tx_rate),
+            "Total Rate" => cmp_f64(a.rx_rate + a.tx_rate, b.rx_rate + b.tx_rate),
+            "Rx Total" => a.rx_bytes.cmp(&b.rx_bytes),
+            "Tx Total" => a.tx_bytes.cmp(&b.tx_bytes),
+            _ => std::cmp::Ordering::Equal,
+        };
+        apply_direction(ord, ascending)
+    });
+}
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let layout = widgets::frame_layout(area);
@@ -25,19 +67,15 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_process_table(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec![
-        Cell::from("Process").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("PID").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Conns").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("RX Rate").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("TX Rate").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Total Rate").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("RX Total").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("TX Total").style(Style::default().fg(app.theme.brand).bold()),
-    ])
-    .height(1);
+    let tab = crate::app::Tab::Processes;
 
-    let ranked = app.process_bandwidth.ranked();
+    let header = widgets::sort_header_row(app, tab, COLUMNS);
+
+    let mut ranked = app.process_bandwidth.ranked().to_vec();
+    let sort_state = app.sort_states.get(&crate::app::Tab::Processes);
+    if let Some(state) = sort_state {
+        sort(&mut ranked, state.column, state.ascending);
+    }
     let visible_rows = area.height.saturating_sub(3) as usize;
     let scroll = app
         .scroll
@@ -107,6 +145,8 @@ fn render_process_table(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = vec![
+        Span::styled("s", Style::default().fg(app.theme.key_hint).bold()),
+        Span::raw(":Sort  "),
         Span::styled("e", Style::default().fg(app.theme.key_hint).bold()),
         Span::raw(":Export  "),
         Span::styled("Enter", Style::default().fg(app.theme.key_hint).bold()),

@@ -1,9 +1,63 @@
 use crate::app::App;
 use crate::collectors::traceroute::TracerouteStatus;
+use crate::sort::{
+    apply_direction, cmp_case_insensitive, cmp_f64, cmp_ip_addr, SortColumn, TabSortState,
+};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
 };
+
+pub const COLUMNS: &[SortColumn] = &[
+    SortColumn { name: "Process" },
+    SortColumn { name: "PID" },
+    SortColumn { name: "Proto" },
+    SortColumn { name: "State" },
+    SortColumn {
+        name: "Local Address",
+    },
+    SortColumn {
+        name: "Remote Address",
+    },
+    SortColumn { name: "Down/Up" }, // RATE_COL — conditionally shown, see render
+];
+
+pub const DEFAULT_SORT: TabSortState = TabSortState {
+    column: 0,
+    ascending: true,
+};
+
+// index of the Down/Up column in COLUMNS (conditionally visible)
+const RATE_COL: usize = 6;
+
+pub fn sort(
+    conns: &mut [crate::collectors::connections::Connection],
+    column: usize,
+    ascending: bool,
+) {
+    let col_name = COLUMNS.get(column).map(|c| c.name).unwrap_or("");
+    conns.sort_by(|a, b| {
+        let ord = match col_name {
+            "Process" => cmp_case_insensitive(
+                a.process_name.as_deref().unwrap_or(""),
+                b.process_name.as_deref().unwrap_or(""),
+            ),
+            "PID" => a.pid.cmp(&b.pid),
+            "Proto" => cmp_case_insensitive(&a.protocol, &b.protocol),
+            "State" => cmp_case_insensitive(&a.state, &b.state),
+            "Local Address" => cmp_ip_addr(&a.local_addr, &b.local_addr),
+            "Remote Address" => cmp_ip_addr(&a.remote_addr, &b.remote_addr),
+            "Down/Up" => {
+                let total = |c: &crate::collectors::connections::Connection| {
+                    c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0)
+                };
+                cmp_f64(total(a), total(b))
+            }
+            _ => std::cmp::Ordering::Equal,
+        };
+        apply_direction(ord, ascending)
+    });
+}
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let layout = crate::ui::widgets::frame_layout(area);
@@ -66,13 +120,7 @@ fn matches_filter(conn: &crate::collectors::connections::Connection, filter: &st
 }
 
 fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
-    let sort_indicator = |col: usize| -> &str {
-        if app.sort_column == col {
-            " ▼"
-        } else {
-            ""
-        }
-    };
+    let tab = crate::app::Tab::Connections;
 
     let mut conns = app.connection_collector.connections.lock().unwrap().clone();
     if let Some(ref f) = active_connection_filter(app) {
@@ -84,40 +132,33 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         .any(|c| c.rx_rate.is_some() || c.tx_rate.is_some());
     let has_sparkline_data = !app.rtt_history.is_empty();
 
-    let mut header_cells = vec![
-        Cell::from(format!("Process{}", sort_indicator(0)))
-            .style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from(format!("PID{}", sort_indicator(1)))
-            .style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from(format!("Proto{}", sort_indicator(2)))
-            .style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from(format!("State{}", sort_indicator(3)))
-            .style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from(format!("Local Address{}", sort_indicator(4)))
-            .style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from(format!("Remote Address{}", sort_indicator(5)))
-            .style(Style::default().fg(app.theme.brand).bold()),
-    ];
-    if has_rate_data {
-        header_cells.push(
-            Cell::from(format!("Down/Up{}", sort_indicator(6)))
-                .style(Style::default().fg(app.theme.brand).bold()),
-        );
-    }
+    // header cells generated from COLUMNS — adding a name to COLUMNS
+    // automatically adds the header with sort indicator (▲/▼)
+    let header_style = Style::default().fg(app.theme.brand).bold();
+    let mut header_cells: Vec<Cell> = COLUMNS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != RATE_COL || has_rate_data)
+        .map(|(i, col)| {
+            Cell::from(format!("{}{}", col.name, app.sort_indicator(tab, i))).style(header_style)
+        })
+        .collect();
+    // non-sortable display-only columns
     if has_rtt_data {
-        header_cells.push(Cell::from("RTT").style(Style::default().fg(app.theme.brand).bold()));
+        header_cells.push(Cell::from("RTT").style(header_style));
     }
     if has_sparkline_data {
-        header_cells
-            .push(Cell::from("RTT Trend").style(Style::default().fg(app.theme.brand).bold()));
+        header_cells.push(Cell::from("RTT Trend").style(header_style));
     }
     if app.show_geo {
-        header_cells
-            .push(Cell::from("Location").style(Style::default().fg(app.theme.brand).bold()));
+        header_cells.push(Cell::from("Location").style(header_style));
     }
     let header = Row::new(header_cells).height(1);
 
-    crate::app::sort_connections(&mut conns, app.sort_column);
+    let conn_sort = app.sort_states.get(&crate::app::Tab::Connections);
+    let sort_col = conn_sort.map(|s| s.column).unwrap_or(0);
+    let sort_asc = conn_sort.map(|s| s.ascending).unwrap_or(true);
+    sort(&mut conns, sort_col, sort_asc);
 
     let visible_rows = area.height.saturating_sub(3) as usize; // borders + header
     let scroll = app

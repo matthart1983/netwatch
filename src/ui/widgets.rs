@@ -2,7 +2,7 @@ use crate::app::{App, Tab};
 use crate::collectors::incident::RecorderState;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Cell, Paragraph, Row},
 };
 
 /// Standard 3-chunk vertical layout used by most tabs: header / content / footer.
@@ -245,6 +245,21 @@ pub fn tab_at_column(col: u16, insights_enabled: bool) -> Option<Tab> {
         x += label_len;
     }
     None
+}
+
+/// Build a table header row from a tab's COLUMNS array with sort indicators.
+pub fn sort_header_row(app: &App, tab: Tab, columns: &[crate::sort::SortColumn]) -> Row<'static> {
+    Row::new(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                Cell::from(format!("{}{}", col.name, app.sort_indicator(tab, i)))
+                    .style(Style::default().fg(app.theme.brand).bold())
+            })
+            .collect::<Vec<_>>(),
+    )
+    .height(1)
 }
 
 pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Span<'static>>) {

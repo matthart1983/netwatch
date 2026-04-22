@@ -111,12 +111,22 @@ fn build_help_lines() -> Vec<Line<'static>> {
     // DASHBOARD
     lines.push(section_header("DASHBOARD (Tab 1)"));
     lines.push(key_line("↑↓", "Select interface"));
+    lines.push(key_line("s", "Open sort picker"));
+    lines.push(Line::raw(""));
+
+    // SORT PICKER
+    lines.push(section_header("SORT PICKER (any table tab)"));
+    lines.push(key_line("↑↓ / j/k", "Move selection"));
+    lines.push(key_line("Enter", "Apply selected sort column"));
+    lines.push(key_line("S (shift)", "Toggle ascending/descending"));
+    lines.push(key_line("/", "Filter columns by name"));
+    lines.push(key_line("Esc / s / q", "Close picker"));
     lines.push(Line::raw(""));
 
     // CONNECTIONS
     lines.push(section_header("CONNECTIONS (Tab 2)"));
     lines.push(key_line("↑↓", "Scroll connection list"));
-    lines.push(key_line("s", "Cycle sort column"));
+    lines.push(key_line("s", "Open sort picker"));
     lines.push(key_line(
         "/",
         "Filter connections (process, state, remote address)",
@@ -140,6 +150,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     // INTERFACES
     lines.push(section_header("INTERFACES (Tab 3)"));
     lines.push(key_line("↑↓", "Select interface"));
+    lines.push(key_line("s", "Open sort picker"));
     lines.push(Line::raw(""));
 
     // PACKETS
@@ -199,7 +210,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     // PROCESSES
     lines.push(section_header("PROCESSES (Tab 8)"));
     lines.push(key_line("↑↓", "Scroll process list"));
-    lines.push(key_line("s", "Cycle sort column"));
+    lines.push(key_line("s", "Open sort picker"));
     lines.push(key_line("e", "Export connections to JSON + CSV"));
     lines.push(Line::raw(""));
 
