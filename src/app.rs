@@ -1671,3 +1671,682 @@ fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
     remote_ips.sort_by(|a, b| b.1.cmp(&a.1));
     remote_ips
 }
+#[cfg(test)]
+pub(crate) fn sort_connections(conns: &mut [Connection], column: usize) {
+    crate::ui::connections::sort(conns, column, true);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collectors::process_bandwidth::ProcessBandwidth;
+    use crate::collectors::traffic::InterfaceTraffic;
+    use crate::sort::*;
+
+    // look up a column index by name for readable test assertions
+    fn col(tab: Tab, name: &str) -> usize {
+        sort_columns_for_tab(tab)
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no column {:?} in {:?}", name, tab))
+    }
+
+    fn conn(process: Option<&str>) -> Connection {
+        Connection {
+            protocol: "TCP".into(),
+            local_addr: "127.0.0.1:0".into(),
+            remote_addr: "0.0.0.0:0".into(),
+            state: "ESTABLISHED".into(),
+            pid: None,
+            process_name: process.map(|s| s.to_string()),
+            kernel_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+        }
+    }
+
+    #[test]
+    fn process_name_sort_is_case_insensitive() {
+        // Mixed-case names should interleave in dictionary order regardless of
+        // case — on macOS this is the common case ("Finder", "facetime",
+        // "kernel_task") and byte-wise sort scatters them.
+        let mut conns = vec![
+            conn(Some("finder")),
+            conn(Some("Apple")),
+            conn(Some("zoom")),
+            conn(Some("Brave")),
+        ];
+        sort_connections(&mut conns, col(Tab::Connections, "Process"));
+        let order: Vec<_> = conns
+            .iter()
+            .map(|c| c.process_name.as_deref().unwrap())
+            .collect();
+        assert_eq!(order, vec!["Apple", "Brave", "finder", "zoom"]);
+    }
+
+    #[test]
+    fn process_name_sort_is_stable_on_case_only_difference() {
+        // When two names differ only in case, lowercase wins the tiebreaker
+        // (byte-wise cmp: 'A' < 'a'), but the important property is that the
+        // order is deterministic frame-to-frame.
+        let mut a = vec![conn(Some("finder")), conn(Some("Finder"))];
+        let mut b = vec![conn(Some("Finder")), conn(Some("finder"))];
+        sort_connections(&mut a, col(Tab::Connections, "Process"));
+        sort_connections(&mut b, col(Tab::Connections, "Process"));
+        let names = |v: &[Connection]| -> Vec<String> {
+            v.iter().map(|c| c.process_name.clone().unwrap()).collect()
+        };
+        assert_eq!(names(&a), names(&b));
+    }
+
+    // -- cmp_ip_addr --
+
+    #[test]
+    fn ip_sort_ipv4_numeric_ordering() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_ip_addr("1.2.3.4:80", "10.0.0.1:80"), Ordering::Less);
+        assert_eq!(
+            cmp_ip_addr("10.0.0.1:80", "192.168.1.1:443"),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_ip_addr("192.168.1.1:80", "1.2.3.4:80"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn ip_sort_same_ip_port_tiebreaker() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_ip_addr("1.2.3.4:80", "1.2.3.4:443"), Ordering::Less);
+        assert_eq!(cmp_ip_addr("1.2.3.4:443", "1.2.3.4:80"), Ordering::Greater);
+        assert_eq!(cmp_ip_addr("1.2.3.4:80", "1.2.3.4:80"), Ordering::Equal);
+    }
+
+    #[test]
+    fn ip_sort_ipv6_ordering() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_ip_addr("[::1]:80", "[::2]:80"), Ordering::Less);
+        assert_eq!(cmp_ip_addr("[fe80::1]:80", "[fe80::2]:80"), Ordering::Less);
+    }
+
+    #[test]
+    fn ip_sort_ipv4_before_ipv6() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_ip_addr("1.2.3.4:80", "[::1]:80"), Ordering::Less);
+        assert_eq!(cmp_ip_addr("[::1]:80", "1.2.3.4:80"), Ordering::Greater);
+    }
+
+    #[test]
+    fn ip_sort_wildcard_and_empty_sort_first() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_ip_addr("*:*", "1.2.3.4:80"), Ordering::Less);
+        assert_eq!(cmp_ip_addr("", "1.2.3.4:80"), Ordering::Less);
+        assert_eq!(cmp_ip_addr("*:*", "*:*"), Ordering::Equal);
+        assert_eq!(cmp_ip_addr("1.2.3.4:80", "*:*"), Ordering::Greater);
+    }
+
+    // -- cmp_case_insensitive --
+
+    #[test]
+    fn case_insensitive_basic_ordering() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_case_insensitive("apple", "Banana"), Ordering::Less);
+        assert_eq!(cmp_case_insensitive("Banana", "apple"), Ordering::Greater);
+        assert_eq!(cmp_case_insensitive("Apple", "apple"), Ordering::Less);
+        assert_eq!(cmp_case_insensitive("apple", "Apple"), Ordering::Greater);
+    }
+
+    // -- cmp_f64 --
+
+    #[test]
+    fn f64_cmp_basic() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_f64(1.0, 2.0), Ordering::Less);
+        assert_eq!(cmp_f64(2.0, 1.0), Ordering::Greater);
+        assert_eq!(cmp_f64(3.14, 3.14), Ordering::Equal);
+    }
+
+    #[test]
+    fn f64_cmp_nan_sorts_after_everything() {
+        use std::cmp::Ordering;
+        // total_cmp places NaN after infinity
+        assert_eq!(cmp_f64(f64::NAN, 1.0), Ordering::Greater);
+        assert_eq!(cmp_f64(1.0, f64::NAN), Ordering::Less);
+        assert_eq!(cmp_f64(f64::NAN, f64::NAN), Ordering::Equal);
+    }
+
+    // -- sort_connections --
+
+    fn conn_full(
+        process: Option<&str>,
+        pid: Option<u32>,
+        local: &str,
+        remote: &str,
+        rx: Option<f64>,
+        tx: Option<f64>,
+    ) -> Connection {
+        Connection {
+            protocol: "TCP".into(),
+            local_addr: local.into(),
+            remote_addr: remote.into(),
+            state: "ESTABLISHED".into(),
+            pid,
+            process_name: process.map(|s| s.to_string()),
+            kernel_rtt_us: None,
+            rx_rate: rx,
+            tx_rate: tx,
+        }
+    }
+
+    #[test]
+    fn sort_connections_by_pid() {
+        let mut conns = vec![
+            conn_full(None, Some(300), "0:0", "0:0", None, None),
+            conn_full(None, Some(100), "0:0", "0:0", None, None),
+            conn_full(None, None, "0:0", "0:0", None, None),
+            conn_full(None, Some(200), "0:0", "0:0", None, None),
+        ];
+        sort_connections(&mut conns, col(Tab::Connections, "PID"));
+        let pids: Vec<_> = conns.iter().map(|c| c.pid).collect();
+        assert_eq!(pids, vec![None, Some(100), Some(200), Some(300)]);
+    }
+
+    #[test]
+    fn sort_connections_by_remote_addr_uses_numeric_ip() {
+        let mut conns = vec![
+            conn_full(None, None, "0:0", "192.168.1.1:443", None, None),
+            conn_full(None, None, "0:0", "1.2.3.4:80", None, None),
+            conn_full(None, None, "0:0", "10.0.0.1:80", None, None),
+        ];
+        sort_connections(&mut conns, col(Tab::Connections, "Remote Address"));
+        let addrs: Vec<_> = conns.iter().map(|c| c.remote_addr.as_str()).collect();
+        assert_eq!(addrs, vec!["1.2.3.4:80", "10.0.0.1:80", "192.168.1.1:443"]);
+    }
+
+    #[test]
+    fn sort_connections_by_rate_descending() {
+        let mut conns = vec![
+            conn_full(None, None, "0:0", "0:0", Some(100.0), Some(50.0)),
+            conn_full(None, None, "0:0", "0:0", Some(500.0), Some(500.0)),
+            conn_full(None, None, "0:0", "0:0", None, None),
+            conn_full(None, None, "0:0", "0:0", Some(200.0), Some(100.0)),
+        ];
+        crate::ui::connections::sort(&mut conns, col(Tab::Connections, "Down/Up"), false);
+        let totals: Vec<f64> = conns
+            .iter()
+            .map(|c| c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0))
+            .collect();
+        assert_eq!(totals, vec![1000.0, 300.0, 150.0, 0.0]);
+    }
+
+    #[test]
+    fn sort_connections_by_rate_ascending() {
+        let mut conns = vec![
+            conn_full(None, None, "0:0", "0:0", Some(500.0), Some(500.0)),
+            conn_full(None, None, "0:0", "0:0", None, None),
+            conn_full(None, None, "0:0", "0:0", Some(100.0), Some(50.0)),
+        ];
+        crate::ui::connections::sort(&mut conns, col(Tab::Connections, "Down/Up"), true);
+        let totals: Vec<f64> = conns
+            .iter()
+            .map(|c| c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0))
+            .collect();
+        assert_eq!(totals, vec![0.0, 150.0, 1000.0]);
+    }
+
+    // -- tab configuration --
+
+    #[test]
+    fn each_sortable_tab_has_keys() {
+        let sortable = [
+            Tab::Dashboard,
+            Tab::Connections,
+            Tab::Interfaces,
+            Tab::Processes,
+        ];
+        for tab in &sortable {
+            assert!(
+                !sort_columns_for_tab(*tab).is_empty(),
+                "{:?} should have sort columns",
+                tab
+            );
+        }
+    }
+
+    #[test]
+    fn non_sortable_tabs_have_no_keys() {
+        let non_sortable = [
+            Tab::Packets,
+            Tab::Stats,
+            Tab::Topology,
+            Tab::Timeline,
+            Tab::Insights,
+        ];
+        for tab in &non_sortable {
+            assert!(
+                sort_columns_for_tab(*tab).is_empty(),
+                "{:?} should have no sort columns",
+                tab
+            );
+        }
+    }
+
+    #[test]
+    fn default_sort_column_is_zero() {
+        for (tab, state) in &default_sort_states() {
+            if *tab == Tab::Processes {
+                // processes default to "Total Rate" (column 5) descending
+                assert_eq!(
+                    state.column, 5,
+                    "Processes default column should be 5 (Total Rate)"
+                );
+            } else {
+                assert_eq!(state.column, 0, "{:?} default column should be 0", tab);
+            }
+        }
+    }
+
+    #[test]
+    fn default_sort_states_are_ascending() {
+        for (tab, state) in &default_sort_states() {
+            if *tab == Tab::Processes {
+                // processes default to descending (top bandwidth first)
+                assert!(!state.ascending, "Processes default should be descending");
+            } else {
+                assert!(state.ascending, "{:?} default should be ascending", tab);
+            }
+        }
+    }
+
+    #[test]
+    fn every_connection_column_has_a_comparator() {
+        // sorting by a column with no comparator arm silently falls through
+        // to Ordering::Equal — this test catches that by verifying the sort
+        // actually reorders data for every column
+        let make = || {
+            let mut a = conn_full(
+                Some("zz"),
+                Some(300),
+                "10.0.0.1:80",
+                "192.168.1.1:443",
+                Some(100.0),
+                Some(50.0),
+            );
+            a.protocol = "UDP".into();
+            a.state = "LISTEN".into();
+            let mut b = conn_full(
+                Some("aa"),
+                Some(100),
+                "1.2.3.4:80",
+                "10.0.0.1:80",
+                Some(500.0),
+                Some(500.0),
+            );
+            b.protocol = "TCP".into();
+            b.state = "ESTABLISHED".into();
+            vec![a, b]
+        };
+        for (i, col) in sort_columns_for_tab(Tab::Connections).iter().enumerate() {
+            let mut data = make();
+            crate::ui::connections::sort(&mut data, i, true);
+            let mut rev = make();
+            crate::ui::connections::sort(&mut rev, i, false);
+            assert_ne!(
+                data.iter()
+                    .map(|c| c.process_name.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>(),
+                rev.iter()
+                    .map(|c| c.process_name.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>(),
+                "column {:?} (index {}) sort has no effect — missing comparator?",
+                col.name,
+                i
+            );
+        }
+    }
+
+    // -- sort_connections_directed: ascending vs descending --
+
+    #[test]
+    fn sort_connections_descending_reverses_ascending() {
+        let mut asc = vec![
+            conn_full(Some("bravo"), None, "0:0", "0:0", None, None),
+            conn_full(Some("alpha"), None, "0:0", "0:0", None, None),
+            conn_full(Some("charlie"), None, "0:0", "0:0", None, None),
+        ];
+        let mut desc = asc.clone();
+        crate::ui::connections::sort(&mut asc, col(Tab::Connections, "Process"), true);
+        crate::ui::connections::sort(&mut desc, col(Tab::Connections, "Process"), false);
+        let asc_names: Vec<_> = asc
+            .iter()
+            .map(|c| c.process_name.as_deref().unwrap())
+            .collect();
+        let desc_names: Vec<_> = desc
+            .iter()
+            .map(|c| c.process_name.as_deref().unwrap())
+            .collect();
+        assert_eq!(asc_names, vec!["alpha", "bravo", "charlie"]);
+        assert_eq!(desc_names, vec!["charlie", "bravo", "alpha"]);
+    }
+
+    // -- sort_interfaces --
+
+    fn iface(name: &str, rx_rate: f64, tx_rate: f64) -> InterfaceTraffic {
+        InterfaceTraffic {
+            name: name.into(),
+            rx_rate,
+            tx_rate,
+            rx_bytes_total: 0,
+            tx_bytes_total: 0,
+            rx_packets: 0,
+            tx_packets: 0,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_drops: 0,
+            tx_drops: 0,
+            rx_history: std::collections::VecDeque::new(),
+            tx_history: std::collections::VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn sort_interfaces_by_name() {
+        let mut ifaces = vec![
+            iface("en0", 0.0, 0.0),
+            iface("awdl0", 0.0, 0.0),
+            iface("lo0", 0.0, 0.0),
+        ];
+        crate::ui::interfaces::sort_interfaces(
+            &mut ifaces,
+            Tab::Dashboard,
+            col(Tab::Dashboard, "Interface"),
+            true,
+            &[],
+        );
+        let names: Vec<_> = ifaces.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["awdl0", "en0", "lo0"]);
+    }
+
+    #[test]
+    fn sort_interfaces_by_rx_rate_descending() {
+        let mut ifaces = vec![
+            iface("a", 100.0, 0.0),
+            iface("b", 500.0, 0.0),
+            iface("c", 200.0, 0.0),
+        ];
+        crate::ui::interfaces::sort_interfaces(
+            &mut ifaces,
+            Tab::Dashboard,
+            col(Tab::Dashboard, "Rx Rate"),
+            false,
+            &[],
+        );
+        let rates: Vec<f64> = ifaces.iter().map(|i| i.rx_rate).collect();
+        assert_eq!(rates, vec![500.0, 200.0, 100.0]);
+    }
+
+    #[test]
+    fn sort_interfaces_by_status_with_info() {
+        use crate::platform::InterfaceInfo;
+        let info = vec![
+            InterfaceInfo {
+                name: "en0".into(),
+                ipv4: None,
+                ipv6: None,
+                mac: None,
+                mtu: None,
+                is_up: true,
+            },
+            InterfaceInfo {
+                name: "en1".into(),
+                ipv4: None,
+                ipv6: None,
+                mac: None,
+                mtu: None,
+                is_up: false,
+            },
+            InterfaceInfo {
+                name: "lo0".into(),
+                ipv4: None,
+                ipv6: None,
+                mac: None,
+                mtu: None,
+                is_up: true,
+            },
+        ];
+        let mut ifaces = vec![
+            iface("en1", 0.0, 0.0),
+            iface("en0", 0.0, 0.0),
+            iface("lo0", 0.0, 0.0),
+        ];
+        crate::ui::interfaces::sort_interfaces(
+            &mut ifaces,
+            Tab::Dashboard,
+            col(Tab::Dashboard, "Status"),
+            true,
+            &info,
+        );
+        let names: Vec<_> = ifaces.iter().map(|i| i.name.as_str()).collect();
+        // is_up=false sorts before is_up=true in ascending
+        assert_eq!(names[0], "en1");
+    }
+
+    #[test]
+    fn every_dashboard_column_has_a_comparator() {
+        use crate::platform::InterfaceInfo;
+        let info = vec![
+            InterfaceInfo {
+                name: "zz".into(),
+                ipv4: Some("10.0.0.1".into()),
+                ipv6: Some("fe80::2".into()),
+                mac: Some("ff:ff:ff:ff:ff:ff".into()),
+                mtu: Some(9000),
+                is_up: true,
+            },
+            InterfaceInfo {
+                name: "aa".into(),
+                ipv4: Some("1.2.3.4".into()),
+                ipv6: Some("fe80::1".into()),
+                mac: Some("00:00:00:00:00:00".into()),
+                mtu: Some(1500),
+                is_up: false,
+            },
+        ];
+        let make = || {
+            let mut a = iface("zz", 500.0, 500.0);
+            a.rx_bytes_total = 10000;
+            a.tx_bytes_total = 10000;
+            let mut b = iface("aa", 100.0, 100.0);
+            b.rx_bytes_total = 1000;
+            b.tx_bytes_total = 1000;
+            vec![a, b]
+        };
+        for (i, col) in sort_columns_for_tab(Tab::Dashboard).iter().enumerate() {
+            let mut data = make();
+            crate::ui::interfaces::sort_interfaces(&mut data, Tab::Dashboard, i, true, &info);
+            let mut rev = make();
+            crate::ui::interfaces::sort_interfaces(&mut rev, Tab::Dashboard, i, false, &info);
+            assert_ne!(
+                data.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                rev.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                "Dashboard column {:?} (index {}) has no comparator",
+                col.name,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn every_interfaces_column_has_a_comparator() {
+        use crate::platform::InterfaceInfo;
+        let info = vec![
+            InterfaceInfo {
+                name: "zz".into(),
+                ipv4: Some("10.0.0.1".into()),
+                ipv6: Some("fe80::2".into()),
+                mac: Some("ff:ff:ff:ff:ff:ff".into()),
+                mtu: Some(9000),
+                is_up: true,
+            },
+            InterfaceInfo {
+                name: "aa".into(),
+                ipv4: Some("1.2.3.4".into()),
+                ipv6: Some("fe80::1".into()),
+                mac: Some("00:00:00:00:00:00".into()),
+                mtu: Some(1500),
+                is_up: false,
+            },
+        ];
+        let make = || {
+            let mut a = iface("zz", 500.0, 500.0);
+            a.rx_packets = 1000;
+            a.tx_packets = 1000;
+            a.rx_errors = 10;
+            a.tx_errors = 10;
+            let mut b = iface("aa", 100.0, 100.0);
+            b.rx_packets = 100;
+            b.tx_packets = 100;
+            b.rx_errors = 1;
+            b.tx_errors = 1;
+            vec![a, b]
+        };
+        for (i, col) in sort_columns_for_tab(Tab::Interfaces).iter().enumerate() {
+            let mut data = make();
+            crate::ui::interfaces::sort_interfaces(&mut data, Tab::Interfaces, i, true, &info);
+            let mut rev = make();
+            crate::ui::interfaces::sort_interfaces(&mut rev, Tab::Interfaces, i, false, &info);
+            assert_ne!(
+                data.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                rev.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                "Interfaces column {:?} (index {}) has no comparator",
+                col.name,
+                i
+            );
+        }
+    }
+
+    // -- sort_processes --
+
+    #[test]
+    fn every_processes_column_has_a_comparator() {
+        let make = || {
+            vec![
+                ProcessBandwidth {
+                    process_name: "zz".into(),
+                    pid: Some(300),
+                    connection_count: 10,
+                    rx_rate: 500.0,
+                    tx_rate: 500.0,
+                    rx_bytes: 10000,
+                    tx_bytes: 10000,
+                },
+                ProcessBandwidth {
+                    process_name: "aa".into(),
+                    pid: Some(100),
+                    connection_count: 1,
+                    rx_rate: 100.0,
+                    tx_rate: 50.0,
+                    rx_bytes: 1000,
+                    tx_bytes: 1000,
+                },
+            ]
+        };
+        for (i, col) in sort_columns_for_tab(Tab::Processes).iter().enumerate() {
+            let mut data = make();
+            crate::ui::processes::sort(&mut data, i, true);
+            let mut rev = make();
+            crate::ui::processes::sort(&mut rev, i, false);
+            assert_ne!(
+                data.iter()
+                    .map(|p| p.process_name.as_str())
+                    .collect::<Vec<_>>(),
+                rev.iter()
+                    .map(|p| p.process_name.as_str())
+                    .collect::<Vec<_>>(),
+                "Processes column {:?} (index {}) has no comparator",
+                col.name,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn sort_processes_by_name() {
+        let mut procs = vec![
+            ProcessBandwidth {
+                process_name: "zoom".into(),
+                pid: None,
+                connection_count: 0,
+                rx_rate: 0.0,
+                tx_rate: 0.0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+            ProcessBandwidth {
+                process_name: "Apple".into(),
+                pid: None,
+                connection_count: 0,
+                rx_rate: 0.0,
+                tx_rate: 0.0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+            ProcessBandwidth {
+                process_name: "brave".into(),
+                pid: None,
+                connection_count: 0,
+                rx_rate: 0.0,
+                tx_rate: 0.0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+        ];
+        crate::ui::processes::sort(&mut procs, col(Tab::Processes, "Process"), true);
+        let names: Vec<_> = procs.iter().map(|p| p.process_name.as_str()).collect();
+        assert_eq!(names, vec!["Apple", "brave", "zoom"]);
+    }
+
+    #[test]
+    fn sort_processes_by_total_rate_descending() {
+        let mut procs = vec![
+            ProcessBandwidth {
+                process_name: "a".into(),
+                pid: None,
+                connection_count: 0,
+                rx_rate: 100.0,
+                tx_rate: 50.0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+            ProcessBandwidth {
+                process_name: "b".into(),
+                pid: None,
+                connection_count: 0,
+                rx_rate: 500.0,
+                tx_rate: 500.0,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+        ];
+        crate::ui::processes::sort(&mut procs, col(Tab::Processes, "Total Rate"), false);
+        let names: Vec<_> = procs.iter().map(|p| p.process_name.as_str()).collect();
+        assert_eq!(names, vec!["b", "a"]);
+    }
+
+    // -- apply_direction --
+
+    #[test]
+    fn apply_direction_ascending_preserves_order() {
+        use std::cmp::Ordering;
+        assert_eq!(apply_direction(Ordering::Less, true), Ordering::Less);
+        assert_eq!(apply_direction(Ordering::Greater, true), Ordering::Greater);
+    }
+
+    #[test]
+    fn apply_direction_descending_reverses_order() {
+        use std::cmp::Ordering;
+        assert_eq!(apply_direction(Ordering::Less, false), Ordering::Greater);
+        assert_eq!(apply_direction(Ordering::Greater, false), Ordering::Less);
+        assert_eq!(apply_direction(Ordering::Equal, false), Ordering::Equal);
+    }
+}
