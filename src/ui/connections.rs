@@ -1,11 +1,12 @@
-use crate::app::App;
+use crate::app::{App, ConnectionGroup, ConnectionStateFilter};
+use crate::collectors::connections::Connection;
 use crate::collectors::traceroute::TracerouteStatus;
 use crate::sort::{
     apply_direction, cmp_case_insensitive, cmp_f64, cmp_ip_addr, SortColumn, TabSortState,
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Clear, Paragraph, Sparkline},
 };
 
 pub const COLUMNS: &[SortColumn] = &[
@@ -27,8 +28,9 @@ pub const DEFAULT_SORT: TabSortState = TabSortState {
     ascending: true,
 };
 
-// index of the Down/Up column in COLUMNS (conditionally visible)
-const RATE_COL: usize = 6;
+// COLUMNS is retained for the existing sort_picker integration; the new
+// chip+group toolbar replaces the visible header but `s:Sort` still opens
+// the picker for fine-grained ordering when group is None.
 
 pub fn sort(
     conns: &mut [crate::collectors::connections::Connection],
@@ -60,14 +62,103 @@ pub fn sort(
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let layout = crate::ui::widgets::frame_layout(area);
-    render_header(f, app, layout.header);
-    render_connection_table(f, app, layout.content);
-    render_footer(f, app, layout.footer);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // header
+            Constraint::Length(2),  // chip row
+            Constraint::Min(8),     // table
+            Constraint::Length(10), // detail strip
+            Constraint::Length(3),  // footer
+        ])
+        .split(area);
+
+    render_header(f, app, chunks[0]);
+    render_chip_row(f, app, chunks[1]);
+    render_connection_table(f, app, chunks[2]);
+    render_detail_strip(f, app, chunks[3]);
+    render_footer(f, app, chunks[4]);
 
     if app.traceroute_view_open {
         render_traceroute_overlay(f, app, area);
     }
+}
+
+struct StateCounts {
+    all: usize,
+    established: usize,
+    listen: usize,
+    time_wait: usize,
+}
+
+fn count_states(conns: &[Connection]) -> StateCounts {
+    let mut c = StateCounts {
+        all: conns.len(),
+        established: 0,
+        listen: 0,
+        time_wait: 0,
+    };
+    for conn in conns {
+        match conn.state.as_str() {
+            "ESTABLISHED" => c.established += 1,
+            "LISTEN" => c.listen += 1,
+            "TIME_WAIT" | "TIME-WAIT" => c.time_wait += 1,
+            _ => {}
+        }
+    }
+    c
+}
+
+fn render_chip_row(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let conns = app.connection_collector.connections.lock().unwrap();
+    let counts = count_states(&conns);
+    drop(conns);
+
+    let chips: [(ConnectionStateFilter, usize); 4] = [
+        (ConnectionStateFilter::All, counts.all),
+        (ConnectionStateFilter::Established, counts.established),
+        (ConnectionStateFilter::Listen, counts.listen),
+        (ConnectionStateFilter::TimeWait, counts.time_wait),
+    ];
+
+    let mut spans: Vec<Span> = vec![Span::styled(" show  ", Style::default().fg(t.text_muted))];
+    for (filter, count) in chips.iter() {
+        let label = format!("{} {}", filter.label(), count);
+        let active = *filter == app.connection_state_filter;
+        if active {
+            spans.push(Span::styled(
+                format!(" {} ", label),
+                Style::default()
+                    .fg(t.text_primary)
+                    .bg(t.selection_bg)
+                    .bold(),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!(" {} ", label),
+                Style::default().fg(t.text_secondary),
+            ));
+        }
+        spans.push(Span::raw(" "));
+    }
+
+    // Right-aligned group toggle: " group: process / remote / none"
+    let group_label = format!(
+        "group: {}    f cycles  G groups",
+        app.connection_group.label(),
+    );
+    let used_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let total_w = area.width as usize;
+    let group_w = group_label.chars().count();
+    if total_w > used_w + group_w + 2 {
+        let pad = total_w - used_w - group_w - 2;
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(group_label, Style::default().fg(t.text_muted)));
+    }
+
+    let row1 = Line::from(spans);
+    f.render_widget(Paragraph::new(vec![row1, Line::from("")]), area);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -119,191 +210,524 @@ fn matches_filter(conn: &crate::collectors::connections::Connection, filter: &st
     process.contains(&needle) || state.contains(&needle) || remote.contains(&needle)
 }
 
-fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
-    let tab = crate::app::Tab::Connections;
-
+fn filtered_sorted_conns(app: &App) -> Vec<Connection> {
     let mut conns = app.connection_collector.connections.lock().unwrap().clone();
+
+    // Chip-based state filter
+    conns.retain(|c| app.connection_state_filter.matches(&c.state));
+
+    // Free-text filter (slash mode)
     if let Some(ref f) = active_connection_filter(app) {
         conns.retain(|c| matches_filter(c, f));
     }
-    let has_rtt_data = conns.iter().any(|c| c.kernel_rtt_us.is_some());
-    let has_rate_data = conns
-        .iter()
-        .any(|c| c.rx_rate.is_some() || c.tx_rate.is_some());
-    let has_sparkline_data = !app.rtt_history.is_empty();
 
-    // header cells generated from COLUMNS — adding a name to COLUMNS
-    // automatically adds the header with sort indicator (▲/▼)
-    let header_style = Style::default().fg(app.theme.brand).bold();
-    let mut header_cells: Vec<Cell> = COLUMNS
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != RATE_COL || has_rate_data)
-        .map(|(i, col)| {
-            Cell::from(format!("{}{}", col.name, app.sort_indicator(tab, i))).style(header_style)
-        })
-        .collect();
-    // non-sortable display-only columns
-    if has_rtt_data {
-        header_cells.push(Cell::from("RTT").style(header_style));
-    }
-    if has_sparkline_data {
-        header_cells.push(Cell::from("RTT Trend").style(header_style));
-    }
-    if app.show_geo {
-        header_cells.push(Cell::from("Location").style(header_style));
-    }
-    let header = Row::new(header_cells).height(1);
-
-    let conn_sort = app.sort_states.get(&crate::app::Tab::Connections);
-    let sort_col = conn_sort.map(|s| s.column).unwrap_or(0);
-    let sort_asc = conn_sort.map(|s| s.ascending).unwrap_or(true);
-    sort(&mut conns, sort_col, sort_asc);
-
-    let visible_rows = area.height.saturating_sub(3) as usize; // borders + header
-    let scroll = app
-        .scroll
-        .connection_scroll
-        .min(conns.len().saturating_sub(visible_rows));
-
-    let rows: Vec<Row> = conns
-        .iter()
-        .skip(scroll)
-        .enumerate()
-        .map(|(i, conn)| {
-            let state_style = match conn.state.as_str() {
-                "ESTABLISHED" => Style::default().fg(app.theme.status_good),
-                "LISTEN" => Style::default().fg(app.theme.status_warn),
-                "CLOSE_WAIT" | "TIME_WAIT" => Style::default().fg(app.theme.status_error),
-                _ => Style::default().fg(app.theme.text_muted),
-            };
-
-            let row_style = if i + scroll == app.scroll.connection_scroll {
-                Style::default().bg(app.theme.selection_bg)
-            } else {
-                Style::default()
-            };
-
-            let mut cells = vec![
-                Cell::from(conn.process_name.as_deref().unwrap_or("—").to_string()),
-                Cell::from(
-                    conn.pid
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "—".to_string()),
-                ),
-                Cell::from(conn.protocol.clone()),
-                Cell::from(conn.state.clone()).style(state_style),
-                Cell::from(conn.local_addr.clone()),
-                Cell::from(conn.remote_addr.clone()),
-            ];
-            if has_rate_data {
-                let (text, style) = match (conn.rx_rate, conn.tx_rate) {
-                    (Some(rx), Some(tx)) => {
-                        let total = rx + tx;
-                        let color = if total > 1_000_000.0 {
-                            app.theme.status_good
-                        } else if total > 10_000.0 {
-                            app.theme.status_warn
-                        } else {
-                            app.theme.text_primary
-                        };
-                        (
-                            format!(
-                                "{}↓/{}↑",
-                                crate::ui::widgets::format_bytes_rate(rx),
-                                crate::ui::widgets::format_bytes_rate(tx),
-                            ),
-                            Style::default().fg(color),
+    // Group/sort: process keeps process-grouped, remote groups by host, none sorts by RX desc
+    match app.connection_group {
+        ConnectionGroup::Process => {
+            conns.sort_by(|a, b| {
+                cmp_case_insensitive(
+                    a.process_name.as_deref().unwrap_or("~"),
+                    b.process_name.as_deref().unwrap_or("~"),
+                )
+                .then_with(|| {
+                    let ar = a.rx_rate.unwrap_or(0.0);
+                    let br = b.rx_rate.unwrap_or(0.0);
+                    cmp_f64(ar, br).reverse()
+                })
+                .then_with(|| a.remote_addr.cmp(&b.remote_addr))
+            });
+        }
+        ConnectionGroup::Remote => {
+            conns.sort_by(|a, b| {
+                let ah = host_only(&a.remote_addr);
+                let bh = host_only(&b.remote_addr);
+                cmp_case_insensitive(&ah, &bh)
+                    .then_with(|| a.remote_addr.cmp(&b.remote_addr))
+                    .then_with(|| {
+                        cmp_case_insensitive(
+                            a.process_name.as_deref().unwrap_or("~"),
+                            b.process_name.as_deref().unwrap_or("~"),
                         )
-                    }
-                    _ => ("—".to_string(), Style::default().fg(app.theme.text_muted)),
-                };
-                cells.push(Cell::from(text).style(style));
-            }
-            if has_rtt_data {
-                let (rtt_text, rtt_style) = match conn.kernel_rtt_us {
-                    Some(rtt) if rtt > 100_000.0 => (
-                        format!("{:.1}ms", rtt / 1000.0),
-                        Style::default().fg(app.theme.status_error),
-                    ),
-                    Some(rtt) if rtt > 10_000.0 => (
-                        format!("{:.1}ms", rtt / 1000.0),
-                        Style::default().fg(app.theme.status_warn),
-                    ),
-                    Some(rtt) => (
-                        format!("{:.1}ms", rtt / 1000.0),
-                        Style::default().fg(app.theme.status_good),
-                    ),
-                    None => ("—".to_string(), Style::default().fg(app.theme.text_muted)),
-                };
-                cells.push(Cell::from(rtt_text).style(rtt_style));
-            }
-            if has_sparkline_data {
-                let remote_ip = extract_ip(&conn.remote_addr);
-                let (spark_text, spark_style) = remote_ip
-                    .and_then(|ip| app.rtt_history.get(ip))
-                    .filter(|h| !h.is_empty())
-                    .map(|h| {
-                        let latest = h.back().copied().unwrap_or(0.0);
-                        let text = format!("{} {:.0}ms", rtt_sparkline(h), latest);
-                        let color = rtt_sparkline_color(h, &app.theme);
-                        (text, Style::default().fg(color))
                     })
-                    .unwrap_or_else(|| {
-                        ("—".to_string(), Style::default().fg(app.theme.text_muted))
-                    });
-                cells.push(Cell::from(spark_text).style(spark_style));
-            }
-            if app.show_geo {
-                let remote_ip = extract_ip(&conn.remote_addr);
-                let geo_label = remote_ip
-                    .and_then(|ip| app.geo_cache.lookup(ip))
-                    .map(|g| {
-                        if g.city.is_empty() {
-                            format!("{} {}", g.country_code, g.org)
-                        } else {
-                            format!("{} {}, {}", g.country_code, g.city, g.org)
-                        }
-                    })
-                    .unwrap_or_default();
-                cells.push(Cell::from(geo_label).style(Style::default().fg(app.theme.text_muted)));
-            }
-            Row::new(cells).style(row_style)
-        })
-        .collect();
+            });
+        }
+        ConnectionGroup::None => {
+            // Apply sort_states-driven sort or default RX desc
+            let sort_state = app.sort_states.get(&crate::app::Tab::Connections);
+            let col = sort_state.map(|s| s.column).unwrap_or(0);
+            let asc = sort_state.map(|s| s.ascending).unwrap_or(true);
+            sort(&mut conns, col, asc);
+        }
+    }
 
-    let mut widths: Vec<Constraint> = vec![
-        Constraint::Length(16),
-        Constraint::Length(8),
-        Constraint::Length(6),
-        Constraint::Length(14),
-        Constraint::Length(22),
-        Constraint::Length(22),
-    ];
-    if has_rate_data {
-        widths.push(Constraint::Length(20));
+    conns
+}
+
+fn host_only(addr: &str) -> String {
+    if let Some(stripped) = addr.strip_prefix('[') {
+        if let Some(end) = stripped.find("]:") {
+            return format!("[{}]", &stripped[..end]);
+        }
     }
-    if has_rtt_data {
-        widths.push(Constraint::Length(10));
+    if let Some(colon) = addr.rfind(':') {
+        addr[..colon].to_string()
+    } else {
+        addr.to_string()
     }
-    if has_sparkline_data {
-        widths.push(Constraint::Length(28));
+}
+
+fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let conns = filtered_sorted_conns(app);
+
+    let title_right = format!(
+        " {} shown  group: {} ",
+        conns.len(),
+        app.connection_group.label()
+    );
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " CONNECTIONS ",
+            Style::default().fg(t.brand).bold(),
+        )))
+        .title(
+            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
+                .alignment(Alignment::Right),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 2 {
+        return;
     }
-    if app.show_geo {
-        widths.push(Constraint::Min(20));
-    }
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .title(format!(
-                " Connections [{}-{}] ",
-                scroll + 1,
-                (scroll + visible_rows).min(conns.len())
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border)),
+
+    // Column header
+    let header_text = "  PROCESS              PROTO  REMOTE                          STATE         RX/s         TX/s     RTT    AGE";
+    let header_area = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            header_text,
+            Style::default().fg(t.text_muted),
+        ))),
+        header_area,
     );
 
-    f.render_widget(table, area);
+    let visible_rows = inner.height.saturating_sub(1) as usize;
+    let max_idx = conns.len().saturating_sub(1);
+    let selected = app.scroll.connection_scroll.min(max_idx);
+    // Auto-scroll: keep selected in view by computing window_top
+    let window_top = if selected < visible_rows {
+        0
+    } else {
+        selected
+            .saturating_sub(visible_rows / 2)
+            .min(conns.len().saturating_sub(visible_rows))
+    };
+
+    for (i, conn) in conns.iter().skip(window_top).take(visible_rows).enumerate() {
+        let abs_idx = window_top + i;
+        let is_selected = abs_idx == selected;
+        let row_y = inner.y + 1 + i as u16;
+        render_conn_row(f, app, inner, row_y, conn, is_selected);
+    }
+
+    if conns.is_empty() {
+        let empty_area = Rect {
+            x: inner.x + 2,
+            y: inner.y + 1,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No connections match this filter (press f to cycle)",
+                Style::default().fg(t.text_muted),
+            ))),
+            empty_area,
+        );
+    }
+}
+
+fn render_conn_row(
+    f: &mut Frame,
+    app: &App,
+    inner: Rect,
+    row_y: u16,
+    conn: &Connection,
+    is_selected: bool,
+) {
+    let t = &app.theme;
+    let state_color = match conn.state.as_str() {
+        "ESTABLISHED" => t.status_good,
+        "LISTEN" => t.status_info,
+        "TIME_WAIT" | "TIME-WAIT" => t.status_warn,
+        "CLOSE_WAIT" | "FIN_WAIT_1" | "FIN_WAIT_2" => t.status_error,
+        _ => t.text_muted,
+    };
+    let active = matches!(
+        (conn.rx_rate, conn.tx_rate),
+        (Some(r), _) if r > 0.0
+    ) || matches!(conn.tx_rate, Some(r) if r > 0.0);
+    let dot_color = if active {
+        t.status_good
+    } else if conn.state == "ESTABLISHED" {
+        t.text_secondary
+    } else {
+        t.text_muted
+    };
+
+    let pid_str = conn
+        .pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "—".into());
+    let process = conn.process_name.as_deref().unwrap_or("—");
+    let proc_label = format!("{:<14} {:>5}", truncate(process, 14), pid_str);
+
+    let proto_color = if conn.protocol.eq_ignore_ascii_case("UDP") {
+        Color::Rgb(217, 122, 255) // magenta-ish for UDP, matches mockup
+    } else {
+        t.status_info
+    };
+
+    let rx_str = conn
+        .rx_rate
+        .map(crate::ui::widgets::format_bytes_rate)
+        .unwrap_or_else(|| "—".into());
+    let tx_str = conn
+        .tx_rate
+        .map(crate::ui::widgets::format_bytes_rate)
+        .unwrap_or_else(|| "—".into());
+
+    let rtt_str = conn
+        .kernel_rtt_us
+        .map(|us| {
+            let ms = us / 1000.0;
+            if ms < 1.0 {
+                format!("{:.1}ms", ms)
+            } else {
+                format!("{:.0}ms", ms)
+            }
+        })
+        .unwrap_or_else(|| "—".into());
+
+    let age_str = connection_age(app, conn);
+
+    let line = Line::from(vec![
+        Span::styled(
+            if is_selected { "▸ " } else { "● " },
+            Style::default().fg(if is_selected { t.brand } else { dot_color }),
+        ),
+        Span::styled(
+            format!("{:<20}", proc_label),
+            Style::default().fg(t.text_primary),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<5}", conn.protocol),
+            Style::default().fg(proto_color),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<32}", truncate(&conn.remote_addr, 32)),
+            Style::default().fg(t.text_primary),
+        ),
+        Span::styled(
+            format!(" {:<12}", truncate(&conn.state, 12)),
+            Style::default().fg(state_color),
+        ),
+        Span::styled(format!(" {:>10}", rx_str), Style::default().fg(t.rx_rate)),
+        Span::raw(" "),
+        Span::styled(format!(" {:>9}", tx_str), Style::default().fg(t.tx_rate)),
+        Span::raw(" "),
+        Span::styled(
+            format!(" {:>5}", rtt_str),
+            Style::default().fg(t.text_primary),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" {:>4}", age_str),
+            Style::default().fg(t.text_muted),
+        ),
+    ]);
+
+    let row_area = Rect {
+        x: inner.x + 1,
+        y: row_y,
+        width: inner.width.saturating_sub(2),
+        height: 1,
+    };
+    let para = if is_selected {
+        Paragraph::new(line).style(Style::default().bg(t.selection_bg))
+    } else {
+        Paragraph::new(line)
+    };
+    f.render_widget(para, row_area);
+}
+
+fn connection_age(app: &App, conn: &Connection) -> String {
+    use crate::collectors::connections::ConnectionKey;
+    let key = ConnectionKey {
+        protocol: conn.protocol.clone(),
+        local_addr: conn.local_addr.clone(),
+        remote_addr: conn.remote_addr.clone(),
+        pid: conn.pid,
+    };
+    let tracked = app
+        .connection_timeline
+        .tracked
+        .iter()
+        .find(|t| t.key == key);
+    match tracked {
+        Some(t) => format_duration_short(t.first_seen.elapsed()),
+        None => "—".to_string(),
+    }
+}
+
+fn format_duration_short(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let conns = filtered_sorted_conns(app);
+    let selected_idx = app
+        .scroll
+        .connection_scroll
+        .min(conns.len().saturating_sub(1));
+    let selected = if conns.is_empty() {
+        None
+    } else {
+        conns.get(selected_idx)
+    };
+
+    let title_left = match selected {
+        Some(c) => {
+            let proc = c.process_name.as_deref().unwrap_or("—");
+            let host = host_only(&c.remote_addr);
+            format!(
+                " DETAIL  {}  pid {}  → {} ",
+                proc,
+                c.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+                host,
+            )
+        }
+        None => " DETAIL ".to_string(),
+    };
+
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            title_left,
+            Style::default().fg(t.status_warn).bold(),
+        )))
+        .title(
+            Line::from(Span::styled(
+                " ↑↓ to switch ",
+                Style::default().fg(t.text_muted),
+            ))
+            .alignment(Alignment::Right),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 4 {
+        return;
+    }
+
+    let Some(conn) = selected else {
+        let hint_area = Rect {
+            x: inner.x + 2,
+            y: inner.y + 1,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No connection selected",
+                Style::default().fg(t.text_muted),
+            ))),
+            hint_area,
+        );
+        return;
+    };
+
+    // Two-column body: left FLOW + STATS, right RX 30s sparkline placeholder
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(70), Constraint::Min(0)])
+        .split(inner);
+
+    render_detail_left(f, app, cols[0], conn);
+    render_detail_right(f, app, cols[1], conn);
+
+    // Action keys at bottom
+    let action_y = inner.y + inner.height.saturating_sub(1);
+    let action_area = Rect {
+        x: inner.x + 1,
+        y: action_y,
+        width: inner.width.saturating_sub(2),
+        height: 1,
+    };
+    let key_style = Style::default().fg(t.key_hint).bold();
+    let dim = Style::default().fg(t.text_muted);
+    let action_line = Line::from(vec![
+        Span::styled("Enter", key_style),
+        Span::styled(" → Packets   ", dim),
+        Span::styled("T", key_style),
+        Span::styled(" Traceroute   ", dim),
+        Span::styled("/", key_style),
+        Span::styled(" Filter   ", dim),
+        Span::styled("f", key_style),
+        Span::styled(" Cycle state   ", dim),
+        Span::styled("G", key_style),
+        Span::styled(" Cycle group", dim),
+    ]);
+    f.render_widget(Paragraph::new(action_line), action_area);
+}
+
+fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
+    let t = &app.theme;
+    if area.height < 2 {
+        return;
+    }
+
+    let age = connection_age(app, conn);
+    let rx = conn
+        .rx_rate
+        .map(crate::ui::widgets::format_bytes_rate)
+        .unwrap_or_else(|| "—".into());
+    let tx = conn
+        .tx_rate
+        .map(crate::ui::widgets::format_bytes_rate)
+        .unwrap_or_else(|| "—".into());
+    let rtt = conn
+        .kernel_rtt_us
+        .map(|us| format!("{:.1}ms", us / 1000.0))
+        .unwrap_or_else(|| "—".into());
+
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled("FLOW", Style::default().fg(t.text_muted))),
+        Line::from(vec![
+            Span::styled(
+                format!("{}", conn.local_addr),
+                Style::default().fg(t.text_primary),
+            ),
+            Span::styled("  →  ", Style::default().fg(t.text_muted)),
+            Span::styled(
+                format!("{}", conn.remote_addr),
+                Style::default().fg(t.text_primary),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{}  ", conn.protocol),
+                Style::default().fg(t.status_info),
+            ),
+            Span::styled(
+                format!("{}  ", conn.state),
+                Style::default().fg(t.text_primary),
+            ),
+            Span::styled(format!("age {}", age), Style::default().fg(t.text_muted)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("STATS  ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("RX {}", rx), Style::default().fg(t.rx_rate)),
+            Span::styled("    ", Style::default()),
+            Span::styled(format!("TX {}", tx), Style::default().fg(t.tx_rate)),
+            Span::styled("    ", Style::default()),
+            Span::styled(format!("RTT {}", rtt), Style::default().fg(t.text_primary)),
+        ]),
+    ];
+
+    let body_area = Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(1),
+    };
+    f.render_widget(Paragraph::new(lines), body_area);
+}
+
+fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
+    let t = &app.theme;
+    if area.height < 3 || area.width < 12 {
+        return;
+    }
+
+    // RX history: try app.top_conn_history keyed by (process, host) — same key the dashboard uses
+    let proc = conn.process_name.clone().unwrap_or_else(|| "—".into());
+    let host = host_only(&conn.remote_addr);
+    let key = (proc, host);
+
+    let hdr_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "RX 30s",
+            Style::default().fg(t.text_muted),
+        ))),
+        hdr_area,
+    );
+
+    if let Some(hist) = app.top_conn_history.get(&key) {
+        let data: Vec<u64> = hist.iter().copied().collect();
+        if !data.is_empty() {
+            let spark_area = Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: area.height.saturating_sub(2),
+            };
+            let padded = pad_hist(&data, spark_area.width as usize);
+            let spark = Sparkline::default()
+                .data(&padded)
+                .style(Style::default().fg(t.rx_rate));
+            f.render_widget(spark, spark_area);
+        }
+    }
+}
+
+fn pad_hist(data: &[u64], target_width: usize) -> Vec<u64> {
+    if target_width == 0 {
+        return Vec::new();
+    }
+    if data.len() >= target_width {
+        return data[data.len() - target_width..].to_vec();
+    }
+    let mut padded = vec![0u64; target_width - data.len()];
+    padded.extend_from_slice(data);
+    padded
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -495,8 +919,10 @@ fn format_hop_line(
     ])
 }
 
+#[allow(dead_code)]
 const SPARKLINE_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
+#[allow(dead_code)]
 fn rtt_sparkline(history: &std::collections::VecDeque<f64>) -> String {
     if history.is_empty() {
         return String::new();
@@ -519,6 +945,7 @@ fn rtt_sparkline(history: &std::collections::VecDeque<f64>) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 fn rtt_sparkline_color(
     history: &std::collections::VecDeque<f64>,
     theme: &crate::theme::Theme,
@@ -530,6 +957,7 @@ fn rtt_sparkline_color(
     }
 }
 
+#[allow(dead_code)]
 fn extract_ip(addr: &str) -> Option<&str> {
     if addr == "*:*" || addr.is_empty() {
         return None;

@@ -75,6 +75,133 @@ pub enum StreamDirectionFilter {
     BtoA,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsRange {
+    Min1,
+    Min5,
+    Min15,
+    Hour1,
+    Hour24,
+    Session,
+}
+
+impl StatsRange {
+    pub fn label(self) -> &'static str {
+        match self {
+            StatsRange::Min1 => "1m",
+            StatsRange::Min5 => "5m",
+            StatsRange::Min15 => "15m",
+            StatsRange::Hour1 => "1h",
+            StatsRange::Hour24 => "24h",
+            StatsRange::Session => "session",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            StatsRange::Min1 => StatsRange::Min5,
+            StatsRange::Min5 => StatsRange::Min15,
+            StatsRange::Min15 => StatsRange::Hour1,
+            StatsRange::Hour1 => StatsRange::Hour24,
+            StatsRange::Hour24 => StatsRange::Session,
+            StatsRange::Session => StatsRange::Min1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStateFilter {
+    All,
+    Established,
+    Listen,
+    TimeWait,
+}
+
+impl ConnectionStateFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectionStateFilter::All => "all",
+            ConnectionStateFilter::Established => "established",
+            ConnectionStateFilter::Listen => "listen",
+            ConnectionStateFilter::TimeWait => "time-wait",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            ConnectionStateFilter::All => ConnectionStateFilter::Established,
+            ConnectionStateFilter::Established => ConnectionStateFilter::Listen,
+            ConnectionStateFilter::Listen => ConnectionStateFilter::TimeWait,
+            ConnectionStateFilter::TimeWait => ConnectionStateFilter::All,
+        }
+    }
+
+    pub fn matches(self, state: &str) -> bool {
+        match self {
+            ConnectionStateFilter::All => true,
+            ConnectionStateFilter::Established => state == "ESTABLISHED",
+            ConnectionStateFilter::Listen => state == "LISTEN",
+            ConnectionStateFilter::TimeWait => state == "TIME_WAIT" || state == "TIME-WAIT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionGroup {
+    Process,
+    Remote,
+    None,
+}
+
+impl ConnectionGroup {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectionGroup::Process => "process",
+            ConnectionGroup::Remote => "remote",
+            ConnectionGroup::None => "none",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            ConnectionGroup::Process => ConnectionGroup::Remote,
+            ConnectionGroup::Remote => ConnectionGroup::None,
+            ConnectionGroup::None => ConnectionGroup::Process,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceFilter {
+    Active,
+    All,
+    Wifi,
+    Vpn,
+    Idle,
+}
+
+impl InterfaceFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            InterfaceFilter::Active => "active",
+            InterfaceFilter::All => "all",
+            InterfaceFilter::Wifi => "wifi",
+            InterfaceFilter::Vpn => "vpn",
+            InterfaceFilter::Idle => "idle",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            InterfaceFilter::Active => InterfaceFilter::All,
+            InterfaceFilter::All => InterfaceFilter::Wifi,
+            InterfaceFilter::Wifi => InterfaceFilter::Vpn,
+            InterfaceFilter::Vpn => InterfaceFilter::Idle,
+            InterfaceFilter::Idle => InterfaceFilter::Active,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     Dashboard,
@@ -150,6 +277,11 @@ pub struct App {
     pub health_prober: HealthProber,
     pub packet_collector: PacketCollector,
     pub selected_interface: Option<usize>,
+    pub interface_filter: InterfaceFilter,
+    pub connection_state_filter: ConnectionStateFilter,
+    pub connection_group: ConnectionGroup,
+    pub stats_range: StatsRange,
+    pub session_started_at: std::time::Instant,
     pub paused: bool,
     pub current_tab: Tab,
     pub scroll: UiScrollState,
@@ -193,6 +325,9 @@ pub struct App {
     pub last_area: Rect,
     /// Per-remote-IP RTT history for sparklines (keyed by remote IP string)
     pub rtt_history: HashMap<String, VecDeque<f64>>,
+    /// Rolling RX rate history per grouped (process, host) for the Dashboard
+    /// Top Connections sparkline. Updated each connection-collector tick.
+    pub top_conn_history: HashMap<(String, String), VecDeque<u64>>,
     rtt_sampled_streams: HashSet<u32>,
     pub theme: Theme,
     pub process_bandwidth: ProcessBandwidthCollector,
@@ -258,6 +393,11 @@ impl App {
             health_prober: HealthProber::new(),
             packet_collector,
             selected_interface: None,
+            interface_filter: InterfaceFilter::Active,
+            connection_state_filter: ConnectionStateFilter::All,
+            connection_group: ConnectionGroup::Process,
+            stats_range: StatsRange::Session,
+            session_started_at: std::time::Instant::now(),
             paused: false,
             current_tab: user_config.tab(),
             scroll: UiScrollState::default(),
@@ -299,6 +439,7 @@ impl App {
             user_config,
             last_area: Rect::default(),
             rtt_history: HashMap::new(),
+            top_conn_history: HashMap::new(),
             rtt_sampled_streams: HashSet::new(),
             theme,
             process_bandwidth: ProcessBandwidthCollector::new(),
@@ -540,6 +681,7 @@ impl App {
             self.connection_timeline.update(&conns);
             let interfaces = self.traffic.interfaces();
             self.process_bandwidth.update(&conns, &interfaces);
+            update_top_conn_history(&mut self.top_conn_history, &conns);
         }
 
         // Drain eBPF connection events and update RTT monitor
@@ -835,6 +977,52 @@ fn clamp_scroll(current: usize, delta: isize, max: usize) -> usize {
     ((current as isize + delta).max(0) as usize).min(max)
 }
 
+const TOP_CONN_HISTORY_LEN: usize = 30;
+
+/// Capture this tick's per-(process, host) RX rate into the rolling history
+/// used by the Dashboard's Top Connections sparkline. Evicts groups that
+/// disappear from the connection list to keep the map bounded.
+fn update_top_conn_history(
+    history: &mut HashMap<(String, String), VecDeque<u64>>,
+    conns: &[Connection],
+) {
+    let mut current_groups: HashMap<(String, String), f64> = HashMap::new();
+    for c in conns {
+        if c.state == "LISTEN" || c.state == "CLOSED" || c.remote_addr.is_empty() {
+            continue;
+        }
+        let proc = c.process_name.clone().unwrap_or_else(|| "—".into());
+        let host = top_conn_host(&c.remote_addr);
+        let entry = current_groups.entry((proc, host)).or_insert(0.0);
+        *entry += c.rx_rate.unwrap_or(0.0);
+    }
+
+    history.retain(|k, _| current_groups.contains_key(k));
+
+    for (key, rate) in current_groups {
+        let buf = history.entry(key).or_default();
+        buf.push_back(rate.round() as u64);
+        if buf.len() > TOP_CONN_HISTORY_LEN {
+            buf.pop_front();
+        }
+    }
+}
+
+/// Strip the trailing :port from a remote_addr; preserves IPv6 brackets.
+/// Must match the grouping key used in `dashboard::render_top_connections`.
+fn top_conn_host(addr: &str) -> String {
+    if let Some(stripped) = addr.strip_prefix('[') {
+        if let Some(end) = stripped.find("]:") {
+            return format!("[{}]", &stripped[..end]);
+        }
+    }
+    if let Some(colon) = addr.rfind(':') {
+        addr[..colon].to_string()
+    } else {
+        addr.to_string()
+    }
+}
+
 fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     let col = mouse.column;
     let row = mouse.row;
@@ -994,7 +1182,7 @@ fn scroll_tab(app: &mut App, delta: isize) {
             app.scroll.insights_scroll =
                 clamp_scroll(app.scroll.insights_scroll, delta, usize::MAX);
         }
-        Tab::Dashboard | Tab::Interfaces => {
+        Tab::Interfaces => {
             let max = app.traffic.interface_count().saturating_sub(1);
             app.selected_interface = match (app.selected_interface, delta < 0) {
                 (Some(0) | None, true) => None,
@@ -1002,6 +1190,7 @@ fn scroll_tab(app: &mut App, delta: isize) {
                 (Some(i), _) => Some(clamp_scroll(i, delta, max)),
             };
         }
+        Tab::Dashboard => {}
     }
 }
 
@@ -1432,6 +1621,28 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('f') if app.current_tab == Tab::Packets => {
             app.packet_follow = !app.packet_follow;
         }
+        KeyCode::Char('f') if app.current_tab == Tab::Interfaces => {
+            app.interface_filter = app.interface_filter.cycle();
+            app.selected_interface = None;
+        }
+        KeyCode::Char('f')
+            if app.current_tab == Tab::Connections
+                && !app.connection_filter_input
+                && !app.traceroute_view_open =>
+        {
+            app.connection_state_filter = app.connection_state_filter.cycle();
+            app.scroll.connection_scroll = 0;
+        }
+        KeyCode::Char('G')
+            if app.current_tab == Tab::Connections
+                && !app.connection_filter_input
+                && !app.traceroute_view_open =>
+        {
+            app.connection_group = app.connection_group.cycle();
+        }
+        KeyCode::Char('t') if app.current_tab == Tab::Stats => {
+            app.stats_range = app.stats_range.cycle();
+        }
         KeyCode::Char('w') if app.current_tab == Tab::Packets => {
             use crate::collectors::packets::{export_pcap, matches_packet, parse_filter};
             let packets = app.packet_collector.get_packets();
@@ -1613,16 +1824,14 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.current_tab = Tab::Connections;
             }
         }
-        KeyCode::Char('T') if app.current_tab == Tab::Topology && !app.traceroute_view_open => {
+        KeyCode::Char('T') if app.current_tab == Tab::Topology => {
             let remote_ips = top_remote_ips(app);
             if let Some((ip, _)) = remote_ips.get(app.scroll.topology_scroll) {
                 app.traceroute_runner.run(ip);
-                app.traceroute_view_open = true;
                 app.scroll.traceroute_scroll = 0;
             }
         }
-        KeyCode::Esc if app.current_tab == Tab::Topology && app.traceroute_view_open => {
-            app.traceroute_view_open = false;
+        KeyCode::Esc if app.current_tab == Tab::Topology => {
             app.traceroute_runner.clear();
         }
         KeyCode::Enter if app.current_tab == Tab::Packets => {
@@ -1665,17 +1874,33 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
 
 /// Returns remote IPs ranked by connection count, used by Topology tab actions.
 fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    // (ip, conn_count, has_established) — sort matches topology renderer's
+    // build_remote_nodes() so the cursor and the keypress hit the same row.
+    let mut acc: HashMap<String, (usize, bool)> = HashMap::new();
     let conns = app.connection_collector.connections.lock().unwrap();
     for conn in conns.iter() {
         let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
         if let Some(ip) = remote_ip {
-            *counts.entry(ip).or_insert(0) += 1;
+            let entry = acc.entry(ip).or_insert((0, false));
+            entry.0 += 1;
+            if conn.state == "ESTABLISHED" {
+                entry.1 = true;
+            }
         }
     }
-    let mut remote_ips: Vec<(String, usize)> = counts.into_iter().collect();
-    remote_ips.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut remote_ips: Vec<(String, usize, bool)> = acc
+        .into_iter()
+        .map(|(ip, (count, est))| (ip, count, est))
+        .collect();
+    remote_ips.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     remote_ips
+        .into_iter()
+        .map(|(ip, count, _)| (ip, count))
+        .collect()
 }
 #[cfg(test)]
 pub(crate) fn sort_connections(conns: &mut [Connection], column: usize) {

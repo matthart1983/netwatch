@@ -17,6 +17,11 @@ pub struct ProcessBandwidth {
 
 pub struct ProcessBandwidthCollector {
     ranked: Vec<ProcessBandwidth>,
+    /// Baseline interface byte totals captured on the first `update()` call,
+    /// so we attribute only bytes that flowed since netwatch started — not the
+    /// kernel's since-interface-up counter (which can be GBs at startup).
+    baseline_rx_bytes: Option<u64>,
+    baseline_tx_bytes: Option<u64>,
 }
 
 impl Default for ProcessBandwidthCollector {
@@ -27,15 +32,24 @@ impl Default for ProcessBandwidthCollector {
 
 impl ProcessBandwidthCollector {
     pub fn new() -> Self {
-        Self { ranked: Vec::new() }
+        Self {
+            ranked: Vec::new(),
+            baseline_rx_bytes: None,
+            baseline_tx_bytes: None,
+        }
     }
 
     pub fn update(&mut self, connections: &[Connection], interfaces: &[InterfaceTraffic]) {
         // Sum total interface bandwidth across all interfaces
         let total_rx_rate: f64 = interfaces.iter().map(|i| i.rx_rate).sum();
         let total_tx_rate: f64 = interfaces.iter().map(|i| i.tx_rate).sum();
-        let total_rx_bytes: u64 = interfaces.iter().map(|i| i.rx_bytes_total).sum();
-        let total_tx_bytes: u64 = interfaces.iter().map(|i| i.tx_bytes_total).sum();
+        let raw_rx_bytes: u64 = interfaces.iter().map(|i| i.rx_bytes_total).sum();
+        let raw_tx_bytes: u64 = interfaces.iter().map(|i| i.tx_bytes_total).sum();
+
+        let baseline_rx = *self.baseline_rx_bytes.get_or_insert(raw_rx_bytes);
+        let baseline_tx = *self.baseline_tx_bytes.get_or_insert(raw_tx_bytes);
+        let total_rx_bytes = raw_rx_bytes.saturating_sub(baseline_rx);
+        let total_tx_bytes = raw_tx_bytes.saturating_sub(baseline_tx);
 
         // Count ESTABLISHED connections per process, keyed by (process_name, pid)
         let mut process_conns: HashMap<(String, Option<u32>), u32> = HashMap::new();
