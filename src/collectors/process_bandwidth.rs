@@ -1,5 +1,9 @@
 use serde::Serialize;
 use std::collections::HashMap;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use super::connections::Connection;
 use super::traffic::InterfaceTraffic;
@@ -13,6 +17,12 @@ pub struct ProcessBandwidth {
     pub rx_rate: f64,
     pub tx_rate: f64,
     pub connection_count: u32,
+    /// Min RTT (ms) across this process's TCP connections — derived from
+    /// `Connection.kernel_rtt_us`. None when no kernel RTT data is available.
+    pub rtt_ms: Option<f64>,
+    /// CPU%, populated from a background `ps` poll. None until the first
+    /// poll completes (or when the platform doesn't support the sampler).
+    pub cpu_percent: Option<f64>,
 }
 
 pub struct ProcessBandwidthCollector {
@@ -22,6 +32,10 @@ pub struct ProcessBandwidthCollector {
     /// kernel's since-interface-up counter (which can be GBs at startup).
     baseline_rx_bytes: Option<u64>,
     baseline_tx_bytes: Option<u64>,
+    /// CPU% per-pid cache, populated by a background `ps` thread on a slow
+    /// tick. The mutex is short-lived; reads are O(1) lookups.
+    cpu_cache: Arc<Mutex<HashMap<u32, f64>>>,
+    cpu_busy: Arc<AtomicBool>,
 }
 
 impl Default for ProcessBandwidthCollector {
@@ -36,6 +50,8 @@ impl ProcessBandwidthCollector {
             ranked: Vec::new(),
             baseline_rx_bytes: None,
             baseline_tx_bytes: None,
+            cpu_cache: Arc::new(Mutex::new(HashMap::new())),
+            cpu_busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -51,8 +67,10 @@ impl ProcessBandwidthCollector {
         let total_rx_bytes = raw_rx_bytes.saturating_sub(baseline_rx);
         let total_tx_bytes = raw_tx_bytes.saturating_sub(baseline_tx);
 
-        // Count ESTABLISHED connections per process, keyed by (process_name, pid)
+        // Count ESTABLISHED connections per process, keyed by (process_name, pid).
+        // While iterating, also track min kernel RTT per group.
         let mut process_conns: HashMap<(String, Option<u32>), u32> = HashMap::new();
+        let mut process_rtt: HashMap<(String, Option<u32>), f64> = HashMap::new();
         let mut total_established: u32 = 0;
 
         for conn in connections {
@@ -64,8 +82,19 @@ impl ProcessBandwidthCollector {
                 .clone()
                 .unwrap_or_else(|| format!("pid:{}", conn.pid.map_or(0, |p| p)));
             let key = (name, conn.pid);
-            *process_conns.entry(key).or_insert(0) += 1;
+            *process_conns.entry(key.clone()).or_insert(0) += 1;
             total_established += 1;
+            if let Some(rtt_us) = conn.kernel_rtt_us {
+                let rtt_ms = rtt_us / 1000.0;
+                process_rtt
+                    .entry(key)
+                    .and_modify(|v| {
+                        if rtt_ms < *v {
+                            *v = rtt_ms;
+                        }
+                    })
+                    .or_insert(rtt_ms);
+            }
         }
 
         if total_established == 0 {
@@ -73,10 +102,14 @@ impl ProcessBandwidthCollector {
             return;
         }
 
+        let cpu_cache = self.cpu_cache.lock().unwrap().clone();
+
         let mut ranked: Vec<ProcessBandwidth> = process_conns
             .into_iter()
             .map(|((process_name, pid), count)| {
                 let fraction = count as f64 / total_established as f64;
+                let rtt_ms = process_rtt.get(&(process_name.clone(), pid)).copied();
+                let cpu_percent = pid.and_then(|p| cpu_cache.get(&p).copied());
                 ProcessBandwidth {
                     process_name,
                     pid,
@@ -85,6 +118,8 @@ impl ProcessBandwidthCollector {
                     rx_rate: total_rx_rate * fraction,
                     tx_rate: total_tx_rate * fraction,
                     connection_count: count,
+                    rtt_ms,
+                    cpu_percent,
                 }
             })
             .collect();
@@ -101,6 +136,51 @@ impl ProcessBandwidthCollector {
     pub fn ranked(&self) -> &[ProcessBandwidth] {
         &self.ranked
     }
+
+    /// Spawn a background `ps` poll to refresh the CPU% cache. Coalesces — if
+    /// a previous poll is still running, this is a no-op. Call from the app
+    /// loop on a slow tick (~5s).
+    pub fn refresh_cpu(&self) {
+        if self.cpu_busy.load(Ordering::SeqCst) {
+            return;
+        }
+        self.cpu_busy.store(true, Ordering::SeqCst);
+        let cache = Arc::clone(&self.cpu_cache);
+        let busy = Arc::clone(&self.cpu_busy);
+        thread::spawn(move || {
+            if let Some(pid_cpu) = sample_cpu() {
+                *cache.lock().unwrap() = pid_cpu;
+            }
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sample_cpu() -> Option<HashMap<u32, f64>> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,pcpu="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut map: HashMap<u32, f64> = HashMap::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let pid: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+        let cpu: Option<f64> = parts.next().and_then(|s| s.parse().ok());
+        if let (Some(pid), Some(cpu)) = (pid, cpu) {
+            map.insert(pid, cpu);
+        }
+    }
+    Some(map)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn sample_cpu() -> Option<HashMap<u32, f64>> {
+    None
 }
 
 #[cfg(test)]

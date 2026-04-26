@@ -18,6 +18,8 @@ pub const COLUMNS: &[SortColumn] = &[
     SortColumn { name: "Total Rate" },
     SortColumn { name: "Rx Total" },
     SortColumn { name: "Tx Total" },
+    SortColumn { name: "RTT" },
+    SortColumn { name: "CPU%" },
 ];
 
 pub const DEFAULT_SORT: TabSortState = TabSortState {
@@ -37,6 +39,11 @@ pub fn sort(procs: &mut [ProcessBandwidth], column: usize, ascending: bool) {
             "Total Rate" => cmp_f64(a.rx_rate + a.tx_rate, b.rx_rate + b.tx_rate),
             "Rx Total" => a.rx_bytes.cmp(&b.rx_bytes),
             "Tx Total" => a.tx_bytes.cmp(&b.tx_bytes),
+            "RTT" => cmp_f64(
+                a.rtt_ms.unwrap_or(f64::INFINITY),
+                b.rtt_ms.unwrap_or(f64::INFINITY),
+            ),
+            "CPU%" => cmp_f64(a.cpu_percent.unwrap_or(0.0), b.cpu_percent.unwrap_or(0.0)),
             _ => std::cmp::Ordering::Equal,
         };
         apply_direction(ord, ascending)
@@ -82,8 +89,8 @@ fn render_sort_chips(f: &mut Frame, app: &App, area: Rect) {
         ("rx/s", "Rx Rate", false),
         ("tx/s", "Tx Rate", false),
         ("conns", "Conns", false),
-        ("rtt", "—", true), // no per-proc RTT data yet
-        ("cpu", "—", true), // no per-proc CPU data yet
+        ("rtt", "RTT", false),
+        ("cpu", "CPU%", false),
         ("name", "Process", false),
     ];
     let active_col_name = COLUMNS.get(sort_state.column).map(|c| c.name).unwrap_or("");
@@ -263,10 +270,25 @@ fn render_process_row(
             Style::default().fg(main_color),
         ),
         Span::raw("   "),
-        // RTT and CPU stubbed — not collected per-process today
-        Span::styled(format!("{:>5}", "—"), Style::default().fg(t.text_muted)),
+        {
+            let (rtt_str, rtt_color) = match proc.rtt_ms {
+                Some(rtt) if rtt < 1.0 => (format!("{:.1}ms", rtt), t.status_good),
+                Some(rtt) if rtt < 50.0 => (format!("{:.0}ms", rtt), t.status_good),
+                Some(rtt) if rtt < 200.0 => (format!("{:.0}ms", rtt), t.status_warn),
+                Some(rtt) => (format!("{:.0}ms", rtt), t.status_error),
+                None => ("—".to_string(), t.text_muted),
+            };
+            Span::styled(format!("{:>6}", rtt_str), Style::default().fg(rtt_color))
+        },
         Span::raw("   "),
-        Span::styled(format!("{:>5}", "—"), Style::default().fg(t.text_muted)),
+        {
+            let (cpu_str, cpu_color) = match proc.cpu_percent {
+                Some(cpu) if cpu >= 10.0 => (format!("{:.1}%", cpu), t.status_warn),
+                Some(cpu) => (format!("{:.1}%", cpu), t.text_primary),
+                None => ("—".to_string(), t.text_muted),
+            };
+            Span::styled(format!("{:>5}", cpu_str), Style::default().fg(cpu_color))
+        },
     ]);
 
     let row_area = Rect {
@@ -493,64 +515,62 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
     }
 }
 
-fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, _proc: &ProcessBandwidth) {
+fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth) {
     let t = &app.theme;
     if area.width < 8 || area.height < 3 {
         return;
     }
 
+    let key = (proc.process_name.clone(), proc.pid);
+    let buf = app.top_proc_rx_history.get(&key);
+    let data: Vec<u64> = buf.map(|b| b.iter().copied().collect()).unwrap_or_default();
+
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "RX 60s  (interface aggregate)",
+            "RX 60s",
             Style::default().fg(t.text_muted),
         ))),
         Rect::new(area.x, area.y, area.width, 1),
     );
-
-    // Per-process RX history isn't tracked yet; show the aggregate interface RX
-    // as a proxy so the panel isn't empty. The footer line marks this caveat.
-    let interfaces = app.traffic.interfaces();
-    let mut acc: Vec<u64> = Vec::new();
-    for iface in &interfaces {
-        if iface.name == "lo0" || iface.name == "lo" {
-            continue;
-        }
-        if iface.rx_history.len() > acc.len() {
-            acc.resize(iface.rx_history.len(), 0);
-        }
-        for (i, &v) in iface.rx_history.iter().enumerate() {
-            acc[i] += v;
-        }
-    }
 
     let chart_h = area.height.saturating_sub(2);
     if chart_h < 1 {
         return;
     }
     let chart_area = Rect::new(area.x, area.y + 1, area.width, chart_h);
-    let padded = pad_history(&acc, area.width as usize);
-    f.render_widget(
-        Sparkline::default()
-            .data(&padded)
-            .style(Style::default().fg(t.rx_rate)),
-        chart_area,
-    );
+    if !data.is_empty() {
+        let padded = pad_history(&data, area.width as usize);
+        f.render_widget(
+            Sparkline::default()
+                .data(&padded)
+                .style(Style::default().fg(t.rx_rate)),
+            chart_area,
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  collecting…",
+                Style::default().fg(t.text_muted),
+            ))),
+            chart_area,
+        );
+    }
 
-    // Footer stats
-    let peak = *acc.iter().max().unwrap_or(&0);
-    let avg = if !acc.is_empty() {
-        acc.iter().sum::<u64>() / acc.len() as u64
+    // Footer stats — peak / avg / p99 from the per-process buffer
+    let peak = *data.iter().max().unwrap_or(&0);
+    let avg = if !data.is_empty() {
+        data.iter().sum::<u64>() / data.len() as u64
     } else {
         0
     };
-    let p99_idx = if acc.is_empty() {
+    let p99 = if data.is_empty() {
         0
     } else {
-        ((acc.len() as f64 * 0.99) as usize).min(acc.len() - 1)
+        let mut sorted = data.clone();
+        sorted.sort();
+        let idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+        sorted[idx]
     };
-    let mut sorted = acc.clone();
-    sorted.sort();
-    let p99 = sorted.get(p99_idx).copied().unwrap_or(0);
     let footer_y = area.y + area.height - 1;
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::app::{App, TimelineFilter};
+use crate::app::{App, IfaceChangeKind, TimelineFilter};
 use crate::collectors::network_intel::{Alert, AlertSeverity};
 use crate::ui::widgets;
 use ratatui::{
@@ -129,6 +129,60 @@ fn build_events(app: &App) -> Vec<Event> {
             category: Category::Conn,
             summary,
             detail,
+        });
+    }
+
+    // RTT spike events — scan health probe history for samples that exceed
+    // 2× the rolling baseline AND 50ms absolute. We can't precisely time them
+    // (history is just a deque of values without timestamps), so we attribute
+    // each spike to "now - i seconds" using the deque index.
+    {
+        let hs = app.health_prober.status.lock().unwrap();
+        for (label, history) in [
+            ("gateway", hs.gateway_rtt_history.as_slices().0),
+            ("DNS", hs.dns_rtt_history.as_slices().0),
+        ] {
+            let valid: Vec<f64> = history.iter().filter_map(|x| *x).collect();
+            if valid.len() < 5 {
+                continue;
+            }
+            let baseline = valid.iter().sum::<f64>() / valid.len() as f64;
+            let now = Instant::now();
+            for (i, sample) in history.iter().enumerate().rev().take(20) {
+                let Some(rtt) = sample else { continue };
+                if *rtt > 50.0 && *rtt > baseline * 2.0 {
+                    let secs_ago = (history.len() - 1 - i) as u64;
+                    events.push(Event {
+                        when: now - Duration::from_secs(secs_ago),
+                        kind: Kind::Warn,
+                        category: Category::Rtt,
+                        summary: format!(
+                            "{} RTT spike {:.0}ms (baseline {:.1}ms)",
+                            label, rtt, baseline
+                        ),
+                        detail: format!("{:.1}× normal", rtt / baseline),
+                    });
+                    break; // one spike event per probe target per render
+                }
+            }
+        }
+    }
+
+    // Interface up/down/IP-changed events captured by app.iface_events
+    for iface_ev in app.iface_events.iter() {
+        let (kind_label, kind) = match iface_ev.kind {
+            IfaceChangeKind::Up => ("up", Kind::Ok),
+            IfaceChangeKind::Down => ("down", Kind::Warn),
+            IfaceChangeKind::IpChanged => ("ip-changed", Kind::Info),
+            IfaceChangeKind::Added => ("added", Kind::Info),
+            IfaceChangeKind::Removed => ("removed", Kind::Info),
+        };
+        events.push(Event {
+            when: iface_ev.when,
+            kind,
+            category: Category::Iface,
+            summary: format!("{} {}", iface_ev.name, kind_label),
+            detail: iface_ev.detail.clone(),
         });
     }
 

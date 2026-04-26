@@ -366,6 +366,15 @@ pub struct App {
     /// Rolling RX rate history per grouped (process, host) for the Dashboard
     /// Top Connections sparkline. Updated each connection-collector tick.
     pub top_conn_history: HashMap<(String, String), VecDeque<u64>>,
+    /// Rolling RX rate history per (process, pid) for the Process drill-in
+    /// chart. Updated each connection-collector tick.
+    pub top_proc_rx_history: HashMap<(String, Option<u32>), VecDeque<u64>>,
+    /// Recent interface up/down/IP-changed events surfaced on the Timeline tab.
+    /// Populated when info_tick detects a delta from the previous snapshot.
+    pub iface_events: VecDeque<IfaceChangeEvent>,
+    /// Snapshot of the previous interface_info, used to detect changes on the
+    /// next info_tick. Empty until the second info refresh.
+    prev_interface_info: Vec<InterfaceInfo>,
     rtt_sampled_streams: HashSet<u32>,
     pub theme: Theme,
     pub process_bandwidth: ProcessBandwidthCollector,
@@ -479,6 +488,9 @@ impl App {
             last_area: Rect::default(),
             rtt_history: HashMap::new(),
             top_conn_history: HashMap::new(),
+            top_proc_rx_history: HashMap::new(),
+            iface_events: VecDeque::new(),
+            prev_interface_info: Vec::new(),
             rtt_sampled_streams: HashSet::new(),
             theme,
             process_bandwidth: ProcessBandwidthCollector::new(),
@@ -706,6 +718,10 @@ impl App {
         if self.info_tick >= 10 {
             self.info_tick = 0;
             if let Ok(info) = platform::collect_interface_info() {
+                if !self.prev_interface_info.is_empty() {
+                    diff_interfaces(&self.prev_interface_info, &info, &mut self.iface_events);
+                }
+                self.prev_interface_info = info.clone();
                 self.interface_info = info;
             }
             self.config_collector.update();
@@ -721,6 +737,7 @@ impl App {
             let interfaces = self.traffic.interfaces();
             self.process_bandwidth.update(&conns, &interfaces);
             update_top_conn_history(&mut self.top_conn_history, &conns);
+            update_top_proc_rx_history(&mut self.top_proc_rx_history, &conns);
         }
 
         // Drain eBPF connection events and update RTT monitor
@@ -767,13 +784,14 @@ impl App {
             self.freeze_incident_recorder(&reason);
         }
 
-        // Refresh health every ~5 ticks (5s)
+        // Refresh health every ~5 ticks (5s) — and piggyback the CPU% sampler.
         self.health_tick += 1;
         if self.health_tick >= 5 {
             self.health_tick = 0;
             let gateway = self.config_collector.config.gateway.clone();
             let dns = self.config_collector.config.dns_servers.first().cloned();
             self.health_prober.probe(gateway.as_deref(), dns.as_deref());
+            self.process_bandwidth.refresh_cpu();
         }
 
         // Feed AI insights collector with a fresh network snapshot
@@ -1059,6 +1077,119 @@ fn top_conn_host(addr: &str) -> String {
         addr[..colon].to_string()
     } else {
         addr.to_string()
+    }
+}
+
+const TOP_PROC_HISTORY_LEN: usize = 60;
+const IFACE_EVENTS_CAP: usize = 200;
+
+#[derive(Debug, Clone)]
+pub struct IfaceChangeEvent {
+    pub when: std::time::Instant,
+    pub name: String,
+    pub kind: IfaceChangeKind,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfaceChangeKind {
+    Up,
+    Down,
+    IpChanged,
+    Added,
+    Removed,
+}
+
+/// Capture per-(process, pid) RX rate into a rolling 60-sample history used by
+/// the Process drill-in chart. Mirrors update_top_conn_history but keyed by pid.
+fn update_top_proc_rx_history(
+    history: &mut HashMap<(String, Option<u32>), VecDeque<u64>>,
+    conns: &[Connection],
+) {
+    let mut current: HashMap<(String, Option<u32>), f64> = HashMap::new();
+    for c in conns {
+        if c.state != "ESTABLISHED" {
+            continue;
+        }
+        let name = c
+            .process_name
+            .clone()
+            .unwrap_or_else(|| format!("pid:{}", c.pid.unwrap_or(0)));
+        let entry = current.entry((name, c.pid)).or_insert(0.0);
+        *entry += c.rx_rate.unwrap_or(0.0);
+    }
+    history.retain(|k, _| current.contains_key(k));
+    for (key, rate) in current {
+        let buf = history.entry(key).or_default();
+        buf.push_back(rate.round() as u64);
+        if buf.len() > TOP_PROC_HISTORY_LEN {
+            buf.pop_front();
+        }
+    }
+}
+
+/// Diff a refreshed `interface_info` snapshot against the previous one and
+/// append change events. Caller is responsible for swapping `prev` with the
+/// new snapshot afterwards.
+fn diff_interfaces(
+    prev: &[InterfaceInfo],
+    curr: &[InterfaceInfo],
+    events: &mut VecDeque<IfaceChangeEvent>,
+) {
+    use std::collections::HashSet;
+    let now = std::time::Instant::now();
+    let prev_names: HashSet<&str> = prev.iter().map(|i| i.name.as_str()).collect();
+    let curr_names: HashSet<&str> = curr.iter().map(|i| i.name.as_str()).collect();
+
+    for iface in curr {
+        if !prev_names.contains(iface.name.as_str()) {
+            events.push_back(IfaceChangeEvent {
+                when: now,
+                name: iface.name.clone(),
+                kind: IfaceChangeKind::Added,
+                detail: iface.ipv4.clone().unwrap_or_else(|| "—".into()),
+            });
+            continue;
+        }
+        let p = prev.iter().find(|i| i.name == iface.name).unwrap();
+        if p.is_up != iface.is_up {
+            events.push_back(IfaceChangeEvent {
+                when: now,
+                name: iface.name.clone(),
+                kind: if iface.is_up {
+                    IfaceChangeKind::Up
+                } else {
+                    IfaceChangeKind::Down
+                },
+                detail: iface.ipv4.clone().unwrap_or_default(),
+            });
+        }
+        if p.ipv4 != iface.ipv4 {
+            events.push_back(IfaceChangeEvent {
+                when: now,
+                name: iface.name.clone(),
+                kind: IfaceChangeKind::IpChanged,
+                detail: format!(
+                    "{} → {}",
+                    p.ipv4.clone().unwrap_or_else(|| "—".into()),
+                    iface.ipv4.clone().unwrap_or_else(|| "—".into())
+                ),
+            });
+        }
+    }
+    for iface in prev {
+        if !curr_names.contains(iface.name.as_str()) {
+            events.push_back(IfaceChangeEvent {
+                when: now,
+                name: iface.name.clone(),
+                kind: IfaceChangeKind::Removed,
+                detail: String::new(),
+            });
+        }
+    }
+
+    while events.len() > IFACE_EVENTS_CAP {
+        events.pop_front();
     }
 }
 
