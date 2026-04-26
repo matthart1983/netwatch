@@ -375,13 +375,7 @@ fn render_conn_row(
         (conn.rx_rate, conn.tx_rate),
         (Some(r), _) if r > 0.0
     ) || matches!(conn.tx_rate, Some(r) if r > 0.0);
-    let dot_color = if active {
-        t.status_good
-    } else if conn.state == "ESTABLISHED" {
-        t.text_secondary
-    } else {
-        t.text_muted
-    };
+    let dot_color = if active { t.status_good } else { t.status_info };
 
     let pid_str = conn
         .pid
