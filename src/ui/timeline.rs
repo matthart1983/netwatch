@@ -133,11 +133,12 @@ fn build_events(app: &App) -> Vec<Event> {
     }
 
     // RTT spike events — scan health probe history for samples that exceed
-    // 2× the rolling baseline AND 50ms absolute. We can't precisely time them
-    // (history is just a deque of values without timestamps), so we attribute
-    // each spike to "now - i seconds" using the deque index.
+    // 2× the rolling baseline AND 50ms absolute. The health prober runs every
+    // 5 main ticks (app.rs), so each history entry represents
+    // 5 * refresh_rate_ms of wall time, not 1 second.
     {
         let hs = app.health_prober.status.lock().unwrap();
+        let probe_interval_secs = (5 * app.user_config.refresh_rate_ms / 1000).max(1);
         for (label, history) in [
             ("gateway", hs.gateway_rtt_history.as_slices().0),
             ("DNS", hs.dns_rtt_history.as_slices().0),
@@ -151,7 +152,7 @@ fn build_events(app: &App) -> Vec<Event> {
             for (i, sample) in history.iter().enumerate().rev().take(20) {
                 let Some(rtt) = sample else { continue };
                 if *rtt > 50.0 && *rtt > baseline * 2.0 {
-                    let secs_ago = (history.len() - 1 - i) as u64;
+                    let secs_ago = (history.len() - 1 - i) as u64 * probe_interval_secs;
                     events.push(Event {
                         when: now - Duration::from_secs(secs_ago),
                         kind: Kind::Warn,
@@ -396,21 +397,36 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
         }
     }
 
+    // Shared y-axis across all three layers — without this each Sparkline
+    // auto-scales to its own max, so a tiny crit-event cell would render at
+    // the same height as a high-throughput green moment.
+    let global_max = green_data
+        .iter()
+        .chain(yellow_data.iter())
+        .chain(red_data.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
     f.render_widget(
         Sparkline::default()
             .data(&green_data)
+            .max(global_max)
             .style(Style::default().fg(t.status_good)),
         inner,
     );
     f.render_widget(
         Sparkline::default()
             .data(&yellow_data)
+            .max(global_max)
             .style(Style::default().fg(t.status_warn)),
         inner,
     );
     f.render_widget(
         Sparkline::default()
             .data(&red_data)
+            .max(global_max)
             .style(Style::default().fg(t.status_error)),
         inner,
     );

@@ -963,6 +963,9 @@ pub async fn run<B: Backend>(
     let gateway = app.config_collector.config.gateway.clone();
     let dns = app.config_collector.config.dns_servers.first().cloned();
     app.health_prober.probe(gateway.as_deref(), dns.as_deref());
+    // Kick off a one-shot traceroute so the topology view's ISP gateway hop
+    // is populated without requiring the user to press T first.
+    app.traceroute_runner.run("1.1.1.1");
 
     // Event loop design:
     //   1. Render  — draw current app state to the terminal
@@ -1336,8 +1339,8 @@ fn scroll_tab(app: &mut App, delta: isize) {
                 app.scroll.traceroute_scroll =
                     clamp_scroll(app.scroll.traceroute_scroll, delta, usize::MAX);
             } else {
-                app.scroll.topology_scroll =
-                    clamp_scroll(app.scroll.topology_scroll, delta, usize::MAX);
+                let max = top_remote_ips(app).len().saturating_sub(1);
+                app.scroll.topology_scroll = clamp_scroll(app.scroll.topology_scroll, delta, max);
             }
         }
         Tab::Timeline => {
@@ -1621,7 +1624,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.scroll.help_scroll = 0;
         }
         KeyCode::Char('g') => app.show_geo = !app.show_geo,
-        KeyCode::Char('t') if app.current_tab != Tab::Timeline => {
+        KeyCode::Char('t') if app.current_tab != Tab::Timeline && app.current_tab != Tab::Stats => {
             let names = crate::theme::THEME_NAMES;
             let current = names.iter().position(|&n| n == app.theme.name).unwrap_or(0);
             let next = (current + 1) % names.len();
@@ -2047,32 +2050,47 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
 
 /// Returns remote IPs ranked by connection count, used by Topology tab actions.
 fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
-    // (ip, conn_count, has_established) — sort matches topology renderer's
-    // build_remote_nodes() so the cursor and the keypress hit the same row.
-    let mut acc: HashMap<String, (usize, bool)> = HashMap::new();
+    // Mirrors build_remote_nodes() in src/ui/topology.rs: partition local vs.
+    // public, then sort each by (has_established desc, conn_count desc,
+    // DNS-label asc). The third key MUST match the renderer's, otherwise the
+    // cursor index and the IP returned here can disagree whenever DNS
+    // resolves a tied row to a name that orders differently from its IP.
+    let mut acc: HashMap<String, (String, usize, bool)> = HashMap::new();
     let conns = app.connection_collector.connections.lock().unwrap();
     for conn in conns.iter() {
         let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
         if let Some(ip) = remote_ip {
-            let entry = acc.entry(ip).or_insert((0, false));
-            entry.0 += 1;
+            let entry = acc.entry(ip.clone()).or_insert_with(|| {
+                let label = app
+                    .packet_collector
+                    .dns_cache
+                    .lookup(&ip)
+                    .unwrap_or_else(|| ip.clone());
+                (label, 0, false)
+            });
+            entry.1 += 1;
             if conn.state == "ESTABLISHED" {
-                entry.1 = true;
+                entry.2 = true;
             }
         }
     }
-    let mut remote_ips: Vec<(String, usize, bool)> = acc
+    let (mut local, mut public): (Vec<_>, Vec<_>) = acc
         .into_iter()
-        .map(|(ip, (count, est))| (ip, count, est))
-        .collect();
-    remote_ips.sort_by(|a, b| {
-        b.2.cmp(&a.2)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    remote_ips
+        .map(|(ip, (label, count, est))| (ip, label, count, est))
+        .partition(|(ip, _, _, _)| crate::collectors::geo::is_private_ip(ip));
+    let sort = |v: &mut Vec<(String, String, usize, bool)>| {
+        v.sort_by(|a, b| {
+            b.3.cmp(&a.3)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+    };
+    sort(&mut local);
+    sort(&mut public);
+    local
         .into_iter()
-        .map(|(ip, count, _)| (ip, count))
+        .chain(public.into_iter())
+        .map(|(ip, _, count, _)| (ip, count))
         .collect()
 }
 #[cfg(test)]
@@ -2302,12 +2320,7 @@ mod tests {
 
     #[test]
     fn each_sortable_tab_has_keys() {
-        let sortable = [
-            Tab::Dashboard,
-            Tab::Connections,
-            Tab::Interfaces,
-            Tab::Processes,
-        ];
+        let sortable = [Tab::Connections, Tab::Interfaces, Tab::Processes];
         for tab in &sortable {
             assert!(
                 !sort_columns_for_tab(*tab).is_empty(),
@@ -2319,7 +2332,10 @@ mod tests {
 
     #[test]
     fn non_sortable_tabs_have_no_keys() {
+        // Dashboard was reduced to a non-tabular landing view in the redesign,
+        // so it now has no sort columns either.
         let non_sortable = [
+            Tab::Dashboard,
             Tab::Packets,
             Tab::Stats,
             Tab::Topology,
@@ -2338,14 +2354,16 @@ mod tests {
     #[test]
     fn default_sort_column_is_zero() {
         for (tab, state) in &default_sort_states() {
-            if *tab == Tab::Processes {
-                // processes default to "Total Rate" (column 5) descending
-                assert_eq!(
+            match tab {
+                Tab::Processes => assert_eq!(
                     state.column, 5,
                     "Processes default column should be 5 (Total Rate)"
-                );
-            } else {
-                assert_eq!(state.column, 0, "{:?} default column should be 0", tab);
+                ),
+                Tab::Interfaces => assert_eq!(
+                    state.column, 3,
+                    "Interfaces default column should be 3 (RX/s)"
+                ),
+                _ => assert_eq!(state.column, 0, "{:?} default column should be 0", tab),
             }
         }
     }
@@ -2353,11 +2371,13 @@ mod tests {
     #[test]
     fn default_sort_states_are_ascending() {
         for (tab, state) in &default_sort_states() {
-            if *tab == Tab::Processes {
-                // processes default to descending (top bandwidth first)
-                assert!(!state.ascending, "Processes default should be descending");
-            } else {
-                assert!(state.ascending, "{:?} default should be ascending", tab);
+            match tab {
+                Tab::Processes | Tab::Interfaces => assert!(
+                    !state.ascending,
+                    "{:?} default should be descending (top traffic first)",
+                    tab
+                ),
+                _ => assert!(state.ascending, "{:?} default should be ascending", tab),
             }
         }
     }
@@ -2462,8 +2482,8 @@ mod tests {
         ];
         crate::ui::interfaces::sort_interfaces(
             &mut ifaces,
-            Tab::Dashboard,
-            col(Tab::Dashboard, "Interface"),
+            Tab::Interfaces,
+            col(Tab::Interfaces, "Iface"),
             true,
             &[],
         );
@@ -2480,59 +2500,13 @@ mod tests {
         ];
         crate::ui::interfaces::sort_interfaces(
             &mut ifaces,
-            Tab::Dashboard,
-            col(Tab::Dashboard, "Rx Rate"),
+            Tab::Interfaces,
+            col(Tab::Interfaces, "RX/s"),
             false,
             &[],
         );
         let rates: Vec<f64> = ifaces.iter().map(|i| i.rx_rate).collect();
         assert_eq!(rates, vec![500.0, 200.0, 100.0]);
-    }
-
-    #[test]
-    fn sort_interfaces_by_status_with_info() {
-        use crate::platform::InterfaceInfo;
-        let info = vec![
-            InterfaceInfo {
-                name: "en0".into(),
-                ipv4: None,
-                ipv6: None,
-                mac: None,
-                mtu: None,
-                is_up: true,
-            },
-            InterfaceInfo {
-                name: "en1".into(),
-                ipv4: None,
-                ipv6: None,
-                mac: None,
-                mtu: None,
-                is_up: false,
-            },
-            InterfaceInfo {
-                name: "lo0".into(),
-                ipv4: None,
-                ipv6: None,
-                mac: None,
-                mtu: None,
-                is_up: true,
-            },
-        ];
-        let mut ifaces = vec![
-            iface("en1", 0.0, 0.0),
-            iface("en0", 0.0, 0.0),
-            iface("lo0", 0.0, 0.0),
-        ];
-        crate::ui::interfaces::sort_interfaces(
-            &mut ifaces,
-            Tab::Dashboard,
-            col(Tab::Dashboard, "Status"),
-            true,
-            &info,
-        );
-        let names: Vec<_> = ifaces.iter().map(|i| i.name.as_str()).collect();
-        // is_up=false sorts before is_up=true in ascending
-        assert_eq!(names[0], "en1");
     }
 
     #[test]
@@ -2583,9 +2557,12 @@ mod tests {
     #[test]
     fn every_interfaces_column_has_a_comparator() {
         use crate::platform::InterfaceInfo;
+        // Names chosen so role_for() produces distinct roles ("wifi" vs.
+        // "loopback") — otherwise the Role column would tie and the
+        // comparator-presence assertion below would fail spuriously.
         let info = vec![
             InterfaceInfo {
-                name: "zz".into(),
+                name: "en0".into(),
                 ipv4: Some("10.0.0.1".into()),
                 ipv6: Some("fe80::2".into()),
                 mac: Some("ff:ff:ff:ff:ff:ff".into()),
@@ -2593,7 +2570,7 @@ mod tests {
                 is_up: true,
             },
             InterfaceInfo {
-                name: "aa".into(),
+                name: "lo0".into(),
                 ipv4: Some("1.2.3.4".into()),
                 ipv6: Some("fe80::1".into()),
                 mac: Some("00:00:00:00:00:00".into()),
@@ -2602,12 +2579,16 @@ mod tests {
             },
         ];
         let make = || {
-            let mut a = iface("zz", 500.0, 500.0);
+            let mut a = iface("en0", 500.0, 500.0);
+            a.rx_bytes_total = 10_000;
+            a.tx_bytes_total = 10_000;
             a.rx_packets = 1000;
             a.tx_packets = 1000;
             a.rx_errors = 10;
             a.tx_errors = 10;
-            let mut b = iface("aa", 100.0, 100.0);
+            let mut b = iface("lo0", 100.0, 100.0);
+            b.rx_bytes_total = 1_000;
+            b.tx_bytes_total = 1_000;
             b.rx_packets = 100;
             b.tx_packets = 100;
             b.rx_errors = 1;
@@ -2643,6 +2624,8 @@ mod tests {
                     tx_rate: 500.0,
                     rx_bytes: 10000,
                     tx_bytes: 10000,
+                    rtt_ms: Some(50.0),
+                    cpu_percent: Some(25.0),
                 },
                 ProcessBandwidth {
                     process_name: "aa".into(),
@@ -2652,6 +2635,8 @@ mod tests {
                     tx_rate: 50.0,
                     rx_bytes: 1000,
                     tx_bytes: 1000,
+                    rtt_ms: Some(10.0),
+                    cpu_percent: Some(5.0),
                 },
             ]
         };
@@ -2685,6 +2670,8 @@ mod tests {
                 tx_rate: 0.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
+                rtt_ms: None,
+                cpu_percent: None,
             },
             ProcessBandwidth {
                 process_name: "Apple".into(),
@@ -2694,6 +2681,8 @@ mod tests {
                 tx_rate: 0.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
+                rtt_ms: None,
+                cpu_percent: None,
             },
             ProcessBandwidth {
                 process_name: "brave".into(),
@@ -2703,6 +2692,8 @@ mod tests {
                 tx_rate: 0.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
+                rtt_ms: None,
+                cpu_percent: None,
             },
         ];
         crate::ui::processes::sort(&mut procs, col(Tab::Processes, "Process"), true);
@@ -2721,6 +2712,8 @@ mod tests {
                 tx_rate: 50.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
+                rtt_ms: None,
+                cpu_percent: None,
             },
             ProcessBandwidth {
                 process_name: "b".into(),
@@ -2730,6 +2723,8 @@ mod tests {
                 tx_rate: 500.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
+                rtt_ms: None,
+                cpu_percent: None,
             },
         ];
         crate::ui::processes::sort(&mut procs, col(Tab::Processes, "Total Rate"), false);

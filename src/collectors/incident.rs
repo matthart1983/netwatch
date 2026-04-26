@@ -735,6 +735,8 @@ mod tests {
             rx_rate: 1000.0,
             tx_rate: 500.0,
             connection_count: 1,
+            rtt_ms: None,
+            cpu_percent: None,
         }
     }
 

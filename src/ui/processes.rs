@@ -387,7 +387,11 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
     let conns = app.connection_collector.connections.lock().unwrap();
     let mut totals: HashMap<String, u32> = HashMap::new();
     for c in conns.iter() {
-        if c.process_name.as_deref() != Some(proc.process_name.as_str()) {
+        let conn_name = c
+            .process_name
+            .clone()
+            .unwrap_or_else(|| format!("pid:{}", c.pid.unwrap_or(0)));
+        if conn_name != proc.process_name {
             continue;
         }
         if c.pid != proc.pid {
@@ -464,7 +468,11 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
     let conns = app.connection_collector.connections.lock().unwrap();
     let mut counts: HashMap<&'static str, u32> = HashMap::new();
     for c in conns.iter() {
-        if c.process_name.as_deref() != Some(proc.process_name.as_str()) {
+        let conn_name = c
+            .process_name
+            .clone()
+            .unwrap_or_else(|| format!("pid:{}", c.pid.unwrap_or(0)));
+        if conn_name != proc.process_name {
             continue;
         }
         if c.pid != proc.pid {

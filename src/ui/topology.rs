@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::app::App;
+use crate::collectors::geo::is_private_ip;
 use crate::collectors::traceroute::TracerouteStatus;
 use crate::theme::Theme;
 use crate::ui::widgets;
@@ -36,48 +37,66 @@ struct RemoteNode {
     has_established: bool,
 }
 
-fn build_remote_nodes(app: &App) -> Vec<RemoteNode> {
-    let mut remotes: HashMap<String, RemoteNode> = HashMap::new();
+fn build_remote_nodes(app: &App) -> (Vec<RemoteNode>, Vec<RemoteNode>) {
+    let mut remotes: HashMap<String, (RemoteNode, bool)> = HashMap::new();
     let conns = app.connection_collector.connections.lock().unwrap();
     for conn in conns.iter() {
         let ip = extract_ip(&conn.remote_addr);
         if ip.is_empty() || ip == "*" {
             continue;
         }
-        let entry = remotes.entry(ip.clone()).or_insert_with(|| RemoteNode {
-            label: app
-                .packet_collector
-                .dns_cache
-                .lookup(&ip)
-                .unwrap_or(ip.clone()),
-            process: None,
-            conn_count: 0,
-            rtt_ms: None,
-            has_established: false,
+        let is_local = is_private_ip(&ip);
+        let entry = remotes.entry(ip.clone()).or_insert_with(|| {
+            (
+                RemoteNode {
+                    label: app
+                        .packet_collector
+                        .dns_cache
+                        .lookup(&ip)
+                        .unwrap_or(ip.clone()),
+                    process: None,
+                    conn_count: 0,
+                    rtt_ms: None,
+                    has_established: false,
+                },
+                is_local,
+            )
         });
-        entry.conn_count += 1;
+        entry.0.conn_count += 1;
         if conn.state == "ESTABLISHED" {
-            entry.has_established = true;
+            entry.0.has_established = true;
         }
-        if entry.process.is_none() {
-            entry.process = conn.process_name.clone();
+        if entry.0.process.is_none() {
+            entry.0.process = conn.process_name.clone();
         }
         if let Some(rtt_us) = conn.kernel_rtt_us {
             let rtt_ms = rtt_us / 1000.0;
-            entry.rtt_ms = Some(match entry.rtt_ms {
+            entry.0.rtt_ms = Some(match entry.0.rtt_ms {
                 Some(prev) => prev.min(rtt_ms),
                 None => rtt_ms,
             });
         }
     }
-    let mut nodes: Vec<RemoteNode> = remotes.into_values().collect();
-    nodes.sort_by(|a, b| {
-        b.has_established
-            .cmp(&a.has_established)
-            .then_with(|| b.conn_count.cmp(&a.conn_count))
-            .then_with(|| a.label.cmp(&b.label))
-    });
-    nodes
+    let mut local: Vec<RemoteNode> = Vec::new();
+    let mut public: Vec<RemoteNode> = Vec::new();
+    for (_, (node, is_local)) in remotes {
+        if is_local {
+            local.push(node);
+        } else {
+            public.push(node);
+        }
+    }
+    let sort = |nodes: &mut Vec<RemoteNode>| {
+        nodes.sort_by(|a, b| {
+            b.has_established
+                .cmp(&a.has_established)
+                .then_with(|| b.conn_count.cmp(&a.conn_count))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+    };
+    sort(&mut local);
+    sort(&mut public);
+    (local, public)
 }
 
 fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
@@ -102,30 +121,36 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if inner.height < 8 || inner.width < 80 {
+    if inner.height < 8 || inner.width < 90 {
         let msg = Paragraph::new(" Terminal too small for graph view")
             .style(Style::default().fg(t.text_muted));
         f.render_widget(msg, inner);
         return;
     }
 
-    let remotes = build_remote_nodes(app);
+    let (local_nodes, public_nodes) = build_remote_nodes(app);
     let hs = app.health_prober.status.lock().unwrap();
 
-    // Layout: SELF (left) → ROUTER → ISP → remotes (right)
-    let self_x = inner.x;
-    let self_w = 22u16;
-    let router_x = self_x + self_w + 8; // 8 cells for connector
-    let router_w = 18u16;
-    let isp_x = router_x + router_w + 8;
-    let isp_w = 18u16;
-    let remotes_x = isp_x + isp_w + 6;
-    let remotes_w = inner.x + inner.width - remotes_x;
+    // Layout: [SELF + LAN peers] ─ ROUTER ─ ISP ─ [public peers]
+    let router_w = 16u16;
+    let isp_w = 16u16;
+    let gap = 4u16; // gap between center boxes
+    let edge_gap = 3u16; // gap between center boxes and side columns
+    let center_w = router_w + gap + isp_w;
+    let side_total = inner.width.saturating_sub(center_w + edge_gap * 2);
+    let lan_w = side_total / 2;
+    let pub_w = side_total - lan_w;
 
-    // Center vertical row for the chain
+    let lan_x = inner.x;
+    let router_x = lan_x + lan_w + edge_gap;
+    let isp_x = router_x + router_w + gap;
+    let pub_x = isp_x + isp_w + edge_gap;
+
+    // Center vertical row for the spine
     let mid_y = inner.y + inner.height / 2;
 
-    // SELF box
+    // SELF box — rendered at the top of the left column, since the user's
+    // host is itself a "local address" and belongs visually with the LAN.
     let hostname = app.config_collector.config.hostname.clone();
     let primary_ip = app
         .interface_info
@@ -140,7 +165,8 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
         .map(|i| i.name.clone())
         .unwrap_or_else(|| "—".to_string());
     let self_h = 4u16;
-    let self_y = mid_y.saturating_sub(self_h / 2);
+    let self_w = lan_w;
+    let self_y = inner.y;
     let self_block = Block::default()
         .title(Line::from(Span::styled(
             " SELF ",
@@ -149,9 +175,9 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(t.brand));
-    let self_inner = Rect::new(self_x, self_y, self_w, self_h);
-    let self_inner_inner = self_block.inner(self_inner);
-    f.render_widget(self_block, self_inner);
+    let self_rect = Rect::new(lan_x, self_y, self_w, self_h);
+    let self_inner_inner = self_block.inner(self_rect);
+    f.render_widget(self_block, self_rect);
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -198,14 +224,10 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
                 format!(" {} ", router_label),
                 Style::default().fg(t.text_primary),
             )),
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled("● ", Style::default().fg(gw_color)),
-                Span::styled(
-                    format!("up  {}", rtt_str),
-                    Style::default().fg(t.text_muted),
-                ),
-            ]),
+            Line::from(Span::styled(
+                format!(" up  {}", rtt_str),
+                Style::default().fg(t.text_muted),
+            )),
         ]),
         router_inner,
     );
@@ -250,45 +272,19 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
                 format!(" {} ", truncate(&isp_ip, isp_w as usize - 2)),
                 Style::default().fg(t.text_primary),
             )),
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled("● ", Style::default().fg(isp_dot_color)),
-                Span::styled(isp_status, Style::default().fg(t.text_muted)),
-            ]),
+            Line::from(Span::styled(
+                format!(" {}", isp_status),
+                Style::default().fg(t.text_muted),
+            )),
         ]),
         isp_inner,
     );
     drop(traceroute);
 
-    // Connectors with inline RTT labels
-    let self_to_router_y = mid_y;
-    if self_to_router_y >= inner.y && self_to_router_y < inner.y + inner.height {
-        let connector_x = self_x + self_w;
-        let connector_w = router_x - connector_x;
-        let conn_text: String = "─".repeat(connector_w as usize);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                conn_text,
-                Style::default().fg(gw_color),
-            ))),
-            Rect::new(connector_x, self_to_router_y, connector_w, 1),
-        );
-        // Above the connector: RTT label
-        if self_to_router_y > inner.y {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {} {:.0}% ", rtt_str, hs.gateway_loss_pct),
-                    Style::default().fg(t.text_muted),
-                ))),
-                Rect::new(
-                    connector_x + 1,
-                    self_to_router_y - 1,
-                    connector_w.saturating_sub(2),
-                    1,
-                ),
-            );
-        }
-
+    // Spine connector: ROUTER → ISP. The locals-trunk (left column → ROUTER)
+    // and publics-trunk (ISP → right column) are drawn below.
+    let spine_y = mid_y;
+    if spine_y >= inner.y && spine_y < inner.y + inner.height {
         let connector2_x = router_x + router_w;
         let connector2_w = isp_x - connector2_x;
         let conn2_text: String = "─".repeat(connector2_w as usize);
@@ -297,9 +293,9 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
                 conn2_text,
                 Style::default().fg(isp_dot_color),
             ))),
-            Rect::new(connector2_x, self_to_router_y, connector2_w, 1),
+            Rect::new(connector2_x, spine_y, connector2_w, 1),
         );
-        if self_to_router_y > inner.y {
+        if spine_y > inner.y {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {} ", isp_rtt_str),
@@ -307,7 +303,7 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
                 ))),
                 Rect::new(
                     connector2_x + 1,
-                    self_to_router_y - 1,
+                    spine_y - 1,
                     connector2_w.saturating_sub(2),
                     1,
                 ),
@@ -315,60 +311,166 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // Suppress unused-warning: rtt_str is rendered as part of ROUTER box,
+    // and gateway_loss_pct is not shown on the trunk in this layout.
+    let _ = (&rtt_str, hs.gateway_loss_pct, gw_color);
     drop(hs);
 
-    // Remote endpoints column
-    if remotes_w > 16 {
-        render_remote_column(
+    // Cursor index spans both columns: [local..., public...]
+    let combined_len = local_nodes.len() + public_nodes.len();
+    let selected = if combined_len == 0 {
+        0
+    } else {
+        app.scroll.topology_scroll.min(combined_len - 1)
+    };
+    let local_selected = if selected < local_nodes.len() {
+        Some(selected)
+    } else {
+        None
+    };
+    let public_selected = if selected >= local_nodes.len() {
+        Some(selected - local_nodes.len())
+    } else {
+        None
+    };
+
+    // Trunk connectors: a single horizontal line at mid_y between each spine
+    // box and its side column, so peers feel attached to the box even when
+    // their rows are above or below mid_y.
+    // Trunk connectors. Each trunk ends with a colored ● status dot pinned to
+    // the spine box's edge, so router/isp health is visible at a glance.
+    // Locals trunk: left column → ROUTER; publics trunk: ISP → right column.
+    if lan_w > 14 && mid_y < inner.y + inner.height {
+        let trunk_x = lan_x + lan_w;
+        let trunk_w = router_x.saturating_sub(trunk_x);
+        if trunk_w >= 1 {
+            let mut spans: Vec<Span> = Vec::new();
+            if trunk_w > 1 {
+                spans.push(Span::styled(
+                    "─".repeat((trunk_w - 1) as usize),
+                    Style::default().fg(t.border),
+                ));
+            }
+            spans.push(Span::styled("●", Style::default().fg(gw_color)));
+            f.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect::new(trunk_x, mid_y, trunk_w, 1),
+            );
+        }
+    }
+    if pub_w > 14 && mid_y < inner.y + inner.height {
+        let trunk_x = isp_x + isp_w;
+        let trunk_w = pub_x.saturating_sub(trunk_x);
+        if trunk_w >= 1 {
+            let mut spans: Vec<Span> = vec![Span::styled("●", Style::default().fg(isp_dot_color))];
+            if trunk_w > 1 {
+                spans.push(Span::styled(
+                    "─".repeat((trunk_w - 1) as usize),
+                    Style::default().fg(t.border),
+                ));
+            }
+            f.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect::new(trunk_x, mid_y, trunk_w, 1),
+            );
+        }
+    }
+
+    // LAN peers column — sits below the SELF box at the top of the left side.
+    let lan_body_y = inner.y + self_h;
+    let lan_body_h = inner.height.saturating_sub(self_h);
+    if lan_w > 14 && lan_body_h > 1 {
+        render_side_column(
             f,
             app,
-            Rect::new(remotes_x, inner.y, remotes_w, inner.height),
-            isp_x + isp_w,
+            Rect::new(lan_x, lan_body_y, lan_w, lan_body_h),
+            &local_nodes,
+            local_selected,
+            Side::Left,
+            "no LAN peers",
             mid_y,
-            &remotes,
-            app.scroll.topology_scroll,
+        );
+    }
+
+    // Public peers column (right of ISP)
+    if pub_w > 14 {
+        render_side_column(
+            f,
+            app,
+            Rect::new(pub_x, inner.y, pub_w, inner.height),
+            &public_nodes,
+            public_selected,
+            Side::Right,
+            "no public peers",
+            mid_y,
         );
     }
 }
 
-fn render_remote_column(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+fn render_side_column(
     f: &mut Frame,
     app: &App,
     area: Rect,
-    isp_right_edge_x: u16,
-    isp_mid_y: u16,
-    remotes: &[RemoteNode],
-    selected_idx: usize,
+    nodes: &[RemoteNode],
+    selected_idx: Option<usize>,
+    side: Side,
+    empty_label: &str,
+    spine_mid_y: u16,
 ) {
     let t = &app.theme;
-    let max_remotes = (area.height / 2).min(5) as usize;
-    let visible: Vec<&RemoteNode> = remotes.iter().take(max_remotes).collect();
+    let header_text = match side {
+        Side::Left => " LAN PEERS ",
+        Side::Right => " INTERNET ",
+    };
+    let align = match side {
+        Side::Left => Alignment::Left,
+        Side::Right => Alignment::Right,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            header_text,
+            Style::default().fg(t.text_muted).bold(),
+        )))
+        .alignment(align),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    // Reserve the header row so node rows don't sit on top of it.
+    let body_y = area.y + 1;
+    let body_h = area.height.saturating_sub(1);
+
+    let max_nodes = (body_h / 2).min(5) as usize;
+    let visible: Vec<&RemoteNode> = nodes.iter().take(max_nodes).collect();
     if visible.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " no remotes",
+                empty_label,
                 Style::default().fg(t.text_muted),
-            ))),
-            Rect::new(area.x, isp_mid_y, area.width, 1),
+            )))
+            .alignment(align),
+            Rect::new(area.x, spine_mid_y, area.width, 1),
         );
         return;
     }
 
     let n = visible.len() as u16;
-    let spacing = (area.height / n).max(2);
+    let spacing = (body_h / n).max(2);
     let total = spacing * n;
-    let start_y = area.y + area.height.saturating_sub(total) / 2;
-
-    let max_idx = visible.len().saturating_sub(1);
-    let selected = selected_idx.min(max_idx);
+    let start_y = body_y + body_h.saturating_sub(total) / 2;
 
     for (i, remote) in visible.iter().enumerate() {
         let row_y = start_y + i as u16 * spacing;
-        if row_y >= area.y + area.height {
+        if row_y + 1 >= area.y + area.height {
             break;
         }
 
-        let is_selected = i == selected;
+        let is_selected = selected_idx == Some(i);
         let dot_color = match remote.rtt_ms {
             Some(r) if r < 50.0 => t.status_good,
             Some(r) if r < 200.0 => t.status_warn,
@@ -377,50 +479,65 @@ fn render_remote_column(
             None => t.text_muted,
         };
 
-        let connector_w = area.x.saturating_sub(isp_right_edge_x);
-        if connector_w > 0 {
-            let connector = "─".repeat(connector_w as usize);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    connector,
-                    Style::default().fg(if is_selected { t.brand } else { dot_color }),
-                ))),
-                Rect::new(isp_right_edge_x, row_y, connector_w, 1),
-            );
-        }
-
         let rtt_str = remote
             .rtt_ms
             .map(|r| format!("{:.0}ms", r))
             .unwrap_or_else(|| "—".to_string());
         let proc_str = remote.process.as_deref().unwrap_or("—");
-        let label_truncate = (area.width.saturating_sub(4) as usize).saturating_sub(8);
-        let cursor = if is_selected {
-            Span::styled("▸ ", Style::default().fg(t.brand).bold())
-        } else {
-            Span::raw("  ")
-        };
         let label_color = if is_selected { t.brand } else { t.text_primary };
-        let line1 = Line::from(vec![
-            cursor,
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    truncate(&remote.label, label_truncate),
-                    width = label_truncate
-                ),
-                Style::default().fg(label_color).bold().to_owned(),
-            ),
-            Span::styled("● ", Style::default().fg(dot_color)),
-            Span::styled(rtt_str, Style::default().fg(t.text_muted)),
-        ]);
-        let line2 = Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("{}× {}", remote.conn_count, proc_str),
-                Style::default().fg(t.text_muted),
-            ),
-        ]);
+        let muted = Style::default().fg(t.text_muted);
+        let bold_label = Style::default().fg(label_color).bold();
+        let cursor_style = Style::default().fg(t.brand).bold();
+
+        // Layout per side: status ● sits at the spine-facing edge so it lines
+        // up with the trunk; label/cursor on the outer edge.
+        // Reserve: cursor (2) + " " (1) + rtt (5) + " " (1) + ● (1) = 10
+        let label_w = (area.width as usize).saturating_sub(10);
+        let label = truncate(&remote.label, label_w);
+
+        let (line1, line2) = match side {
+            Side::Left => {
+                // [▸ label   12ms ●]   — ● pinned to right edge (trunk side)
+                let label_pad = format!("{:<w$}", label, w = label_w);
+                let cursor = if is_selected { "▸ " } else { "  " };
+                let l1 = Line::from(vec![
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(label_pad, bold_label),
+                    Span::raw(" "),
+                    Span::styled(format!("{:>5}", rtt_str), muted),
+                    Span::raw(" "),
+                    Span::styled("●", Style::default().fg(dot_color)),
+                ]);
+                let l2 = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{}× {}", remote.conn_count, proc_str), muted),
+                ]);
+                (l1, l2)
+            }
+            Side::Right => {
+                // [● 12ms   label ◂]   — ● pinned to left edge (trunk side)
+                let label_pad = format!("{:>w$}", label, w = label_w);
+                let cursor = if is_selected { " ◂" } else { "  " };
+                let l1 = Line::from(vec![
+                    Span::styled("●", Style::default().fg(dot_color)),
+                    Span::raw(" "),
+                    Span::styled(format!("{:<5}", rtt_str), muted),
+                    Span::raw(" "),
+                    Span::styled(label_pad, bold_label),
+                    Span::styled(cursor, cursor_style),
+                ]);
+                let body = format!("{}× {}", remote.conn_count, proc_str);
+                let l2 = Line::from(vec![
+                    Span::styled(
+                        format!("{:>w$}", body, w = (area.width as usize).saturating_sub(2)),
+                        muted,
+                    ),
+                    Span::raw("  "),
+                ]);
+                (l1, l2)
+            }
+        };
+
         f.render_widget(
             Paragraph::new(vec![line1, line2]),
             Rect::new(area.x, row_y, area.width, 2),
