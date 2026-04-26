@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.14.0-rc.1"
+version = "0.14.0-rc.2"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -10,7 +10,21 @@ homepage = "https://github.com/matthart1983/netwatch"
 readme = "README.md"
 keywords = ["network", "tui", "terminal", "packet-capture", "diagnostics"]
 categories = ["command-line-utilities", "network-programming"]
-exclude = ["demo.gif", "demo.tape", ".DS_Store"]
+exclude = [
+    ".DS_Store",
+    # Demo capture artifacts — kept in the repo for README/marketing, but
+    # excluded from the published crate (crates.io has a 10 MiB limit).
+    "demo.gif",
+    "demo.tape",
+    "demo-all.gif",
+    "demo-all.tape",
+    "demo-linkedin.gif",
+    "demo-linkedin.tape",
+    "demo-slides.txt",
+    "netwatch-demo.mov",
+    "*.tape",
+    "*.mov",
+]
 
 [lib]
 name = "netwatch"
