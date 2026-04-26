@@ -76,6 +76,43 @@ pub enum StreamDirectionFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineFilter {
+    All,
+    Crit,
+    Warn,
+    Conn,
+    Dns,
+    Rtt,
+    Iface,
+}
+
+impl TimelineFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            TimelineFilter::All => "all",
+            TimelineFilter::Crit => "crit",
+            TimelineFilter::Warn => "warn",
+            TimelineFilter::Conn => "conn",
+            TimelineFilter::Dns => "dns",
+            TimelineFilter::Rtt => "rtt",
+            TimelineFilter::Iface => "iface",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            TimelineFilter::All => TimelineFilter::Crit,
+            TimelineFilter::Crit => TimelineFilter::Warn,
+            TimelineFilter::Warn => TimelineFilter::Conn,
+            TimelineFilter::Conn => TimelineFilter::Dns,
+            TimelineFilter::Dns => TimelineFilter::Rtt,
+            TimelineFilter::Rtt => TimelineFilter::Iface,
+            TimelineFilter::Iface => TimelineFilter::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatsRange {
     Min1,
     Min5,
@@ -281,6 +318,7 @@ pub struct App {
     pub connection_state_filter: ConnectionStateFilter,
     pub connection_group: ConnectionGroup,
     pub stats_range: StatsRange,
+    pub timeline_filter: TimelineFilter,
     pub session_started_at: std::time::Instant,
     pub paused: bool,
     pub current_tab: Tab,
@@ -397,6 +435,7 @@ impl App {
             connection_state_filter: ConnectionStateFilter::All,
             connection_group: ConnectionGroup::Process,
             stats_range: StatsRange::Session,
+            timeline_filter: TimelineFilter::All,
             session_started_at: std::time::Instant::now(),
             paused: false,
             current_tab: user_config.tab(),
@@ -1642,6 +1681,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Char('t') if app.current_tab == Tab::Stats => {
             app.stats_range = app.stats_range.cycle();
+        }
+        KeyCode::Char('f') if app.current_tab == Tab::Timeline => {
+            app.timeline_filter = app.timeline_filter.cycle();
         }
         KeyCode::Char('w') if app.current_tab == Tab::Packets => {
             use crate::collectors::packets::{export_pcap, matches_packet, parse_filter};

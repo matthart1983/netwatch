@@ -1,11 +1,11 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::app::App;
-use crate::collectors::connections::TrackedConnection;
+use crate::app::{App, TimelineFilter};
+use crate::collectors::network_intel::{Alert, AlertSeverity};
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Sparkline},
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -13,359 +13,519 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(6),    // timeline chart
-            Constraint::Length(3), // legend
-            Constraint::Length(3), // summary
+            Constraint::Length(2), // filter chips
+            Constraint::Length(5), // activity strip
+            Constraint::Min(8),    // events log
             Constraint::Length(3), // footer
         ])
         .split(area);
 
-    render_header(f, app, chunks[0]);
-    render_chart(f, app, chunks[1]);
-    render_legend(f, app, chunks[2]);
-    render_summary(f, app, chunks[3]);
+    let events = build_events(app);
+
+    widgets::render_header(f, app, chunks[0]);
+    render_chip_row(f, app, &events, chunks[1]);
+    render_activity_strip(f, app, &events, chunks[2]);
+    render_events(f, app, &events, chunks[3]);
     render_footer(f, app, chunks[4]);
 }
 
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let window_label = app.timeline_window.label();
-    let extra = vec![
-        Span::raw("  "),
-        Span::styled(
-            format!("last {}", window_label),
-            Style::default().fg(app.theme.status_good),
-        ),
-    ];
-    widgets::render_header_with_extra(f, app, area, extra);
+// ── Event model ─────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Crit,
+    Warn,
+    Info,
+    Ok,
 }
 
-fn render_chart(f: &mut Frame, app: &App, area: Rect) {
-    let window_secs = app.timeline_window.seconds();
-    let now = Instant::now();
-    let window_start = now - std::time::Duration::from_secs(window_secs);
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Crit => "CRIT",
+            Kind::Warn => "WARN",
+            Kind::Info => "INFO",
+            Kind::Ok => "OK",
+        }
+    }
+    fn color(self, t: &crate::theme::Theme) -> Color {
+        match self {
+            Kind::Crit => t.status_error,
+            Kind::Warn => t.status_warn,
+            Kind::Info => t.status_info,
+            Kind::Ok => t.status_good,
+        }
+    }
+}
 
-    // Sort: active first, then by first_seen (oldest at top)
-    let mut sorted: Vec<&TrackedConnection> = app
-        .connection_timeline
-        .tracked
-        .iter()
-        .filter(|t| t.last_seen >= window_start)
-        .collect();
-    sorted.sort_by(|a, b| {
-        b.is_active
-            .cmp(&a.is_active)
-            .then_with(|| a.first_seen.cmp(&b.first_seen))
-    });
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum Category {
+    Conn,
+    Dns,
+    Rtt,
+    Iface,
+    Proc,
+    Reset,
+    Alert,
+}
 
+impl Category {
+    fn label(self) -> &'static str {
+        match self {
+            Category::Conn => "CONN",
+            Category::Dns => "DNS",
+            Category::Rtt => "RTT",
+            Category::Iface => "IFACE",
+            Category::Proc => "PROC",
+            Category::Reset => "RESET",
+            Category::Alert => "ALERT",
+        }
+    }
+}
+
+struct Event {
+    when: Instant,
+    kind: Kind,
+    category: Category,
+    summary: String,
+    detail: String,
+}
+
+fn build_events(app: &App) -> Vec<Event> {
+    let mut events: Vec<Event> = Vec::new();
+
+    // Network-intel alerts
+    for alert in app.network_intel.active_alerts() {
+        events.push(alert_to_event(&alert));
+    }
+
+    // Connection lifecycle from ConnectionTimeline.tracked
+    for tracked in &app.connection_timeline.tracked {
+        let host = remote_host(&tracked.key.remote_addr);
+        let proc = tracked.process_name.clone().unwrap_or_else(|| "—".into());
+        let summary = format!(
+            "{} → {} {}",
+            proc,
+            host,
+            if tracked.is_active {
+                "established"
+            } else {
+                "closed"
+            }
+        );
+        let detail = format!(
+            "{}  age {}",
+            tracked.key.protocol,
+            duration_label(tracked.last_seen.duration_since(tracked.first_seen))
+        );
+        events.push(Event {
+            when: tracked.last_seen,
+            kind: if tracked.is_active {
+                Kind::Ok
+            } else {
+                Kind::Info
+            },
+            category: Category::Conn,
+            summary,
+            detail,
+        });
+    }
+
+    // DNS errors from packets (last ~200)
+    let packets = app.packet_collector.get_packets();
+    for pkt in packets.iter().rev().take(200) {
+        if pkt.protocol != "DNS" {
+            continue;
+        }
+        let info_lc = pkt.info.to_lowercase();
+        let (kind, label) = if info_lc.contains("nxdomain") {
+            (Kind::Warn, "NXDOMAIN")
+        } else if info_lc.contains("server failure") || info_lc.contains("servfail") {
+            (Kind::Warn, "SERVFAIL")
+        } else if info_lc.contains("refused") {
+            (Kind::Warn, "REFUSED")
+        } else {
+            continue;
+        };
+        // CapturedPacket only carries timestamp_ns relative to capture start;
+        // we don't have a wall-clock Instant. Treat all DNS errors as "now".
+        events.push(Event {
+            when: Instant::now(),
+            kind,
+            category: Category::Dns,
+            summary: format!("{}  {}", label, truncate(&pkt.info, 60)),
+            detail: format!("from {}:{}", pkt.src_ip, pkt.src_port.unwrap_or(0)),
+        });
+    }
+
+    events.sort_by(|a, b| b.when.cmp(&a.when));
+    events
+}
+
+fn alert_to_event(alert: &Alert) -> Event {
+    let kind = match alert.severity {
+        AlertSeverity::Critical => Kind::Crit,
+        AlertSeverity::Warning => Kind::Warn,
+    };
+    Event {
+        when: alert.timestamp,
+        kind,
+        category: Category::Alert,
+        summary: format!("{}  {}", alert.category.label(), alert.message),
+        detail: alert.detail.clone(),
+    }
+}
+
+fn filter_matches(filter: TimelineFilter, ev: &Event) -> bool {
+    match filter {
+        TimelineFilter::All => true,
+        TimelineFilter::Crit => ev.kind == Kind::Crit,
+        TimelineFilter::Warn => ev.kind == Kind::Warn,
+        TimelineFilter::Conn => ev.category == Category::Conn,
+        TimelineFilter::Dns => ev.category == Category::Dns,
+        TimelineFilter::Rtt => ev.category == Category::Rtt,
+        TimelineFilter::Iface => ev.category == Category::Iface,
+    }
+}
+
+// ── Filter chip row ─────────────────────────────────────────
+
+fn render_chip_row(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
+    let t = &app.theme;
+
+    let count_for = |filter: TimelineFilter| -> usize {
+        events.iter().filter(|e| filter_matches(filter, e)).count()
+    };
+
+    let chips: [TimelineFilter; 7] = [
+        TimelineFilter::All,
+        TimelineFilter::Crit,
+        TimelineFilter::Warn,
+        TimelineFilter::Conn,
+        TimelineFilter::Dns,
+        TimelineFilter::Rtt,
+        TimelineFilter::Iface,
+    ];
+
+    let mut spans: Vec<Span> = vec![Span::styled(" filter  ", Style::default().fg(t.text_muted))];
+    for f in chips.iter() {
+        let label = format!("{} {}", f.label(), count_for(*f));
+        let active = *f == app.timeline_filter;
+        if active {
+            spans.push(Span::styled(
+                format!(" {} ", label),
+                Style::default()
+                    .fg(t.text_primary)
+                    .bg(t.selection_bg)
+                    .bold(),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!(" {} ", label),
+                Style::default().fg(t.text_secondary),
+            ));
+        }
+        spans.push(Span::raw(" "));
+    }
+
+    let session = format!(
+        "session  duration {}    f cycles",
+        format_session_duration(app.session_started_at.elapsed()),
+    );
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let total = area.width as usize;
+    let session_w = session.chars().count();
+    if total > used + session_w + 2 {
+        spans.push(Span::raw(" ".repeat(total - used - session_w - 1)));
+        spans.push(Span::styled(session, Style::default().fg(t.text_muted)));
+    }
+
+    f.render_widget(
+        Paragraph::new(vec![Line::from(spans), Line::from("")]),
+        area,
+    );
+}
+
+fn format_session_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+// ── Activity strip ──────────────────────────────────────────
+
+fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
+    let t = &app.theme;
     let block = Block::default()
-        .title(format!(
-            " Timeline ({}) — now ← {:>30} → {} ago ",
-            sorted.len(),
-            "",
-            app.timeline_window.label(),
-        ))
+        .title(Line::from(Span::styled(
+            " ACTIVITY  session ",
+            Style::default().fg(t.brand).bold(),
+        )))
+        .title(
+            Line::from(Span::styled(
+                " density per second  cyan = now ",
+                Style::default().fg(t.text_muted),
+            ))
+            .alignment(Alignment::Right),
+        )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.border));
+        .border_style(Style::default().fg(t.border));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if inner.height < 2 || inner.width < 30 {
+    if inner.height < 2 {
         return;
     }
 
-    let label_width = 24u16; // "process    remote_ip   "
-    let bar_width = inner.width.saturating_sub(label_width + 1) as usize;
-
-    if bar_width < 5 {
-        return;
+    // Aggregate interface RX history as activity proxy (last 60s)
+    let interfaces = app.traffic.interfaces();
+    let mut acc: Vec<u64> = Vec::new();
+    for iface in &interfaces {
+        if iface.name == "lo0" || iface.name == "lo" {
+            continue;
+        }
+        if iface.rx_history.len() > acc.len() {
+            acc.resize(iface.rx_history.len(), 0);
+        }
+        for (i, &v) in iface.rx_history.iter().enumerate() {
+            acc[i] += v;
+        }
     }
 
-    // Build time axis
-    let time_axis = build_time_axis(
-        app.timeline_window.seconds(),
-        label_width as usize,
-        bar_width,
-        &app.theme,
+    // Mark seconds where Crit/Warn events happened so we tint those bars
+    let now = Instant::now();
+    let mut event_severity: Vec<Option<Kind>> = vec![None; acc.len()];
+    for ev in events {
+        let secs_ago = now.duration_since(ev.when).as_secs() as usize;
+        if secs_ago >= acc.len() {
+            continue;
+        }
+        let idx = acc.len().saturating_sub(secs_ago + 1);
+        if let Some(slot) = event_severity.get_mut(idx) {
+            let cur = *slot;
+            let new = ev.kind;
+            *slot = match (cur, new) {
+                (Some(Kind::Crit), _) | (_, Kind::Crit) => Some(Kind::Crit),
+                (Some(Kind::Warn), _) | (_, Kind::Warn) => Some(Kind::Warn),
+                (cur, _) => cur.or(Some(new)),
+            };
+        }
+    }
+
+    let chart_w = inner.width as usize;
+    let padded = pad_history(&acc, chart_w);
+    let pad = chart_w.saturating_sub(acc.len());
+
+    // Three-color overlay: green / yellow / red layers, only the cells
+    // matching that severity tier carry data on each layer.
+    let mut green_data = vec![0u64; chart_w];
+    let mut yellow_data = vec![0u64; chart_w];
+    let mut red_data = vec![0u64; chart_w];
+
+    for i in 0..chart_w {
+        let v = padded[i];
+        if v == 0 {
+            continue;
+        }
+        let raw_idx = if i < pad { None } else { Some(i - pad) };
+        let sev = raw_idx.and_then(|idx| event_severity.get(idx).copied().flatten());
+        match sev {
+            Some(Kind::Crit) => red_data[i] = v,
+            Some(Kind::Warn) => yellow_data[i] = v,
+            _ => green_data[i] = v,
+        }
+    }
+
+    f.render_widget(
+        Sparkline::default()
+            .data(&green_data)
+            .style(Style::default().fg(t.status_good)),
+        inner,
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(&yellow_data)
+            .style(Style::default().fg(t.status_warn)),
+        inner,
+    );
+    f.render_widget(
+        Sparkline::default()
+            .data(&red_data)
+            .style(Style::default().fg(t.status_error)),
+        inner,
     );
 
-    let visible_rows = inner.height.saturating_sub(1) as usize;
+    // Cyan cursor at the right edge ("now")
+    let cursor_x = inner.x + inner.width.saturating_sub(1);
+    for y in inner.y..inner.y + inner.height {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("│", Style::default().fg(t.brand)))),
+            Rect::new(cursor_x, y, 1, 1),
+        );
+    }
+}
+
+fn pad_history(data: &[u64], target_width: usize) -> Vec<u64> {
+    if target_width == 0 {
+        return Vec::new();
+    }
+    if data.len() >= target_width {
+        return data[data.len() - target_width..].to_vec();
+    }
+    let mut padded = vec![0u64; target_width - data.len()];
+    padded.extend_from_slice(data);
+    padded
+}
+
+// ── Event log ───────────────────────────────────────────────
+
+fn render_events(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
+    let t = &app.theme;
+
+    let filtered: Vec<&Event> = events
+        .iter()
+        .filter(|e| filter_matches(app.timeline_filter, e))
+        .collect();
+
+    let title_right = format!(" {} events  newest first ", filtered.len());
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " EVENTS ",
+            Style::default().fg(t.brand).bold(),
+        )))
+        .title(
+            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
+                .alignment(Alignment::Right),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    let header = "  AGE        KIND   CAT    EVENT";
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            header,
+            Style::default().fg(t.text_muted),
+        ))),
+        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 1),
+    );
+
+    if filtered.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No events yet — alerts and connection openings appear here as they happen.",
+                Style::default().fg(t.text_muted),
+            ))),
+            Rect::new(inner.x + 2, inner.y + 1, inner.width.saturating_sub(2), 1),
+        );
+        return;
+    }
+
+    let max_rows = inner.height.saturating_sub(1) as usize;
     let scroll = app
         .scroll
         .timeline_scroll
-        .min(sorted.len().saturating_sub(visible_rows.max(1)));
-    let visible: Vec<&TrackedConnection> = sorted
-        .iter()
-        .skip(scroll)
-        .take(visible_rows)
-        .copied()
-        .collect();
-
-    let lines: Vec<Line> = visible
-        .iter()
-        .enumerate()
-        .map(|(i, tracked)| {
-            let is_selected = i + scroll == app.scroll.timeline_scroll;
-
-            // Build label: "process    remote_ip"
-            let proc_name = tracked.process_name.as_deref().unwrap_or("—");
-            let remote = extract_ip(&tracked.key.remote_addr);
-            let label = format!(
-                " {:<10} {:<12}",
-                truncate(proc_name, 10),
-                truncate(&remote, 12)
-            );
-
-            let label_style = if is_selected {
-                Style::default().fg(app.theme.active_tab).bold()
-            } else if tracked.is_active {
-                Style::default().fg(app.theme.text_primary)
-            } else {
-                Style::default().fg(app.theme.text_muted)
-            };
-
-            // Build the bar
-            let bar = render_bar(tracked, now, window_start, bar_width, &app.theme);
-
-            let mut spans = vec![Span::styled(label, label_style), Span::raw(" ")];
-            spans.extend(bar);
-
-            Line::from(spans)
-        })
-        .collect();
-
-    let mut all_lines = vec![time_axis];
-    all_lines.extend(lines);
-    let content = Paragraph::new(all_lines);
-    f.render_widget(content, inner);
+        .min(filtered.len().saturating_sub(1));
+    let now = Instant::now();
+    for (i, ev) in filtered.iter().skip(scroll).take(max_rows).enumerate() {
+        let row_y = inner.y + 1 + i as u16;
+        let is_selected = i + scroll == app.scroll.timeline_scroll;
+        let age = format_age(now.duration_since(ev.when));
+        let line = Line::from(vec![
+            Span::styled(
+                if is_selected { "▸ " } else { "  " },
+                Style::default().fg(t.brand).bold(),
+            ),
+            Span::styled(format!("{:<10}", age), Style::default().fg(t.text_muted)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:<5}", ev.kind.label()),
+                Style::default().fg(ev.kind.color(t)).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:<6}", ev.category.label()),
+                Style::default().fg(t.text_muted),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&ev.summary, 50),
+                Style::default().fg(t.text_primary),
+            ),
+            Span::raw("  "),
+            Span::styled(truncate(&ev.detail, 50), Style::default().fg(t.text_muted)),
+        ]);
+        let row_area = Rect {
+            x: inner.x + 1,
+            y: row_y,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        let para = if is_selected {
+            Paragraph::new(line).style(Style::default().bg(t.selection_bg))
+        } else {
+            Paragraph::new(line)
+        };
+        f.render_widget(para, row_area);
+    }
 }
 
-fn render_bar(
-    tracked: &TrackedConnection,
-    now: Instant,
-    window_start: Instant,
-    width: usize,
-    theme: &crate::theme::Theme,
-) -> Vec<Span<'static>> {
-    let window_duration = now.duration_since(window_start).as_secs_f64();
-    if window_duration <= 0.0 || width == 0 {
-        return vec![Span::raw(" ".repeat(width))];
-    }
-
-    let first = tracked.first_seen.max(window_start);
-    let last = tracked.last_seen.min(now);
-
-    if first > last {
-        return vec![Span::raw(" ".repeat(width))];
-    }
-
-    // Flipped axis: left = now (col 0), right = window_start (col width)
-    // A point at time T maps to col: (now - T) / window_duration * width
-    let start_frac = now.duration_since(last).as_secs_f64() / window_duration;
-    let end_frac = now.duration_since(first).as_secs_f64() / window_duration;
-
-    let start_col = (start_frac * width as f64).floor() as usize;
-    let end_col = (end_frac * width as f64).ceil() as usize;
-    let start_col = start_col.min(width);
-    let end_col = end_col.max(start_col + 1).min(width);
-
-    let (bar_char, color) = bar_style(tracked, theme);
-
-    let mut spans = Vec::new();
-
-    // If active, mark the leftmost cell (now edge) with ▓
-    if tracked.is_active && start_col == 0 {
-        spans.push(Span::styled("▓".to_string(), Style::default().fg(color)));
-        let bar_len = (end_col - start_col).saturating_sub(1);
-        if bar_len > 0 {
-            spans.push(Span::styled(
-                bar_char.to_string().repeat(bar_len),
-                Style::default().fg(color),
-            ));
-        }
+fn format_age(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{}s ago", s)
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3600)
     } else {
-        if start_col > 0 {
-            spans.push(Span::raw(" ".repeat(start_col)));
-        }
-        let bar_len = end_col - start_col;
-        spans.push(Span::styled(
-            bar_char.to_string().repeat(bar_len),
-            Style::default().fg(color),
-        ));
-    }
-
-    let used = end_col;
-    if used < width {
-        spans.push(Span::raw(" ".repeat(width - used)));
-    }
-
-    spans
-}
-
-fn bar_style(tracked: &TrackedConnection, theme: &crate::theme::Theme) -> (char, Color) {
-    if !tracked.is_active {
-        return ('░', theme.text_muted);
-    }
-    match tracked.state.as_str() {
-        "ESTABLISHED" => ('█', theme.status_good),
-        "LISTEN" => ('█', theme.status_warn),
-        "SYN_SENT" | "SYN_RECV" | "SYN_RECEIVED" => ('░', theme.status_info),
-        "CLOSE_WAIT" | "TIME_WAIT" | "FIN_WAIT_1" | "FIN_WAIT_2" | "FIN_WAIT1" | "FIN_WAIT2" => {
-            ('░', theme.status_error)
-        }
-        _ => ('█', theme.status_good),
+        format!("{}d ago", s / 86_400)
     }
 }
 
-fn render_legend(f: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
-    let legend = Paragraph::new(Line::from(vec![
-        Span::styled(" ██", Style::default().fg(t.status_good)),
-        Span::raw(" Established  "),
-        Span::styled("██", Style::default().fg(t.status_warn)),
-        Span::raw(" Listen  "),
-        Span::styled("░░", Style::default().fg(t.status_info)),
-        Span::raw(" Connecting  "),
-        Span::styled("░░", Style::default().fg(t.status_error)),
-        Span::raw(" Closing  "),
-        Span::styled("░░", Style::default().fg(t.text_muted)),
-        Span::raw(" Closed  "),
-        Span::styled("▓", Style::default().fg(t.status_good)),
-        Span::raw(" Active edge"),
-    ]))
-    .block(
-        Block::default()
-            .title(" Legend ")
-            .title_style(Style::default().fg(t.brand))
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(t.brand)),
-    );
-    f.render_widget(legend, area);
+fn duration_label(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m{}s", s / 60, s % 60)
+    } else {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    }
 }
 
-fn render_summary(f: &mut Frame, app: &App, area: Rect) {
-    let active = app
-        .connection_timeline
-        .tracked
-        .iter()
-        .filter(|t| t.is_active)
-        .count();
-    let closed = app
-        .connection_timeline
-        .tracked
-        .iter()
-        .filter(|t| !t.is_active)
-        .count();
-    let total = app.connection_timeline.tracked.len();
-
-    let t = &app.theme;
-    let summary = Paragraph::new(Line::from(vec![
-        Span::styled(" Active: ", Style::default().fg(t.brand).bold()),
-        Span::styled(format!("{}", active), Style::default().fg(t.status_good)),
-        Span::raw("  │  "),
-        Span::styled("Closed: ", Style::default().fg(t.brand).bold()),
-        Span::styled(format!("{}", closed), Style::default().fg(t.text_muted)),
-        Span::raw("  │  "),
-        Span::styled("Total seen: ", Style::default().fg(t.brand).bold()),
-        Span::raw(format!("{}", total)),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(t.brand)),
-    );
-    f.render_widget(summary, area);
-}
+// ── helpers ─────────────────────────────────────────────────
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
     let hints = vec![
-        Span::styled("Enter", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":→Connections  "),
-        Span::styled("t", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Timespan  "),
-        Span::styled("p", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Pause"),
+        Span::styled("f", Style::default().fg(t.key_hint).bold()),
+        Span::raw(":Filter  "),
+        Span::styled("Enter", Style::default().fg(t.key_hint).bold()),
+        Span::raw(":→Connections"),
     ];
     widgets::render_footer(f, app, area, hints);
 }
 
-fn build_time_axis(
-    window_secs: u64,
-    label_width: usize,
-    bar_width: usize,
-    theme: &crate::theme::Theme,
-) -> Line<'static> {
-    // Choose tick interval based on window size
-    let (tick_count, tick_label_fn): (usize, Box<dyn Fn(usize) -> String>) = match window_secs {
-        0..=60 => (6, Box::new(|i| format!("{}s", i * 10))),
-        61..=300 => (5, Box::new(|i| format!("{}m", i))),
-        301..=900 => (5, Box::new(|i| format!("{}m", i * 3))),
-        901..=1800 => (6, Box::new(|i| format!("{}m", i * 5))),
-        _ => (6, Box::new(|i| format!("{}m", i * 10))),
-    };
-
-    let muted = theme.text_muted;
-
-    // Build the axis string
-    // Left side: label padding + "now"
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        format!("{:>width$} ", "", width = label_width),
-        Style::default().fg(muted),
-    )];
-
-    // The axis goes left=now, right=oldest
-    // Track character count (not byte count) since '─' is multi-byte
-    let segment_width = if tick_count > 0 {
-        bar_width / tick_count
-    } else {
-        bar_width
-    };
-
-    let mut axis_chars: Vec<char> = Vec::with_capacity(bar_width);
-
-    // First label: "now"
-    for c in "now".chars() {
-        axis_chars.push(c);
-    }
-
-    for i in 1..=tick_count {
-        let target = segment_width * i;
-        let label = tick_label_fn(i);
-        let label_char_count = label.chars().count();
-        let fill = target
-            .saturating_sub(axis_chars.len())
-            .saturating_sub(label_char_count);
-        for _ in 0..fill {
-            axis_chars.push('─');
-        }
-        for c in label.chars() {
-            axis_chars.push(c);
+fn remote_host(addr: &str) -> String {
+    if let Some(stripped) = addr.strip_prefix('[') {
+        if let Some(end) = stripped.find("]:") {
+            return format!("[{}]", &stripped[..end]);
         }
     }
-
-    // Pad or truncate to bar_width (by character count)
-    while axis_chars.len() < bar_width {
-        axis_chars.push(' ');
-    }
-    axis_chars.truncate(bar_width);
-
-    let axis: String = axis_chars.into_iter().collect();
-    spans.push(Span::styled(axis, Style::default().fg(muted)));
-    Line::from(spans)
-}
-
-fn extract_ip(addr: &str) -> String {
-    if addr == "*:*" || addr.is_empty() {
-        return "—".to_string();
-    }
-    if let Some(bracket_end) = addr.rfind("]:") {
-        addr[1..bracket_end].to_string()
-    } else if let Some(colon) = addr.rfind(':') {
-        let ip = &addr[..colon];
-        if ip == "*" {
-            "—".to_string()
-        } else {
-            ip.to_string()
-        }
+    if let Some(colon) = addr.rfind(':') {
+        addr[..colon].to_string()
     } else {
         addr.to_string()
     }
@@ -373,9 +533,9 @@ fn extract_ip(addr: &str) -> String {
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max - 1).collect();
-        format!("{}…", truncated)
+        return s.to_string();
     }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
