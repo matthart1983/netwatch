@@ -192,6 +192,11 @@ jobs:
 
   homebrew:
     needs: release
+    # Skip homebrew formula update for pre-release tags (e.g. v0.14.0-rc.1).
+    # Brew has no pre-release concept, so any formula push reaches every
+    # `brew upgrade` user. crates.io still publishes — pre-release versions
+    # there are opt-in via `cargo install --version`.
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Compute sha256 for each release asset
