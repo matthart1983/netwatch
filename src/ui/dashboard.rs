@@ -404,7 +404,21 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         .map(|i| i.name.clone())
         .unwrap_or_else(|| "—".into());
 
-    let title_left = format!(" THROUGHPUT  {}  last 60s ", primary_name);
+    // Aggregate histories first so the title can describe what actually
+    // fits in the chart (sparkline width vs available samples).
+    let agg_rx = aggregate_rx(&actives);
+    let agg_tx = aggregate_tx(&actives);
+
+    // Approximate sparkline width before block.inner is computed (area minus
+    // borders + 2-cell padding inside render).
+    let chart_width = (area.width as usize).saturating_sub(4);
+    let displayed = chart_width.min(agg_rx.len().max(agg_tx.len())).max(1);
+    let window_label = if displayed >= 120 {
+        format!("last {}m", displayed / 60)
+    } else {
+        format!("last {}s", displayed)
+    };
+    let title_left = format!(" THROUGHPUT  {}  {} ", primary_name, window_label);
     let block = Block::default()
         .title(Line::from(Span::styled(
             title_left,
@@ -422,10 +436,6 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
     if inner.height < 4 {
         return;
     }
-
-    // Aggregate histories
-    let agg_rx = aggregate_rx(&actives);
-    let agg_tx = aggregate_tx(&actives);
     let peak_rx = *agg_rx.iter().max().unwrap_or(&0);
     let peak_tx = *agg_tx.iter().max().unwrap_or(&0);
     let avg_rx = if !agg_rx.is_empty() {

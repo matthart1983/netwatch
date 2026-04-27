@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-const SPARKLINE_HISTORY: usize = 60;
+// Capped at 600 samples (10 min @ 1 Hz) so wide terminals can fill their
+// throughput sparkline without trailing empty cells. Per-interface memory cost
+// is ~5 KiB (600 × 8 bytes × 2 series), which is trivial.
+const SPARKLINE_HISTORY: usize = 600;
 
 #[derive(Debug, Clone)]
 pub struct InterfaceTraffic {
