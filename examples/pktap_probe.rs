@@ -14,9 +14,21 @@
 // and prints raw events as they arrive, so you can confirm coverage of
 // short-lived flows (e.g. `curl https://example.com` in another terminal).
 
+// PKTAP is xnu-only; the rest of the example body is gated below so this
+// file still compiles on Linux/Windows for `cargo test --all-targets`.
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("pktap_probe is macOS-only — PKTAP is an xnu kernel feature.");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "macos")]
 use netwatch::platform::pktap;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 fn main() {
     println!("Spawning PKTAP attributor (requires sudo)...");
     let handle = pktap::spawn();
