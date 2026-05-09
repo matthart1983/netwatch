@@ -1,8 +1,8 @@
 class Netwatch < Formula
   desc "Real-time network diagnostics TUI — like htop for your network"
   homepage "https://github.com/matthart1983/netwatch"
-  url "https://github.com/matthart1983/netwatch/archive/refs/tags/v0.8.0.tar.gz"
-  sha256 "186d634729d925bdcae8ded9eb1ac698f17d78ee870a10456dc470f8e4df7759"
+  url "https://github.com/matthart1983/netwatch/archive/refs/tags/v0.15.3.tar.gz"
+  sha256 "5ad084f93c8fe521b6b4976500c0fb02b938fca4401fd0bdd3569c6dda66e5a0"
   license "MIT"
   head "https://github.com/matthart1983/netwatch.git", branch: "main"
 

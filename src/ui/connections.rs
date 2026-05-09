@@ -1,4 +1,5 @@
-use crate::app::{App, ConnectionGroup, ConnectionStateFilter};
+use crate::app::{App, ConnectionGroup, ConnectionStateFilter, PktapStatus};
+use crate::collectors::connections::AttributionSource;
 use crate::collectors::connections::Connection;
 use crate::collectors::traceroute::TracerouteStatus;
 use crate::sort::{
@@ -189,6 +190,31 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(app.theme.status_good),
         ));
     }
+
+    // PKTAP attribution status (macOS only). Tells users whether the rows
+    // they see are kernel-attributed (`pktap`) or polled (`lsof`), and why
+    // pktap fell back if it did. Skipped entirely on non-macOS so Linux
+    // and Windows headers stay uncluttered.
+    match app.pktap_status() {
+        PktapStatus::NotApplicable => {}
+        PktapStatus::Active => {
+            extra.push(Span::raw("  "));
+            extra.push(Span::styled(
+                "attribution: pktap",
+                Style::default().fg(app.theme.status_good),
+            ));
+        }
+        PktapStatus::Failed(err) => {
+            extra.push(Span::raw("  "));
+            // Truncate the error so it doesn't blow out narrow terminals.
+            let short = err.chars().take(60).collect::<String>();
+            extra.push(Span::styled(
+                format!("attribution: lsof — pktap unavailable: {short}"),
+                Style::default().fg(app.theme.status_warn),
+            ));
+        }
+    }
+
     crate::ui::widgets::render_header_with_extra(f, app, area, extra);
 }
 
@@ -440,9 +466,20 @@ fn render_conn_row(
 
     let age_str = connection_age(app, conn);
 
+    // Bullet glyph encodes attribution source: `◉` (filled+ring) for
+    // kernel-attributed rows, plain `●` for lsof-polled rows. The header
+    // labels which path is active so users can decode this; see
+    // `render_header`. Selected row uses the same arrow regardless.
+    let bullet = if is_selected {
+        "▸ "
+    } else if conn.attribution == AttributionSource::Pktap {
+        "◉ "
+    } else {
+        "● "
+    };
     let mut spans: Vec<Span> = vec![
         Span::styled(
-            if is_selected { "▸ " } else { "● " },
+            bullet,
             Style::default().fg(if is_selected { t.brand } else { dot_color }),
         ),
         Span::styled(

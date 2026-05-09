@@ -402,8 +402,21 @@ pub struct App {
     /// here so it stops cleanly when the App drops. None on non-macOS or
     /// when pktap couldn't be opened (e.g. no root).
     #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
     pktap_handle: Option<crate::platform::pktap::PktapHandle>,
+}
+
+/// State of the PKTAP attribution path for status display. macOS-only;
+/// other platforms always report `NotApplicable` so the renderer can
+/// branch on this once without `cfg`-gating the call sites.
+#[derive(Debug, Clone)]
+pub enum PktapStatus {
+    /// Not running on macOS (Linux/Windows have no PKTAP equivalent yet).
+    NotApplicable,
+    /// PKTAP attributor is running; kernel attribution is being applied.
+    Active,
+    /// Attributor failed to start. Carries the libpcap/setup error so the
+    /// UI can show users why attribution silently fell back to lsof.
+    Failed(String),
 }
 
 impl App {
@@ -547,6 +560,24 @@ impl App {
             #[cfg(target_os = "macos")]
             pktap_handle,
         }
+    }
+
+    /// State of the PKTAP attribution path for the Connections header.
+    /// Always `NotApplicable` on non-macOS.
+    #[cfg(target_os = "macos")]
+    pub fn pktap_status(&self) -> PktapStatus {
+        match self.pktap_handle.as_ref() {
+            None => PktapStatus::NotApplicable,
+            Some(h) => match h.startup_error() {
+                Some(err) => PktapStatus::Failed(err),
+                None => PktapStatus::Active,
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn pktap_status(&self) -> PktapStatus {
+        PktapStatus::NotApplicable
     }
 
     pub fn sort_column_index(&self, tab: Tab) -> Option<usize> {
