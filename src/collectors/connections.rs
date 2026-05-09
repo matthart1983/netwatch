@@ -1,4 +1,6 @@
 use crate::collectors::packets::{StreamKey, StreamProtocol, StreamTracker};
+#[cfg(target_os = "macos")]
+use crate::platform::pktap::PktapAttributor;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -6,6 +8,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+
+/// Where the (pid, process_name) on a Connection came from.
+///
+/// `Lsof` is the userspace fallback (lsof/ss/netstat polling). `Pktap` means
+/// the attribution came from the macOS PKTAP kernel-level capture path —
+/// faster, accurate for short-lived flows, and not subject to poll-interval
+/// blind spots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AttributionSource {
+    #[default]
+    Lsof,
+    Pktap,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Connection {
@@ -23,6 +39,8 @@ pub struct Connection {
     pub rx_rate: Option<f64>,
     /// Outbound (local→remote) payload bytes per second.
     pub tx_rate: Option<f64>,
+    #[serde(default)]
+    pub attribution: AttributionSource,
 }
 
 /// Which side of a canonical `StreamKey` the connection's local endpoint sits on.
@@ -140,6 +158,8 @@ pub struct ConnectionCollector {
     busy: Arc<AtomicBool>,
     stream_tracker: Arc<Mutex<StreamTracker>>,
     rate_state: Arc<Mutex<RateState>>,
+    #[cfg(target_os = "macos")]
+    pktap: Option<Arc<PktapAttributor>>,
 }
 
 impl ConnectionCollector {
@@ -149,7 +169,18 @@ impl ConnectionCollector {
             busy: Arc::new(AtomicBool::new(false)),
             stream_tracker,
             rate_state: Arc::new(Mutex::new(RateState::new())),
+            #[cfg(target_os = "macos")]
+            pktap: None,
         }
+    }
+
+    /// Attach a PKTAP attribution cache. When set, `update()` will overlay
+    /// kernel-derived (pid, comm) onto each lsof-discovered connection whose
+    /// 5-tuple appears in the cache.
+    #[cfg(target_os = "macos")]
+    pub fn with_pktap(mut self, pktap: Arc<PktapAttributor>) -> Self {
+        self.pktap = Some(pktap);
+        self
     }
 
     pub fn update(&self) {
@@ -161,6 +192,8 @@ impl ConnectionCollector {
         let busy = Arc::clone(&self.busy);
         let stream_tracker = Arc::clone(&self.stream_tracker);
         let rate_state = Arc::clone(&self.rate_state);
+        #[cfg(target_os = "macos")]
+        let pktap = self.pktap.clone();
         thread::spawn(move || {
             #[cfg(target_os = "macos")]
             let mut result = parse_lsof();
@@ -184,9 +217,31 @@ impl ConnectionCollector {
             }
             drop(state);
 
+            #[cfg(target_os = "macos")]
+            if let Some(pktap) = pktap.as_ref() {
+                overlay_pktap_attribution(&mut result, pktap);
+            }
+
             *connections.lock().unwrap() = result;
             busy.store(false, Ordering::SeqCst);
         });
+    }
+}
+
+/// For each lsof-discovered connection whose 5-tuple appears in the PKTAP
+/// cache, replace the userspace-scraped (pid, process_name) with the
+/// kernel-attributed values and flip `attribution` to `Pktap`. Connections
+/// not present in the cache are left untouched.
+#[cfg(target_os = "macos")]
+fn overlay_pktap_attribution(connections: &mut [Connection], pktap: &PktapAttributor) {
+    for conn in connections {
+        if let Some((key, _)) = connection_stream_key(conn) {
+            if let Some(attr) = pktap.lookup(&key) {
+                conn.pid = Some(attr.pid);
+                conn.process_name = Some(attr.comm);
+                conn.attribution = AttributionSource::Pktap;
+            }
+        }
     }
 }
 
@@ -352,6 +407,7 @@ fn parse_lsof() -> Vec<Connection> {
                 kernel_rtt_us: None,
                 rx_rate: None,
                 tx_rate: None,
+                attribution: AttributionSource::Lsof,
             });
             *has_network = false;
         }
@@ -475,6 +531,7 @@ fn parse_linux_connections() -> Vec<Connection> {
                 kernel_rtt_us: None,
                 rx_rate: None,
                 tx_rate: None,
+                attribution: AttributionSource::Lsof,
             });
         }
     }
@@ -615,6 +672,7 @@ fn parse_windows_connections() -> Vec<Connection> {
             kernel_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
+            attribution: AttributionSource::Lsof,
         })
         .collect()
 }
@@ -687,6 +745,7 @@ mod tests {
             kernel_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
+            attribution: AttributionSource::Lsof,
         }
     }
 

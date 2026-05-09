@@ -694,6 +694,7 @@ mod tests {
             kernel_rtt_us: Some(12_000.0),
             rx_rate: None,
             tx_rate: None,
+            attribution: Default::default(),
         }
     }
 

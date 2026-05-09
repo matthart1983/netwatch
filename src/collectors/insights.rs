@@ -526,6 +526,7 @@ mod tests {
             kernel_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
+            attribution: Default::default(),
         }
     }
 

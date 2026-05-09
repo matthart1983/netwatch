@@ -398,6 +398,12 @@ pub struct App {
     pub settings_status: Option<String>,
     settings_status_tick: u32,
     incident_capture_started: bool,
+    /// macOS PKTAP-based per-packet attribution. Spawned at startup; kept
+    /// here so it stops cleanly when the App drops. None on non-macOS or
+    /// when pktap couldn't be opened (e.g. no root).
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    pktap_handle: Option<crate::platform::pktap::PktapHandle>,
 }
 
 impl App {
@@ -441,6 +447,27 @@ impl App {
         // per-connection rates. If this fails (no sudo, no interface), the
         // error surfaces on the Packets tab and rate columns stay blank.
         packet_collector.start_capture(&capture_interface, bpf_filter_active.as_deref());
+
+        // On macOS, try to start PKTAP capture for kernel-level per-packet
+        // process attribution. Requires root — falls back gracefully to lsof
+        // polling when unavailable.
+        #[cfg(target_os = "macos")]
+        let pktap_handle = {
+            let handle = crate::platform::pktap::spawn();
+            // If startup fails fast we still keep the handle so the UI can
+            // surface the reason; lookups against the empty cache are cheap.
+            Some(handle)
+        };
+
+        #[cfg(target_os = "macos")]
+        let connection_collector = {
+            let cc = ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker));
+            match pktap_handle.as_ref() {
+                Some(h) => cc.with_pktap(Arc::clone(&h.attributor)),
+                None => cc,
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
         let connection_collector =
             ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker));
 
@@ -517,6 +544,8 @@ impl App {
             settings_status_tick: 0,
             incident_capture_started: false,
             sort_picker: Default::default(),
+            #[cfg(target_os = "macos")]
+            pktap_handle,
         }
     }
 
@@ -2150,6 +2179,7 @@ mod tests {
             kernel_rtt_us: None,
             rx_rate: None,
             tx_rate: None,
+            attribution: Default::default(),
         }
     }
 
@@ -2284,6 +2314,7 @@ mod tests {
             kernel_rtt_us: None,
             rx_rate: rx,
             tx_rate: tx,
+            attribution: Default::default(),
         }
     }
 
