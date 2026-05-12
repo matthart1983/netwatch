@@ -9,6 +9,14 @@ use netwatch::config::NetwatchConfig;
 use ratatui::prelude::*;
 use std::io;
 
+// Replace glibc's `ptmalloc` (Linux) and the system allocator on other
+// platforms with mimalloc. Long-running TUI daemons that spawn short
+// per-tick threads pay a noticeable RSS tax to ptmalloc's per-thread
+// arena retention; mimalloc returns memory to the OS more aggressively
+// and shaves a meaningful chunk off our steady-state baseline.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Handle CLI flags before entering TUI mode

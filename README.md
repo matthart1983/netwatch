@@ -70,6 +70,29 @@ sudo netwatch       # Full mode — adds health probes + packet capture
 netwatch --generate-config
 ```
 
+### Running without sudo (Linux)
+
+Packet capture and eBPF process attribution need elevated capabilities, but
+you don't have to run the whole TUI as root. Grant them once to the binary
+and `netwatch` works for your normal user thereafter:
+
+```bash
+sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"
+netwatch
+```
+
+| Capability       | What it unlocks                                                                |
+|------------------|--------------------------------------------------------------------------------|
+| `cap_net_raw`    | Opening packet capture on a live interface (libpcap)                           |
+| `cap_bpf`        | Loading the kernel-level process-attribution kprobe (kernel ≥ 5.10)            |
+| `cap_perfmon`    | Reading the BPF ring buffer the kprobe writes to                               |
+
+Without them netwatch still runs — it falls back to `ss`/`lsof`-style polling
+for process attribution and skips packet capture. The Connections tab's
+header surfaces the active source (`attribution: ebpf`, `attribution: pktap`,
+or `attribution: lsof — ebpf unavailable: …`) so you can tell at a glance
+which path is live.
+
 ### Flight Recorder
 
 Catch transient failures that vanish before you can inspect them:

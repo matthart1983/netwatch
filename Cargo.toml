@@ -53,6 +53,13 @@ maxminddb = "0.27"
 # the tree as a transitive dep of rustls; pinning explicitly so the QUIC
 # crypto can't break under a transitive bump.
 ring = "0.17"
+# Global allocator. The default glibc `ptmalloc` retains freed chunks in
+# per-thread arenas and can hold tens to a hundred MB of RSS that isn't
+# logically in use, especially for long-running daemons that spawn short
+# threads (which we do, per-collector tick). mimalloc trims aggressively
+# and shaves a meaningful chunk off our steady-state baseline. Two-line
+# wire-up: this dep + `#[global_allocator]` in src/main.rs.
+mimalloc = { version = "0.1", default-features = false }
 # Default: pulls in netwatch-sdk's Phase 1 BPF event source (a kprobe on
 # `tcp_v4_connect` emitting per-(pid, comm, 5-tuple) connect events into
 # a ring buffer for userspace). The SDK gates aya behind its own Linux
