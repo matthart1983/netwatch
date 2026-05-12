@@ -252,7 +252,10 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             format!(" Packets ({total_all}){bm_label} ")
         };
         Block::default()
-            .title(title)
+            .title(Line::from(Span::styled(
+                title,
+                Style::default().fg(app.theme.brand).bold(),
+            )))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border))
     });
@@ -394,7 +397,10 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
 
             let proto_detail = Paragraph::new(detail_lines).block(
                 Block::default()
-                    .title(" Protocol Detail ")
+                    .title(Line::from(Span::styled(
+                        " Protocol Detail ",
+                        Style::default().fg(app.theme.brand).bold(),
+                    )))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(app.theme.border)),
             );
@@ -406,7 +412,10 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                     .style(Style::default().fg(app.theme.text_primary))
                     .block(
                         Block::default()
-                            .title(" Payload Content ")
+                            .title(Line::from(Span::styled(
+                                " Payload Content ",
+                                Style::default().fg(app.theme.brand).bold(),
+                            )))
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(app.theme.border)),
                     )
@@ -435,7 +444,10 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 .style(Style::default().fg(app.theme.text_muted))
                 .block(
                     Block::default()
-                        .title(" Packet Detail ")
+                        .title(Line::from(Span::styled(
+                            " Packet Detail ",
+                            Style::default().fg(app.theme.brand).bold(),
+                        )))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(app.theme.border)),
                 );
@@ -454,7 +466,10 @@ fn render_hex_ascii(
         .style(Style::default().fg(theme.status_good))
         .block(
             Block::default()
-                .title(" Hex Dump ")
+                .title(Line::from(Span::styled(
+                    " Hex Dump ",
+                    Style::default().fg(theme.brand).bold(),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border)),
         )
@@ -465,7 +480,10 @@ fn render_hex_ascii(
         .style(Style::default().fg(theme.status_warn))
         .block(
             Block::default()
-                .title(" ASCII ")
+                .title(Line::from(Span::styled(
+                    " ASCII ",
+                    Style::default().fg(theme.brand).bold(),
+                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border)),
         )
@@ -481,7 +499,10 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().fg(app.theme.text_muted))
                 .block(
                     Block::default()
-                        .title(" Stream View ")
+                        .title(Line::from(Span::styled(
+                            " Stream View ",
+                            Style::default().fg(app.theme.brand).bold(),
+                        )))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(app.theme.border)),
                 );
@@ -497,7 +518,10 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().fg(app.theme.status_error))
                 .block(
                     Block::default()
-                        .title(" Stream View ")
+                        .title(Line::from(Span::styled(
+                            " Stream View ",
+                            Style::default().fg(app.theme.brand).bold(),
+                        )))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(app.theme.border)),
                 );
