@@ -333,10 +333,18 @@ pub fn paper() -> Theme {
     //   text_muted     #5a5a5a  ≈ 5.7:1   AA
     //   inactive_tab   #5a5a64  ≈ 5.6:1   AA
     //   border         #a0a0a0  ≈ 2.5:1   chrome-only, intentionally faint
+    //
+    // Data colors were originally inherited from the existing `light`
+    // theme (designed for whichever bg the terminal supplied) and were
+    // measurably too pale against our committed off-white. Adjusted:
+    //   status_good / rx_rate  #006428  ≈ 7.0:1  AAA (was #007832 ≈ 5.3:1)
+    //   status_warn            #785000  ≈ 6.3:1  AAA (was #aa6e00 ≈ 3.9:1)
+    //   key_hint               #785000  ≈ 6.3:1  AAA (was #b46400 ≈ 3.8:1)
+    //   active_tab             #905800  ≈ 5.4:1  AA  (was #b46400 ≈ 4.2:1)
     Theme {
         name: "paper",
         brand: Color::Rgb(0, 100, 160),
-        active_tab: Color::Rgb(180, 100, 0),
+        active_tab: Color::Rgb(0x90, 0x58, 0x00),
         inactive_tab: Color::Rgb(90, 90, 100),
         border: Color::Rgb(160, 160, 160),
         separator: Color::Rgb(160, 160, 160),
@@ -344,13 +352,13 @@ pub fn paper() -> Theme {
         text_secondary: Color::Rgb(64, 64, 64),
         text_muted: Color::Rgb(90, 90, 90),
         text_inverse: Color::Rgb(255, 255, 255),
-        status_good: Color::Rgb(0, 120, 50),
-        status_warn: Color::Rgb(170, 110, 0),
+        status_good: Color::Rgb(0x00, 0x64, 0x28),
+        status_warn: Color::Rgb(0x78, 0x50, 0x00),
         status_error: Color::Rgb(180, 30, 30),
         status_info: Color::Rgb(0, 100, 160),
-        rx_rate: Color::Rgb(0, 120, 50),
+        rx_rate: Color::Rgb(0x00, 0x64, 0x28),
         tx_rate: Color::Rgb(0, 80, 160),
-        key_hint: Color::Rgb(180, 100, 0),
+        key_hint: Color::Rgb(0x78, 0x50, 0x00),
         selection_bg: Color::Rgb(220, 230, 240),
         highlight_bg: Color::Rgb(200, 215, 230),
         bg: Color::Rgb(0xF5, 0xF5, 0xF2),
