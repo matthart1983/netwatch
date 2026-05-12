@@ -115,7 +115,7 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(
         theme,
         "t",
-        "Cycle theme (dark/light/ocean/solarized/dracula/nord/sky/paper)",
+        "Cycle theme (dark/minimal/ocean/solarized/dracula/nord/sky/paper)",
     ));
     lines.push(key_line(
         theme,

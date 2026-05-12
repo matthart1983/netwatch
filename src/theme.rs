@@ -46,7 +46,7 @@ pub struct Theme {
 
 pub const THEME_NAMES: &[&str] = &[
     "dark",
-    "light",
+    "minimal",
     "ocean",
     "solarized",
     "dracula",
@@ -59,7 +59,12 @@ pub const THEME_NAMES: &[&str] = &[
 
 pub fn by_name(name: &str) -> Theme {
     match name.to_lowercase().as_str() {
-        "light" => light(),
+        // Accept the historical "light" name as an alias for "minimal" so
+        // saved configs from earlier releases keep working. The theme is
+        // dark-text-on-terminal-default, which is only readable when the
+        // user's terminal is in a light mode — "minimal" makes that
+        // constraint explicit; "light" set the wrong expectation.
+        "minimal" | "light" => minimal(),
         "ocean" => ocean(),
         "solarized" => solarized(),
         "dracula" => dracula(),
@@ -95,9 +100,18 @@ pub fn dark() -> Theme {
     }
 }
 
-pub fn light() -> Theme {
+/// "Minimal" styling — leaves the panel background as `Color::Reset`
+/// (terminal default) and uses dark RGB text. Only legible when the
+/// terminal's own background is in a light mode, so it's intentionally
+/// scoped to users who pair netwatch with a light-themed terminal.
+/// For a self-contained light-themed UI that works regardless of the
+/// terminal's palette, use `paper` instead.
+///
+/// Was named "light" historically; `by_name` still accepts the old
+/// alias so existing configs keep working.
+pub fn minimal() -> Theme {
     Theme {
-        name: "light",
+        name: "minimal",
         brand: Color::Rgb(0, 120, 180),
         active_tab: Color::Rgb(180, 100, 0),
         inactive_tab: Color::Rgb(140, 140, 140),
@@ -411,7 +425,7 @@ mod tests {
     fn transparent_themes_leave_bg_reset() {
         // Existing six keep terminal-default bg so users who picked
         // their terminal palette deliberately don't have it stomped.
-        for name in ["dark", "light", "ocean", "solarized", "dracula", "nord"] {
+        for name in ["dark", "minimal", "ocean", "solarized", "dracula", "nord"] {
             assert_eq!(
                 by_name(name).bg,
                 Color::Reset,
@@ -423,7 +437,12 @@ mod tests {
     #[test]
     fn by_name_case_insensitive() {
         assert_eq!(by_name("DARK").name, "dark");
-        assert_eq!(by_name("Light").name, "light");
+        assert_eq!(by_name("Minimal").name, "minimal");
+        // Historical alias: configs that still say "light" resolve to
+        // the renamed theme rather than silently dropping to the
+        // dark fallback.
+        assert_eq!(by_name("light").name, "minimal");
+        assert_eq!(by_name("Light").name, "minimal");
         assert_eq!(by_name("DRACULA").name, "dracula");
     }
 }
