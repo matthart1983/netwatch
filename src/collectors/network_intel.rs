@@ -13,9 +13,9 @@ const DNS_TUNNEL_QUERY_RATE: u32 = 50; // per minute per base domain
 const DNS_TUNNEL_UNIQUE_SUBS: usize = 30;
 const DNS_OUTSTANDING_TIMEOUT_SECS: u64 = 5;
 const STALE_ENTRY_SECS: u64 = 300;
-const MAX_TRACKED_IPS: usize = 1000;
+pub(crate) const MAX_TRACKED_IPS: usize = 1000;
 const MAX_TRACKED_DOMAINS: usize = 500;
-const MAX_TRACKED_BEACONS: usize = 500;
+pub(crate) const MAX_TRACKED_BEACONS: usize = 500;
 const BW_ALERT_CONSECUTIVE: u32 = 2;
 const BW_ALERT_CLEAR_RATIO: f64 = 0.9;
 const TOP_DOMAINS_COUNT: usize = 20;
@@ -227,6 +227,17 @@ impl NetworkIntelCollector {
         &self.alert_history
     }
 
+    // ── Memory-stats accessors (drive the `M` debug overlay) ──────────
+    pub fn scan_states_len(&self) -> usize {
+        self.scan_states.len()
+    }
+    pub fn beacon_states_len(&self) -> usize {
+        self.beacon_states.len()
+    }
+    pub fn alert_history_len(&self) -> usize {
+        self.alert_history.len()
+    }
+
     pub fn dns_analytics(&self) -> DnsAnalytics {
         let mut top: Vec<(String, u32)> = self
             .domain_counts
@@ -402,10 +413,21 @@ impl NetworkIntelCollector {
     // ── Internal detection logic ───────────────────────────
 
     fn detect_port_scan(&mut self, event: &ConnAttemptEvent, now: Instant) {
+        // At cap with a genuinely new key: evict the oldest-last_seen
+        // entry rather than silently dropping the new one. Otherwise a
+        // burst of 1k concurrent source IPs makes us blind to new
+        // attackers until prune_stale's next sweep ~5 minutes later.
         if self.scan_states.len() >= MAX_TRACKED_IPS
             && !self.scan_states.contains_key(&event.src_ip)
         {
-            return;
+            if let Some(oldest_ip) = self
+                .scan_states
+                .iter()
+                .min_by_key(|(_, s)| s.last_seen)
+                .map(|(k, _)| k.clone())
+            {
+                self.scan_states.remove(&oldest_ip);
+            }
         }
 
         let state = self
@@ -454,9 +476,19 @@ impl NetworkIntelCollector {
             dst_port: event.dst_port,
         };
 
+        // Same LRU-evict-on-overflow pattern as detect_port_scan. A
+        // sufficiently noisy set of beaconing flows shouldn't lock us
+        // out of detecting newer ones.
         if self.beacon_states.len() >= MAX_TRACKED_BEACONS && !self.beacon_states.contains_key(&key)
         {
-            return;
+            if let Some(oldest_key) = self
+                .beacon_states
+                .iter()
+                .min_by_key(|(_, s)| s.last_seen)
+                .map(|(k, _)| k.clone())
+            {
+                self.beacon_states.remove(&oldest_key);
+            }
         }
 
         let state = self
@@ -762,5 +794,90 @@ mod tests {
         let analytics = intel.dns_analytics();
         assert_eq!(analytics.top_domains[0].0, "example.com");
         assert_eq!(analytics.top_domains[0].1, 10);
+    }
+
+    // ── Memory-cap stress tests ─────────────────────────────────────────
+
+    #[test]
+    fn scan_states_evicts_oldest_at_cap_instead_of_silent_drop() {
+        // Fill scan_states to MAX_TRACKED_IPS with synthetic source IPs.
+        // Then send one more event from a brand-new IP and verify it
+        // gets tracked (not silently dropped) by evicting the oldest.
+        let mut intel = NetworkIntelCollector::new();
+        for i in 0..MAX_TRACKED_IPS {
+            intel.on_conn_attempt(ConnAttemptEvent {
+                src_ip: format!("10.0.{}.{}", i / 256, i % 256),
+                dst_ip: "1.1.1.1".into(),
+                dst_port: 80,
+            });
+        }
+        assert_eq!(intel.scan_states.len(), MAX_TRACKED_IPS);
+
+        // The very first inserted IP becomes the LRU victim.
+        let victim = "10.0.0.0".to_string();
+        let newcomer = "192.0.2.99".to_string();
+        assert!(intel.scan_states.contains_key(&victim));
+        assert!(!intel.scan_states.contains_key(&newcomer));
+
+        intel.on_conn_attempt(ConnAttemptEvent {
+            src_ip: newcomer.clone(),
+            dst_ip: "1.1.1.1".into(),
+            dst_port: 80,
+        });
+
+        assert!(
+            intel.scan_states.contains_key(&newcomer),
+            "newcomer must be inserted via LRU eviction"
+        );
+        assert_eq!(
+            intel.scan_states.len(),
+            MAX_TRACKED_IPS,
+            "cap holds — count stays at MAX_TRACKED_IPS"
+        );
+    }
+
+    #[test]
+    fn beacon_states_evicts_oldest_at_cap() {
+        let mut intel = NetworkIntelCollector::new();
+        for i in 0..MAX_TRACKED_BEACONS {
+            intel.on_conn_attempt(ConnAttemptEvent {
+                src_ip: format!("10.1.{}.{}", i / 256, i % 256),
+                dst_ip: "8.8.8.8".into(),
+                dst_port: 53,
+            });
+        }
+        assert_eq!(intel.beacon_states.len(), MAX_TRACKED_BEACONS);
+
+        let newcomer_src = "192.0.2.42".to_string();
+        intel.on_conn_attempt(ConnAttemptEvent {
+            src_ip: newcomer_src.clone(),
+            dst_ip: "8.8.8.8".into(),
+            dst_port: 53,
+        });
+        assert!(intel
+            .beacon_states
+            .keys()
+            .any(|k| k.src == newcomer_src && k.dst_port == 53));
+        assert_eq!(intel.beacon_states.len(), MAX_TRACKED_BEACONS);
+    }
+
+    #[test]
+    fn scan_states_never_exceeds_cap_under_sustained_load() {
+        // Simulate a botnet: 5× MAX_TRACKED_IPS distinct attackers in
+        // tight succession. The collector should stay bounded the
+        // entire time, not just at the end.
+        let mut intel = NetworkIntelCollector::new();
+        for i in 0..(MAX_TRACKED_IPS * 5) {
+            intel.on_conn_attempt(ConnAttemptEvent {
+                src_ip: format!("203.0.113.{}.{}", i / 256, i),
+                dst_ip: "1.1.1.1".into(),
+                dst_port: (i as u16 % 65534) + 1,
+            });
+            assert!(
+                intel.scan_states.len() <= MAX_TRACKED_IPS,
+                "scan_states grew past cap at iteration {}",
+                i
+            );
+        }
     }
 }

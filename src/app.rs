@@ -278,6 +278,40 @@ pub fn default_sort_states() -> HashMap<Tab, TabSortState> {
     m
 }
 
+/// Record one RTT sample for `remote_ip`, capping both the per-IP
+/// VecDeque to `RTT_SPARKLINE_SAMPLES` entries and the overall IP-key
+/// count to `MAX_RTT_HISTORY_IPS` via FIFO eviction through `order`.
+///
+/// Extracted from `App::sample_rtt_from_streams` so the cap logic is
+/// directly unit-testable without standing up a full PacketCollector.
+pub(crate) fn record_rtt_sample(
+    history: &mut HashMap<String, VecDeque<f64>>,
+    order: &mut VecDeque<String>,
+    remote_ip: &str,
+    rtt_ms: f64,
+) {
+    use std::collections::hash_map::Entry;
+    let is_new = matches!(history.entry(remote_ip.to_string()), Entry::Vacant(_));
+    let h = history
+        .entry(remote_ip.to_string())
+        .or_insert_with(|| VecDeque::with_capacity(RTT_SPARKLINE_SAMPLES + 1));
+    h.push_back(rtt_ms);
+    if h.len() > RTT_SPARKLINE_SAMPLES {
+        h.pop_front();
+    }
+    if is_new {
+        order.push_back(remote_ip.to_string());
+        while history.len() > MAX_RTT_HISTORY_IPS {
+            match order.pop_front() {
+                Some(old_ip) => {
+                    history.remove(&old_ip);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// Per-tab scroll positions and selection state.
 pub struct UiScrollState {
     pub connection_scroll: usize,
@@ -346,6 +380,10 @@ pub struct App {
     pub bpf_filter_active: Option<String>,
     pub incident_recorder: IncidentRecorder,
     pub show_help: bool,
+    /// Debug `M` overlay — current size of every bounded collection
+    /// vs its cap. Off by default; toggled with `M`. Documented in
+    /// help dialog but not advertised in the footer hotkey strip.
+    pub show_memory_stats: bool,
     pub geo_cache: GeoCache,
     pub show_geo: bool,
     pub whois_cache: WhoisCache,
@@ -565,6 +603,7 @@ impl App {
             bpf_filter_active,
             incident_recorder: IncidentRecorder::new(),
             show_help: false,
+            show_memory_stats: false,
             geo_cache: GeoCache::with_mmdb(&user_config.geoip_db, &user_config.geoip_asn_db),
             show_geo: user_config.show_geo,
             whois_cache: WhoisCache::new(),
@@ -962,26 +1001,7 @@ impl App {
         let sampled = &mut self.rtt_sampled_streams;
         let tracker = tracker_arc.lock().unwrap();
         tracker.for_each_new_handshake_rtt(sampled, |remote_ip, rtt_ms| {
-            use std::collections::hash_map::Entry;
-            let is_new = matches!(history.entry(remote_ip.to_string()), Entry::Vacant(_));
-            let h = history
-                .entry(remote_ip.to_string())
-                .or_insert_with(|| VecDeque::with_capacity(RTT_SPARKLINE_SAMPLES + 1));
-            h.push_back(rtt_ms);
-            if h.len() > RTT_SPARKLINE_SAMPLES {
-                h.pop_front();
-            }
-            if is_new {
-                order.push_back(remote_ip.to_string());
-                while history.len() > MAX_RTT_HISTORY_IPS {
-                    match order.pop_front() {
-                        Some(old_ip) => {
-                            history.remove(&old_ip);
-                        }
-                        None => break,
-                    }
-                }
-            }
+            record_rtt_sample(history, order, remote_ip, rtt_ms);
         });
     }
 
@@ -1138,6 +1158,9 @@ pub async fn run<B: Backend>(
             }
             if app.show_settings {
                 ui::settings::render(f, &app, area);
+            }
+            if app.show_memory_stats {
+                ui::memory_stats::render(f, &app, area);
             }
             if app.sort_picker.is_open() {
                 ui::sort_picker::render(
@@ -1370,17 +1393,41 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 let clicked_row = (row - content_top) as usize;
                 match app.current_tab {
                     Tab::Connections if !app.traceroute_view_open => {
-                        // Account for table header row. Use the filtered
-                        // list — the unfiltered length would let clicks
-                        // land on rows that aren't visible, and clicks on
-                        // visible rows would index past the filter.
-                        if clicked_row > 0 {
-                            let visible_row = clicked_row - 1;
-                            let conns = crate::ui::connections::filtered_sorted_conns(app);
-                            let max = conns.len().saturating_sub(1);
-                            let idx = (app.scroll.connection_scroll + visible_row).min(max);
-                            app.scroll.connection_scroll = idx;
+                        // Map the screen click to a connection index. The
+                        // Connections tab has a chip row + detail strip the
+                        // generic content_top/content_bottom above doesn't
+                        // know about, so we re-compute the table's actual
+                        // inner rect via the same helper the renderer uses.
+                        // This also fixes the bug (issue #28) where the
+                        // selection was being set to `connection_scroll +
+                        // visible_row` — i.e. relative to the previously
+                        // selected row, not to the visible window — which
+                        // made clicks land on rows further down than the
+                        // one the user clicked.
+                        let inner = crate::ui::connections::table_inner_area(area);
+                        if row < inner.y || row >= inner.y + inner.height {
+                            return;
                         }
+                        let row_within = (row - inner.y) as usize;
+                        if row_within == 0 {
+                            return; // table column-header row
+                        }
+                        let visible_row = row_within - 1;
+
+                        let conns = crate::ui::connections::filtered_sorted_conns(app);
+                        if conns.is_empty() {
+                            return;
+                        }
+                        let visible_rows = inner.height.saturating_sub(1) as usize;
+                        let max_idx = conns.len().saturating_sub(1);
+                        let selected = app.scroll.connection_scroll.min(max_idx);
+                        let window_top = crate::ui::connections::compute_window_top(
+                            selected,
+                            conns.len(),
+                            visible_rows,
+                        );
+                        let idx = (window_top + visible_row).min(max_idx);
+                        app.scroll.connection_scroll = idx;
                     }
                     Tab::Packets if !app.stream_view_open => {
                         if clicked_row > 0 {
@@ -1526,6 +1573,16 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     }
     if app.show_settings {
         return handle_settings_key(app, key);
+    }
+    if app.show_memory_stats {
+        // Tiny dedicated handler — Esc / M close, q / Ctrl-C still quit.
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('M') => app.show_memory_stats = false,
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            _ => {}
+        }
+        return false;
     }
     if app.sort_picker.is_open() {
         // auto-close if tab changed to a non-sortable tab (e.g. via mouse)
@@ -1788,6 +1845,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('?') => {
             app.show_help = !app.show_help;
             app.scroll.help_scroll = 0;
+        }
+        KeyCode::Char('M') => {
+            // Capital M — debug overlay for bounded-collection sizes.
+            // Intentionally only the uppercase variant so it doesn't
+            // collide with any future lowercase `m` binding.
+            app.show_memory_stats = !app.show_memory_stats;
         }
         KeyCode::Char('g') => app.show_geo = !app.show_geo,
         KeyCode::Char('t') if app.current_tab != Tab::Timeline && app.current_tab != Tab::Stats => {
@@ -2898,5 +2961,73 @@ mod tests {
         assert_eq!(apply_direction(Ordering::Less, false), Ordering::Greater);
         assert_eq!(apply_direction(Ordering::Greater, false), Ordering::Less);
         assert_eq!(apply_direction(Ordering::Equal, false), Ordering::Equal);
+    }
+
+    // ── RTT history cap tests ───────────────────────────────────────────
+
+    #[test]
+    fn rtt_history_caps_per_ip_samples() {
+        let mut history: HashMap<String, VecDeque<f64>> = HashMap::new();
+        let mut order: VecDeque<String> = VecDeque::new();
+        // Push more than RTT_SPARKLINE_SAMPLES samples for the same IP.
+        for i in 0..(RTT_SPARKLINE_SAMPLES * 3) {
+            record_rtt_sample(&mut history, &mut order, "10.0.0.1", i as f64);
+        }
+        let q = history.get("10.0.0.1").unwrap();
+        assert_eq!(q.len(), RTT_SPARKLINE_SAMPLES);
+        // The freshest sample wins.
+        let newest = (RTT_SPARKLINE_SAMPLES * 3 - 1) as f64;
+        assert_eq!(*q.back().unwrap(), newest);
+    }
+
+    #[test]
+    fn rtt_history_caps_total_ip_keys() {
+        let mut history: HashMap<String, VecDeque<f64>> = HashMap::new();
+        let mut order: VecDeque<String> = VecDeque::new();
+        // 3× the IP cap, one sample each. History should hold exactly
+        // MAX_RTT_HISTORY_IPS keys; the freshest insertions win.
+        for i in 0..(MAX_RTT_HISTORY_IPS * 3) {
+            let ip = format!("10.0.{}.{}", i / 256, i % 256);
+            record_rtt_sample(&mut history, &mut order, &ip, 5.0);
+            assert!(
+                history.len() <= MAX_RTT_HISTORY_IPS,
+                "rtt_history grew past MAX_RTT_HISTORY_IPS at iteration {}",
+                i
+            );
+        }
+        assert_eq!(history.len(), MAX_RTT_HISTORY_IPS);
+        // First-inserted IP must have been evicted; latest-inserted IP
+        // must still be present.
+        assert!(!history.contains_key("10.0.0.0"));
+        let last = MAX_RTT_HISTORY_IPS * 3 - 1;
+        let last_ip = format!("10.0.{}.{}", last / 256, last % 256);
+        assert!(history.contains_key(&last_ip));
+    }
+
+    #[test]
+    fn rtt_history_repeated_ip_doesnt_consume_key_budget() {
+        // Re-sampling an existing IP must not push it through the
+        // FIFO eviction logic — otherwise a single chatty host could
+        // displace all the others over time.
+        let mut history: HashMap<String, VecDeque<f64>> = HashMap::new();
+        let mut order: VecDeque<String> = VecDeque::new();
+        // Fill to MAX_RTT_HISTORY_IPS with distinct IPs.
+        for i in 0..MAX_RTT_HISTORY_IPS {
+            record_rtt_sample(
+                &mut history,
+                &mut order,
+                &format!("10.0.{}.{}", i / 256, i % 256),
+                1.0,
+            );
+        }
+        let order_len_before = order.len();
+        // Now sample the first IP many times.
+        for _ in 0..1000 {
+            record_rtt_sample(&mut history, &mut order, "10.0.0.0", 2.0);
+        }
+        // Order queue length stays the same; no eviction triggered.
+        assert_eq!(order.len(), order_len_before);
+        assert_eq!(history.len(), MAX_RTT_HISTORY_IPS);
+        assert!(history.contains_key("10.0.0.0"));
     }
 }

@@ -3,6 +3,7 @@ pub mod dashboard;
 pub mod help;
 pub mod insights;
 pub mod interfaces;
+pub mod memory_stats;
 pub mod packets;
 pub mod processes;
 pub mod settings;

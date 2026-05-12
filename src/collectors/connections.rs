@@ -356,6 +356,15 @@ impl ConnectionTimeline {
         }
     }
 
+    /// Current tracked-connection count, for the `M` debug overlay.
+    pub fn tracked_len(&self) -> usize {
+        self.tracked.len()
+    }
+    /// Hard cap from `MAX_TRACKED_CONNECTIONS`, for the `M` debug overlay.
+    pub fn tracked_cap(&self) -> usize {
+        MAX_TRACKED_CONNECTIONS
+    }
+
     pub fn update(&mut self, connections: &[Connection]) {
         let now = Instant::now();
 

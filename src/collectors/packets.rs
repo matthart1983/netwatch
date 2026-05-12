@@ -736,6 +736,16 @@ impl PacketCollector {
         self.error.lock().unwrap().clone()
     }
 
+    /// Cheap read of the packet ring's current length — for the `M`
+    /// debug overlay. Uses try_read so a contended lock doesn't stall
+    /// the redraw; returns 0 if the lock can't be acquired this frame.
+    pub fn packet_count_hint(&self) -> usize {
+        match self.packets.try_read() {
+            Ok(g) => g.len(),
+            Err(_) => 0,
+        }
+    }
+
     pub fn get_packets(&self) -> std::sync::RwLockReadGuard<'_, Vec<CapturedPacket>> {
         self.packets.read().unwrap()
     }
