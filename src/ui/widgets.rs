@@ -49,7 +49,13 @@ pub fn paint_overlay_bg(f: &mut Frame, theme: &crate::theme::Theme, area: Rect) 
     if theme.bg == ratatui::style::Color::Reset {
         return;
     }
-    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
+    // Set both bg AND fg so unstyled spans inside the popup inherit
+    // theme.text_primary — otherwise they fall back to the terminal's
+    // own default fg, which washes out on a painted bg.
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.bg).fg(theme.text_primary)),
+        area,
+    );
 }
 
 /// Returns true if the interface saw any traffic in the last few history

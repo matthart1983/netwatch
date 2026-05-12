@@ -1142,16 +1142,25 @@ pub async fn run<B: Backend>(
         terminal.draw(|f| {
             let area = f.size();
             app.last_area = area;
-            // Paint the theme's panel background first so themes that
-            // opt in (sky, paper) get a colored fill behind everything.
+            // Paint the theme's panel background AND default foreground
+            // first so themes that opt in (sky, paper) get a colored fill
+            // *and* a sane default text color behind everything. Setting
+            // both means ratatui's Buffer retains them under cells —
+            // subsequent renders that use `Style::default()` / `Span::raw`
+            // (no explicit fg) inherit the theme's text_primary instead
+            // of the terminal's own default fg, which would otherwise
+            // wash out unstyled body text on the painted bg.
+            //
             // Themes with `bg: Color::Reset` paint nothing — terminal
-            // default shows through, preserving the historical look.
+            // defaults stay in charge, preserving the historical look.
             if app.theme.bg != ratatui::style::Color::Reset {
                 use ratatui::widgets::{Block, Borders};
                 f.render_widget(
-                    Block::default()
-                        .borders(Borders::NONE)
-                        .style(ratatui::style::Style::default().bg(app.theme.bg)),
+                    Block::default().borders(Borders::NONE).style(
+                        ratatui::style::Style::default()
+                            .bg(app.theme.bg)
+                            .fg(app.theme.text_primary),
+                    ),
                     area,
                 );
             }
