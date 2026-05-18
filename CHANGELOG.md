@@ -2,6 +2,11 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.16.1] - 2026-05-18
+
+### Fixed
+- **Shift+W now actually shows whois on the Connections tab** (#29). The keybinding was wired up and the help overlay advertised it, but the Connections UI never rendered the resolved cache entry — only the Packets tab did. The lookup fired silently into the background; nothing appeared in the UI. The detail strip below the connection table now shows `WHOIS  netname │ org │ range │ country` plus an optional description line, mirroring the existing Packets-tab format.
+
 ## [0.16.0] - 2026-05-17
 
 ### Added
