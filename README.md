@@ -106,7 +106,7 @@ which path is live.
 
 ### Security sandbox (Linux)
 
-Available on **v0.17.1+** (`v0.17.0` had a regression — see below). Once
+Available on **v0.18.0+** (v0.17.0 had a path-coverage regression; v0.17.1 fixed that but the sandbox's `NO_NEW_PRIVS` requirement broke the subprocess-based ping path, blanking gateway / DNS RTTs). v0.18.0 routes health probing through a native DGRAM ICMP socket, so the sandbox + health probes finally coexist. Once
 pcap, PKTAP, and the eBPF kprobe finish setup, netwatch hands the elevated
 capabilities back and locks itself into a Landlock-enforced filesystem
 allow-list — so a memory-safety bug in DPI parsing can't read SSH keys,

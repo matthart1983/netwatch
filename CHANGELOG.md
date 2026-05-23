@@ -2,6 +2,19 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.18.0] - 2026-05-23
+
+### Changed
+- **Health probing now uses native DGRAM ICMP instead of `Command::new("ping")`.** The v0.17.x sandbox sets `PR_SET_NO_NEW_PRIVS=1` before applying Landlock (required by the kernel for unprivileged use), and `NO_NEW_PRIVS` causes the kernel to ignore the setcap on `/usr/bin/ping` on execve — so the subprocess fallback returned EPERM and both gateway and DNS RTTs sat at "0.0 ms / 100% loss" while the sandbox was active. The new path opens a `SOCK_DGRAM` `IPPROTO_ICMP` (and `IPPROTO_ICMPV6`) socket directly via `nix`, which gates on `net.ipv4.ping_group_range` (default `0 2147483647` on most distros — i.e. any user) instead of `CAP_NET_RAW`, so it works under sandbox without any capability requirement.
+- The subprocess `ping` path is preserved as a fallback for systems where DGRAM ICMP isn't permitted (`ping_group_range` set to a restrictive range) and for Windows.
+- Verified end-to-end on Linux under best-effort sandbox: `cargo run --example ping_under_sandbox -- 192.168.0.54` returns a clean RTT (3.25 ms in a representative LAN measurement) with Landlock ABI V7 active and `NO_NEW_PRIVS=1` set.
+
+### Fixed
+- **Gateway ping + DNS RTT no longer blank under the sandbox** (the regression flagged on v0.17.1). Net effect: with v0.17.1 you had to choose `--no-sandbox` to see health metrics; in v0.18.0 the default-on sandbox and health probing both work together.
+
+### Notes
+- The `Topology` tab's `traceroute` hops are still subprocess-based and will hit the same `NO_NEW_PRIVS` issue. That's a separate rewrite (UDP+TTL probes in-process) tracked for a later release. Workaround until then: traceroute renders correctly with `--no-sandbox`, and the rest of the Topology tab (gateway dot, ISP detection, color-coded edges) works under sandbox.
+
 ## [0.17.1] - 2026-05-23
 
 ### Fixed

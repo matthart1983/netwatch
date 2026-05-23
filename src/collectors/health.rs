@@ -97,6 +97,154 @@ impl HealthProber {
 }
 
 fn run_ping(target: &str) -> (Option<f64>, f64) {
+    // Prefer native DGRAM ICMP on Unix — works under the sandbox
+    // because Landlock sets NO_NEW_PRIVS, which makes the kernel
+    // ignore the setcap on /usr/bin/ping and break the subprocess
+    // fallback. DGRAM ICMP gates on `net.ipv4.ping_group_range`
+    // (default `0 2147483647` on most distros) instead of CAP_NET_RAW.
+    #[cfg(unix)]
+    if let Some(result) = run_ping_native(target) {
+        return result;
+    }
+
+    run_ping_subprocess(target)
+}
+
+#[cfg(unix)]
+fn run_ping_native(target: &str) -> Option<(Option<f64>, f64)> {
+    use nix::sys::socket::{
+        recvfrom, sendto, setsockopt, socket, sockopt::ReceiveTimeout, AddressFamily, MsgFlags,
+        SockFlag, SockType, SockaddrIn, SockaddrIn6,
+    };
+    use nix::sys::time::TimeVal;
+    use std::net::{IpAddr, SocketAddrV4, SocketAddrV6};
+    use std::os::fd::AsRawFd;
+    use std::time::Instant;
+
+    let addr: IpAddr = target.parse().ok()?;
+
+    let (af, proto, icmp_echo_type, icmp_echo_reply_type) = match addr {
+        IpAddr::V4(_) => (
+            AddressFamily::Inet,
+            nix::sys::socket::SockProtocol::Icmp,
+            8u8,
+            0u8,
+        ),
+        IpAddr::V6(_) => (
+            AddressFamily::Inet6,
+            nix::sys::socket::SockProtocol::IcmpV6,
+            128u8,
+            129u8,
+        ),
+    };
+
+    // SOCK_DGRAM ICMP: kernel rewrites the Identifier per-socket and
+    // delivers only matching Echo Replies. No CAP_NET_RAW required.
+    let sock = socket(af, SockType::Datagram, SockFlag::empty(), proto).ok()?;
+
+    // 1-second receive timeout per probe so a dead gateway doesn't
+    // hang the prober thread.
+    setsockopt(&sock, ReceiveTimeout, &TimeVal::new(1, 0)).ok()?;
+
+    let fd = sock.as_raw_fd();
+
+    const PROBES: usize = 3;
+    let mut rtts = Vec::with_capacity(PROBES);
+
+    for seq in 0..PROBES as u16 {
+        let mut pkt = vec![0u8; 16];
+        pkt[0] = icmp_echo_type;
+        pkt[1] = 0; // code
+        pkt[2] = 0; // checksum hi (we'll compute below for IPv4)
+        pkt[3] = 0; // checksum lo
+        pkt[4] = 0; // id hi (kernel rewrites for SOCK_DGRAM)
+        pkt[5] = 0; // id lo
+        pkt[6] = (seq >> 8) as u8;
+        pkt[7] = seq as u8;
+        // Payload: 8 arbitrary bytes so the reply is large enough to
+        // identify and so we match `ping`'s 8-byte data block default.
+        pkt[8..16].copy_from_slice(b"netwatch");
+
+        // For IPv4 SOCK_DGRAM ICMP the kernel does NOT compute the
+        // checksum for us — userspace must. (IPv6 the kernel does.)
+        if matches!(addr, IpAddr::V4(_)) {
+            let cksum = icmp_checksum(&pkt);
+            pkt[2] = (cksum >> 8) as u8;
+            pkt[3] = cksum as u8;
+        }
+
+        let send_t = Instant::now();
+
+        let send_ok = match addr {
+            IpAddr::V4(v4) => {
+                let dst: SockaddrIn = SocketAddrV4::new(v4, 0).into();
+                sendto(fd, &pkt, &dst, MsgFlags::empty()).is_ok()
+            }
+            IpAddr::V6(v6) => {
+                let dst: SockaddrIn6 = SocketAddrV6::new(v6, 0, 0, 0).into();
+                sendto(fd, &pkt, &dst, MsgFlags::empty()).is_ok()
+            }
+        };
+        if !send_ok {
+            // EPERM here probably means the kernel rejected SOCK_DGRAM
+            // ICMP entirely (no ping_group_range entry). Caller falls
+            // back to the subprocess path.
+            return None;
+        }
+
+        let mut buf = [0u8; 256];
+        let recv_ok = match addr {
+            IpAddr::V4(_) => recvfrom::<SockaddrIn>(fd, &mut buf).map(|_| ()).is_ok(),
+            IpAddr::V6(_) => recvfrom::<SockaddrIn6>(fd, &mut buf).map(|_| ()).is_ok(),
+        };
+
+        if recv_ok {
+            // Sanity-check the reply type so we don't count a stray
+            // DestUnreach as a successful echo.
+            let reply_type_ok = match addr {
+                IpAddr::V4(_) => buf.first() == Some(&icmp_echo_reply_type),
+                IpAddr::V6(_) => buf.first() == Some(&icmp_echo_reply_type),
+            };
+            if reply_type_ok {
+                let elapsed_ms = send_t.elapsed().as_secs_f64() * 1000.0;
+                rtts.push(elapsed_ms);
+            }
+        }
+    }
+
+    let avg = if rtts.is_empty() {
+        None
+    } else {
+        Some(rtts.iter().sum::<f64>() / rtts.len() as f64)
+    };
+    let loss = (PROBES - rtts.len()) as f64 / PROBES as f64 * 100.0;
+    Some((avg, loss))
+}
+
+#[cfg(unix)]
+fn icmp_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Subprocess fallback for Windows + Unix systems where SOCK_DGRAM ICMP
+/// isn't available (no `net.ipv4.ping_group_range` entry, exotic
+/// kernels). Under the v0.17.x Linux sandbox this path is broken
+/// because Landlock sets NO_NEW_PRIVS and the setcap on `/usr/bin/ping`
+/// is ignored on exec — the native path above is what makes pings
+/// work under sandbox.
+fn run_ping_subprocess(target: &str) -> (Option<f64>, f64) {
     #[cfg(target_os = "macos")]
     let args = ["-c", "3", "-t", "1", target];
 
