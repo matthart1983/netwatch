@@ -55,6 +55,16 @@ pub struct NetwatchConfig {
     /// RX/TX charts on the dashboard and interfaces tabs; in-row sparklines
     /// always use the default `bars` style regardless of this setting.
     pub graph_style: String,
+
+    /// btop-style fade + faint grid effect. When `true`, every chart in
+    /// the app — hero RX/TX panels, in-row sparklines, RTT history,
+    /// timeline severity layers — renders columns with progressively
+    /// dimmer color from right (newest, full intensity) to left (oldest,
+    /// ~30% intensity), and overlays a faint dot grid behind the data so
+    /// the magnitude is easier to read. Off by default; the solid-color
+    /// look matches the original UI exactly.
+    #[serde(default)]
+    pub graph_fade: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +100,7 @@ impl Default for NetwatchConfig {
             insights_endpoint: "local".into(),
             theme: "dark".into(),
             graph_style: "bars".into(),
+            graph_fade: false,
         }
     }
 }
@@ -246,6 +257,7 @@ show_geo = false
             insights_endpoint: "local".into(),
             theme: "dark".into(),
             graph_style: "bars".into(),
+            graph_fade: false,
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();

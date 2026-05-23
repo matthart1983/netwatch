@@ -150,17 +150,39 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             .min(total.saturating_sub(visible_height))
     };
 
+    // Number of rows that will actually be rendered — capped by the
+    // visible window AND the filtered packet count. Used as the denominator
+    // for the top-bright / bottom-dim row fade so the gradient spans the
+    // actual visible region rather than the maximum window size.
+    let rendered_rows = filtered.len().saturating_sub(offset).min(visible_height);
     let rows: Vec<Row> = filtered
         .iter()
         .skip(offset)
         .take(visible_height)
-        .map(|pkt| {
+        .enumerate()
+        .map(|(row_idx, pkt)| {
             let proto_style = protocol_color(&pkt.protocol, &app.theme);
             let selected = app.ui.scroll.packet_selected == Some(pkt.id);
             let row_style = if selected {
                 Style::default().bg(app.theme.selection_bg)
             } else {
                 expert_row_style(pkt.expert, &app.theme)
+            };
+            // Position-based fade alpha; selected row stays at full intensity
+            // so it remains visually grounded regardless of where it sits.
+            let row_alpha = if app.user_config.graph_fade && !selected {
+                crate::graph::row_fade_alpha(row_idx, rendered_rows)
+            } else {
+                1.0
+            };
+            let fade = |s: Style| {
+                if (row_alpha - 1.0).abs() < f32::EPSILON {
+                    s
+                } else if let Some(fg) = s.fg {
+                    s.fg(crate::graph::fade_color(fg, app.theme.bg, row_alpha))
+                } else {
+                    s
+                }
             };
 
             let is_bookmarked = app.caches.bookmarks.contains(&pkt.id);
@@ -285,16 +307,23 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 None => Style::default(),
             };
 
+            // For cells that previously didn't set an explicit fg, set
+            // one to text_primary so fade actually has a color to dim.
+            // Without this, those cells inherit the buffer default and
+            // the fade only touches the cells with explicit colors —
+            // looks visually inconsistent across the row.
+            let unstyled_fg = fade(Style::default().fg(app.theme.text_primary));
             Row::new(vec![
-                Cell::from(expert_icon).style(expert_style),
-                Cell::from(pkt.id.to_string()).style(Style::default().fg(app.theme.text_muted)),
-                Cell::from(pkt.timestamp.clone()),
-                Cell::from(src_display),
-                Cell::from(dst_display),
-                Cell::from(pkt.protocol.clone()).style(proto_style),
-                Cell::from(pkt.length.to_string()),
-                Cell::from(stream_label).style(Style::default().fg(app.theme.text_muted)),
-                Cell::from(truncate_info(&info_text, 40)).style(info_style),
+                Cell::from(expert_icon).style(fade(expert_style)),
+                Cell::from(pkt.id.to_string())
+                    .style(fade(Style::default().fg(app.theme.text_muted))),
+                Cell::from(pkt.timestamp.clone()).style(unstyled_fg),
+                Cell::from(src_display).style(unstyled_fg),
+                Cell::from(dst_display).style(unstyled_fg),
+                Cell::from(pkt.protocol.clone()).style(fade(proto_style)),
+                Cell::from(pkt.length.to_string()).style(unstyled_fg),
+                Cell::from(stream_label).style(fade(Style::default().fg(app.theme.text_muted))),
+                Cell::from(truncate_info(&info_text, 40)).style(fade(info_style)),
             ])
             .style(row_style)
         })

@@ -419,6 +419,7 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
         app.graph_style,
         t.status_good,
         t.status_warn,
+        app.graph_opts(),
     );
     crate::graph::render_with_max(
         f,
@@ -428,6 +429,7 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
         app.graph_style,
         t.status_warn,
         t.status_warn,
+        app.graph_opts(),
     );
     crate::graph::render_with_max(
         f,
@@ -437,6 +439,7 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
         app.graph_style,
         t.status_error,
         t.status_warn,
+        app.graph_opts(),
     );
 
     // Cyan cursor at the right edge ("now")

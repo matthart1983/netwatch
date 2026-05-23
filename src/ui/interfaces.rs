@@ -353,6 +353,7 @@ fn render_interface_row(f: &mut Frame, app: &App, inner: Rect, i: usize, iface: 
                 app.graph_style,
                 t.rx_rate,
                 t.status_warn,
+                app.graph_opts(),
             );
         }
     }
@@ -604,6 +605,7 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
         app.graph_style,
         t.rx_rate,
         t.status_warn,
+        app.graph_opts(),
     );
 
     let tx_padded = pad_history(&tx_hist, chart_w as usize);
@@ -614,6 +616,7 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
         app.graph_style,
         t.tx_rate,
         t.status_warn,
+        app.graph_opts(),
     );
 
     // x-axis line

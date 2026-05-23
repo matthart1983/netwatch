@@ -525,11 +525,19 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     let selected = app.ui.scroll.connection_scroll.min(max_idx);
     let window_top = compute_window_top(selected, conns.len(), visible_rows);
 
+    let rendered = conns.iter().skip(window_top).take(visible_rows).count();
     for (i, conn) in conns.iter().skip(window_top).take(visible_rows).enumerate() {
         let abs_idx = window_top + i;
         let is_selected = abs_idx == selected;
         let row_y = inner.y + 1 + i as u16;
-        render_conn_row(f, app, inner, row_y, conn, is_selected);
+        // Selected row stays at full intensity regardless of position;
+        // unselected rows fade top-bright / bottom-dim when fade is on.
+        let row_alpha = if app.user_config.graph_fade && !is_selected {
+            crate::graph::row_fade_alpha(i, rendered)
+        } else {
+            1.0
+        };
+        render_conn_row(f, app, inner, row_y, conn, is_selected, row_alpha);
     }
 
     if conns.is_empty() {
@@ -556,6 +564,7 @@ fn render_conn_row(
     row_y: u16,
     conn: &Connection,
     is_selected: bool,
+    row_alpha: f32,
 ) {
     let t = &app.theme;
     let state_color = match conn.state.as_str() {
@@ -698,7 +707,12 @@ fn render_conn_row(
             Style::default().fg(t.text_muted),
         ),
     ]);
-    let line = Line::from(spans);
+    let faded_spans = if (row_alpha - 1.0).abs() < f32::EPSILON {
+        spans
+    } else {
+        crate::graph::fade_spans_fg(spans, t.bg, row_alpha)
+    };
+    let line = Line::from(faded_spans);
 
     let row_area = Rect {
         x: inner.x + 1,
@@ -993,6 +1007,7 @@ fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) 
                 app.graph_style,
                 t.rx_rate,
                 t.status_warn,
+                app.graph_opts(),
             );
         }
     }

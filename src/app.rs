@@ -678,6 +678,17 @@ impl App {
         }
     }
 
+    /// Render-time graph options bundle. Built once per render path
+    /// from `user_config.graph_fade` + `theme.bg`; passed to every
+    /// `graph::render` / `graph::render_with_max` call site so a single
+    /// config toggle drives the entire UI.
+    pub fn graph_opts(&self) -> crate::graph::GraphOpts {
+        crate::graph::GraphOpts {
+            fade: self.user_config.graph_fade,
+            bg: self.theme.bg,
+        }
+    }
+
     fn pick_capture_interface(info: &[InterfaceInfo]) -> String {
         // Prefer UP interfaces with an IPv4 address, skip loopback
         info.iter()
@@ -1763,6 +1774,24 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.user_config.graph_style = names[next].to_string();
                 app.graph_style = crate::graph::by_name(names[next]);
                 app.ui.settings_status = Some(format!("Graph style: {}", names[next]));
+                app.ui.settings_status_tick = 0;
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Char(' ')
+                if app.ui.settings_cursor == ui::settings::cursor::GRAPH_FADE =>
+            {
+                app.user_config.graph_fade = !app.user_config.graph_fade;
+                app.ui.settings_status = Some(format!(
+                    "Graph fade: {}",
+                    if app.user_config.graph_fade {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ));
                 app.ui.settings_status_tick = 0;
             }
             KeyCode::Enter => {

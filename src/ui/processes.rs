@@ -199,11 +199,17 @@ fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], a
             .min(ranked.len().saturating_sub(visible))
     };
 
+    let rendered = ranked.iter().skip(window_top).take(visible).count();
     for (i, proc) in ranked.iter().skip(window_top).take(visible).enumerate() {
         let row_y = inner.y + 1 + i as u16;
         let abs_idx = window_top + i;
         let is_selected = abs_idx == selected;
-        render_process_row(f, app, inner, row_y, proc, is_selected);
+        let row_alpha = if app.user_config.graph_fade && !is_selected {
+            crate::graph::row_fade_alpha(i, rendered)
+        } else {
+            1.0
+        };
+        render_process_row(f, app, inner, row_y, proc, is_selected, row_alpha);
     }
 
     if ranked.is_empty() {
@@ -224,6 +230,7 @@ fn render_process_row(
     row_y: u16,
     proc: &ProcessBandwidth,
     is_selected: bool,
+    row_alpha: f32,
 ) {
     let t = &app.theme;
     let active = proc.rx_rate > 0.0 || proc.tx_rate > 0.0;
@@ -302,6 +309,11 @@ fn render_process_row(
         Style::default().bg(t.selection_bg)
     } else {
         Style::default()
+    };
+    let line = if (row_alpha - 1.0).abs() < f32::EPSILON {
+        line
+    } else {
+        Line::from(crate::graph::fade_spans_fg(line.spans, t.bg, row_alpha))
     };
     f.render_widget(Paragraph::new(line).style(bg), row_area);
 }
@@ -556,6 +568,7 @@ fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth
             app.graph_style,
             t.rx_rate,
             t.status_warn,
+            app.graph_opts(),
         );
     } else {
         f.render_widget(

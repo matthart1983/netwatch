@@ -213,6 +213,7 @@ fn render_kpi_tile(
             app.graph_style,
             t.rx_rate,
             t.status_warn,
+            app.graph_opts(),
         );
     }
 }
@@ -521,6 +522,7 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         app.graph_style,
         t.rx_rate,
         t.status_warn,
+        app.graph_opts(),
     );
 
     let agg_tx_padded = pad_history(&agg_tx, tx_area.width as usize);
@@ -531,6 +533,7 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         app.graph_style,
         t.tx_rate,
         t.status_warn,
+        app.graph_opts(),
     );
 
     // x-axis labels
@@ -747,6 +750,7 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
                             app.graph_style,
                             if active { t.rx_rate } else { t.text_muted },
                             t.status_warn,
+                            app.graph_opts(),
                         );
                     }
                 }
@@ -988,6 +992,7 @@ fn render_health_target(
                 app.graph_style,
                 dot_color,
                 app.theme.status_warn,
+                app.graph_opts(),
             );
         }
     }

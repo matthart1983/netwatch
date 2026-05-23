@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-pub const SETTINGS_COUNT: usize = 16;
+pub const SETTINGS_COUNT: usize = 17;
 
 pub const TAB_NAMES: &[&str] = &[
     "dashboard",
@@ -37,6 +37,7 @@ pub mod cursor {
     pub const AI_MODEL: usize = 13;
     pub const AI_ENDPOINT: usize = 14;
     pub const GRAPH_STYLE: usize = 15;
+    pub const GRAPH_FADE: usize = 16;
 }
 
 struct SettingRow {
@@ -126,6 +127,10 @@ fn build_rows(cfg: &NetwatchConfig) -> Vec<SettingRow> {
             label: "Graph Style",
             value: cfg.graph_style.clone(),
         },
+        SettingRow {
+            label: "Graph Fade (btop)",
+            value: if cfg.graph_fade { "on" } else { "off" }.into(),
+        },
     ]
 }
 
@@ -189,7 +194,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         let value_display = if is_editing {
             format!("{}▏", app.ui.settings_edit_buf)
         } else if is_selected
-            && (i == cursor::THEME || i == cursor::DEFAULT_TAB || i == cursor::GRAPH_STYLE)
+            && (i == cursor::THEME
+                || i == cursor::DEFAULT_TAB
+                || i == cursor::GRAPH_STYLE
+                || i == cursor::GRAPH_FADE)
         {
             format!("◀ {} ▶", row.value)
         } else {
@@ -270,6 +278,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     } else if app.ui.settings_cursor == cursor::THEME
         || app.ui.settings_cursor == cursor::DEFAULT_TAB
         || app.ui.settings_cursor == cursor::GRAPH_STYLE
+        || app.ui.settings_cursor == cursor::GRAPH_FADE
     {
         vec![
             Span::styled("←→", Style::default().fg(app.theme.key_hint).bold()),
@@ -323,6 +332,7 @@ pub fn get_edit_value(cfg: &NetwatchConfig, cursor: usize) -> String {
         13 => cfg.insights_model.clone(),
         14 => cfg.insights_endpoint.clone(),
         15 => cfg.graph_style.clone(),
+        16 => if cfg.graph_fade { "on" } else { "off" }.into(),
         _ => String::new(),
     }
 }
@@ -438,6 +448,14 @@ pub fn apply_edit(cfg: &mut NetwatchConfig, cursor: usize, value: &str) -> Resul
             } else {
                 Err(format!("Invalid graph style. Use: {}", valid.join(", ")))
             }
+        }
+        16 => {
+            match value.to_lowercase().as_str() {
+                "on" | "true" | "yes" | "1" => cfg.graph_fade = true,
+                "off" | "false" | "no" | "0" => cfg.graph_fade = false,
+                _ => return Err("Use on / off".into()),
+            }
+            Ok(())
         }
         _ => Err("Unknown setting".into()),
     }

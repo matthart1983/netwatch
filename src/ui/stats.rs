@@ -395,13 +395,14 @@ fn render_breakdown_panel(
         .max(1.0);
 
     let max_rows = inner.height as usize;
+    let rendered = items.iter().take(max_rows).count();
     for (i, item) in items.iter().take(max_rows).enumerate() {
         let filled = ((item.value / max_val) * bar_w as f64).round() as usize;
         let bar: String = (0..bar_w)
             .map(|j| if j < filled { '█' } else { '░' })
             .collect();
 
-        let line = Line::from(vec![
+        let spans = vec![
             Span::raw(" "),
             Span::styled(
                 format!(
@@ -419,7 +420,14 @@ fn render_breakdown_panel(
                 Style::default().fg(t.text_primary),
             ),
             Span::styled(format!(" {}", item.unit), Style::default().fg(t.text_muted)),
-        ]);
+        ];
+        let spans = if app.user_config.graph_fade {
+            let alpha = crate::graph::row_fade_alpha(i, rendered);
+            crate::graph::fade_spans_fg(spans, t.bg, alpha)
+        } else {
+            spans
+        };
+        let line = Line::from(spans);
         let row_area = Rect {
             x: inner.x,
             y: inner.y + i as u16,
@@ -772,6 +780,7 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         app.graph_style,
         t.rx_rate,
         t.status_warn,
+        app.graph_opts(),
     );
     crate::graph::render(
         f,
@@ -780,6 +789,7 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         app.graph_style,
         t.tx_rate,
         t.status_warn,
+        app.graph_opts(),
     );
 
     // X-axis labels (last row of inner)

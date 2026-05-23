@@ -2,6 +2,28 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.21.0] - 2026-05-23
+
+### Fixed
+- **macOS health prober no longer reports a fake 100% loss.** The v0.18.0 native DGRAM ICMP path checked the reply type at offset 0 of the recvfrom buffer, which is correct on Linux (the kernel strips the IPv4 header for `SOCK_DGRAM IPPROTO_ICMP`) but wrong on macOS (the IPv4 header is delivered intact, so offset 0 is `0x45` — IP version/IHL nibble — not the ICMP type). Every reply was rejected, the prober reported 0 successful probes, and the Dashboard's Gateway / DNS RTT cards showed "100% loss" despite the network being fine. The reply check now sniffs `buf[0] >> 4 == 4` to detect a leading IPv4 header and skips past it via the IHL field. IPv6 leaves the header outside the recvfrom buffer on both kernels, so offset 0 stays correct there.
+- Verified end-to-end on both platforms with `cargo run --example ping_smoke` against 1.1.1.1: macOS reports ~12 ms RTT / 0% loss (was 100% on v0.18.0–v0.20.0), Linux still ~12 ms RTT / 0% loss (no regression — the IHL skip only triggers when the first byte has the IPv4 version nibble, which doesn't appear on Linux's stripped-header path).
+
+### Added
+- **btop-style fade + faint grid as a Settings option.** New `Graph Fade (btop)` row in the Settings overlay (`S`); toggle with `←`/`→`/`Space`/`h`/`l`. The single switch governs three places at once when on:
+  - **Charts** — every chart in the app (hero RX/TX panels, in-row connection / process sparklines, RTT history, timeline severity layers) renders columns with a right-bright / left-dim color gradient (newest data at full intensity, oldest at ~30%), with a faint `·` dot grid behind charts at least 16×4 cells (narrower in-row sparklines skip the grid to avoid visual noise).
+  - **Tables** — Connections, Packets, Processes, and Stats tables fade row-by-row top-bright → bottom-dim (top row at full intensity, bottom row at ~55%) so visual hierarchy mirrors btop's process list. Selected row stays at full intensity regardless of position.
+  - **Persistence** — setting saves to `~/.config/netwatch/config.toml` via the existing save flow.
+
+  Default is off; the original solid-color look is unchanged for users who don't want the effect.
+
+### Changed
+- `graph::render` / `graph::render_with_max` now take a `GraphOpts` parameter (carries `fade: bool` and the theme `bg` color used as the fade anchor). `App::graph_opts()` builds it once and every call site passes it, so the toggle drives the whole UI from a single config switch.
+- `render_bars` reimplemented to render manually instead of delegating to ratatui's `Sparkline` — necessary because `Sparkline` only supports a single color per chart and fade requires per-column color computation. Visual output is identical to the previous Sparkline-based path (same 8-glyph bar set, same right-aligned sample window) when fade is off.
+
+### Implementation
+- `fade_color(base, bg, alpha)` linearly interpolates RGB channels between base and background at the given alpha. Named/indexed colors fall back to sensible defaults (white → black) so non-RGB themes still get *some* gradient. Five unit tests cover endpoints, midpoint, alpha clamping, and the non-RGB fallback.
+- Grid uses `·` (middle dot) at quartile-spaced rows and columns, colored 20% from `bg` toward a neutral gray so it sits well below the data on every theme.
+
 ## [0.20.0] - 2026-05-23
 
 ### Added — DPI protocol breadth

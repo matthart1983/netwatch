@@ -199,12 +199,23 @@ fn run_ping_native(target: &str) -> Option<(Option<f64>, f64)> {
         };
 
         if recv_ok {
-            // Sanity-check the reply type so we don't count a stray
-            // DestUnreach as a successful echo.
-            let reply_type_ok = match addr {
-                IpAddr::V4(_) => buf.first() == Some(&icmp_echo_reply_type),
-                IpAddr::V6(_) => buf.first() == Some(&icmp_echo_reply_type),
+            // ICMP type sits at different offsets depending on OS:
+            //   Linux SOCK_DGRAM ICMP: kernel strips the IPv4 header, so
+            //     buf[0] is the ICMP type.
+            //   macOS SOCK_DGRAM ICMP: IPv4 header is delivered intact,
+            //     so the ICMP type sits at offset `IHL * 4`. Without
+            //     this, every reply got rejected and the prober reported
+            //     a fake "100% loss" on macOS.
+            // IPv6 leaves the header outside the recvfrom buffer on
+            // both kernels, so offset 0 is always correct there.
+            let reply_offset = match addr {
+                IpAddr::V4(_) if buf.first().map(|b| b >> 4) == Some(4) => {
+                    let ihl_words = (buf[0] & 0x0F) as usize;
+                    ihl_words * 4
+                }
+                _ => 0,
             };
+            let reply_type_ok = buf.get(reply_offset) == Some(&icmp_echo_reply_type);
             if reply_type_ok {
                 let elapsed_ms = send_t.elapsed().as_secs_f64() * 1000.0;
                 rtts.push(elapsed_ms);
