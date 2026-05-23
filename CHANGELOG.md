@@ -2,6 +2,11 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.21.2] - 2026-05-23
+
+### Fixed
+- **Processes tab now includes UDP and non-ESTABLISHED TCP flows.** `ProcessBandwidthCollector::update` was filtering connections with `state != "ESTABLISHED"`, which silently excluded the bulk of normal traffic on macOS: every QUIC flow from a browser, every DNS resolver socket, mDNS responders, the whole UDP world (lsof and procfs report UDP with an empty state, not "ESTABLISHED"). The Processes tab was usable mostly for SSH and TCP-only services, missing everything modern web apps actually do. New filter is the inverse — only `LISTEN` and `CLOSED` sockets are skipped (they have no peer traffic by definition). Everything else, including UDP, `TIME_WAIT`, `CLOSE_WAIT`, `FIN_WAIT_*`, etc., now counts toward the process aggregate. Two new unit tests cover both directions of the regression (LISTEN/CLOSED still excluded, UDP/TIME_WAIT now included).
+
 ## [0.21.1] - 2026-05-23
 
 ### Fixed

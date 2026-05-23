@@ -89,10 +89,17 @@ impl ProcessBandwidthCollector {
         let mut process_rx_rate: HashMap<(String, Option<u32>), f64> = HashMap::new();
         let mut process_tx_rate: HashMap<(String, Option<u32>), f64> = HashMap::new();
         let mut process_rtt: HashMap<(String, Option<u32>), f64> = HashMap::new();
-        let mut total_established: u32 = 0;
+        let mut total_active: u32 = 0;
 
         for conn in connections {
-            if conn.state != "ESTABLISHED" {
+            // Skip server-side sockets (LISTEN) and fully closed sockets —
+            // they have no current peer traffic by definition. Everything
+            // else counts: TCP ESTABLISHED / TIME_WAIT / CLOSE_WAIT /
+            // FIN_WAIT_*, and UDP (which lsof and procfs report with an
+            // empty state). This is what was hiding the bulk of browser
+            // traffic (QUIC over UDP), DNS resolvers, mDNS responders,
+            // and every other UDP service from the Processes tab.
+            if conn.state == "LISTEN" || conn.state == "CLOSED" {
                 continue;
             }
             let name = conn
@@ -101,7 +108,7 @@ impl ProcessBandwidthCollector {
                 .unwrap_or_else(|| format!("pid:{}", conn.pid.map_or(0, |p| p)));
             let key = (name, conn.pid);
             *process_conns.entry(key.clone()).or_insert(0) += 1;
-            total_established += 1;
+            total_active += 1;
             if let Some(rx) = conn.rx_rate {
                 *process_rx_rate.entry(key.clone()).or_insert(0.0) += rx;
             }
@@ -163,7 +170,7 @@ impl ProcessBandwidthCollector {
         self.process_totals
             .retain(|_, t| now.duration_since(t.last_seen) < PROCESS_TOTALS_TTL);
 
-        if total_established == 0 {
+        if total_active == 0 {
             self.ranked.clear();
             return;
         }
@@ -315,11 +322,40 @@ mod tests {
     }
 
     #[test]
-    fn non_established_connections_are_ignored() {
+    fn listen_and_closed_connections_are_ignored() {
+        // LISTEN / CLOSED carry no current peer traffic by definition,
+        // so they should never produce a Processes-tab entry. Every
+        // other state — TIME_WAIT, CLOSE_WAIT, UDP with empty state,
+        // etc. — should pass through (regression test for the
+        // pre-v0.21.2 behaviour where ESTABLISHED-only filtering hid
+        // all UDP / QUIC processes).
         let mut collector = ProcessBandwidthCollector::new();
-        let conns = vec![make_conn("firefox", 100, "TIME_WAIT")];
-        collector.update(&conns, &[make_interface(1000.0, 500.0)]);
+        let conns = vec![
+            make_conn("nginx", 1, "LISTEN"),
+            make_conn("ssh", 2, "CLOSED"),
+        ];
+        collector.update(&conns, &[make_interface(0.0, 0.0)]);
         assert!(collector.ranked().is_empty());
+    }
+
+    #[test]
+    fn udp_and_time_wait_connections_count_toward_processes() {
+        let mut collector = ProcessBandwidthCollector::new();
+        let conns = vec![
+            // UDP from lsof/procfs has empty state.
+            make_conn("firefox", 100, ""),
+            // TCP states other than ESTABLISHED still represent flows
+            // the process is involved in.
+            make_conn("ssh", 200, "TIME_WAIT"),
+        ];
+        collector.update(&conns, &[make_interface(0.0, 0.0)]);
+        let names: std::collections::HashSet<&str> = collector
+            .ranked()
+            .iter()
+            .map(|p| p.process_name.as_str())
+            .collect();
+        assert!(names.contains("firefox"), "UDP process should be ranked");
+        assert!(names.contains("ssh"), "TIME_WAIT process should be ranked");
     }
 
     #[test]
