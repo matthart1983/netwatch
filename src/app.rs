@@ -1794,6 +1794,29 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 ));
                 app.ui.settings_status_tick = 0;
             }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                if app.ui.settings_cursor == ui::settings::cursor::SANDBOX =>
+            {
+                // Sandbox modes cycle: on → strict → off → on. The live
+                // sandbox state can't be changed at runtime (Landlock is
+                // one-way, dropped caps can't be regained), so this only
+                // updates the persistent config — restart applies it.
+                const MODES: &[&str] = &["on", "strict", "off"];
+                let current = MODES
+                    .iter()
+                    .position(|m| *m == app.user_config.sandbox)
+                    .unwrap_or(0);
+                let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                let next = if forward {
+                    (current + 1) % MODES.len()
+                } else {
+                    (current + MODES.len() - 1) % MODES.len()
+                };
+                app.user_config.sandbox = MODES[next].to_string();
+                app.ui.settings_status =
+                    Some(format!("Sandbox: {} (restart to apply)", MODES[next]));
+                app.ui.settings_status_tick = 0;
+            }
             KeyCode::Enter => {
                 app.ui.settings_editing = true;
                 app.ui.settings_edit_buf =

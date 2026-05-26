@@ -65,6 +65,20 @@ pub struct NetwatchConfig {
     /// look matches the original UI exactly.
     #[serde(default)]
     pub graph_fade: bool,
+
+    /// Sandbox enforcement mode — `"on"` (best-effort, default),
+    /// `"strict"` (refuse to start if the platform backend can't apply),
+    /// or `"off"` (skip sandboxing entirely). CLI flags `--no-sandbox`
+    /// and `--sandbox-strict` still override. Changes apply on next
+    /// netwatch start — Landlock and dropped capabilities can't be undone
+    /// at runtime, so the live process keeps whatever mode it launched
+    /// with.
+    #[serde(default = "default_sandbox")]
+    pub sandbox: String,
+}
+
+fn default_sandbox() -> String {
+    "on".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +115,7 @@ impl Default for NetwatchConfig {
             theme: "dark".into(),
             graph_style: "bars".into(),
             graph_fade: false,
+            sandbox: default_sandbox(),
         }
     }
 }
@@ -258,6 +273,7 @@ show_geo = false
             theme: "dark".into(),
             graph_style: "bars".into(),
             graph_fade: false,
+            sandbox: "strict".into(),
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();
@@ -272,6 +288,18 @@ show_geo = false
         assert_eq!(deserialized.alerts.port_scan_threshold, 10);
         assert_eq!(deserialized.alerts.port_scan_window_secs, 60);
         assert_eq!(deserialized.insights_model, "llama3:8b");
+        assert_eq!(deserialized.sandbox, "strict");
+    }
+
+    #[test]
+    fn sandbox_field_defaults_when_missing() {
+        // Pre-v0.21.5 configs don't have a `sandbox` key — they must
+        // continue to load cleanly and pick up the default ("on").
+        let toml_str = r#"
+default_tab = "dashboard"
+"#;
+        let cfg: NetwatchConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.sandbox, "on");
     }
 
     #[test]

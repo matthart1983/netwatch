@@ -2,6 +2,14 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.21.5] - 2026-05-26
+
+### Fixed
+- **DNS Health probe now sends a real DNS query instead of ICMP-pinging the server.** ICMP echo was a misleading health signal anyway (plenty of resolvers — cloud LBs, hardened routers, internal CoreDNS — drop ICMP while answering DNS just fine), but it also broke entirely on Linux hosts where `net.ipv4.ping_group_range = 1 0` and the sandbox has dropped `CAP_NET_RAW`. Even with `ping_group_range` permissive, Landlock sets `NO_NEW_PRIVS` which makes the kernel ignore the file capability on `/usr/bin/ping`, so the subprocess fallback dies too — leaving every DNS probe at 100% loss on affected systems. New `run_dns_query()` sends a 17-byte standard query for the root NS record over UDP/53 and times the response; unprivileged, no sandbox interaction, and a more honest "DNS health" signal because it tests what actually matters. Three new unit tests cover header layout + transaction-ID round-trip.
+
+### Added
+- **Sandbox enforcement mode is now a Settings entry.** New "Sandbox" row in the Settings overlay (`S`) cycles through `on` / `strict` / `off` with `←` / `→`. Persists to `~/.config/netwatch/config.toml` as the new `sandbox = "..."` key; the CLI flags `--no-sandbox` and `--sandbox-strict` still override per-invocation. Changes apply on next netwatch start — Landlock and dropped capabilities can't be undone at runtime, so the live process keeps whatever mode it launched with. The Settings row surfaces "Applies on next netwatch start." when selected so the restart requirement is visible inline. Existing configs without a `sandbox` field continue to load cleanly and pick up the default (`"on"`).
+
 ## [0.21.4] - 2026-05-26
 
 ### Fixed

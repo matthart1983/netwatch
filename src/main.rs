@@ -66,7 +66,10 @@ async fn main() -> Result<()> {
     } else if args.iter().any(|a| a == "--sandbox-strict") {
         netwatch::sandbox::Mode::Strict
     } else {
-        netwatch::sandbox::Mode::BestEffort
+        // No CLI flag — honor the persistent setting from
+        // ~/.config/netwatch/config.toml (Settings overlay → "Sandbox").
+        // `load()` already falls back to defaults on missing/malformed.
+        netwatch::sandbox::Mode::from_config(&NetwatchConfig::load().sandbox)
     };
 
     let remote_publisher = match (remote_url, api_key) {

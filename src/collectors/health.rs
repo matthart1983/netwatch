@@ -80,7 +80,14 @@ impl HealthProber {
                 *safe_write(&snapshot, "health::probe::publish_gw") = Arc::new(next);
             }
             if let Some(dns) = dns.as_deref() {
-                let (rtt, loss) = run_ping(dns);
+                // Send a real DNS query rather than ICMP. ICMP-pinging the
+                // DNS server is a misleading health signal — plenty of
+                // resolvers (cloud LBs, internal CoreDNS, hardened routers)
+                // drop ICMP echo while happily answering DNS. It also fails
+                // on Linux hosts where `net.ipv4.ping_group_range = 1 0`
+                // and the sandbox has dropped CAP_NET_RAW, even though UDP
+                // queries to port 53 work fine.
+                let (rtt, loss) = run_dns_query(dns);
                 let mut next = (**safe_read(&snapshot, "health::probe::read_dns")).clone();
                 next.dns_rtt_ms = rtt;
                 next.dns_loss_pct = loss;
@@ -94,6 +101,102 @@ impl HealthProber {
             busy.store(false, Ordering::SeqCst);
         });
     }
+}
+
+/// Probe a DNS server by sending a real DNS query over UDP/53 and timing
+/// the response. Returns the same `(avg_rtt_ms, loss_pct)` shape as
+/// [`run_ping`] so the Health widget consumes both the same way.
+///
+/// Why a DNS query instead of ICMP:
+/// - Many resolvers don't respond to ICMP echo (cloud LBs, hardened
+///   routers) but happily answer DNS — ICMP loss has no correlation with
+///   DNS health for those targets.
+/// - Linux with `net.ipv4.ping_group_range = 1 0` blocks unprivileged
+///   SOCK_DGRAM ICMP. Combined with netwatch's sandbox dropping
+///   CAP_NET_RAW and Landlock setting NO_NEW_PRIVS (which makes the
+///   kernel ignore the file-cap on `/usr/bin/ping`), ICMP probes are
+///   silently impossible for some users. UDP/53 is unprivileged.
+/// - It tests the thing that actually matters — DNS resolution — rather
+///   than a proxy for it.
+fn run_dns_query(server: &str) -> (Option<f64>, f64) {
+    use std::net::{IpAddr, SocketAddr, UdpSocket};
+    use std::time::{Duration, Instant};
+
+    // `IpAddr::parse` rejects IPv6 zone identifiers (e.g. `fe80::1%en0`),
+    // which means `primary_dns()` should already have skipped link-local
+    // entries upstream. If it didn't (only link-local servers configured),
+    // we report 100% loss rather than panic — same as the old ICMP path.
+    let addr: IpAddr = match server.parse() {
+        Ok(a) => a,
+        Err(_) => return (None, 100.0),
+    };
+
+    let bind_addr = match addr {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
+    };
+    let sock = match UdpSocket::bind(bind_addr) {
+        Ok(s) => s,
+        Err(_) => return (None, 100.0),
+    };
+    if sock.set_read_timeout(Some(Duration::from_secs(1))).is_err() {
+        return (None, 100.0);
+    }
+    let dest = SocketAddr::new(addr, 53);
+
+    const PROBES: usize = 3;
+    let mut rtts = Vec::with_capacity(PROBES);
+
+    for seq in 0..PROBES as u16 {
+        // Per-probe IDs let us reject stale replies from earlier probes
+        // landing late inside the same socket's recv buffer.
+        let id = 0xa6b4u16.wrapping_add(seq);
+        let query = build_dns_query(id);
+
+        let send_t = Instant::now();
+        if sock.send_to(&query, dest).is_err() {
+            continue;
+        }
+
+        let mut buf = [0u8; 512];
+        if let Ok((n, _src)) = sock.recv_from(&mut buf) {
+            // Header is 12 bytes; first 2 are the transaction ID.
+            if n >= 12 {
+                let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
+                // We don't validate RCODE — even a SERVFAIL means the
+                // resolver is reachable and responsive, which is what
+                // the Health widget measures.
+                if resp_id == id {
+                    rtts.push(send_t.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+        }
+    }
+
+    let avg = if rtts.is_empty() {
+        None
+    } else {
+        Some(rtts.iter().sum::<f64>() / rtts.len() as f64)
+    };
+    let loss = (PROBES - rtts.len()) as f64 / PROBES as f64 * 100.0;
+    (avg, loss)
+}
+
+/// Minimal DNS query: standard query (RD=1) for the root zone's NS
+/// record. Total payload is 17 bytes — smallest valid query we can send
+/// without depending on any name being resolvable.
+fn build_dns_query(id: u16) -> Vec<u8> {
+    let mut q = Vec::with_capacity(17);
+    q.extend_from_slice(&id.to_be_bytes()); // transaction id
+    q.extend_from_slice(&[0x01, 0x00]); // flags: standard query, RD=1
+    q.extend_from_slice(&[0x00, 0x01]); // qdcount = 1
+    q.extend_from_slice(&[0x00, 0x00]); // ancount = 0
+    q.extend_from_slice(&[0x00, 0x00]); // nscount = 0
+    q.extend_from_slice(&[0x00, 0x00]); // arcount = 0
+    q.push(0x00); // qname: root (single null label)
+    q.extend_from_slice(&[0x00, 0x02]); // qtype = NS
+    q.extend_from_slice(&[0x00, 0x01]); // qclass = IN
+    q
 }
 
 fn run_ping(target: &str) -> (Option<f64>, f64) {
@@ -456,5 +559,34 @@ Approximate round trip times in milli-seconds:
     #[test]
     fn parse_avg_rtt_gibberish() {
         assert_eq!(parse_avg_rtt("this is not ping output"), None);
+    }
+
+    // ── build_dns_query tests ─────────────────────────────────────────
+
+    #[test]
+    fn dns_query_has_correct_header_and_question() {
+        let q = build_dns_query(0xa6b4);
+        // 12-byte header + 1 byte qname + 2 qtype + 2 qclass = 17
+        assert_eq!(q.len(), 17);
+
+        // Transaction ID
+        assert_eq!(&q[0..2], &[0xa6, 0xb4]);
+        // Flags: standard query, RD=1
+        assert_eq!(&q[2..4], &[0x01, 0x00]);
+        // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        assert_eq!(&q[4..12], &[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        // Root qname
+        assert_eq!(q[12], 0x00);
+        // QTYPE=NS(2), QCLASS=IN(1)
+        assert_eq!(&q[13..17], &[0x00, 0x02, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn dns_query_id_round_trips() {
+        for id in [0u16, 1, 0x1234, 0xfffe, 0xffff] {
+            let q = build_dns_query(id);
+            let parsed = u16::from_be_bytes([q[0], q[1]]);
+            assert_eq!(parsed, id, "id round-trip failed for {id:#x}");
+        }
     }
 }

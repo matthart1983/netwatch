@@ -51,6 +51,41 @@ impl Mode {
             Mode::Strict => "strict",
         }
     }
+
+    /// Parse the persistent config string from `NetwatchConfig::sandbox`.
+    /// Unknown values fall back to [`Mode::BestEffort`] so a typo doesn't
+    /// silently disable enforcement.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "disabled" | "false" | "no" | "0" => Mode::Disabled,
+            "strict" => Mode::Strict,
+            _ => Mode::BestEffort,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_config_parses_known_values() {
+        assert_eq!(Mode::from_config("on"), Mode::BestEffort);
+        assert_eq!(Mode::from_config("ON"), Mode::BestEffort);
+        assert_eq!(Mode::from_config("strict"), Mode::Strict);
+        assert_eq!(Mode::from_config("Strict "), Mode::Strict);
+        assert_eq!(Mode::from_config("off"), Mode::Disabled);
+        assert_eq!(Mode::from_config("disabled"), Mode::Disabled);
+        assert_eq!(Mode::from_config("false"), Mode::Disabled);
+    }
+
+    #[test]
+    fn from_config_unknown_falls_back_to_best_effort() {
+        // A typo should not silently disable enforcement — that would
+        // change security behavior in a way the user didn't ask for.
+        assert_eq!(Mode::from_config("loose"), Mode::BestEffort);
+        assert_eq!(Mode::from_config(""), Mode::BestEffort);
+    }
 }
 
 /// What the sandbox actually applied. Surfaced in the Settings overlay so

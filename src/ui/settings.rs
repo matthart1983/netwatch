@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-pub const SETTINGS_COUNT: usize = 17;
+pub const SETTINGS_COUNT: usize = 18;
 
 pub const TAB_NAMES: &[&str] = &[
     "dashboard",
@@ -38,11 +38,26 @@ pub mod cursor {
     pub const AI_ENDPOINT: usize = 14;
     pub const GRAPH_STYLE: usize = 15;
     pub const GRAPH_FADE: usize = 16;
+    pub const SANDBOX: usize = 17;
 }
 
 struct SettingRow {
     label: &'static str,
     value: String,
+}
+
+/// Rows whose value cycles through a small enum on `←` / `→` rather than
+/// being edited as free text. Rendered with `◀ value ▶` chevrons and the
+/// footer hint reads "Cycle" instead of "Edit".
+fn is_cycle_through(cursor: usize) -> bool {
+    matches!(
+        cursor,
+        cursor::THEME
+            | cursor::DEFAULT_TAB
+            | cursor::GRAPH_STYLE
+            | cursor::GRAPH_FADE
+            | cursor::SANDBOX
+    )
 }
 
 fn build_rows(cfg: &NetwatchConfig) -> Vec<SettingRow> {
@@ -131,6 +146,10 @@ fn build_rows(cfg: &NetwatchConfig) -> Vec<SettingRow> {
             label: "Graph Fade (btop)",
             value: if cfg.graph_fade { "on" } else { "off" }.into(),
         },
+        SettingRow {
+            label: "Sandbox",
+            value: cfg.sandbox.clone(),
+        },
     ]
 }
 
@@ -193,12 +212,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
         let value_display = if is_editing {
             format!("{}▏", app.ui.settings_edit_buf)
-        } else if is_selected
-            && (i == cursor::THEME
-                || i == cursor::DEFAULT_TAB
-                || i == cursor::GRAPH_STYLE
-                || i == cursor::GRAPH_FADE)
-        {
+        } else if is_selected && is_cycle_through(i) {
             format!("◀ {} ▶", row.value)
         } else {
             row.value.clone()
@@ -256,6 +270,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             format!("  {}", status),
             Style::default().fg(app.theme.status_good),
         )));
+    } else if app.ui.settings_cursor == cursor::SANDBOX {
+        // Sandbox changes don't reapply at runtime — Landlock can't be
+        // undone and dropped caps can't be regained. Surface that to the
+        // user inline so they don't expect the live process to react.
+        lines.push(Line::from(Span::styled(
+            "  Applies on next netwatch start.",
+            Style::default().fg(app.theme.text_muted),
+        )));
     } else {
         lines.push(Line::raw(""));
     }
@@ -275,11 +297,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("Esc", Style::default().fg(app.theme.key_hint).bold()),
             Span::raw(":Cancel"),
         ]
-    } else if app.ui.settings_cursor == cursor::THEME
-        || app.ui.settings_cursor == cursor::DEFAULT_TAB
-        || app.ui.settings_cursor == cursor::GRAPH_STYLE
-        || app.ui.settings_cursor == cursor::GRAPH_FADE
-    {
+    } else if is_cycle_through(app.ui.settings_cursor) {
         vec![
             Span::styled("←→", Style::default().fg(app.theme.key_hint).bold()),
             Span::raw(":Cycle  "),
@@ -333,6 +351,7 @@ pub fn get_edit_value(cfg: &NetwatchConfig, cursor: usize) -> String {
         14 => cfg.insights_endpoint.clone(),
         15 => cfg.graph_style.clone(),
         16 => if cfg.graph_fade { "on" } else { "off" }.into(),
+        17 => cfg.sandbox.clone(),
         _ => String::new(),
     }
 }
@@ -457,6 +476,16 @@ pub fn apply_edit(cfg: &mut NetwatchConfig, cursor: usize, value: &str) -> Resul
             }
             Ok(())
         }
+        17 => {
+            let v = value.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "on" | "strict" | "off" => {
+                    cfg.sandbox = v;
+                    Ok(())
+                }
+                _ => Err("Use on / strict / off".into()),
+            }
+        }
         _ => Err("Unknown setting".into()),
     }
 }
@@ -569,5 +598,31 @@ mod tests {
         assert_eq!(format_bandwidth(50_000), "50 KB/s");
         assert_eq!(format_bandwidth(100_000_000), "100 MB/s");
         assert_eq!(format_bandwidth(2_000_000_000), "2 GB/s");
+    }
+
+    #[test]
+    fn apply_sandbox_accepts_valid_modes() {
+        let mut cfg = NetwatchConfig::default();
+        for v in ["on", "strict", "off", "ON", "Strict"] {
+            assert!(
+                apply_edit(&mut cfg, cursor::SANDBOX, v).is_ok(),
+                "rejected {v}"
+            );
+            assert_eq!(cfg.sandbox, v.to_lowercase());
+        }
+    }
+
+    #[test]
+    fn apply_sandbox_rejects_unknown() {
+        let mut cfg = NetwatchConfig::default();
+        assert!(apply_edit(&mut cfg, cursor::SANDBOX, "loose").is_err());
+        assert!(apply_edit(&mut cfg, cursor::SANDBOX, "").is_err());
+    }
+
+    #[test]
+    fn cycle_through_includes_sandbox() {
+        assert!(is_cycle_through(cursor::SANDBOX));
+        assert!(is_cycle_through(cursor::THEME));
+        assert!(!is_cycle_through(cursor::REFRESH_RATE));
     }
 }
