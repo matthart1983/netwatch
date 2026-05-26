@@ -2,6 +2,11 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.21.7] - 2026-05-26
+
+### Fixed
+- **Capture toggle (`c` on the Packets tab) no longer fails with `Capture failed: libpcap error: socket: Operation not permitted` on Linux under the default sandbox.** The Linux sandbox was dropping `CAP_NET_RAW` after startup on the assumption that "pcap is already open, we don't need raw sockets anymore." That assumption was wrong: multiple UI actions re-open a pcap handle mid-run — toggling capture from the Packets tab (`c`), cycling the capture interface (`i`), and arming the Flight Recorder (`Shift+R`) when capture is paused. Each one calls `socket(AF_PACKET, SOCK_RAW, …)` which needs `CAP_NET_RAW`. Split the drop list: `CAPS_TO_DROP_DEFAULT` keeps the BPF caps (`CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`) which aren't needed at runtime once the kprobe is attached; `CAPS_TO_DROP_STRICT` additionally drops `CAP_NET_RAW` for users who explicitly opted into "fail closed" with `--sandbox-strict` or `sandbox = "strict"`. Two new regression tests pin the policy.
+
 ## [0.21.6] - 2026-05-26
 
 ### Fixed

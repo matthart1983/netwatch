@@ -23,9 +23,11 @@ use std::path::{Path, PathBuf};
 /// V3 / V2 / V1 on older kernels.
 const TARGET_ABI: ABI = ABI::V4;
 
-/// Capabilities we want gone after pcap and the eBPF kprobe are up.
-const CAPS_TO_DROP: &[Capability] = &[
-    Capability::CAP_NET_RAW,
+/// Capabilities dropped in every mode that runs `drop_caps`. These are
+/// the BPF-related capabilities: once the kprobe is attached and the
+/// ringbuffer is open, we don't need to load new BPF programs at runtime,
+/// so giving them up shrinks the blast radius if netwatch is compromised.
+const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
     Capability::CAP_BPF,
     Capability::CAP_PERFMON,
     // CAP_SYS_ADMIN is the legacy fallback for BPF on pre-5.8 kernels.
@@ -33,10 +35,21 @@ const CAPS_TO_DROP: &[Capability] = &[
     Capability::CAP_SYS_ADMIN,
 ];
 
+/// Additional caps dropped in `Mode::Strict` only. CAP_NET_RAW is the
+/// painful one: pcap needs it for `socket(AF_PACKET, SOCK_RAW, …)`, and
+/// the user can re-open pcap handles mid-run by toggling capture from
+/// the Packets tab (`c`), cycling the capture interface (`i`), or arming
+/// the Flight Recorder (`Shift+R`) when capture is paused. Dropping it
+/// in BestEffort caused `Capture failed: libpcap error: socket:
+/// Operation not permitted` the moment a user pressed `c` twice. Strict
+/// users have opted into "fail closed" semantics — we keep dropping it
+/// there.
+const CAPS_TO_DROP_STRICT: &[Capability] = &[Capability::CAP_NET_RAW];
+
 pub fn apply(mode: Mode, paths: &SandboxPaths, report: &mut Report) {
     report.mode.effective = Some(mode.label());
 
-    drop_caps(report);
+    drop_caps(mode, report);
 
     let read_only = collect_read_only(paths);
     let read_write = collect_read_write(paths);
@@ -55,8 +68,13 @@ pub fn apply(mode: Mode, paths: &SandboxPaths, report: &mut Report) {
     }
 }
 
-fn drop_caps(report: &mut Report) {
-    for cap in CAPS_TO_DROP {
+fn drop_caps(mode: Mode, report: &mut Report) {
+    let extra: &[Capability] = if matches!(mode, Mode::Strict) {
+        CAPS_TO_DROP_STRICT
+    } else {
+        &[]
+    };
+    for cap in CAPS_TO_DROP_DEFAULT.iter().chain(extra.iter()) {
         // Try to drop from every set we have access to. `caps::drop`
         // returns Ok(()) even if the cap wasn't present, so the no-cap
         // (unprivileged) path is silently fine.
@@ -274,5 +292,55 @@ mod tests {
         let paths = SandboxPaths::default();
         let rw = collect_read_write(&paths);
         assert!(rw.iter().any(|p| p == Path::new("/tmp")));
+    }
+
+    #[test]
+    fn collect_read_write_includes_config_dir_so_save_works() {
+        // Regression for the "Permission denied (os error 13)" report on
+        // a Linux NUC running v0.21.5 with the sandbox on. If the config
+        // dir slips back into the read-only bucket, NetwatchConfig::save()
+        // breaks under Landlock and users get trapped in whatever sandbox
+        // mode they launched with.
+        let mut paths = SandboxPaths::default();
+        paths.config_dir = Some(PathBuf::from("/tmp/netwatch-test-cfg"));
+        let rw = collect_read_write(&paths);
+        assert!(
+            rw.iter().any(|p| p == Path::new("/tmp/netwatch-test-cfg")),
+            "config_dir must be writable so the Settings overlay can save"
+        );
+    }
+
+    #[test]
+    fn besteffort_keeps_cap_net_raw_for_pcap_reopen() {
+        // Regression: pcap re-opens (Packets `c` toggle, interface cycle
+        // via `i`, Flight Recorder arm) need CAP_NET_RAW. Dropping it in
+        // BestEffort produced "Capture failed: libpcap error: socket:
+        // Operation not permitted" on Linux NUCs. Strict still drops it
+        // — those users opted in to fail-closed semantics.
+        assert!(
+            !CAPS_TO_DROP_DEFAULT.contains(&Capability::CAP_NET_RAW),
+            "BestEffort must keep CAP_NET_RAW so capture toggle works"
+        );
+        assert!(
+            CAPS_TO_DROP_STRICT.contains(&Capability::CAP_NET_RAW),
+            "Strict mode should still drop CAP_NET_RAW (opt-in trade-off)"
+        );
+    }
+
+    #[test]
+    fn besteffort_still_drops_bpf_caps_after_kprobe_attached() {
+        // BPF caps (CAP_BPF, CAP_PERFMON, CAP_SYS_ADMIN) aren't needed at
+        // runtime once the kprobe is attached and the ringbuffer is open,
+        // so they stay in the default drop list even in BestEffort.
+        for cap in [
+            Capability::CAP_BPF,
+            Capability::CAP_PERFMON,
+            Capability::CAP_SYS_ADMIN,
+        ] {
+            assert!(
+                CAPS_TO_DROP_DEFAULT.contains(&cap),
+                "{cap:?} should be dropped in BestEffort"
+            );
+        }
     }
 }
