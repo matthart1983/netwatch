@@ -30,9 +30,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppProtocol {
     /// TLS handshake observed; SNI / ALPN extracted when present.
+    /// `ech` is true when the ClientHello carries an `encrypted_client_hello`
+    /// extension (type 0xfe0d). When true, `sni` is the *outer* SNI — the
+    /// real destination is hidden from the network. We can't distinguish
+    /// real ECH from GREASE-ECH (RFC 8744) without the server's keys; both
+    /// look identical on the wire and both mean the observer can't see the
+    /// inner SNI, so the flag is honest either way.
     Tls {
         sni: Option<String>,
         alpn: Option<String>,
+        #[serde(default)]
+        ech: bool,
     },
     /// HTTP/1.x request line + `Host:` header.
     Http {
@@ -44,8 +52,15 @@ pub enum AppProtocol {
     /// SSH server / client banner line, e.g. `SSH-2.0-OpenSSH_9.0`.
     Ssh { version: String },
     /// QUIC Initial packet detected; SNI extracted across reassembled
-    /// CRYPTO frames in `collectors::packets`.
-    Quic { sni: Option<String> },
+    /// CRYPTO frames in `collectors::packets`. `ech` mirrors the TLS
+    /// variant — true when the reassembled ClientHello carried an
+    /// `encrypted_client_hello` extension, in which case `sni` is the
+    /// outer SNI.
+    Quic {
+        sni: Option<String>,
+        #[serde(default)]
+        ech: bool,
+    },
     /// MQTT control packet. Variant carries CONNECT client-id when seen.
     Mqtt { client_id: Option<String> },
     /// STUN binding request / response (RFC 5389) — message method + class.

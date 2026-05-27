@@ -1,10 +1,16 @@
 //! TLS classifier — extracts SNI hostname + ALPN protocol from the
-//! first TLS record on a TCP flow.
+//! first TLS record on a TCP flow, and flags Encrypted ClientHello (ECH)
+//! presence when the ClientHello carries the `encrypted_client_hello`
+//! extension.
 //!
 //! Coverage: TLS 1.0–1.3 ClientHello with the standard SNI extension
-//! (RFC 6066). TLS 1.3 with Encrypted ClientHello (ECH, RFC 9460)
-//! produces an outer SNI of `cloudflare-ech.com` or similar; we report
-//! that as-is rather than pretending we know the real destination.
+//! (RFC 6066). TLS 1.3 with ECH (draft-ietf-tls-esni, ext type 0xfe0d)
+//! is detected and surfaced as a flag; the reported SNI in that case is
+//! the *outer* SNI (typically `cloudflare-ech.com` or similar). Real ECH
+//! and GREASE-ECH (RFC 8744) are indistinguishable on the wire without
+//! the server's keys, so we flag presence rather than claiming to know
+//! which is which — the user-relevant signal is the same either way:
+//! the network observer doesn't see the inner SNI.
 //!
 //! Limits:
 //! - Server-side Hellos (ServerHello, EncryptedExtensions) are ignored;
@@ -21,25 +27,59 @@ use tls_parser::{
 
 use super::{AppProtocol, Classifier};
 
-/// Reusable SNI extraction from bare TLS 1.3 handshake bytes (no TLS
-/// record wrapper). Used by `dpi::quic` to read SNI out of a QUIC
-/// Initial's reassembled CRYPTO frames, which contain raw handshake
-/// messages — not record-framed.
-pub fn extract_sni_from_handshake(handshake_bytes: &[u8]) -> Option<String> {
-    let (_, msg) = parse_tls_message_handshake(handshake_bytes).ok()?;
-    if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg {
-        let ext_data = ch.ext?;
-        let (_, exts) = parse_tls_extensions(ext_data).ok()?;
-        for ext in exts {
-            if let TlsExtension::SNI(entries) = ext {
-                return entries
-                    .first()
-                    .and_then(|(_, host)| std::str::from_utf8(host).ok())
-                    .map(|s| s.to_string());
-            }
+/// IANA TLS ExtensionType code point for `encrypted_client_hello`
+/// (draft-ietf-tls-esni). tls-parser 0.12 doesn't have a typed variant
+/// for this, so real ECH extensions arrive as `TlsExtension::Unknown`
+/// with this type code.
+const ECH_EXTENSION_TYPE: u16 = 0xfe0d;
+
+/// `true` when the extension list contains an `encrypted_client_hello`
+/// extension. Used by both the TLS classifier and any downstream caller
+/// (e.g. QUIC ECH detection if added) that has already parsed
+/// extensions out of a handshake.
+pub fn has_ech(exts: &[TlsExtension]) -> bool {
+    exts.iter()
+        .any(|e| matches!(e, TlsExtension::Unknown(t, _) if t.0 == ECH_EXTENSION_TYPE))
+}
+
+/// Fields extracted from a bare TLS 1.3 ClientHello in a single
+/// extension-walk. Used by `dpi::quic` to read both SNI and ECH-presence
+/// out of a QUIC Initial's reassembled CRYPTO frames without parsing
+/// the extension list twice.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HandshakeMetadata {
+    pub sni: Option<String>,
+    pub ech: bool,
+}
+
+/// Walk a bare TLS 1.3 handshake (no TLS record wrapper) and extract
+/// the SNI hostname and `encrypted_client_hello` flag. Returns all
+/// defaults (None / false) if the bytes aren't a parseable ClientHello.
+pub fn extract_handshake_metadata(handshake_bytes: &[u8]) -> HandshakeMetadata {
+    let Ok((_, msg)) = parse_tls_message_handshake(handshake_bytes) else {
+        return HandshakeMetadata::default();
+    };
+    let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg else {
+        return HandshakeMetadata::default();
+    };
+    let Some(ext_data) = ch.ext else {
+        return HandshakeMetadata::default();
+    };
+    let Ok((_, exts)) = parse_tls_extensions(ext_data) else {
+        return HandshakeMetadata::default();
+    };
+    let mut meta = HandshakeMetadata::default();
+    meta.ech = has_ech(&exts);
+    for ext in &exts {
+        if let TlsExtension::SNI(entries) = ext {
+            meta.sni = entries
+                .first()
+                .and_then(|(_, host)| std::str::from_utf8(host).ok())
+                .map(|s| s.to_string());
+            break;
         }
     }
-    None
+    meta
 }
 
 pub struct TlsClassifier;
@@ -61,9 +101,11 @@ impl Classifier for TlsClassifier {
             if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg {
                 let mut sni: Option<String> = None;
                 let mut alpn: Option<String> = None;
+                let mut ech = false;
                 if let Some(ext_data) = ch.ext {
                     if let Ok((_, exts)) = parse_tls_extensions(ext_data) {
-                        for ext in exts {
+                        ech = has_ech(&exts);
+                        for ext in &exts {
                             match ext {
                                 TlsExtension::SNI(entries) => {
                                     sni = entries
@@ -82,7 +124,7 @@ impl Classifier for TlsClassifier {
                         }
                     }
                 }
-                return Some(AppProtocol::Tls { sni, alpn });
+                return Some(AppProtocol::Tls { sni, alpn, ech });
             }
         }
         None
@@ -149,10 +191,12 @@ mod tests {
     fn extracts_sni_from_clienthello() {
         let result = TlsClassifier.classify(CLIENT_HELLO_EXAMPLE_COM, true);
         match result {
-            Some(AppProtocol::Tls { sni, alpn }) => {
+            Some(AppProtocol::Tls { sni, alpn, ech }) => {
                 assert_eq!(sni.as_deref(), Some("example.com"));
                 // No ALPN in this particular fixture (Python ssl default).
                 assert!(alpn.is_none(), "didn't expect ALPN in this fixture");
+                // Vanilla Python ssl does not send the ECH extension.
+                assert!(!ech, "vanilla fixture should not be flagged as ECH");
             }
             other => panic!("expected Tls{{..}}, got {:?}", other),
         }
@@ -174,5 +218,104 @@ mod tests {
     #[test]
     fn handles_empty_payload() {
         assert!(TlsClassifier.classify(&[], true).is_none());
+    }
+
+    #[test]
+    fn has_ech_detects_encrypted_client_hello() {
+        use tls_parser::TlsExtensionType;
+        let exts = vec![
+            TlsExtension::SNI(vec![]),
+            TlsExtension::Unknown(TlsExtensionType(ECH_EXTENSION_TYPE), &[]),
+        ];
+        assert!(has_ech(&exts));
+    }
+
+    #[test]
+    fn has_ech_ignores_unrelated_unknown_extensions() {
+        use tls_parser::TlsExtensionType;
+        // Some arbitrary other Unknown extension type code — must not
+        // false-positive as ECH.
+        let exts = vec![TlsExtension::Unknown(TlsExtensionType(0x1234), &[])];
+        assert!(!has_ech(&exts));
+    }
+
+    #[test]
+    fn has_ech_returns_false_on_empty() {
+        assert!(!has_ech(&[]));
+    }
+
+    /// Synthetic ClientHello: takes the example.com fixture and appends
+    /// a 4-byte ECH extension (type 0xfe0d, length 0) with the three
+    /// length fields fixed up: extensions list length (+4), handshake
+    /// length (+4), and TLS record length (+4).
+    ///
+    /// Field offsets derived by walking the fixture structure:
+    /// - Bytes 3..=4    = TLS record length    (0x0200 = 512)
+    /// - Bytes 6..=8    = handshake length     (0x0001fc = 508)
+    /// - Bytes 116..=117 = extensions length   (0x018f = 399)
+    ///   (session_id at 44..=75, ciphers at 78..=113, then 1-byte
+    ///   compression-list length + 1-byte method.)
+    fn build_ech_fixture() -> Vec<u8> {
+        assert_eq!(
+            &CLIENT_HELLO_EXAMPLE_COM[116..=117],
+            &[0x01, 0x8f],
+            "fixture changed; re-derive extensions_length offset"
+        );
+
+        let mut bytes = CLIENT_HELLO_EXAMPLE_COM.to_vec();
+        // Bump TLS record length: 0x0200 -> 0x0204
+        bytes[3] = 0x02;
+        bytes[4] = 0x04;
+        // Bump handshake length: 0x0001fc -> 0x000200
+        bytes[6] = 0x00;
+        bytes[7] = 0x02;
+        bytes[8] = 0x00;
+        // Bump extensions length: 0x018f -> 0x0193
+        bytes[116] = 0x01;
+        bytes[117] = 0x93;
+        // Append an empty ECH extension: type 0xfe0d, length 0x0000.
+        bytes.extend_from_slice(&[0xfe, 0x0d, 0x00, 0x00]);
+        bytes
+    }
+
+    #[test]
+    fn extract_metadata_strips_record_header_and_finds_sni() {
+        // Skip the 5-byte TLS record header (content_type + version + len)
+        // to get the bare handshake bytes that the QUIC path feeds in.
+        let handshake = &CLIENT_HELLO_EXAMPLE_COM[5..];
+        let meta = extract_handshake_metadata(handshake);
+        assert_eq!(meta.sni.as_deref(), Some("example.com"));
+        assert!(!meta.ech, "vanilla fixture has no ECH");
+    }
+
+    #[test]
+    fn extract_metadata_finds_ech_when_present() {
+        let fixture = build_ech_fixture();
+        let meta = extract_handshake_metadata(&fixture[5..]);
+        assert_eq!(meta.sni.as_deref(), Some("example.com"));
+        assert!(meta.ech, "augmented fixture should carry ECH flag");
+    }
+
+    #[test]
+    fn extract_metadata_returns_defaults_on_garbage() {
+        let meta = extract_handshake_metadata(&[0xff; 16]);
+        assert_eq!(meta, HandshakeMetadata::default());
+    }
+
+    #[test]
+    fn detects_ech_in_clienthello_pipeline() {
+        let fixture = build_ech_fixture();
+        let result = TlsClassifier.classify(&fixture, true);
+        match result {
+            Some(AppProtocol::Tls { sni, ech, .. }) => {
+                assert_eq!(
+                    sni.as_deref(),
+                    Some("example.com"),
+                    "ECH-augmented fixture should still expose its (outer) SNI"
+                );
+                assert!(ech, "expected ECH extension to be detected");
+            }
+            other => panic!("expected Tls{{..}}, got {:?}", other),
+        }
     }
 }

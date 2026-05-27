@@ -238,12 +238,35 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             // "HTTPS api.example.com" / "QUIC youtube.com" / "DNS
             // example.com" lines. Falls back to the L4 info otherwise.
             let info_text = match &pkt.app_protocol {
+                // ECH-flagged TLS gets a distinct prefix so the user can
+                // tell at a glance that the displayed SNI is the *outer*
+                // SNI and the real destination is hidden from the network.
+                Some(crate::dpi::AppProtocol::Tls {
+                    sni: Some(host),
+                    ech: true,
+                    ..
+                }) => format!("HTTPS-ECH {}", host),
+                Some(crate::dpi::AppProtocol::Tls {
+                    sni: None,
+                    ech: true,
+                    ..
+                }) => "HTTPS-ECH".to_string(),
                 Some(crate::dpi::AppProtocol::Tls {
                     sni: Some(host), ..
                 }) => {
                     format!("HTTPS {}", host)
                 }
-                Some(crate::dpi::AppProtocol::Quic { sni: Some(host) }) => {
+                Some(crate::dpi::AppProtocol::Quic {
+                    sni: Some(host),
+                    ech: true,
+                }) => format!("QUIC-ECH {}", host),
+                Some(crate::dpi::AppProtocol::Quic {
+                    sni: None,
+                    ech: true,
+                }) => "QUIC-ECH".to_string(),
+                Some(crate::dpi::AppProtocol::Quic {
+                    sni: Some(host), ..
+                }) => {
                     format!("QUIC {}", host)
                 }
                 Some(crate::dpi::AppProtocol::Http {

@@ -601,7 +601,7 @@ impl StreamTracker {
             // haven't extracted the hostname yet" — keep trying on
             // subsequent Initial packets.
             stream.app_protocol_attempted = match stream.app_protocol {
-                Some(crate::dpi::AppProtocol::Quic { sni: None }) => false,
+                Some(crate::dpi::AppProtocol::Quic { sni: None, .. }) => false,
                 Some(_) => true,
                 None => true,
             };
@@ -612,7 +612,7 @@ impl StreamTracker {
         if !is_tcp
             && !matches!(
                 stream.app_protocol,
-                Some(crate::dpi::AppProtocol::Quic { sni: Some(_) })
+                Some(crate::dpi::AppProtocol::Quic { sni: Some(_), .. })
             )
             && stream.quic_crypto_buf.len() < MAX_QUIC_CRYPTO_BUF
             && payload.len() >= 16
@@ -628,16 +628,19 @@ impl StreamTracker {
                     }
                     stream.quic_crypto_buf[offset as usize..end].copy_from_slice(&data);
                 }
-                if let Some(host) =
-                    crate::dpi::tls::extract_sni_from_handshake(&stream.quic_crypto_buf)
-                {
+                let meta = crate::dpi::tls::extract_handshake_metadata(&stream.quic_crypto_buf);
+                if let Some(host) = meta.sni {
                     tracing::trace!(
                         target: "netwatch::dpi::quic",
                         host = %host,
+                        ech = meta.ech,
                         buf_len = stream.quic_crypto_buf.len(),
                         "SNI extracted after cross-packet reassembly"
                     );
-                    stream.app_protocol = Some(crate::dpi::AppProtocol::Quic { sni: Some(host) });
+                    stream.app_protocol = Some(crate::dpi::AppProtocol::Quic {
+                        sni: Some(host),
+                        ech: meta.ech,
+                    });
                     stream.app_protocol_attempted = true;
                     // Release the buffer; we have what we need.
                     stream.quic_crypto_buf = Vec::new();
@@ -649,7 +652,10 @@ impl StreamTracker {
                     );
                     if stream.app_protocol.is_none() {
                         // At least tag it as QUIC even before full SNI.
-                        stream.app_protocol = Some(crate::dpi::AppProtocol::Quic { sni: None });
+                        stream.app_protocol = Some(crate::dpi::AppProtocol::Quic {
+                            sni: None,
+                            ech: false,
+                        });
                     }
                 }
             }
@@ -2848,7 +2854,7 @@ pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
             Some(crate::dpi::AppProtocol::Tls { sni: Some(h), .. }) => {
                 h.to_lowercase().contains(needle.as_str())
             }
-            Some(crate::dpi::AppProtocol::Quic { sni: Some(h) }) => {
+            Some(crate::dpi::AppProtocol::Quic { sni: Some(h), .. }) => {
                 h.to_lowercase().contains(needle.as_str())
             }
             _ => false,

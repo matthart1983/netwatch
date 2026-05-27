@@ -1261,7 +1261,7 @@ fn dpi_hostname(app_proto: &Option<crate::dpi::AppProtocol>) -> Option<String> {
     use crate::dpi::AppProtocol::*;
     match app_proto {
         Some(Tls { sni: Some(h), .. }) => Some(h.clone()),
-        Some(Quic { sni: Some(h) }) => Some(h.clone()),
+        Some(Quic { sni: Some(h), .. }) => Some(h.clone()),
         Some(Http { host: Some(h), .. }) => Some(h.clone()),
         _ => None,
     }

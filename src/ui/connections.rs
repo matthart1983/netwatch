@@ -293,6 +293,19 @@ pub(crate) fn render_app_protocol(p: &Option<crate::dpi::AppProtocol>) -> String
     use crate::dpi::AppProtocol::*;
     match p {
         None => "—".into(),
+        // ECH-flagged variants get a distinct prefix so the user can
+        // tell at a glance that the displayed SNI is the *outer* SNI
+        // and the real destination is hidden from the network.
+        Some(Tls {
+            sni: Some(host),
+            ech: true,
+            ..
+        }) => format!("HTTPS-ECH {}", host),
+        Some(Tls {
+            sni: None,
+            ech: true,
+            ..
+        }) => "HTTPS-ECH".into(),
         Some(Tls {
             sni: Some(host), ..
         }) => format!("HTTPS {}", host),
@@ -304,8 +317,16 @@ pub(crate) fn render_app_protocol(p: &Option<crate::dpi::AppProtocol>) -> String
         Some(Http { method, .. }) => format!("HTTP {}", method),
         Some(Dns { qname, .. }) => format!("DNS {}", qname),
         Some(Ssh { version }) => format!("SSH {}", version),
-        Some(Quic { sni: Some(h) }) => format!("QUIC {}", h),
-        Some(Quic { sni: None }) => "QUIC".into(),
+        Some(Quic {
+            sni: Some(h),
+            ech: true,
+        }) => format!("QUIC-ECH {}", h),
+        Some(Quic {
+            sni: None,
+            ech: true,
+        }) => "QUIC-ECH".into(),
+        Some(Quic { sni: Some(h), .. }) => format!("QUIC {}", h),
+        Some(Quic { sni: None, .. }) => "QUIC".into(),
         Some(Mqtt { client_id: Some(c) }) => format!("MQTT {}", c),
         Some(Mqtt { client_id: None }) => "MQTT".into(),
         Some(Stun { message_type }) => format!("STUN {}", message_type),
@@ -356,7 +377,7 @@ fn app_protocol_sni(p: &Option<crate::dpi::AppProtocol>) -> Option<&str> {
     use crate::dpi::AppProtocol::*;
     match p {
         Some(Tls { sni: Some(s), .. }) => Some(s.as_str()),
-        Some(Quic { sni: Some(s) }) => Some(s.as_str()),
+        Some(Quic { sni: Some(s), .. }) => Some(s.as_str()),
         _ => None,
     }
 }

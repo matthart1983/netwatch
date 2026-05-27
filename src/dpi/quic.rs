@@ -100,24 +100,26 @@ impl Classifier for QuicClassifier {
         // so users can debug "why is this just QUIC and not QUIC
         // host.com" via the file log. Levels: trace = single line per
         // Initial we touch; debug = stage-by-stage outcome.
-        let result = try_extract_sni(payload, &header);
-        let sni = match &result {
-            Ok(Some(host)) => {
+        let result = try_extract_handshake_metadata(payload, &header);
+        let (sni, ech) = match &result {
+            Ok(meta) if meta.sni.is_some() => {
                 tracing::trace!(
                     target: "netwatch::dpi::quic",
                     version = ?header.version_kind.map(version_label),
-                    host = %host,
+                    host = ?meta.sni,
+                    ech = meta.ech,
                     "SNI extracted"
                 );
-                Some(host.clone())
+                (meta.sni.clone(), meta.ech)
             }
-            Ok(None) => {
+            Ok(meta) => {
                 tracing::trace!(
                     target: "netwatch::dpi::quic",
                     version = ?header.version_kind.map(version_label),
+                    ech = meta.ech,
                     "Initial decrypted but ClientHello has no SNI extension"
                 );
-                None
+                (None, meta.ech)
             }
             Err(reason) => {
                 tracing::trace!(
@@ -126,10 +128,10 @@ impl Classifier for QuicClassifier {
                     reason = %reason,
                     "SNI extraction failed; emitting bare QUIC tag"
                 );
-                None
+                (None, false)
             }
         };
-        Some(AppProtocol::Quic { sni })
+        Some(AppProtocol::Quic { sni, ech })
     }
 }
 
@@ -558,7 +560,10 @@ fn crypto_frame_fragments(plaintext: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
     }
 }
 
-fn try_extract_sni(payload: &[u8], header: &LongHeader) -> Result<Option<String>, &'static str> {
+fn try_extract_handshake_metadata(
+    payload: &[u8],
+    header: &LongHeader,
+) -> Result<tls::HandshakeMetadata, &'static str> {
     if header.dcid_len == 0 || header.dcid_len > 20 {
         return Err("invalid dcid length");
     }
@@ -572,7 +577,7 @@ fn try_extract_sni(payload: &[u8], header: &LongHeader) -> Result<Option<String>
     let plaintext = decrypt_payload(&mut buf, header, &keys, pn, pn_len)
         .map_err(|_| "aead decrypt failed (auth tag or short buffer)")?;
     let crypto = reassemble_crypto(&plaintext).map_err(|_| "crypto-frame reassembly failed")?;
-    Ok(tls::extract_sni_from_handshake(&crypto))
+    Ok(tls::extract_handshake_metadata(&crypto))
 }
 
 #[cfg(test)]
@@ -665,7 +670,9 @@ e221af44860018ab0856972e194cd934";
         let packet = hex_to_bytes(hex);
         let result = QuicClassifier.classify(&packet, false);
         match result {
-            Some(AppProtocol::Quic { sni: Some(host) }) => {
+            Some(AppProtocol::Quic {
+                sni: Some(host), ..
+            }) => {
                 assert_eq!(host, "example.com");
             }
             other => panic!(
