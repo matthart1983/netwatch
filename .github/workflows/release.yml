@@ -228,12 +228,19 @@ jobs:
           VERSION="${RELEASE_TAG#v}"
           # `cargo publish` errors with "crate version is already
           # uploaded" — match that and exit 0 so re-dispatches stay green.
-          if cargo publish 2>&1 | tee /tmp/publish.log; then
+          # IMPORTANT: read PIPESTATUS, not $? — piping through `tee` would
+          # otherwise hide cargo's exit code (tee always succeeds) and the
+          # step would falsely report "Published OK" on real failures like
+          # 403 auth errors. Found while backfilling v0.21.6 — silent
+          # success masked an invalid CARGO_REGISTRY_TOKEN.
+          cargo publish 2>&1 | tee /tmp/publish.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -eq 0 ]; then
             echo "Published OK"
           elif grep -q "already uploaded" /tmp/publish.log; then
             echo "v${VERSION} already on crates.io — skipping"
           else
-            echo "Publish failed for a reason other than 'already uploaded'"
+            echo "Publish failed (cargo exit $rc) for a reason other than 'already uploaded'"
             exit 1
           fi
         env:
