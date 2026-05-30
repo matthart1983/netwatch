@@ -6,7 +6,11 @@
 
 ## Overview
 
-NetWatch is a Rust terminal UI for real-time local network diagnostics. The current shipped surface area is the 8-tab TUI plus a small CLI helper for writing a starter config file with `netwatch --generate-config`.
+NetWatch is a Rust terminal UI for real-time local network diagnostics. The current shipped surface area is the 9-tab TUI plus a small CLI helper for writing a starter config file with `netwatch --generate-config`.
+
+> User-facing deep dives (DPI, TLS decryption, JA4, eBPF, sandbox) live in the
+> [GitHub wiki](https://github.com/matthart1983/netwatch/wiki). This file is the
+> contributor-facing architecture/maintenance guide.
 
 The repo docs now intentionally stay focused on what is live in this codebase today:
 
@@ -31,17 +35,22 @@ NetWatch currently exposes these runtime tabs:
 6. Topology
 7. Timeline
 8. Processes
+9. Insights (opt-in AI analysis; tab appears when enabled)
 
 ### Primary capabilities
 
 - Interface traffic with rolling sparklines and totals
-- Active connections with process attribution
+- Active connections with process attribution (Linux eBPF kprobe / macOS PKTAP / lsof fallback)
 - Network config discovery for gateway, DNS, and hostname
 - Health probing for gateway and DNS targets
-- Packet capture, decoding, display filters, BPF filters, bookmarks, and PCAP export
+- Packet capture with 17 L7 decoders (`src/dpi/`), display filters, BPF filters, bookmarks, PCAP export
+- TLS 1.3 decryption via `SSLKEYLOGFILE` and JA4/JA4Q fingerprinting
+- Threat detection (port scan, beaconing, DNS tunnel) via `network_intel.rs`
 - Stream reassembly with text and hex views
 - Traceroute and WHOIS/RDAP lookups
 - Flight recorder with incident export bundles
+- Landlock sandbox (Linux): capability drop + filesystem allow-list post-init
+- Optional AI insights via local/cloud Ollama
 - Settings overlay with persistent user config
 
 ### Supported platforms
@@ -111,13 +120,17 @@ The main loop is tick-driven.
 - `src/collectors/connections.rs` resolves sockets, process names, exports, and timeline state
 - `src/collectors/config.rs` discovers gateway, DNS servers, and hostname
 - `src/collectors/health.rs` performs gateway and DNS probe collection
-- `src/collectors/packets.rs` owns capture, decode, filters, streams, bookmarks, and PCAP export
+- `src/collectors/packets/` owns capture, decode orchestration, the filter DSL, dns cache, and PCAP export
+- `src/dpi/` holds the 17 L7 classifiers plus `tls_decrypt.rs` (SSLKEYLOGFILE) and `ja4.rs`
+- `src/ebpf/` holds the Linux kprobe connection tracker and RTT monitor
+- `src/sandbox/` implements the Landlock filesystem + capability sandbox
 - `src/collectors/process_bandwidth.rs` ranks processes by RX/TX activity
 - `src/collectors/traceroute.rs` runs traceroute jobs for overlays
 - `src/collectors/whois.rs` performs WHOIS/RDAP lookups
 - `src/collectors/geo.rs` resolves GeoIP data via MaxMind or online fallback
 - `src/collectors/network_intel.rs` generates alert events used by the dashboard and recorder
 - `src/collectors/incident.rs` manages the rolling flight recorder window and bundle export
+- `src/collectors/insights.rs` builds network snapshots for the optional Ollama analysis
 
 ### UI
 
@@ -129,6 +142,7 @@ The main loop is tick-driven.
 - `src/ui/topology.rs`
 - `src/ui/timeline.rs`
 - `src/ui/processes.rs`
+- `src/ui/insights.rs`
 - `src/ui/help.rs`
 - `src/ui/settings.rs`
 - `src/ui/widgets.rs`
