@@ -1,6 +1,6 @@
 # QUIC 1-RTT Application-Data Decryption — Implementation Plan
 
-**Status:** in progress (Phase 2a)
+**Status:** Phase 2a ✅ done · Phase 2b next
 **Branch:** `feature/quic-decryption`
 **Context:** Extends the TLS 1.3 decryption shipped in v0.24.0 (passive,
 `SSLKEYLOGFILE`-based, read-only) from TLS-over-TCP to QUIC 1-RTT
@@ -39,13 +39,14 @@ TCP-TLS was "have the key → AEAD-open the record." QUIC needs protocol state:
 
 ## Phases
 
-### Phase 2a — connection-state foundation (no decryption) ← CURRENT
-- Add `Stream.quic_client_random: Option<[u8; 32]>`.
-- In the QUIC CRYPTO-reassembly block, once the ClientHello is reassembled,
-  capture `client_random` via `crate::dpi::tls::extract_client_random`.
-- Acceptance: field populated for QUIC flows; no behavior change; tests green.
+### Phase 2a — connection-state foundation (no decryption) ✅ DONE
+- Added `Stream.quic_client_random: Option<[u8; 32]>`.
+- `extract_handshake_metadata` now also returns `client_random` (captured
+  early, survives truncated ClientHellos); the QUIC reassembly block stores it
+  on the stream before the buffer is released on SNI success.
+- Done: field populated for QUIC flows; no behavior change; 456 tests green.
 
-### Phase 2b — 1-RTT key derivation
+### Phase 2b — 1-RTT key derivation ← CURRENT
 - Add QUIC-label key derivation (`"quic key"`/`"quic iv"`/`"quic hp"`) from a
   keylog `*_TRAFFIC_SECRET_0`. Likely a `DirectionKeys::from_quic_secret` or a
   `quic` flag on the existing derivation.
