@@ -1,6 +1,9 @@
 # QUIC 1-RTT Application-Data Decryption — Implementation Plan
 
-**Status:** 2a ✅ · 2b ✅ · 2c-i ✅ (decrypt fn + RFC 9001 §A.5 KAT) · 2c-ii next (CID tracking + capture wiring)
+**Status:** 2a ✅ · 2b ✅ · 2c-i ✅ · 2c-ii ✅ (wired into capture; live-verified
+vs Chrome HTTP/3) · 3a ✅ (HTTP/3 body decompression — gzip/deflate/brotli,
+offset-0; live-verified) · 3b next (cross-packet STREAM reassembly) · 2d polish
+(key-update) deferred. Shipped in **v0.25.0**.
 **Branch:** `feature/quic-decryption` (worktree at `~/netwatch-quic`)
 **Context:** Extends the TLS 1.3 decryption shipped in v0.24.0 (passive,
 `SSLKEYLOGFILE`-based, read-only) from TLS-over-TCP to QUIC 1-RTT
@@ -60,17 +63,28 @@ TCP-TLS was "have the key → AEAD-open the record." QUIC needs protocol state:
   short-header KAT** (protected packet → payload `01`). `#[allow(dead_code)]`
   until wired in 2c-ii.
 
-### Phase 2c-ii — connection state + capture wiring ← CURRENT
-- Track the server's chosen CID (its SCID from server long headers) → the
-  client's short-header DCID, and the CID length, on `Stream`.
-- In the capture path: for short-header QUIC packets on a flow with
-  `quic_client_random` + a keylog hit, pick the direction's secret, trial-
-  decrypt across the 3 suites via `decrypt_1rtt_packet`, and set
-  `CapturedPacket.decrypted_plaintext`.
-- Acceptance: live `cargo run --example` against an HTTP/3 client with
-  `SSLKEYLOGFILE` set shows decrypted 1-RTT payload in the inspection UI.
+### Phase 2c-ii — connection state + capture wiring ✅ DONE
+- Server CID / DCID length and per-direction `largest_pn` tracked on `Stream`;
+  first packet brute-forces (suite × DCID length) with AEAD as the oracle, then
+  caches. Decrypted plaintext flows into `CapturedPacket.decrypted_plaintext`.
+- Acceptance met: live capture against Chrome HTTP/3 with `SSLKEYLOGFILE` shows
+  decrypted 1-RTT payload (green rows, `decrypted:true`, payload pane, yank).
+  Verification harness: `examples/quic_decrypt_test.rs`.
 
-### Phase 2d — polish
+### Phase 3a — HTTP/3 body decompression ✅ DONE
+- `dpi/http3.rs`: walk QUIC frames → collect offset-0 STREAM data → parse the
+  HTTP/3 framing layer (RFC 9114) → concatenate DATA frames → sniff/trial-
+  decompress (gzip/zlib magic, brotli fallback; the `Content-Encoding` lives in
+  the QPACK HEADERS frame, which we deliberately skip). zstd deferred.
+- Scope: single-packet, offset-0 bodies. Mid-stream fragments can't be
+  decompressed alone — that's 3b. Live-verified (brotli) against YouTube QUIC.
+
+### Phase 3b — cross-packet STREAM reassembly ← NEXT
+- Buffer STREAM data per (stream_id, direction) by offset into a contiguous,
+  capped/evicted per-stream body; decompress once the head (offset 0) plus a
+  usable prefix is present. Unlocks large responses (the common case).
+
+### Phase 2d — polish (deferred)
 - Key-phase / key-update handling (RFC 9001 §6).
 - Packet-number window / reordering tolerance.
 

@@ -16,6 +16,7 @@ pub mod dhcp;
 pub mod dns;
 pub mod ftp;
 pub mod http;
+pub mod http3;
 pub mod ja4;
 pub mod ja4_db;
 pub mod llmnr;

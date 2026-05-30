@@ -157,11 +157,35 @@ pub fn format_packet_for_clipboard(pkt: &CapturedPacket) -> String {
     // Full TLS-decrypted application data — untruncated, unlike the
     // on-screen preview, so `y` is the way to grab the complete payload.
     if let Some(pt) = &pkt.decrypted_plaintext {
+        let is_quic = matches!(pkt.app_protocol, Some(crate::dpi::AppProtocol::Quic { .. }));
         s.push('\n');
-        let _ = writeln!(s, "  ── TLS decrypted ({} bytes) ──", pt.len());
+        if is_quic {
+            let _ = writeln!(s, "  ── QUIC 1-RTT decrypted ({} bytes) ──", pt.len());
+        } else {
+            let _ = writeln!(s, "  ── TLS decrypted ({} bytes) ──", pt.len());
+        }
         s.push_str(&preview_decrypted_bytes(pt, pt.len()));
         if !s.ends_with('\n') {
             s.push('\n');
+        }
+        // Include the decompressed HTTP/3 body when we can recover one.
+        if is_quic {
+            if let Some(decoded) = crate::dpi::http3::try_decode_single_packet(pt) {
+                let _ = writeln!(
+                    s,
+                    "  ── HTTP/3 stream {} · {} body ({} bytes) ──",
+                    decoded.stream_id,
+                    decoded.encoding.label(),
+                    decoded.bytes.len()
+                );
+                s.push_str(&preview_decrypted_bytes(
+                    &decoded.bytes,
+                    decoded.bytes.len(),
+                ));
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+            }
         }
     }
     s
@@ -761,45 +785,41 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 }
             }
 
-            // TLS-decrypted application data (when SSLKEYLOGFILE
-            // matched this flow). Shows a readable text preview if the
-            // plaintext looks like UTF-8, falling back to a hex dump.
-            // The inline view is capped (more in the `d`-expanded view);
-            // `y` copies the FULL payload to the clipboard.
+            // TLS/QUIC-decrypted application data (when SSLKEYLOGFILE
+            // matched this flow). The detail pane only summarizes what we
+            // recovered — the bytes themselves live in the Payload Content
+            // pane below, so we don't duplicate them here.
             if let Some(pt) = &pkt.decrypted_plaintext {
+                let is_quic =
+                    matches!(pkt.app_protocol, Some(crate::dpi::AppProtocol::Quic { .. }));
+                let label = if is_quic {
+                    "  ── QUIC 1-RTT decrypted ──"
+                } else {
+                    "  ── TLS decrypted ──"
+                };
                 detail_lines.push(Line::from(Span::styled(
-                    "  ── TLS decrypted ──",
+                    label,
                     Style::default().fg(app.theme.status_good).bold(),
                 )));
                 detail_lines.push(Line::from(Span::styled(
                     format!("  {} bytes plaintext", pt.len()),
                     Style::default().fg(app.theme.status_good),
                 )));
-                // Expanded mode (`d`) gets the whole pane, so show a lot;
-                // the compact pane shares space with hex/ascii, so cap low.
-                let max_lines = if app.ui.packet_detail_expanded {
-                    500
-                } else {
-                    16
-                };
-                let byte_cap = if app.ui.packet_detail_expanded {
-                    65536
-                } else {
-                    2048
-                };
-                let preview = preview_decrypted_bytes(pt, byte_cap);
-                let preview_lines: Vec<&str> = preview.lines().collect();
-                for line in preview_lines.iter().take(max_lines) {
-                    detail_lines.push(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(app.theme.text_primary),
-                    )));
-                }
-                if preview_lines.len() > max_lines || pt.len() > byte_cap {
-                    detail_lines.push(Line::from(Span::styled(
-                        "  … (press d to expand · y to copy full payload)",
-                        Style::default().fg(app.theme.text_muted).italic(),
-                    )));
+                // Phase 3a: note when this QUIC packet carries an offset-0
+                // HTTP/3 DATA body we decompressed (gzip/deflate/br). The
+                // decoded bytes render in the Payload Content pane.
+                if is_quic {
+                    if let Some(decoded) = crate::dpi::http3::try_decode_single_packet(pt) {
+                        detail_lines.push(Line::from(Span::styled(
+                            format!(
+                                "  HTTP/3 stream {} · {} body → {} bytes",
+                                decoded.stream_id,
+                                decoded.encoding.label(),
+                                decoded.bytes.len()
+                            ),
+                            Style::default().fg(app.theme.status_good),
+                        )));
+                    }
                 }
             }
 
@@ -903,11 +923,27 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 // here instead and label the pane accordingly.
                 let (payload_body, payload_title, payload_style) =
                     if let Some(pt) = &pkt.decrypted_plaintext {
-                        (
-                            preview_decrypted_bytes(pt, 16384),
-                            " Payload Content (TLS decrypted) ",
-                            Style::default().fg(app.theme.status_good),
-                        )
+                        let is_quic =
+                            matches!(pkt.app_protocol, Some(crate::dpi::AppProtocol::Quic { .. }));
+                        // For QUIC, surface the decompressed HTTP/3 body
+                        // (Phase 3a) beneath the raw decrypted frames so the
+                        // readable content is right here in one pane.
+                        let mut body = preview_decrypted_bytes(pt, 16384);
+                        let title = if is_quic {
+                            if let Some(decoded) = crate::dpi::http3::try_decode_single_packet(pt) {
+                                body.push_str(&format!(
+                                    "\n── HTTP/3 stream {} · {} body ({} bytes) ──\n",
+                                    decoded.stream_id,
+                                    decoded.encoding.label(),
+                                    decoded.bytes.len()
+                                ));
+                                body.push_str(&preview_decrypted_bytes(&decoded.bytes, 16384));
+                            }
+                            " Payload Content (QUIC 1-RTT decrypted) "
+                        } else {
+                            " Payload Content (TLS decrypted) "
+                        };
+                        (body, title, Style::default().fg(app.theme.status_good))
                     } else {
                         (
                             pkt.payload_text.clone(),

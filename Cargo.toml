@@ -84,6 +84,13 @@ netwatch-sdk = { version = "0.1.2", features = ["ebpf"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+# HTTP/3 response-body decompression for decrypted QUIC 1-RTT. Once a
+# 1-RTT packet is decrypted, the H3 DATA-frame payload is usually gzip /
+# deflate (flate2) or brotli (`br`) compressed; we sniff/trial-decompress
+# rather than decode the QPACK-compressed Content-Encoding header. zstd
+# deferred.
+flate2 = "1"
+brotli = "8"
 
 [features]
 # eBPF process attribution is on by default. The runtime gracefully
