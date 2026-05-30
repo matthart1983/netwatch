@@ -204,6 +204,25 @@ fn app_protocol_summary(p: &crate::dpi::AppProtocol) -> String {
         } => format!("SSDP {method} {t}"),
         Ssdp { method, .. } => format!("SSDP {method}"),
         Ftp { command } => format!("FTP {command}"),
+        Dhcp { op } => match op {
+            1 => "DHCP Discover/Request".into(),
+            2 => "DHCP Offer/ACK".into(),
+            n => format!("DHCP op={n}"),
+        },
+        Ntp { version, mode } => format!("NTPv{version} {}", ntp_mode_label(*mode)),
+    }
+}
+
+/// RFC 5905 NTP mode names (the low 3 bits of the first byte).
+fn ntp_mode_label(mode: u8) -> &'static str {
+    match mode {
+        1 => "Symmetric Active",
+        2 => "Symmetric Passive",
+        3 => "Client",
+        4 => "Server",
+        5 => "Broadcast",
+        6 => "Control",
+        _ => "Unknown",
     }
 }
 
@@ -528,6 +547,10 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 Some(crate::dpi::AppProtocol::Stun { .. })
                 | Some(crate::dpi::AppProtocol::BitTorrent { .. }) => {
                     Style::default().fg(app.theme.text_muted)
+                }
+                Some(crate::dpi::AppProtocol::Dhcp { .. })
+                | Some(crate::dpi::AppProtocol::Ntp { .. }) => {
+                    Style::default().fg(app.theme.status_warn)
                 }
                 None => Style::default(),
             };

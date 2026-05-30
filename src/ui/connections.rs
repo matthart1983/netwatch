@@ -393,6 +393,12 @@ fn render_app_protocol_base(p: &Option<crate::dpi::AppProtocol>) -> String {
         }) => format!("SSDP {}", method),
         Some(Ftp { command }) => format!("FTP {}", command),
         Some(Llmnr { qname, .. }) => format!("LLMNR {}", qname),
+        Some(Dhcp { op }) => match op {
+            1 => "DHCP Discover/Request".into(),
+            2 => "DHCP Offer/ACK".into(),
+            n => format!("DHCP op={}", n),
+        },
+        Some(Ntp { version, .. }) => format!("NTPv{}", version),
     }
 }
 
@@ -413,6 +419,8 @@ fn app_protocol_tag(p: &Option<crate::dpi::AppProtocol>) -> Option<&'static str>
         Some(Ssdp { .. }) => Some("ssdp"),
         Some(Ftp { .. }) => Some("ftp"),
         Some(Llmnr { .. }) => Some("llmnr"),
+        Some(Dhcp { .. }) => Some("dhcp"),
+        Some(Ntp { .. }) => Some("ntp"),
     }
 }
 
@@ -462,6 +470,7 @@ fn app_protocol_color(
         Some(Dns { .. }) | Some(Llmnr { .. }) | Some(Snmp { .. }) => t.brand,      // brand accent
         Some(Ssh { .. }) | Some(Ssdp { .. }) | Some(NetBios { .. }) => t.status_warn, // yellow
         Some(Stun { .. }) | Some(BitTorrent { .. }) => t.text_muted, // muted (transport-level)
+        Some(Dhcp { .. }) | Some(Ntp { .. }) => t.status_warn,       // infra services
     }
 }
 

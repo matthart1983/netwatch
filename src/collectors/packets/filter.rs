@@ -299,6 +299,8 @@ pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
             Some(crate::dpi::AppProtocol::Ssdp { .. }) => "ssdp" == tag.as_str(),
             Some(crate::dpi::AppProtocol::Ftp { .. }) => "ftp" == tag.as_str(),
             Some(crate::dpi::AppProtocol::Llmnr { .. }) => "llmnr" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Dhcp { .. }) => "dhcp" == tag.as_str(),
+            Some(crate::dpi::AppProtocol::Ntp { .. }) => "ntp" == tag.as_str(),
             None => false,
         },
         FilterExpr::Sni(needle) => match &pkt.app_protocol {
