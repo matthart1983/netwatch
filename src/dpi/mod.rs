@@ -12,6 +12,7 @@
 //!    classifiers first, parser-based ones later.
 
 pub mod bittorrent;
+pub mod dhcp;
 pub mod dns;
 pub mod ftp;
 pub mod http;
@@ -20,6 +21,7 @@ pub mod ja4_db;
 pub mod llmnr;
 pub mod mqtt;
 pub mod netbios;
+pub mod ntp;
 pub mod quic;
 pub mod snmp;
 pub mod ssdp;
@@ -97,6 +99,12 @@ pub enum AppProtocol {
     /// LLMNR query (RFC 4795) — wire-format-identical to DNS but on port
     /// 5355. Carries qname + qtype like the DNS variant.
     Llmnr { qname: String, qtype: u16 },
+    /// DHCP / BOOTP message, identified by its BOOTP op code (1 = request,
+    /// 2 = reply). Port-gated to 67/68.
+    Dhcp { op: u8 },
+    /// NTP message — protocol `version` and `mode` from the leap/version/mode
+    /// byte (RFC 5905). Port-gated to 123.
+    Ntp { version: u8, mode: u8 },
 }
 
 pub trait Classifier {
@@ -164,6 +172,18 @@ pub fn classify_once(
     if !is_tcp {
         if let Some(p) = quic::QuicClassifier.classify(payload, is_tcp) {
             return Some(p);
+        }
+        // DHCP/BOOTP on UDP 67/68 and NTP on 123 — strictly port-gated,
+        // so a cheap op-byte read is enough to label them.
+        if any_port(67) || any_port(68) {
+            if let Some(p) = dhcp::DhcpClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
+        }
+        if any_port(123) {
+            if let Some(p) = ntp::NtpClassifier.classify(payload, is_tcp) {
+                return Some(p);
+            }
         }
         // SSDP on UDP/1900 (HTTP-like text payload). Check before DNS
         // because its `M-SEARCH * HTTP/1.1` looks like nothing else.
