@@ -1,6 +1,9 @@
 /target
 /result
 *.DS_Store
+
+# JetBrains IDE config — machine-specific, shouldn't be tracked
+.idea/
 Roadmap*.md
 SPEC-*.md
 comparison.md
