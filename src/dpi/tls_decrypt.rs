@@ -65,7 +65,7 @@ impl CipherSuite {
         }
     }
 
-    fn hkdf_alg(self) -> hkdf::Algorithm {
+    pub(crate) fn hkdf_alg(self) -> hkdf::Algorithm {
         match self {
             Self::Aes128GcmSha256 => hkdf::HKDF_SHA256,
             Self::Aes256GcmSha384 => hkdf::HKDF_SHA384,
@@ -73,7 +73,7 @@ impl CipherSuite {
         }
     }
 
-    fn aead_alg(self) -> &'static aead::Algorithm {
+    pub(crate) fn aead_alg(self) -> &'static aead::Algorithm {
         match self {
             Self::Aes128GcmSha256 => &aead::AES_128_GCM,
             Self::Aes256GcmSha384 => &aead::AES_256_GCM,
@@ -81,7 +81,7 @@ impl CipherSuite {
         }
     }
 
-    fn key_len(self) -> usize {
+    pub(crate) fn key_len(self) -> usize {
         self.aead_alg().key_len()
     }
 }

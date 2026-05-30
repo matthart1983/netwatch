@@ -53,7 +53,7 @@ const VERSION_V2: u32 = 0x6b33_43cf;
 const SAMPLE_LEN: usize = 16;
 
 #[derive(Clone, Copy)]
-enum QuicVersion {
+pub(crate) enum QuicVersion {
     V1,
     V2,
 }
@@ -285,6 +285,42 @@ fn derive_initial_keys(dcid: &[u8], version: QuicVersion) -> Result<InitialKeys,
     hkdf_expand_label(&client_prk, version.iv_label(), &mut iv)?;
     hkdf_expand_label(&client_prk, version.hp_label(), &mut hp)?;
     Ok(InitialKeys { key, iv, hp })
+}
+
+/// AEAD + header-protection material for QUIC 1-RTT (and Handshake) packets,
+/// derived from a TLS traffic secret. Unlike Initial keys (from DCID + a
+/// fixed salt), the secret here is the `*_TRAFFIC_SECRET_0` the cooperating
+/// client wrote to `SSLKEYLOGFILE`. `key`/`hp` are 16 bytes for AES-128-GCM,
+/// 32 for AES-256-GCM and ChaCha20-Poly1305.
+// Wired into the short-header decrypt path in Phase 2c; for now only the
+// derivation + its RFC 9001 §A.5 KAT exercise it.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct OneRttKeys {
+    pub key: Vec<u8>,
+    pub iv: [u8; 12],
+    pub hp: Vec<u8>,
+}
+
+/// Derive 1-RTT keys from a traffic secret per RFC 9001 §5.1, using the
+/// QUIC HKDF labels (`"quic key"`/`"quic iv"`/`"quic hp"`, or the `quicv2`
+/// variants). The HKDF hash and key length come from the negotiated cipher
+/// suite. Validated against the RFC 9001 §A.5 ChaCha20 test vector.
+#[allow(clippy::result_unit_err, dead_code)] // wired in Phase 2c
+pub(crate) fn derive_1rtt_keys(
+    secret: &[u8],
+    suite: crate::dpi::tls_decrypt::CipherSuite,
+    version: QuicVersion,
+) -> Result<OneRttKeys, ()> {
+    let prk = hkdf::Prk::new_less_safe(suite.hkdf_alg(), secret);
+    let klen = suite.key_len();
+    let mut key = vec![0u8; klen];
+    let mut iv = [0u8; 12];
+    let mut hp = vec![0u8; klen];
+    hkdf_expand_label(&prk, version.key_label(), &mut key)?;
+    hkdf_expand_label(&prk, version.iv_label(), &mut iv)?;
+    hkdf_expand_label(&prk, version.hp_label(), &mut hp)?;
+    Ok(OneRttKeys { key, iv, hp })
 }
 
 /// Remove header protection on a full Initial packet. Mutates `buf` so
@@ -690,5 +726,30 @@ e221af44860018ab0856972e194cd934";
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// RFC 9001 §A.5 — derive 1-RTT key/iv/hp from the ChaCha20-Poly1305
+    /// application secret and check against the published values. This pins
+    /// the QUIC HKDF labels ("quic key"/"quic iv"/"quic hp") and the
+    /// suite's hash, independent of any packet decryption.
+    #[test]
+    fn derive_1rtt_keys_matches_rfc9001_a5_chacha20() {
+        let secret =
+            hex_to_bytes("9ac312a7f877468ebe69422748ad00a1 5443f18203a07d6060f688f30f21632b");
+        let keys = derive_1rtt_keys(
+            &secret,
+            crate::dpi::tls_decrypt::CipherSuite::Chacha20Poly1305Sha256,
+            QuicVersion::V1,
+        )
+        .expect("derive");
+        assert_eq!(
+            keys.key,
+            hex_to_bytes("c6d98ff3441c3fe1b2182094f69caa2e d4b716b65488960a7a984979fb23e1c8")
+        );
+        assert_eq!(keys.iv.to_vec(), hex_to_bytes("e0459b3474bdd0e44a41c144"));
+        assert_eq!(
+            keys.hp,
+            hex_to_bytes("25a282b9e82f06f21f488917a4fc8f1b 73573685608597d0efcb076b0ab7a7a4")
+        );
     }
 }

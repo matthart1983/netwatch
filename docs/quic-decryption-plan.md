@@ -1,7 +1,7 @@
 # QUIC 1-RTT Application-Data Decryption — Implementation Plan
 
-**Status:** Phase 2a ✅ done · Phase 2b next
-**Branch:** `feature/quic-decryption`
+**Status:** Phase 2a ✅ · Phase 2b ✅ · Phase 2c next
+**Branch:** `feature/quic-decryption` (worktree at `~/netwatch-quic`)
 **Context:** Extends the TLS 1.3 decryption shipped in v0.24.0 (passive,
 `SSLKEYLOGFILE`-based, read-only) from TLS-over-TCP to QUIC 1-RTT
 application data. netwatch already decrypts QUIC **Initial** packets (SNI/JA4
@@ -46,14 +46,13 @@ TCP-TLS was "have the key → AEAD-open the record." QUIC needs protocol state:
   on the stream before the buffer is released on SNI success.
 - Done: field populated for QUIC flows; no behavior change; 456 tests green.
 
-### Phase 2b — 1-RTT key derivation ← CURRENT
-- Add QUIC-label key derivation (`"quic key"`/`"quic iv"`/`"quic hp"`) from a
-  keylog `*_TRAFFIC_SECRET_0`. Likely a `DirectionKeys::from_quic_secret` or a
-  `quic` flag on the existing derivation.
-- Acceptance: unit test against an RFC 9001 §A test vector (known secret →
-  known key/iv/hp).
+### Phase 2b — 1-RTT key derivation ✅ DONE
+- `dpi/quic::derive_1rtt_keys(secret, suite, version)` → `OneRttKeys {key, iv, hp}`
+  using the `"quic key/iv/hp"` labels and the suite's hash/key-len (reuses
+  `tls_decrypt::CipherSuite`). Validated against the RFC 9001 §A.5 ChaCha20 KAT.
+  Marked `#[allow(dead_code)]` until 2c calls it.
 
-### Phase 2c — short-header decrypt
+### Phase 2c — short-header decrypt ← CURRENT
 - Track the server's chosen CID (its SCID from server long headers) →
   the client's short-header DCID, and the CID length.
 - Parse short headers using the tracked DCID length; reuse `unprotect_header`
