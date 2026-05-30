@@ -24,13 +24,13 @@
   <em>Go from a 10,000-ft dashboard to <strong>decrypted TLS 1.3 bytes</strong> without leaving your terminal.</em>
 </p>
 
-<p align="center">
-  <em>Siblings: <a href="https://github.com/matthart1983/syswatch">SysWatch</a> (system) and <a href="https://github.com/matthart1983/diskwatch">DiskWatch</a> (disk). Same chrome. Different surface.</em>
-</p>
-
 ---
 
-NetWatch is a real-time network diagnostics TUI that does what usually takes three tools. It draws the live dashboard of `bandwhich`/`iftop`, decodes packets like `tshark`, and hunts threats like a mini-IDS — in one zero-config binary you launch with a single command.
+NetWatch is a real-time network **forensics** TUI. It **decrypts TLS 1.3**, fingerprints clients with **JA4**, and hunts **C2 beaconing, port scans, and DNS tunneling** — live, in one zero-config binary. It's a great live dashboard too, but that's the part everything else already does.
+
+**Who it's for:** blue-teamers, incident responders, and homelabbers who need live triage and evidence capture — not just a bandwidth meter.
+
+<samp>500+ tests · Landlock-sandboxed · safely parses hostile capture traffic</samp>
 
 ## What makes it different
 
@@ -45,6 +45,13 @@ Most terminal network tools stop at *"which process is using bandwidth."* NetWat
 - 🛡️ **Landlock sandbox** — after setup, NetWatch drops its capabilities and locks itself into a filesystem allow-list. A forensics tool that parses hostile traffic can never read your SSH keys, browser profiles, or `/etc/shadow`.
 
 **No config files. No setup. No flags required.**
+
+## Why not just `tshark` or `rustnet`?
+
+You probably already have them. Here's where NetWatch fits between them:
+
+- **vs `tshark` / Wireshark** — those are pcap *surgery*: powerful, but offline and after the fact. NetWatch is live *triage* — decode, fingerprint, detect, and freeze an evidence bundle in the moment an incident happens, without dropping to a three-pane GUI.
+- **vs `rustnet` / `bandwhich`** — those show you *what's on* the wire. NetWatch shows you *what's wrong with it*: decrypted payloads, JA4 fingerprints to pivot on, and background IDS detectors raising alerts. They're bandwidth meters; this is a forensics workbench.
 
 ---
 
@@ -92,6 +99,18 @@ netwatch            # Interface stats, connections, config
 sudo netwatch       # Full mode — adds health probes + packet capture
 netwatch --generate-config
 ```
+
+### See it decrypt TLS in 60 seconds
+
+The fastest way to understand what NetWatch is — watch it read the plaintext of a TLS 1.3 session *you* control, the same `SSLKEYLOGFILE` way Wireshark does (no MITM, no proxy):
+
+```bash
+sudo netwatch                                              # 1. launch; in the Packets tab press 'c' to capture
+SSLKEYLOGFILE=/tmp/sslkeylog.txt curl https://example.com  # 2. any cooperating client, the default keylog path
+#                                                            3. filter with:  decrypted:true  →  open the record
+```
+
+The decrypted application data renders inline. A keylog miss never breaks capture — the record just stays opaque.
 
 ### Running without sudo (Linux)
 
@@ -406,8 +425,8 @@ On Linux, `setcap` (above) unlocks capture and eBPF without running as root.
 
 ## Themes
 
-5 built-in themes with instant switching via `t`:
-**Dark** (default) · **Light** · **Solarized** · **Dracula** · **Nord**
+7 built-in themes with instant switching via `t`:
+**Dark** (default) · **Ocean** · **Solarized** · **Dracula** · **Nord** · **Sky** · **Paper**
 
 Theme changes apply immediately. Persist them from the Settings overlay with `S`.
 
@@ -448,6 +467,8 @@ Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → 17 L7 decoders
 ---
 
 ## Related
+
+**Siblings:** [SysWatch](https://github.com/matthart1983/syswatch) (system) and [DiskWatch](https://github.com/matthart1983/diskwatch) (disk) — same chrome, different surface.
 
 **[ESSH](https://github.com/matthart1983/essh)** — If you manage the hosts you monitor, ESSH is built for the same workflow. Same TUI aesthetic, pure-Rust SSH client with concurrent sessions, live remote host diagnostics (CPU, memory, disk, processes — no agent install), fleet management, file transfer, and port forwarding. Connects where NetWatch observes.
 
