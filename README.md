@@ -2,7 +2,7 @@
   <h1 align="center">NetWatch</h1>
   <p align="center">
     <strong>Network forensics that fits in your terminal.</strong><br>
-    <em>Wireshark's depth. <code>htop</code>'s speed. Pure Rust. Zero config.</em>
+    <em>Deep packet inspection at real-time speed. Built in Rust. Zero config.</em>
   </p>
   <p align="center">
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
