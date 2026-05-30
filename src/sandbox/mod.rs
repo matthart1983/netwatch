@@ -1,7 +1,7 @@
 //! Security sandbox — restrict netwatch's authority after pcap + eBPF setup.
 //!
-//! Designed to mirror rustnet's three-OS approach (Landlock / Seatbelt /
-//! restricted token) but shipped in phases:
+//! A three-OS approach (Landlock / Seatbelt / restricted token),
+//! shipped in phases:
 //!
 //! - **Phase 1 (this module): Linux** — `caps` drop + `landlock` filesystem
 //!   and network restrictions. Applied after `ConnTracker::new()` returns

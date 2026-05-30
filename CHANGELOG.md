@@ -134,13 +134,12 @@ LAN / IoT / ops protocols that previously rendered as generic "TCP" /
 
 ### Notes
 
-This closes the `DPI protocol breadth` row on the netwatch-vs-rustnet
-comparison that's been red since rustnet shipped its long-tail. After
-v0.20.0 netwatch has 13 shipped classifiers (TLS / QUIC with Initial
-decrypt / DNS / HTTP / SSH / MQTT / STUN / BitTorrent / NetBIOS /
-SNMP / SSDP / FTP / LLMNR) + IGMP at the IP layer + 25 port labels.
-rustnet has 17 stream classifiers; netwatch covers all the operationally
-common ones plus the QUIC depth (Initial decryption) rustnet doesn't.
+This substantially broadens DPI protocol breadth. After v0.20.0 netwatch
+has 13 shipped classifiers (TLS / QUIC with Initial decrypt / DNS / HTTP /
+SSH / MQTT / STUN / BitTorrent / NetBIOS / SNMP / SSDP / FTP / LLMNR) +
+IGMP at the IP layer + 25 port labels — covering the operationally common
+protocols, plus QUIC Initial-decryption depth that most terminal tools
+don't attempt.
 
 37 new unit tests across the 8 classifier files cover the success
 case, the rejection of look-alike traffic (HTTP on FTP port, garbage
@@ -163,7 +162,7 @@ non-CONNECT MQTT, v1 vs v2c SNMP, M-SEARCH vs NOTIFY SSDP).
 - `Connection` struct gained `retransmits: u32` and `out_of_order: u32` fields, sourced from a new `StreamTracker::snapshot_anomalies()` snapshot during the connection collector's update tick. Both default to 0 via `#[serde(default)]` so on-disk Flight Recorder bundles and stored configs remain forward-compatible.
 
 ### Notes
-This closes the `TCP retransmits / out-of-order analytics` row on the netwatch-vs-rustnet matrix that's been red since the May snapshots. Combined with the v0.18.x sandbox arc, netwatch's defensible-edge picture vs. rustnet narrows the rustnet column to: DPI long-tail (MQTT/BitTorrent/SNMP/…), smart staleness coloring, Windows+FreeBSD native process attribution, and distribution breadth.
+This adds per-stream TCP retransmit / out-of-order analytics — health signals that previously meant dropping to a full packet analyzer. Combined with the v0.18.x sandbox arc, it strengthens netwatch's live-forensics edge; remaining areas to grow are DPI long-tail breadth (MQTT/BitTorrent/SNMP/…), smart staleness coloring, Windows/FreeBSD native process attribution, and distribution breadth.
 
 ## [0.18.1] - 2026-05-23
 

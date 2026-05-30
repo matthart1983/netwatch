@@ -418,7 +418,7 @@ fn reassemble_crypto(plaintext: &[u8]) -> Result<Vec<u8>, ()> {
 /// Decode one Initial packet into a human-readable frame breakdown.
 /// Returns lines like `"CRYPTO offset=0 len=1100"` or
 /// `"PADDING bytes=200"`. Used by the Packets tab's detail pane to
-/// surface the decrypted QUIC frame structure that rustnet/wireshark
+/// surface the decrypted QUIC frame structure that tools like Wireshark
 /// can't show without similar header-protection removal.
 pub fn decode_initial_frame_summary(payload: &[u8]) -> Option<Vec<String>> {
     let header = parse_long_header(payload)?;

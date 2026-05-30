@@ -46,12 +46,11 @@ Most terminal network tools stop at *"which process is using bandwidth."* NetWat
 
 **No config files. No setup. No flags required.**
 
-## Why not just `tshark` or `rustnet`?
+## Live forensics, not just monitoring
 
-You probably already have them. Here's where NetWatch fits between them:
+Most terminal network tools answer one question — *"which process is using bandwidth?"* — and stop. Full packet analyzers answer *"what happened?"*, but offline, after the fact, in a heavyweight GUI.
 
-- **vs `tshark` / Wireshark** — those are pcap *surgery*: powerful, but offline and after the fact. NetWatch is live *triage* — decode, fingerprint, detect, and freeze an evidence bundle in the moment an incident happens, without dropping to a three-pane GUI.
-- **vs `rustnet` / `bandwhich`** — those show you *what's on* the wire. NetWatch shows you *what's wrong with it*: decrypted payloads, JA4 fingerprints to pivot on, and background IDS detectors raising alerts. They're bandwidth meters; this is a forensics workbench.
+NetWatch lives in the gap: **live triage**. Decode L7 protocols, fingerprint clients with JA4, detect beaconing / port scans / DNS tunneling, and freeze an evidence bundle the moment an incident happens — in real time, in one terminal. A bandwidth meter tells you *what's on* the wire; NetWatch tells you *what's wrong with it*.
 
 ---
 
