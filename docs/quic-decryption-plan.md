@@ -1,6 +1,6 @@
 # QUIC 1-RTT Application-Data Decryption — Implementation Plan
 
-**Status:** Phase 2a ✅ · Phase 2b ✅ · Phase 2c next
+**Status:** 2a ✅ · 2b ✅ · 2c-i ✅ (decrypt fn + RFC 9001 §A.5 KAT) · 2c-ii next (CID tracking + capture wiring)
 **Branch:** `feature/quic-decryption` (worktree at `~/netwatch-quic`)
 **Context:** Extends the TLS 1.3 decryption shipped in v0.24.0 (passive,
 `SSLKEYLOGFILE`-based, read-only) from TLS-over-TCP to QUIC 1-RTT
@@ -52,15 +52,23 @@ TCP-TLS was "have the key → AEAD-open the record." QUIC needs protocol state:
   `tls_decrypt::CipherSuite`). Validated against the RFC 9001 §A.5 ChaCha20 KAT.
   Marked `#[allow(dead_code)]` until 2c calls it.
 
-### Phase 2c — short-header decrypt ← CURRENT
-- Track the server's chosen CID (its SCID from server long headers) →
-  the client's short-header DCID, and the CID length.
-- Parse short headers using the tracked DCID length; reuse `unprotect_header`
-  + `decrypt_payload`. Trial-decrypt across cipher suites (2b).
-- Wire decrypted 1-RTT payload into `CapturedPacket.decrypted_plaintext`.
+### Phase 2c-i — short-header decrypt function ✅ DONE
+- `dpi/quic::decrypt_1rtt_packet(packet, dcid_len, secret, suite, version,
+  largest_pn)` — short-header parse, HP removal (`one_rtt_hp_mask`, per-suite
+  AES/ChaCha20), packet-number reconstruction (`decode_packet_number`, RFC
+  9000 §A.3), AEAD open. **Validated against the RFC 9001 §A.5 ChaCha20
+  short-header KAT** (protected packet → payload `01`). `#[allow(dead_code)]`
+  until wired in 2c-ii.
+
+### Phase 2c-ii — connection state + capture wiring ← CURRENT
+- Track the server's chosen CID (its SCID from server long headers) → the
+  client's short-header DCID, and the CID length, on `Stream`.
+- In the capture path: for short-header QUIC packets on a flow with
+  `quic_client_random` + a keylog hit, pick the direction's secret, trial-
+  decrypt across the 3 suites via `decrypt_1rtt_packet`, and set
+  `CapturedPacket.decrypted_plaintext`.
 - Acceptance: live `cargo run --example` against an HTTP/3 client with
-  `SSLKEYLOGFILE` set shows decrypted 1-RTT payload; RFC 9001 KAT for one
-  short-header packet.
+  `SSLKEYLOGFILE` set shows decrypted 1-RTT payload in the inspection UI.
 
 ### Phase 2d — polish
 - Key-phase / key-update handling (RFC 9001 §6).

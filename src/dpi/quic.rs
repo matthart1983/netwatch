@@ -323,6 +323,113 @@ pub(crate) fn derive_1rtt_keys(
     Ok(OneRttKeys { key, iv, hp })
 }
 
+/// Header-protection mask for a 1-RTT packet, selecting the cipher per the
+/// negotiated suite (AES-128/256 ECB or ChaCha20). `sample` is 16 bytes.
+#[allow(clippy::result_unit_err)]
+fn one_rtt_hp_mask(
+    suite: crate::dpi::tls_decrypt::CipherSuite,
+    hp_key: &[u8],
+    sample: &[u8; SAMPLE_LEN],
+) -> Result<[u8; 5], ()> {
+    use crate::dpi::tls_decrypt::CipherSuite::*;
+    let key = match suite {
+        Aes128GcmSha256 => quic::HeaderProtectionKey::new(&quic::AES_128, hp_key),
+        Aes256GcmSha384 => quic::HeaderProtectionKey::new(&quic::AES_256, hp_key),
+        Chacha20Poly1305Sha256 => quic::HeaderProtectionKey::new(&quic::CHACHA20, hp_key),
+    }
+    .map_err(|_| ())?;
+    key.new_mask(sample).map_err(|_| ())
+}
+
+/// Reconstruct the full packet number from a truncated on-wire value, per
+/// RFC 9000 §A.3, given the largest packet number already processed in this
+/// packet-number space.
+fn decode_packet_number(largest_pn: u64, truncated: u64, pn_len: usize) -> u64 {
+    let pn_nbits = pn_len * 8;
+    let pn_win = 1u64 << pn_nbits;
+    let pn_hwin = pn_win / 2;
+    let pn_mask = pn_win - 1;
+    let expected = largest_pn.wrapping_add(1);
+    let candidate = (expected & !pn_mask) | truncated;
+    if candidate.wrapping_add(pn_hwin) <= expected && candidate < (1u64 << 62) - pn_win {
+        candidate + pn_win
+    } else if candidate > expected.wrapping_add(pn_hwin) && candidate >= pn_win {
+        candidate - pn_win
+    } else {
+        candidate
+    }
+}
+
+/// Decrypt a QUIC 1-RTT (short-header) packet. `dcid_len` is the connection's
+/// Destination Connection ID length — known from the handshake, *not* on the
+/// wire for short headers. `secret` is this direction's `*_TRAFFIC_SECRET_0`
+/// from the keylog; `largest_pn` is the largest pn already seen in this
+/// direction (for truncated-pn reconstruction). Returns the decrypted frame
+/// payload (QUIC frames), or `Err` if not a short header / auth fails.
+///
+/// Validated against the RFC 9001 §A.5 ChaCha20 short-header vector.
+#[allow(clippy::result_unit_err, dead_code)] // wired into the capture path in Phase 2c-ii
+pub(crate) fn decrypt_1rtt_packet(
+    packet: &[u8],
+    dcid_len: usize,
+    secret: &[u8],
+    suite: crate::dpi::tls_decrypt::CipherSuite,
+    version: QuicVersion,
+    largest_pn: u64,
+) -> Result<Vec<u8>, ()> {
+    // Short header: fixed bit 0x40 set, long-header bit 0x80 clear.
+    if packet.is_empty() || packet[0] & 0x80 != 0 {
+        return Err(());
+    }
+    let pn_offset = 1 + dcid_len;
+    let keys = derive_1rtt_keys(secret, suite, version)?;
+    let mut buf = packet.to_vec();
+
+    // Header protection: sample 16 bytes starting 4 after the pn field.
+    let sample_offset = pn_offset + 4;
+    if buf.len() < sample_offset + SAMPLE_LEN {
+        return Err(());
+    }
+    let sample: [u8; SAMPLE_LEN] = buf[sample_offset..sample_offset + SAMPLE_LEN]
+        .try_into()
+        .map_err(|_| ())?;
+    let mask = one_rtt_hp_mask(suite, &keys.hp, &sample)?;
+    // Short header masks the low 5 bits of byte 0 (long header masks 4).
+    buf[0] ^= mask[0] & 0x1f;
+    let pn_len = ((buf[0] & 0x03) as usize) + 1;
+    if buf.len() < pn_offset + pn_len {
+        return Err(());
+    }
+    let mut truncated: u64 = 0;
+    for i in 0..pn_len {
+        buf[pn_offset + i] ^= mask[1 + i];
+        truncated = (truncated << 8) | buf[pn_offset + i] as u64;
+    }
+    let pn = decode_packet_number(largest_pn, truncated, pn_len);
+
+    // AEAD: nonce = iv XOR (pn right-aligned), AAD = unprotected header.
+    let mut nonce_bytes = keys.iv;
+    let pn_be = pn.to_be_bytes();
+    for i in 0..8 {
+        nonce_bytes[4 + i] ^= pn_be[i];
+    }
+    let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let header_end = pn_offset + pn_len;
+    let aad = aead::Aad::from(buf[..header_end].to_vec());
+    let mut ciphertext = buf[header_end..].to_vec();
+    let tag_len = suite.aead_alg().tag_len();
+    if ciphertext.len() < tag_len {
+        return Err(());
+    }
+    let opening =
+        aead::LessSafeKey::new(aead::UnboundKey::new(suite.aead_alg(), &keys.key).map_err(|_| ())?);
+    opening
+        .open_in_place(nonce, aad, &mut ciphertext)
+        .map_err(|_| ())?;
+    ciphertext.truncate(ciphertext.len() - tag_len);
+    Ok(ciphertext)
+}
+
 /// Remove header protection on a full Initial packet. Mutates `buf` so
 /// that the first byte's low 4 bits and the packet-number bytes are
 /// their unprotected values. Returns the packet number (as a u64) and
@@ -751,5 +858,34 @@ e221af44860018ab0856972e194cd934";
             keys.hp,
             hex_to_bytes("25a282b9e82f06f21f488917a4fc8f1b 73573685608597d0efcb076b0ab7a7a4")
         );
+    }
+
+    /// RFC 9001 §A.5 — full short-header decrypt: protected packet + the
+    /// server application secret → unprotected header `4200bff4` and payload
+    /// plaintext `01` (a single PING frame). Empty DCID, pn 654360564.
+    #[test]
+    fn decrypt_1rtt_packet_matches_rfc9001_a5() {
+        let packet = hex_to_bytes("4cfe4189655e5cd55c41f69080575d7999c25a5bfb");
+        let secret =
+            hex_to_bytes("9ac312a7f877468ebe69422748ad00a1 5443f18203a07d6060f688f30f21632b");
+        // largest_pn = 654360563 so reconstruction yields the example's
+        // full pn 654360564 (= 0x2700bff4) from the 3-byte truncated 0x00bff4.
+        let plaintext = decrypt_1rtt_packet(
+            &packet,
+            0, // empty Destination Connection ID
+            &secret,
+            crate::dpi::tls_decrypt::CipherSuite::Chacha20Poly1305Sha256,
+            QuicVersion::V1,
+            654360563,
+        )
+        .expect("RFC 9001 A.5 packet must decrypt");
+        assert_eq!(plaintext, hex_to_bytes("01"));
+    }
+
+    #[test]
+    fn decode_packet_number_reconstructs_rfc9000_a3() {
+        // RFC 9000 §A.3 worked example: largest=0xa82f30ea, truncated=0x9b32,
+        // pn_len=2 → 0xa82f9b32.
+        assert_eq!(decode_packet_number(0xa82f30ea, 0x9b32, 2), 0xa82f9b32);
     }
 }
