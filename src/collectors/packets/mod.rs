@@ -1348,6 +1348,84 @@ fn parse_transport(
     }
 }
 
+/// Render a classified `AppProtocol` into the `(protocol-label, summary)` the
+/// Info column shows. The label is preserved from the retired legacy parsers
+/// so filters / colors / stats keyed on `pkt.protocol` keep working; the
+/// summary is the human-readable middle of the Info string. `crate::dpi` is
+/// now the single DPI source — this is the only spot the capture path crosses
+/// back from `AppProtocol` to display strings.
+fn describe_app_protocol(p: &crate::dpi::AppProtocol) -> (&'static str, String) {
+    use crate::dpi::AppProtocol::*;
+    match p {
+        Tls { sni, alpn, ech, .. } => {
+            let mut s = sni.clone().unwrap_or_else(|| "(no SNI)".into());
+            if *ech {
+                s.push_str(" [ECH]");
+            }
+            if let Some(a) = alpn {
+                s.push_str(&format!(" alpn={a}"));
+            }
+            ("TLS", s)
+        }
+        Quic { sni, ech, .. } => {
+            let mut s = sni.clone().unwrap_or_else(|| "(no SNI)".into());
+            if *ech {
+                s.push_str(" [ECH]");
+            }
+            ("QUIC", s)
+        }
+        Http { method, host } => (
+            "HTTP",
+            match host {
+                Some(h) => format!("{method} {h}"),
+                None => method.clone(),
+            },
+        ),
+        Dns { qname, qtype } => ("DNS", format!("{qname} (type={qtype})")),
+        Llmnr { qname, qtype } => ("LLMNR", format!("{qname} (type={qtype})")),
+        Ssh { version } => ("SSH", version.clone()),
+        Mqtt { client_id } => ("MQTT", client_id.clone().unwrap_or_default()),
+        Stun { message_type } => ("STUN", message_type.clone()),
+        BitTorrent { info_hash } => ("BitTorrent", info_hash.clone().unwrap_or_default()),
+        NetBios { service } => ("NetBIOS", service.clone()),
+        Snmp { version, community } => (
+            "SNMP",
+            match community {
+                Some(c) => format!("{version} {c}"),
+                None => version.clone(),
+            },
+        ),
+        Ssdp { method, target } => (
+            "SSDP",
+            match target {
+                Some(t) => format!("{method} {t}"),
+                None => method.clone(),
+            },
+        ),
+        Ftp { command } => ("FTP", command.clone()),
+        Dhcp { op } => (
+            "DHCP",
+            match op {
+                1 => "Discover/Request".into(),
+                2 => "Offer/ACK".into(),
+                n => format!("op={n}"),
+            },
+        ),
+        Ntp { version, mode } => {
+            let m = match mode {
+                1 => "Symmetric Active",
+                2 => "Symmetric Passive",
+                3 => "Client",
+                4 => "Server",
+                5 => "Broadcast",
+                6 => "Control",
+                _ => "Unknown",
+            };
+            ("NTP", format!("v{version} {m}"))
+        }
+    }
+}
+
 fn parse_tcp(
     data: &[u8],
     src_ip: &str,
@@ -1382,27 +1460,24 @@ fn parse_tcp(
         &[]
     };
 
-    let ctx = ParseCtx {
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-    };
-    for parser in TCP_PARSERS.iter() {
-        if parser.matches(src_port, dst_port, payload) {
-            if let Some(result) = parser.parse(payload, &ctx, &flag_str) {
-                details.push(result.detail);
-                return (
-                    result.proto,
-                    Some(src_port),
-                    Some(dst_port),
-                    result.info,
-                    data_offset,
-                    Some(flags),
-                    Some(seq),
-                );
-            }
-        }
+    // Single DPI path: classify via `crate::dpi` and render the Info string
+    // from the result. Replaces the old per-packet TCP parser registry.
+    if let Some(ap) = crate::dpi::classify_once(payload, true, src_port, dst_port) {
+        let (label, summary) = describe_app_protocol(&ap);
+        details.push(format!("{label}: {summary}"));
+        let info = format!(
+            "{}:{} → {}:{} {} [{}]",
+            src_ip, src_port, dst_ip, dst_port, summary, flag_str
+        );
+        return (
+            label.to_string(),
+            Some(src_port),
+            Some(dst_port),
+            info,
+            data_offset,
+            Some(flags),
+            Some(seq),
+        );
     }
 
     let payload_len = payload.len();
@@ -1462,27 +1537,23 @@ fn parse_udp(
 
     let payload = if data.len() > 8 { &data[8..] } else { &[] };
 
-    let ctx = ParseCtx {
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-    };
-    for parser in UDP_PARSERS.iter() {
-        if parser.matches(src_port, dst_port, payload) {
-            if let Some(result) = parser.parse(payload, &ctx) {
-                details.push(result.detail);
-                return (
-                    result.proto,
-                    Some(src_port),
-                    Some(dst_port),
-                    result.info,
-                    8,
-                    None,
-                    None,
-                );
-            }
-        }
+    // Single DPI path (see parse_tcp). UDP Info omits TCP flags.
+    if let Some(ap) = crate::dpi::classify_once(payload, false, src_port, dst_port) {
+        let (label, summary) = describe_app_protocol(&ap);
+        details.push(format!("{label}: {summary}"));
+        let info = format!(
+            "{}:{} → {}:{} {}",
+            src_ip, src_port, dst_ip, dst_port, summary
+        );
+        return (
+            label.to_string(),
+            Some(src_port),
+            Some(dst_port),
+            info,
+            8,
+            None,
+            None,
+        );
     }
 
     let svc = if dst_svc != "—" { dst_svc } else { src_svc };
@@ -1605,385 +1676,6 @@ fn parse_icmpv6(
     ("ICMPv6".into(), None, None, info)
 }
 
-// ── Protocol parser traits ─────────────────────────────────────────────────────
-
-/// Shared address/port context passed to every protocol parser.
-struct ParseCtx<'a> {
-    src_ip: &'a str,
-    dst_ip: &'a str,
-    src_port: u16,
-    dst_port: u16,
-}
-
-/// Successful result from a protocol parser: protocol name, one-line summary,
-/// and a detail line suitable for `details.push(...)`.
-struct ParsedProto {
-    proto: String,
-    info: String,
-    detail: String,
-}
-
-/// Pluggable UDP application-layer parser. Implement this trait and add an
-/// instance to `UDP_PARSERS` to support a new protocol without modifying
-/// `parse_udp` itself.
-trait UdpProtocolParser: Send + Sync {
-    /// Returns `true` if this parser should attempt to parse the datagram.
-    fn matches(&self, src_port: u16, dst_port: u16, payload: &[u8]) -> bool;
-    /// Attempt to parse `payload`. Returns `None` to pass to the next parser.
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx) -> Option<ParsedProto>;
-}
-
-/// Pluggable TCP application-layer parser.
-trait TcpProtocolParser: Send + Sync {
-    fn matches(&self, src_port: u16, dst_port: u16, payload: &[u8]) -> bool;
-    /// Parse `payload` and produce a result. `flag_str` is the TCP flags label.
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx, flag_str: &str) -> Option<ParsedProto>;
-}
-
-// ── UDP parser implementations ─────────────────────────────────────────────
-
-struct UdpDnsParser;
-impl UdpProtocolParser for UdpDnsParser {
-    fn matches(&self, src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
-        (src_port == 53 || dst_port == 53 || src_port == 5353 || dst_port == 5353)
-            && !payload.is_empty()
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx) -> Option<ParsedProto> {
-        let proto_name = if ctx.src_port == 5353 || ctx.dst_port == 5353 {
-            "mDNS"
-        } else {
-            "DNS"
-        };
-        let (dns_info, detail) = parse_dns(payload)?;
-        let info = format!("{} → {} {}", ctx.src_ip, ctx.dst_ip, dns_info);
-        Some(ParsedProto {
-            proto: proto_name.into(),
-            info,
-            detail,
-        })
-    }
-}
-
-struct DhcpParser;
-impl UdpProtocolParser for DhcpParser {
-    fn matches(&self, src_port: u16, dst_port: u16, _payload: &[u8]) -> bool {
-        (src_port == 67 || src_port == 68) && (dst_port == 67 || dst_port == 68)
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx) -> Option<ParsedProto> {
-        let dhcp_info = parse_dhcp(payload);
-        Some(ParsedProto {
-            proto: "DHCP".into(),
-            info: format!("{} → {} {}", ctx.src_ip, ctx.dst_ip, dhcp_info),
-            detail: format!("DHCP: {}", dhcp_info),
-        })
-    }
-}
-
-struct SsdpParser;
-impl UdpProtocolParser for SsdpParser {
-    fn matches(&self, src_port: u16, dst_port: u16, _payload: &[u8]) -> bool {
-        src_port == 1900 || dst_port == 1900
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx) -> Option<ParsedProto> {
-        let (ssdp_info, detail) = parse_ssdp(payload)?;
-        let info = format!("{} → {} {}", ctx.src_ip, ctx.dst_ip, ssdp_info);
-        Some(ParsedProto {
-            proto: "SSDP".into(),
-            info,
-            detail,
-        })
-    }
-}
-
-struct NtpParser;
-impl UdpProtocolParser for NtpParser {
-    fn matches(&self, src_port: u16, dst_port: u16, _payload: &[u8]) -> bool {
-        src_port == 123 || dst_port == 123
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx) -> Option<ParsedProto> {
-        let ntp_info = parse_ntp(payload);
-        Some(ParsedProto {
-            proto: "NTP".into(),
-            info: format!("{} → {} {}", ctx.src_ip, ctx.dst_ip, ntp_info),
-            detail: format!("NTP: {}", ntp_info),
-        })
-    }
-}
-
-struct QuicParser;
-impl UdpProtocolParser for QuicParser {
-    fn matches(&self, src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
-        (dst_port == 443 || src_port == 443) && !payload.is_empty()
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx) -> Option<ParsedProto> {
-        let (quic_info, detail) = parse_quic(payload)?;
-        let info = format!(
-            "{}:{} → {}:{} {}",
-            ctx.src_ip, ctx.src_port, ctx.dst_ip, ctx.dst_port, quic_info
-        );
-        Some(ParsedProto {
-            proto: "QUIC".into(),
-            info,
-            detail,
-        })
-    }
-}
-
-static UDP_PARSERS: std::sync::LazyLock<Vec<Box<dyn UdpProtocolParser>>> =
-    std::sync::LazyLock::new(|| {
-        vec![
-            Box::new(UdpDnsParser),
-            Box::new(DhcpParser),
-            Box::new(SsdpParser),
-            Box::new(NtpParser),
-            Box::new(QuicParser),
-        ]
-    });
-
-// ── TCP application-layer parser implementations ───────────────────────────
-
-struct TcpDnsParser;
-impl TcpProtocolParser for TcpDnsParser {
-    fn matches(&self, src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
-        (src_port == 53 || dst_port == 53) && payload.len() > 2
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx, _flag_str: &str) -> Option<ParsedProto> {
-        let dns_data = &payload[2..];
-        let (dns_info, detail) = parse_dns(dns_data)?;
-        let info = format!("{} → {} {}", ctx.src_ip, ctx.dst_ip, dns_info);
-        Some(ParsedProto {
-            proto: "DNS".into(),
-            info,
-            detail,
-        })
-    }
-}
-
-struct TlsParser;
-impl TcpProtocolParser for TlsParser {
-    fn matches(&self, _src_port: u16, _dst_port: u16, payload: &[u8]) -> bool {
-        !payload.is_empty()
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx, flag_str: &str) -> Option<ParsedProto> {
-        let (tls_info, detail) = parse_tls(payload)?;
-        let info = format!(
-            "{}:{} → {}:{} {} [{}]",
-            ctx.src_ip, ctx.src_port, ctx.dst_ip, ctx.dst_port, tls_info, flag_str
-        );
-        Some(ParsedProto {
-            proto: "TLS".into(),
-            info,
-            detail,
-        })
-    }
-}
-
-struct HttpParser;
-impl TcpProtocolParser for HttpParser {
-    fn matches(&self, _src_port: u16, _dst_port: u16, payload: &[u8]) -> bool {
-        !payload.is_empty()
-    }
-    fn parse(&self, payload: &[u8], ctx: &ParseCtx, _flag_str: &str) -> Option<ParsedProto> {
-        let (http_info, detail) = parse_http(payload)?;
-        let info = format!(
-            "{}:{} → {}:{} {}",
-            ctx.src_ip, ctx.src_port, ctx.dst_ip, ctx.dst_port, http_info
-        );
-        Some(ParsedProto {
-            proto: "HTTP".into(),
-            info,
-            detail,
-        })
-    }
-}
-
-static TCP_PARSERS: std::sync::LazyLock<Vec<Box<dyn TcpProtocolParser>>> =
-    std::sync::LazyLock::new(|| {
-        vec![
-            Box::new(TcpDnsParser),
-            Box::new(TlsParser),
-            Box::new(HttpParser),
-        ]
-    });
-
-// ── Application-layer parsers ───────────────────────────────
-
-fn parse_dns(data: &[u8]) -> Option<(String, String)> {
-    if data.len() < 12 {
-        return None;
-    }
-    let flags = u16::from_be_bytes([data[2], data[3]]);
-    let is_response = flags & 0x8000 != 0;
-    let qd_count = u16::from_be_bytes([data[4], data[5]]);
-    let an_count = u16::from_be_bytes([data[6], data[7]]);
-
-    if is_response {
-        let rcode = flags & 0x000F;
-        let rcode_str = match rcode {
-            0 => "No Error",
-            1 => "Format Error",
-            2 => "Server Failure",
-            3 => "Name Error (NXDOMAIN)",
-            4 => "Not Implemented",
-            5 => "Refused",
-            _ => "Unknown",
-        };
-        let info = format!("DNS Response, {} answers, {}", an_count, rcode_str);
-        let detail = format!("DNS: Response, Answers: {}, Rcode: {}", an_count, rcode_str);
-        Some((info, detail))
-    } else {
-        // Parse query name
-        let name = parse_dns_name(data, 12).unwrap_or_else(|| "?".into());
-        let qtype = dns_query_type(data, 12, &name);
-        let info = format!("DNS Query {} {}", qtype, name);
-        let detail = format!(
-            "DNS: Query, Questions: {}, Name: {}, Type: {}",
-            qd_count, name, qtype
-        );
-        Some((info, detail))
-    }
-}
-
-fn parse_dns_name(data: &[u8], offset: usize) -> Option<String> {
-    let mut name = String::new();
-    let mut pos = offset;
-    let mut first = true;
-    for _ in 0..128 {
-        if pos >= data.len() {
-            return None;
-        }
-        let len = data[pos] as usize;
-        if len == 0 {
-            break;
-        }
-        if len >= 0xC0 {
-            break;
-        }
-        if !first {
-            name.push('.');
-        }
-        first = false;
-        pos += 1;
-        if pos + len > data.len() {
-            return None;
-        }
-        name.push_str(&String::from_utf8_lossy(&data[pos..pos + len]));
-        pos += len;
-    }
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-fn dns_query_type(data: &[u8], start: usize, _name: &str) -> &'static str {
-    // Skip past the name to find the QTYPE
-    let mut pos = start;
-    for _ in 0..128 {
-        if pos >= data.len() {
-            return "?";
-        }
-        let len = data[pos] as usize;
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        if len >= 0xC0 {
-            pos += 2;
-            break;
-        }
-        pos += 1 + len;
-    }
-    if pos + 2 > data.len() {
-        return "?";
-    }
-    let qtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-    match qtype {
-        1 => "A",
-        2 => "NS",
-        5 => "CNAME",
-        6 => "SOA",
-        12 => "PTR",
-        15 => "MX",
-        16 => "TXT",
-        28 => "AAAA",
-        33 => "SRV",
-        255 => "ANY",
-        65 => "HTTPS",
-        _ => "?",
-    }
-}
-
-fn parse_tls(data: &[u8]) -> Option<(String, String)> {
-    if data.len() < 6 {
-        return None;
-    }
-    let content_type = data[0];
-    if content_type != 0x16 {
-        return None; // Not a TLS handshake
-    }
-    let tls_major = data[1];
-    let tls_minor = data[2];
-    if tls_major < 3 {
-        return None;
-    }
-    let version = match (tls_major, tls_minor) {
-        (3, 0) => "SSL 3.0",
-        (3, 1) => "TLS 1.0",
-        (3, 2) => "TLS 1.1",
-        (3, 3) => "TLS 1.2",
-        (3, 4) => "TLS 1.3",
-        _ => "TLS",
-    };
-
-    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-    if data.len() < 5 + 1 || record_len < 1 {
-        return None;
-    }
-    let handshake_type = data[5];
-    match handshake_type {
-        1 => {
-            // ClientHello — try to extract SNI
-            let sni = extract_sni(&data[5..]);
-            let sni_str = sni.as_deref().unwrap_or("—");
-            let info = format!("Client Hello ({}), SNI: {}", version, sni_str);
-            let detail = format!("TLS: Client Hello, Version: {}, SNI: {}", version, sni_str);
-            Some((info, detail))
-        }
-        2 => {
-            let cipher = extract_cipher_suite(&data[5..]);
-            let cipher_str = cipher.as_deref().unwrap_or("—");
-            let info = format!("Server Hello ({}), Cipher: {}", version, cipher_str);
-            let detail = format!(
-                "TLS: Server Hello, Version: {}, Cipher Suite: {}",
-                version, cipher_str
-            );
-            Some((info, detail))
-        }
-        11 => Some((
-            "Certificate".into(),
-            format!("TLS: Certificate, Version: {}", version),
-        )),
-        14 => Some((
-            "Server Hello Done".into(),
-            "TLS: Server Hello Done".to_string(),
-        )),
-        16 => Some((
-            "Client Key Exchange".into(),
-            "TLS: Client Key Exchange".to_string(),
-        )),
-        _ => {
-            let info = format!("Handshake type {}", handshake_type);
-            let detail = format!(
-                "TLS: Handshake type {}, Version: {}",
-                handshake_type, version
-            );
-            Some((info, detail))
-        }
-    }
-}
-
 /// Wrapper for use from `crate::collectors::quic`. Re-exposes the existing
 /// TLS ClientHello SNI extractor so QUIC can reuse the parser unchanged
 /// rather than duplicating the extension walk.
@@ -2048,239 +1740,6 @@ fn extract_sni(handshake: &[u8]) -> Option<String> {
     }
     None
 }
-
-fn extract_cipher_suite(handshake: &[u8]) -> Option<String> {
-    // ServerHello: type(1) + length(3) + version(2) + random(32) = 38 bytes
-    // then session_id_length(1) + session_id(var) + cipher_suite(2)
-    if handshake.len() < 39 {
-        return None;
-    }
-    let mut pos = 38;
-    if pos >= handshake.len() {
-        return None;
-    }
-    let sid_len = handshake[pos] as usize;
-    pos += 1 + sid_len;
-    if pos + 2 > handshake.len() {
-        return None;
-    }
-    let suite = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]);
-    Some(cipher_suite_name(suite))
-}
-
-fn cipher_suite_name(suite: u16) -> String {
-    match suite {
-        0x1301 => "TLS_AES_128_GCM_SHA256".into(),
-        0x1302 => "TLS_AES_256_GCM_SHA384".into(),
-        0x1303 => "TLS_CHACHA20_POLY1305_SHA256".into(),
-        0xc02b => "ECDHE_ECDSA_AES_128_GCM_SHA256".into(),
-        0xc02c => "ECDHE_ECDSA_AES_256_GCM_SHA384".into(),
-        0xc02f => "ECDHE_RSA_AES_128_GCM_SHA256".into(),
-        0xc030 => "ECDHE_RSA_AES_256_GCM_SHA384".into(),
-        0xcca8 => "ECDHE_RSA_CHACHA20_POLY1305".into(),
-        0xcca9 => "ECDHE_ECDSA_CHACHA20_POLY1305".into(),
-        0x009c => "RSA_AES_128_GCM_SHA256".into(),
-        0x009d => "RSA_AES_256_GCM_SHA384".into(),
-        0x002f => "RSA_AES_128_CBC_SHA".into(),
-        0x0035 => "RSA_AES_256_CBC_SHA".into(),
-        0x00ff => "EMPTY_RENEGOTIATION_INFO".into(),
-        _ => format!("0x{:04x}", suite),
-    }
-}
-
-fn parse_http(data: &[u8]) -> Option<(String, String)> {
-    let methods = [
-        "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "PATCH ", "OPTIONS ", "HTTP/",
-    ];
-    let text = String::from_utf8_lossy(&data[..data.len().min(512)]);
-    let first_line = text.lines().next().unwrap_or("");
-
-    for method in &methods {
-        if first_line.starts_with(method) {
-            let truncated = if first_line.len() > 80 {
-                let t: String = first_line.chars().take(80).collect();
-                format!("{}…", t)
-            } else {
-                first_line.to_string()
-            };
-
-            let host = extract_header(&text, "Host");
-            let content_type = extract_header(&text, "Content-Type");
-
-            let mut detail = format!("HTTP: {}", truncated);
-            if let Some(ref h) = host {
-                detail.push_str(&format!(", Host: {}", h));
-            }
-            if let Some(ref ct) = content_type {
-                detail.push_str(&format!(", Content-Type: {}", ct));
-            }
-
-            let info = if first_line.starts_with("HTTP/") {
-                truncated.to_string()
-            } else if let Some(ref h) = host {
-                format!("{} ({})", truncated, h)
-            } else {
-                truncated.to_string()
-            };
-
-            return Some((info, detail));
-        }
-    }
-    None
-}
-
-fn parse_ssdp(data: &[u8]) -> Option<(String, String)> {
-    let text = String::from_utf8_lossy(&data[..data.len().min(512)]);
-    let first_line = text.lines().next()?;
-
-    if first_line.starts_with("M-SEARCH") {
-        let st = extract_header(&text, "ST");
-        let info = format!("M-SEARCH {}", st.as_deref().unwrap_or("*"));
-        let detail = format!("SSDP: M-SEARCH, ST: {}", st.as_deref().unwrap_or("—"));
-        Some((info, detail))
-    } else if first_line.starts_with("NOTIFY") {
-        let nt = extract_header(&text, "NT");
-        let nts = extract_header(&text, "NTS");
-        let info = format!(
-            "NOTIFY {} {}",
-            nt.as_deref().unwrap_or(""),
-            nts.as_deref().unwrap_or("")
-        );
-        let detail = format!(
-            "SSDP: NOTIFY, NT: {}, NTS: {}",
-            nt.as_deref().unwrap_or("—"),
-            nts.as_deref().unwrap_or("—")
-        );
-        Some((info, detail))
-    } else if first_line.starts_with("HTTP/") {
-        let server = extract_header(&text, "SERVER");
-        let st = extract_header(&text, "ST");
-        let label = server.as_deref().or(st.as_deref()).unwrap_or("");
-        let info = format!("Response {}", label);
-        let detail = format!(
-            "SSDP: Response, Server: {}",
-            server.as_deref().unwrap_or("—")
-        );
-        Some((info, detail))
-    } else {
-        None
-    }
-}
-
-fn extract_header(text: &str, name: &str) -> Option<String> {
-    let prefix_lower = format!("{}:", name.to_lowercase());
-    for line in text.lines() {
-        if line.to_lowercase().starts_with(&prefix_lower) {
-            return Some(line[name.len() + 1..].trim().to_string());
-        }
-    }
-    None
-}
-
-fn parse_dhcp(data: &[u8]) -> String {
-    if data.is_empty() {
-        return "DHCP".into();
-    }
-    let op = data[0];
-    match op {
-        1 => "DHCP Discover/Request".into(),
-        2 => "DHCP Offer/ACK".into(),
-        _ => format!("DHCP op={}", op),
-    }
-}
-
-fn parse_ntp(data: &[u8]) -> String {
-    if data.is_empty() {
-        return "NTP".into();
-    }
-    let li_vn_mode = data[0];
-    let mode = li_vn_mode & 0x07;
-    let version = (li_vn_mode >> 3) & 0x07;
-    let mode_str = match mode {
-        1 => "Symmetric Active",
-        2 => "Symmetric Passive",
-        3 => "Client",
-        4 => "Server",
-        5 => "Broadcast",
-        6 => "Control",
-        _ => "Unknown",
-    };
-    format!("NTPv{} {}", version, mode_str)
-}
-
-fn parse_quic(data: &[u8]) -> Option<(String, String)> {
-    if data.is_empty() {
-        return None;
-    }
-
-    let first = data[0];
-
-    // QUIC long header: bit 7 (form) = 1
-    if first & 0x80 == 0 {
-        // Short header (1-RTT) — encrypted, can't decode much
-        return Some((
-            "Protected Payload (1-RTT)".into(),
-            "QUIC: Short Header, Protected Payload".into(),
-        ));
-    }
-
-    // Long header
-    if data.len() < 5 {
-        return None;
-    }
-
-    let version = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-    let pkt_type = (first & 0x30) >> 4;
-
-    let version_str = match version {
-        0x00000001 => "v1",
-        0x6b3343cf => "v2",
-        0x00000000 => "Version Negotiation",
-        v if v & 0x0f0f0f0f == 0x0a0a0a0a => "Greased",
-        _ => "Unknown",
-    };
-
-    let type_str = match pkt_type {
-        0 => "Initial",
-        1 => "0-RTT",
-        2 => "Handshake",
-        3 => "Retry",
-        _ => "Unknown",
-    };
-
-    // For Initial packets, derive the well-known Initial keys from the DCID
-    // and decrypt the embedded TLS ClientHello to extract the SNI. Falls
-    // back to "—" when decryption fails (server-side Initials, non-v1/v2
-    // versions, truncated captures, or AEAD failures from packet damage).
-    // See `crate::collectors::quic` for the RFC 9001 implementation.
-    let is_initial = match version {
-        0x00000001 => pkt_type == 0,
-        0x6b3343cf => pkt_type == 1, // QUIC v2 reorders type bits (RFC 9369 §3.2)
-        _ => false,
-    };
-    if is_initial && data.len() > 7 {
-        let sni = crate::collectors::quic::try_extract_initial_sni(data);
-        let sni_str = sni.as_deref().unwrap_or("—");
-        let info = format!("QUIC {} {} SNI: {}", version_str, type_str, sni_str);
-        let detail = format!(
-            "QUIC: {} {}, Version: {} (0x{:08x}), SNI: {}",
-            type_str, version_str, version_str, version, sni_str
-        );
-        return Some((info, detail));
-    }
-
-    let info = format!("QUIC {} {}", version_str, type_str);
-    let detail = format!(
-        "QUIC: {} {}, Version: {} (0x{:08x})",
-        type_str, version_str, version_str, version
-    );
-    Some((info, detail))
-}
-
-// QUIC SNI extraction now lives in `crate::collectors::quic` (RFC 9001
-// HKDF + AEAD path). The previous heuristic that scanned the encrypted
-// payload for a cleartext ClientHello pattern has been removed — it
-// effectively never fired on real-world QUIC traffic.
 
 // ── Build packet ────────────────────────────────────────────
 
@@ -2746,46 +2205,6 @@ mod tests {
         );
     }
 
-    // ── parse_timestamp_for_pcap ────────────────────────────
-
-    // ── parse_dns_name ──────────────────────────────────────
-    #[test]
-    fn test_dns_name_simple() {
-        // "\x07example\x03com\x00"
-        let data = b"\x07example\x03com\x00";
-        assert_eq!(parse_dns_name(data, 0), Some("example.com".into()));
-    }
-    #[test]
-    fn test_dns_name_subdomain() {
-        let data = b"\x03www\x07example\x03com\x00";
-        assert_eq!(parse_dns_name(data, 0), Some("www.example.com".into()));
-    }
-    #[test]
-    fn test_dns_name_empty() {
-        let data = b"\x00";
-        assert_eq!(parse_dns_name(data, 0), None);
-    }
-    #[test]
-    fn test_dns_name_truncated() {
-        let data = b"\x07exam";
-        assert_eq!(parse_dns_name(data, 0), None);
-    }
-
-    // ── dns_query_type ──────────────────────────────────────
-    #[test]
-    fn test_dns_qtype_a() {
-        // name: "\x07example\x03com\x00" + qtype 1 (A)
-        let mut data = b"\x07example\x03com\x00".to_vec();
-        data.extend_from_slice(&[0x00, 0x01]); // A record
-        assert_eq!(dns_query_type(&data, 0, "example.com"), "A");
-    }
-    #[test]
-    fn test_dns_qtype_aaaa() {
-        let mut data = b"\x07example\x03com\x00".to_vec();
-        data.extend_from_slice(&[0x00, 28]); // AAAA
-        assert_eq!(dns_query_type(&data, 0, "example.com"), "AAAA");
-    }
-
     // ── parse_arp ───────────────────────────────────────────
     #[test]
     fn test_arp_request() {
@@ -2816,53 +2235,6 @@ mod tests {
         let mut details = vec![];
         let info = parse_arp(&[0; 10], &mut details);
         assert!(info.contains("truncated"));
-    }
-
-    // ── parse_dhcp / parse_ntp ──────────────────────────────
-    #[test]
-    fn test_dhcp_discover() {
-        assert!(parse_dhcp(&[1]).contains("Discover"));
-    }
-    #[test]
-    fn test_dhcp_offer() {
-        assert!(parse_dhcp(&[2]).contains("Offer"));
-    }
-    #[test]
-    fn test_dhcp_empty() {
-        assert_eq!(parse_dhcp(&[]), "DHCP");
-    }
-
-    #[test]
-    fn test_ntp_client() {
-        let data = [0x23]; // version 4, mode 3 (client)
-        assert!(parse_ntp(&data).contains("Client"));
-    }
-    #[test]
-    fn test_ntp_server() {
-        let data = [0x24]; // version 4, mode 4 (server)
-        assert!(parse_ntp(&data).contains("Server"));
-    }
-    #[test]
-    fn test_ntp_empty() {
-        assert_eq!(parse_ntp(&[]), "NTP");
-    }
-
-    // ── parse_http ──────────────────────────────────────────
-    #[test]
-    fn test_http_get() {
-        let data = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n";
-        let (info, _detail) = parse_http(data).unwrap();
-        assert!(info.contains("GET /index.html"));
-    }
-    #[test]
-    fn test_http_response() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n";
-        let (info, _) = parse_http(data).unwrap();
-        assert!(info.contains("200 OK"));
-    }
-    #[test]
-    fn test_http_not_http() {
-        assert!(parse_http(b"\x16\x03\x01binary stuff").is_none());
     }
 
     // ── extract_readable_payload ────────────────────────────
