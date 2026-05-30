@@ -95,6 +95,11 @@ pub struct HandshakeMetadata {
     /// reassembled QUIC ClientHello. `None` if the handshake bytes
     /// weren't a parseable ClientHello.
     pub ja4: Option<String>,
+    /// ClientHello random (32 bytes) — the `client_random` used to look
+    /// up this connection's secrets in the SSLKEYLOGFILE keylog. `None`
+    /// if the bytes weren't a parseable ClientHello. Needed by QUIC
+    /// 1-RTT decryption to associate the flow with its keylog entry.
+    pub client_random: Option<[u8; 32]>,
 }
 
 /// Walk a bare TLS 1.3 handshake (no TLS record wrapper) and extract
@@ -110,13 +115,21 @@ pub fn extract_handshake_metadata(handshake_bytes: &[u8]) -> HandshakeMetadata {
     let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg else {
         return HandshakeMetadata::default();
     };
+    // Capture client_random first — it's available regardless of the
+    // extension list, and QUIC 1-RTT decryption needs it even when the
+    // ClientHello is too truncated to finish extension parsing.
+    let mut meta = HandshakeMetadata::default();
+    if ch.random.len() == 32 {
+        let mut r = [0u8; 32];
+        r.copy_from_slice(ch.random);
+        meta.client_random = Some(r);
+    }
     let Some(ext_data) = ch.ext else {
-        return HandshakeMetadata::default();
+        return meta;
     };
     let Ok((_, exts)) = parse_tls_extensions(ext_data) else {
-        return HandshakeMetadata::default();
+        return meta;
     };
-    let mut meta = HandshakeMetadata::default();
     meta.ech = has_ech(&exts);
     let mut alpn_first_bytes: Option<&[u8]> = None;
     let mut sig_algs: Vec<u16> = Vec::new();
@@ -452,6 +465,21 @@ mod tests {
         let meta = extract_handshake_metadata(handshake);
         assert_eq!(meta.sni.as_deref(), Some("example.com"));
         assert!(!meta.ech, "vanilla fixture has no ECH");
+        // Phase 2a: client_random is captured for QUIC 1-RTT keylog lookup.
+        // It's the same 32 bytes extract_client_random pulls from the record.
+        assert_eq!(
+            meta.client_random.as_ref().map(|r| &r[..]),
+            Some(&CLIENT_HELLO_EXAMPLE_COM[11..=42])
+        );
+    }
+
+    #[test]
+    fn extract_metadata_finds_client_random_even_without_extensions() {
+        // A ClientHello truncated before its extensions still yields the
+        // random — QUIC 1-RTT decryption needs it even from a partial CH.
+        let handshake = &CLIENT_HELLO_EXAMPLE_COM[5..];
+        let meta = extract_handshake_metadata(handshake);
+        assert!(meta.client_random.is_some());
     }
 
     #[test]

@@ -250,6 +250,11 @@ pub struct Stream {
     /// whenever it lands in fragment 2+. Capped at MAX_QUIC_CRYPTO_BUF
     /// bytes; reset to empty once we've extracted the SNI.
     quic_crypto_buf: Vec<u8>,
+    /// ClientHello random from this QUIC connection's reassembled CRYPTO
+    /// frames — the key into the SSLKEYLOGFILE keystore for the flow's
+    /// 1-RTT secrets (QUIC 1-RTT decryption, Phase 2). `None` until the
+    /// ClientHello is reassembled, and for non-QUIC flows.
+    pub quic_client_random: Option<[u8; 32]>,
     /// Monotonic ns timestamp of the last packet seen on this flow. Drives LRU
     /// eviction when the tracker exceeds MAX_STREAMS.
     last_seen_ns: u64,
@@ -420,6 +425,7 @@ impl StreamTracker {
                     app_protocol: None,
                     app_protocol_attempted: false,
                     quic_crypto_buf: Vec::new(),
+                    quic_client_random: None,
                     highest_seq_a_to_b: None,
                     highest_seq_b_to_a: None,
                     retransmits_a_to_b: 0,
@@ -635,6 +641,19 @@ impl StreamTracker {
                     stream.quic_crypto_buf[offset as usize..end].copy_from_slice(&data);
                 }
                 let meta = crate::dpi::tls::extract_handshake_metadata(&stream.quic_crypto_buf);
+                // Capture client_random for QUIC 1-RTT decryption (Phase 2)
+                // before the buffer is released on SNI success below. The
+                // ClientHello random keys this flow into the SSLKEYLOGFILE.
+                if stream.quic_client_random.is_none() {
+                    if let Some(cr) = meta.client_random {
+                        stream.quic_client_random = Some(cr);
+                        tracing::trace!(
+                            target: "netwatch::dpi::quic",
+                            cr_prefix = %hex_prefix(&cr),
+                            "captured QUIC client_random from reassembled ClientHello"
+                        );
+                    }
+                }
                 if let Some(host) = meta.sni {
                     tracing::trace!(
                         target: "netwatch::dpi::quic",
