@@ -2,6 +2,15 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.25.0] - 2026-05-31
+
+### Added
+- **Passive QUIC 1-RTT application-data decryption via `SSLKEYLOGFILE`.** Extends the v0.24.0 TLS 1.3 decryption from TLS-over-TCP to QUIC's encrypted short-header (1-RTT) packets — the same opt-in, read-only `tls_keylog_path` mechanism. netwatch derives the 1-RTT keys from the keylog `*_TRAFFIC_SECRET_0` (RFC 9001 §5), removes header protection, reconstructs the truncated packet number (RFC 9000 §A.3), and AEAD-opens the payload. The cipher suite and per-direction connection-ID length aren't on the wire for short headers, so the first packet brute-forces them with AEAD authentication as the oracle, then caches the result per flow. Supports the three QUIC v1 suites (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305). Verified against the RFC 9001 §A.5 known-answer vectors and against live Chrome HTTP/3 traffic. QUIC v2 1-RTT, key updates (key-phase), and coalesced packets are out of scope for this phase.
+- **HTTP/3 response-body decompression.** When a decrypted 1-RTT packet carries an offset-0 HTTP/3 DATA body, netwatch parses the HTTP/3 framing layer (RFC 9114), concatenates the DATA frames, and decompresses the body — gzip/deflate detected by magic bytes, brotli (`br`) by trial decompression (the `Content-Encoding` lives in the QPACK-compressed HEADERS frame, which is deliberately not decoded). The decoded body renders in the Payload Content pane. Scope is single-packet, offset-0 bodies; larger responses that span multiple packets need cross-packet stream reassembly (a later phase). zstd is out of scope.
+
+### Changed
+- **Decrypted QUIC packets are now labelled "QUIC 1-RTT decrypted"** (rather than "TLS decrypted") across the Protocol Detail pane, Payload Content title, and clipboard yank. The decrypted payload is shown once in the Payload Content pane instead of being duplicated in both panes.
+
 ## [0.24.0] - 2026-05-30
 
 ### Added
