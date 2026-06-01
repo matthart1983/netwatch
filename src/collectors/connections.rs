@@ -684,10 +684,14 @@ fn parse_linux_connections() -> Vec<Connection> {
             let local_addr = cols[4].to_string();
             let remote_addr = cols[5].to_string();
 
-            let (pid, process_name) = if cols.len() > 6 {
-                parse_ss_process(cols[6])
-            } else {
-                (None, None)
+            // The process column (`users:(("name",pid=N,fd=M))`) can contain
+            // spaces — Firefox's "Web Content", "Isolated Web Co", etc. —
+            // which `split_whitespace` above would shred across cols[6..].
+            // Slice from the literal `users:((` token in the raw line so the
+            // whole field reaches the parser intact.
+            let (pid, process_name) = match line.find("users:((") {
+                Some(idx) => parse_ss_process(&line[idx..]),
+                None => (None, None),
             };
 
             connections.push(Connection {
@@ -708,12 +712,23 @@ fn parse_linux_connections() -> Vec<Connection> {
         }
     }
 
+    // `ss -p` only attributes sockets the caller is privileged to see. As a
+    // normal user it returns NO process info — not even for the box's own
+    // daemons — and on some hosts it stays empty even under sudo (see issue
+    // #40). Fill anything ss left nameless straight from the kernel's tables:
+    // /proc/net/{tcp,udp}{,6} maps a 5-tuple → socket inode, and
+    // /proc/<pid>/fd/* maps that inode → owning process. Same source ss uses,
+    // no subprocess, and it degrades to "attribute what this uid can see"
+    // instead of the current all-or-nothing.
+    overlay_proc_attribution(&mut connections);
+
     connections
 }
 
 #[cfg(target_os = "linux")]
 fn parse_ss_process(field: &str) -> (Option<u32>, Option<String>) {
-    // Format: users:(("process",pid=1234,fd=3))
+    // Format: users:(("process",pid=1234,fd=3)). The name is between the
+    // first pair of double-quotes, so it survives embedded spaces.
     let name = field.split('"').nth(1).map(|s| s.to_string());
 
     let pid = field
@@ -723,6 +738,175 @@ fn parse_ss_process(field: &str) -> (Option<u32>, Option<String>) {
         .and_then(|s| s.parse().ok());
 
     (pid, name)
+}
+
+/// Parse a `/proc/net/{tcp,udp}*` hex endpoint (`"0100007F:1F90"`) into
+/// `(IpAddr, port)`. The kernel prints the IPv4 address as the little-endian
+/// host value of a network-order `be32`, and IPv6 as four little-endian
+/// 32-bit words, so both need byte reversal. Port is plain big-endian hex.
+///
+/// Not `cfg`-gated so it stays unit-testable on every platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_net_hex(s: &str) -> Option<(std::net::IpAddr, u16)> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let (ip_hex, port_hex) = s.split_once(':')?;
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    let ip = match ip_hex.len() {
+        8 => {
+            let v = u32::from_str_radix(ip_hex, 16).ok()?;
+            let b = v.to_le_bytes();
+            IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+        }
+        32 => {
+            let mut bytes = [0u8; 16];
+            for i in 0..4 {
+                let word = u32::from_str_radix(&ip_hex[i * 8..i * 8 + 8], 16).ok()?;
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            IpAddr::V6(Ipv6Addr::from(bytes))
+        }
+        _ => return None,
+    };
+    Some((ip, port))
+}
+
+/// Normalize an `ss`-rendered address (`"1.2.3.4:443"`, `"[::1]:443"`,
+/// `"*:*"`) into `(IpAddr, port)`. Wildcards / unparseable forms → `None`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn normalize_addr(s: &str) -> Option<(std::net::IpAddr, u16)> {
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        rest.split_once("]:")?
+    } else {
+        s.rsplit_once(':')?
+    };
+    Some((host.parse().ok()?, port.parse().ok()?))
+}
+
+/// Read a process's `comm`, falling back to `pid:<n>` if it's gone.
+#[cfg(target_os = "linux")]
+fn read_proc_comm(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("pid:{pid}"))
+}
+
+/// socket inode → (pid, comm), built by scanning `/proc/<pid>/fd/*` for
+/// `socket:[<inode>]` symlinks. Only sees PIDs the current uid is allowed to
+/// inspect — that's the kernel's call, and it's strictly more than `ss -p`
+/// surfaces for an unprivileged caller (which is nothing).
+#[cfg(target_os = "linux")]
+fn socket_inode_owners() -> HashMap<u64, (u32, String)> {
+    let mut map: HashMap<u64, (u32, String)> = HashMap::new();
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+    for entry in proc.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let mut comm: Option<String> = None;
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(inode) = target
+                .to_str()
+                .and_then(|s| s.strip_prefix("socket:["))
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let name = comm.get_or_insert_with(|| read_proc_comm(pid)).clone();
+            map.entry(inode).or_insert((pid, name));
+        }
+    }
+    map
+}
+
+/// Index of the kernel socket tables: a 5-tuple map for precise matches and a
+/// local-endpoint map as a fallback for sockets with no distinct peer (UDP,
+/// LISTEN). Values are socket inodes joined against `socket_inode_owners()`.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct ProcNetIndex {
+    by_pair: HashMap<((std::net::IpAddr, u16), (std::net::IpAddr, u16)), u64>,
+    by_local: HashMap<(std::net::IpAddr, u16), u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn proc_net_inode_index() -> ProcNetIndex {
+    let mut idx = ProcNetIndex::default();
+    for path in [
+        "/proc/net/tcp",
+        "/proc/net/tcp6",
+        "/proc/net/udp",
+        "/proc/net/udp6",
+    ] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            // sl local rem st tx:rx tr:when retrnsmt uid timeout inode ...
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 {
+                continue;
+            }
+            let Some(local) = parse_proc_net_hex(cols[1]) else {
+                continue;
+            };
+            let Ok(inode) = cols[9].parse::<u64>() else {
+                continue;
+            };
+            if inode == 0 {
+                continue;
+            }
+            if let Some(remote) = parse_proc_net_hex(cols[2]) {
+                idx.by_pair.entry((local, remote)).or_insert(inode);
+            }
+            idx.by_local.entry(local).or_insert(inode);
+        }
+    }
+    idx
+}
+
+/// Fill `process_name`/`pid` on any connection `ss` left nameless, using the
+/// native `/proc` join. No-op (and no `/proc` scan) when everything is already
+/// attributed — the common privileged case where `ss -p` worked.
+#[cfg(target_os = "linux")]
+fn overlay_proc_attribution(connections: &mut [Connection]) {
+    if connections.iter().all(|c| c.process_name.is_some()) {
+        return;
+    }
+    let index = proc_net_inode_index();
+    let owners = socket_inode_owners();
+    if owners.is_empty() {
+        return;
+    }
+    for conn in connections.iter_mut() {
+        if conn.process_name.is_some() {
+            continue;
+        }
+        let Some(local) = normalize_addr(&conn.local_addr) else {
+            continue;
+        };
+        let inode = normalize_addr(&conn.remote_addr)
+            .and_then(|remote| index.by_pair.get(&(local, remote)).copied())
+            .or_else(|| index.by_local.get(&local).copied());
+        if let Some((pid, comm)) = inode.and_then(|i| owners.get(&i)) {
+            conn.pid = Some(*pid);
+            conn.process_name = Some(comm.clone());
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -931,6 +1115,61 @@ mod tests {
     fn new_timeline_is_empty() {
         let tl = ConnectionTimeline::new();
         assert!(tl.tracked.is_empty());
+    }
+
+    #[test]
+    fn proc_net_hex_ipv4_localhost() {
+        // Kernel renders 127.0.0.1:53 as little-endian "0100007F:0035".
+        let (ip, port) = parse_proc_net_hex("0100007F:0035").unwrap();
+        assert_eq!(ip, "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(port, 53);
+    }
+
+    #[test]
+    fn proc_net_hex_ipv4_routable_port() {
+        let (ip, port) = parse_proc_net_hex("0F02000A:1F90").unwrap();
+        assert_eq!(ip, "10.0.2.15".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn proc_net_hex_ipv6_loopback() {
+        // ::1 → three zero words then 01000000 (little-endian last word).
+        let (ip, port) = parse_proc_net_hex("00000000000000000000000001000000:0050").unwrap();
+        assert_eq!(ip, "::1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn proc_net_hex_rejects_garbage() {
+        assert!(parse_proc_net_hex("nope").is_none());
+        assert!(parse_proc_net_hex("0100007F").is_none());
+        assert!(parse_proc_net_hex("12:0035").is_none());
+    }
+
+    #[test]
+    fn normalize_addr_v4_v6_and_wildcards() {
+        assert_eq!(
+            normalize_addr("1.2.3.4:443"),
+            Some(("1.2.3.4".parse().unwrap(), 443))
+        );
+        assert_eq!(
+            normalize_addr("[2001:db8::1]:22"),
+            Some(("2001:db8::1".parse().unwrap(), 22))
+        );
+        assert_eq!(normalize_addr("*:*"), None);
+        assert_eq!(normalize_addr("0.0.0.0:*"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ss_process_field_with_space_in_name() {
+        // Regression: Firefox child processes have spaces in comm. The whole
+        // `users:((...))` field must reach the parser intact (the caller now
+        // slices from `users:((` rather than a whitespace column).
+        let (pid, name) = parse_ss_process(r#"users:(("Isolated Web Co",pid=4242,fd=91))"#);
+        assert_eq!(pid, Some(4242));
+        assert_eq!(name.as_deref(), Some("Isolated Web Co"));
     }
 
     #[test]
