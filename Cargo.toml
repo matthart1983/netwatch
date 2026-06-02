@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.25.0"
+version = "0.25.1"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -75,7 +75,7 @@ mimalloc = { version = "0.1", default-features = false }
 # returns `EbpfError::UnsupportedPlatform` and we fall back to lsof/ss
 # attribution. The Linux runtime path also gracefully falls back when
 # the BPF object is missing or CAP_BPF/CAP_PERFMON aren't granted.
-netwatch-sdk = { version = "0.1.2", features = ["ebpf"], optional = true }
+netwatch-sdk = { version = "0.1.3", features = ["ebpf"], optional = true }
 # File-only structured logging. The TUI owns stdout/stderr in alternate-screen
 # mode, so logs must never go to the terminal — they land in a daily-rotated
 # file under the user's cache dir. Default level is WARN; users can override
