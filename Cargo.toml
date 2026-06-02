@@ -100,6 +100,13 @@ brotli = "8"
 default = ["ebpf"]
 ebpf = ["dep:netwatch-sdk"]
 
+[build-dependencies]
+# Embeds a Windows application manifest (activeCodePage = UTF-8) so libpcap /
+# Npcap device strings and error buffers in non-UTF-8 system locales decode as
+# valid UTF-8 by the time the `pcap` crate sees them. Pure-Rust and a no-op
+# unless the build target is Windows. See build.rs / issue #39.
+embed-manifest = "1"
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["net", "ioctl", "hostname", "uio", "poll"] }
 

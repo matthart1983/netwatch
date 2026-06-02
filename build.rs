@@ -1,6 +1,29 @@
 fn main() {
+    embed_utf8_manifest();
+
     #[cfg(target_os = "windows")]
     windows::configure_npcap();
+}
+
+/// Embed a Windows application manifest that sets the process **active code
+/// page to UTF-8** (Windows 10 1903+). libpcap / Npcap return device
+/// descriptions and error strings in the system ANSI code page (e.g. CP936 on
+/// Chinese-locale Windows); without this, the `pcap` crate's strict UTF-8
+/// decode of those bytes fails with "libpcap returned invalid UTF-8", which
+/// cascades into `Device::list()` and capture-open failures (issue #39).
+/// Gated on `CARGO_CFG_WINDOWS` (the build *target*) so it works whether the
+/// host is Windows or a cross-compile, and is a no-op for non-Windows targets.
+fn embed_utf8_manifest() {
+    println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_none() {
+        return;
+    }
+    use embed_manifest::manifest::ActiveCodePage;
+    use embed_manifest::{embed_manifest, new_manifest};
+    if let Err(e) = embed_manifest(new_manifest("NetWatch").active_code_page(ActiveCodePage::Utf8))
+    {
+        println!("cargo:warning=failed to embed Windows UTF-8 manifest: {e}");
+    }
 }
 
 #[cfg(target_os = "windows")]
