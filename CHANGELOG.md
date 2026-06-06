@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.25.4] - 2026-06-06
 
 ### Added
 - **Follow decrypted stream.** The stream view (`s` on the Packets tab) now renders the **decrypted** application-data conversation for flows decrypted via `SSLKEYLOGFILE`, instead of the raw encrypted wire bytes. Each segment's recovered plaintext is mirrored from the packet onto its stream segment, so opening a decrypted flow shows the full plaintext HTTP request/response exchange in order — both directions, in Text and Hex modes. The encrypted handshake is omitted from the decrypted view so the request/response flow reads cleanly (its timing still shows in the header), and a "🔓 decrypted" indicator appears in the stream header. (Previously the stream view followed only the encrypted bytes, which rendered as gibberish for any TLS/QUIC flow.)

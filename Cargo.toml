@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.25.3"
+version = "0.25.4"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -15,6 +15,7 @@ exclude = [
     # Demo capture artifacts — kept in the repo for README/marketing, but
     # excluded from the published crate (crates.io has a 10 MiB limit).
     "demo.gif",
+    "demo-forensics.gif",
     "demo.tape",
     "demo-all.gif",
     "demo-all.tape",
