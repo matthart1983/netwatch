@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.25.5"
+version = "0.25.6"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."

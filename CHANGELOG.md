@@ -4,8 +4,17 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.25.6] - 2026-06-08
+
 ### Added
+- **Headless agent / fleet mode (`netwatch daemon`).** Runs the same collectors as the TUI with no rendering and streams to a backend — the fleet-agent entry point. Flushes its buffered telemetry on SIGTERM/Ctrl-C before exiting; reports collector liveness (a thread-panic flag) so a stalled agent surfaces as degraded instead of going silently quiet. Ships `systemd` and `launchd` service units under `packaging/`. The interactive TUI is unchanged. Enable streaming with `--remote`/`--api-key` (or `NETWATCH_REMOTE_URL`/`NETWATCH_API_KEY` so the key stays out of `ps`).
+- **Durable remote ingest.** The remote publisher is now at-least-once instead of fire-and-forget: a bounded, drop-oldest queue (≈8h buffer) that only drops a batch after the backend ACKs it, with exponential backoff + jitter and batched drains, so a network blip no longer silently gaps telemetry. Envelopes are versioned (`schema_version`) and carry `agent_health` (collector status, dropped count, queue depth).
+- **Prometheus `/metrics` + `/healthz` exporter (daemon).** `netwatch daemon --metrics` (default `127.0.0.1:9464`, the OpenTelemetry Prometheus port; loopback-only) exposes aggregate signals — per-interface throughput, gateway/DNS RTT + loss, connection/TCP-state counts, and `netwatch_up`/`netwatch_collectors_ok`/`build_info` — in Prometheus exposition format. Aggregate-only by design (per-flow forensics is kept out of metrics to avoid cardinality blow-ups). See `docs/observability-export.md`.
 - **TLS 1.3 KeyUpdate / post-handshake re-keying (decryption Phase 2).** Long-lived TLS 1.3 sessions that issue a post-handshake KeyUpdate (RFC 8446 §4.6.3) now keep decrypting instead of going dark after the re-key. On an observed KeyUpdate, netwatch derives the next-generation traffic secret (`HKDF-Expand-Label(secret_N, "traffic upd", …)`), re-derives the AEAD key/IV, and resets the per-direction record sequence (§5.3). Recovery from a *missed* KeyUpdate packet (via keylog `*_TRAFFIC_SECRET_<N>` generations) is not yet implemented.
+
+### Fixed
+- **Logging no longer crashes the process when the log file can't be opened.** A root-owned `netwatch.log` left by a prior `sudo netwatch` run (or a read-only filesystem) used to panic at startup — fatal for the long-running daemon. File logging now degrades to disabled (with a one-line notice) instead.
+- **Processes "TOP REMOTES" used a proportional byte split instead of real per-remote rates.**
 
 ## [0.25.5] - 2026-06-08
 
