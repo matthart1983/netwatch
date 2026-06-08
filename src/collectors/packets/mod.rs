@@ -872,6 +872,15 @@ impl StreamTracker {
         match dir.decrypt_record_resync(aad, ciphertext_src, TLS_RESYNC_WINDOW) {
             Ok(inner) => {
                 tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, plain_len=inner.content.len(), inner_type=inner.content_type, "decrypted record");
+                // A TLS 1.3 KeyUpdate (handshake type 24, RFC 8446 §4.6.3) is the
+                // last record under the current key; the sender then rekeys its
+                // sending direction. Derive generation N+1 so the records that
+                // follow keep decrypting (this is where long sessions otherwise
+                // "fell off the rails").
+                if inner.content_type == 22 && inner.content.first() == Some(&24) {
+                    dir.advance_generation();
+                    tracing::debug!(target: "netwatch::dpi::tls_decrypt", stream_index, client_to_server, "TLS KeyUpdate — advanced to next key generation");
+                }
                 // Only surface application_data (type 23) as decrypted plaintext.
                 // Post-handshake handshake messages (NewSessionTicket, type 22)
                 // and alerts (21) decrypt fine but are binary control records, not

@@ -17,6 +17,9 @@
 //!   that arrive after the ServerHello (EncryptedExtensions, Certificate,
 //!   etc.) are NOT decrypted here — they use the *handshake* secrets,
 //!   not the application ones.
+//! - Post-handshake **KeyUpdate** (RFC 8446 §4.6.3): an observed KeyUpdate
+//!   derives generation N+1 ("traffic upd") and resets the record sequence, so
+//!   long-lived sessions keep decrypting after a re-key.
 //!
 //! ## What's not in scope (deferred to later phases)
 //!
@@ -24,7 +27,9 @@
 //! - QUIC application-data decryption (different secret labels, same
 //!   AEAD primitives — Phase 2).
 //! - 0-RTT (`EARLY_TRAFFIC_SECRET`).
-//! - KeyUpdate post-handshake re-keying (Phase 2 polish).
+//! - KeyUpdate recovery when the KeyUpdate record itself is *missed* (a capture
+//!   gap): we advance on observed KeyUpdates, but don't yet fall back to keylog
+//!   `*_TRAFFIC_SECRET_<N>` generations to re-sync after a missed one.
 //! - Active interception. netwatch stays read-only.
 //!
 //! ## Security posture
@@ -321,6 +326,10 @@ pub struct DirectionKeys {
     aead: aead::LessSafeKey,
     iv: [u8; 12],
     next_seq: u64,
+    /// Cipher suite and the current `application_traffic_secret_N`, retained so
+    /// a TLS 1.3 KeyUpdate (RFC 8446 §4.6.3) can derive generation N+1.
+    suite: CipherSuite,
+    traffic_secret: Vec<u8>,
 }
 
 /// HKDF-Expand-Label per RFC 8446 §7.1. `Length` is implicit in
@@ -363,17 +372,46 @@ impl DirectionKeys {
     /// Derive AEAD key + IV from a TLS 1.3 traffic secret per
     /// RFC 8446 §7.3.
     pub fn from_traffic_secret(suite: CipherSuite, secret: &[u8]) -> Self {
+        let (aead, iv) = Self::derive_aead(suite, secret);
+        Self {
+            aead,
+            iv,
+            next_seq: 0,
+            suite,
+            traffic_secret: secret.to_vec(),
+        }
+    }
+
+    /// Derive the AEAD key and IV from a traffic secret (RFC 8446 §7.3).
+    fn derive_aead(suite: CipherSuite, secret: &[u8]) -> (aead::LessSafeKey, [u8; 12]) {
         let hkdf_alg = suite.hkdf_alg();
         let mut key = vec![0u8; suite.key_len()];
         hkdf_expand_label(hkdf_alg, secret, b"key", &[], &mut key);
         let mut iv = [0u8; 12];
         hkdf_expand_label(hkdf_alg, secret, b"iv", &[], &mut iv);
         let unbound = aead::UnboundKey::new(suite.aead_alg(), &key).unwrap();
-        Self {
-            aead: aead::LessSafeKey::new(unbound),
-            iv,
-            next_seq: 0,
-        }
+        (aead::LessSafeKey::new(unbound), iv)
+    }
+
+    /// Advance to the next key generation after a TLS 1.3 KeyUpdate
+    /// (RFC 8446 §4.6.3): `application_traffic_secret_{N+1} =
+    /// HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length)`. Re-derives
+    /// the AEAD key/IV and resets the record sequence to 0 (RFC 8446 §5.3), so
+    /// records sent under the new key keep decrypting.
+    pub fn advance_generation(&mut self) {
+        let mut next = vec![0u8; self.traffic_secret.len()];
+        hkdf_expand_label(
+            self.suite.hkdf_alg(),
+            &self.traffic_secret,
+            b"traffic upd",
+            &[],
+            &mut next,
+        );
+        let (aead, iv) = Self::derive_aead(self.suite, &next);
+        self.aead = aead;
+        self.iv = iv;
+        self.next_seq = 0;
+        self.traffic_secret = next;
     }
 
     /// Decrypt one TLS 1.3 record's encrypted payload. `aad` is the
@@ -854,6 +892,8 @@ mod tests {
             ),
             iv: [0xAA; 12],
             next_seq: 0,
+            suite: CipherSuite::Aes128GcmSha256,
+            traffic_secret: vec![0u8; 32],
         };
         let n = dk.nonce_for(5);
         let mut expected = [0xAA; 12];
@@ -877,5 +917,51 @@ mod tests {
         );
         assert_eq!(CipherSuite::from_wire(0x1304), None); // AES-CCM not in scope
         assert_eq!(CipherSuite::from_wire(0xFFFF), None);
+    }
+
+    #[test]
+    fn key_update_advances_to_next_generation() {
+        let suite = CipherSuite::Aes128GcmSha256;
+        // Generation-1 traffic secret per RFC 8446 §4.6.3.
+        let mut gen1 = vec![0u8; RFC8448_CLIENT_SECRET.len()];
+        hkdf_expand_label(
+            suite.hkdf_alg(),
+            &RFC8448_CLIENT_SECRET,
+            b"traffic upd",
+            &[],
+            &mut gen1,
+        );
+
+        // Seal an application-data record at seq 0 under the gen-1 keys.
+        let plaintext = b"post-keyupdate application data".to_vec();
+        let (aad, sealed) = {
+            let mut k = DirectionKeys::from_traffic_secret(suite, &gen1);
+            let mut buf = plaintext.clone();
+            buf.push(0x17); // inner content_type = application_data
+            let total = buf.len() + k.aead.algorithm().tag_len();
+            let aad = vec![0x17, 0x03, 0x03, (total >> 8) as u8, (total & 0xff) as u8];
+            let nonce = aead::Nonce::assume_unique_for_key(k.nonce_for(0));
+            k.aead
+                .seal_in_place_append_tag(nonce, aead::Aad::from(&aad), &mut buf)
+                .unwrap();
+            (aad, buf)
+        };
+
+        // A receiver on gen-0 that observes a KeyUpdate must decrypt the gen-1
+        // record after advancing — and the sequence resets to 0.
+        let mut keys = DirectionKeys::from_traffic_secret(suite, &RFC8448_CLIENT_SECRET);
+        keys.next_seq = 7; // several gen-0 records had already flowed
+        keys.advance_generation();
+        assert_eq!(
+            keys.next_seq, 0,
+            "sequence resets on key change (RFC 8446 §5.3)"
+        );
+
+        let mut ct = sealed.clone();
+        let inner = keys
+            .decrypt_record(&aad, &mut ct)
+            .expect("gen-1 record must decrypt after KeyUpdate advance");
+        assert_eq!(inner.content, plaintext);
+        assert_eq!(inner.content_type, 0x17);
     }
 }

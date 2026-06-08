@@ -2,6 +2,11 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **TLS 1.3 KeyUpdate / post-handshake re-keying (decryption Phase 2).** Long-lived TLS 1.3 sessions that issue a post-handshake KeyUpdate (RFC 8446 §4.6.3) now keep decrypting instead of going dark after the re-key. On an observed KeyUpdate, netwatch derives the next-generation traffic secret (`HKDF-Expand-Label(secret_N, "traffic upd", …)`), re-derives the AEAD key/IV, and resets the per-direction record sequence (§5.3). Recovery from a *missed* KeyUpdate packet (via keylog `*_TRAFFIC_SECRET_<N>` generations) is not yet implemented.
+
 ## [0.25.5] - 2026-06-08
 
 ### Added
