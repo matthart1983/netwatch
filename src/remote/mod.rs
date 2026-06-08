@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -70,6 +71,57 @@ fn jitter_entropy() -> u64 {
         .unwrap_or(0)
 }
 
+/// Directories to persist the agent's stable `host_id`, in preference order.
+/// Config dir is ideal for interactive use; cache dir is the fallback (the
+/// systemd unit guarantees it writable via XDG_CACHE_HOME + CacheDirectory).
+fn host_id_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(d) = dirs::config_dir() {
+        dirs.push(d.join("netwatch"));
+    }
+    if let Some(d) = dirs::cache_dir() {
+        dirs.push(d.join("netwatch"));
+    }
+    dirs
+}
+
+/// Load the persisted agent `host_id`, or generate and persist a new one.
+///
+/// Previously the daemon minted a fresh UUID every start, so each restart
+/// registered a brand-new host in the cloud (fleet churn / duplicates). A
+/// stable, persisted identity fixes that.
+fn load_or_create_host_id() -> Uuid {
+    host_id_in_dirs(&host_id_dirs())
+}
+
+/// Inner, dependency-injected form of [`load_or_create_host_id`] for testing:
+/// reads `host_id` from the first dir that has a valid one, else generates a
+/// new id and writes it to the first writable dir.
+fn host_id_in_dirs(dirs: &[PathBuf]) -> Uuid {
+    for dir in dirs {
+        if let Ok(s) = std::fs::read_to_string(dir.join("host_id")) {
+            if let Ok(id) = Uuid::parse_str(s.trim()) {
+                return id;
+            }
+        }
+    }
+
+    let id = Uuid::new_v4();
+    for dir in dirs {
+        if std::fs::create_dir_all(dir).is_ok()
+            && std::fs::write(dir.join("host_id"), id.to_string()).is_ok()
+        {
+            return id;
+        }
+    }
+
+    tracing::warn!(
+        target: "netwatch::remote",
+        "could not persist host_id; using an ephemeral id (this host will re-register on restart)"
+    );
+    id
+}
+
 pub struct RemoteConfig {
     pub url: String,
     pub api_key: String,
@@ -96,7 +148,7 @@ impl RemotePublisher {
     pub fn new(config: RemoteConfig) -> Self {
         Self {
             config,
-            host_id: Uuid::new_v4(),
+            host_id: load_or_create_host_id(),
             snapshot_data: Arc::new(Mutex::new(None)),
             queue: Arc::new(SnapshotQueue::new(QUEUE_CAP)),
             collectors_ok: Arc::new(AtomicBool::new(true)),
@@ -648,6 +700,40 @@ fn parse_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_id_persists_across_calls() {
+        let dir = std::env::temp_dir().join(format!("nw-hostid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dirs = vec![dir.clone()];
+
+        let first = host_id_in_dirs(&dirs);
+        // A second call must return the SAME id (read back from disk), not a new
+        // one — this is the fleet-churn fix.
+        let second = host_id_in_dirs(&dirs);
+        assert_eq!(first, second, "host_id must be stable across restarts");
+        assert!(dir.join("host_id").exists(), "host_id file must be written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_id_falls_back_to_second_writable_dir() {
+        // First candidate is an unwritable path (a file, so create_dir_all fails);
+        // the id must still be generated and persisted to the second dir.
+        let base = std::env::temp_dir().join(format!("nw-hostid-fb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap(); // a file where a dir is expected
+        let good = base.join("good");
+
+        let id = host_id_in_dirs(&[blocker.join("netwatch"), good.clone()]);
+        assert!(good.join("host_id").exists());
+        assert_eq!(host_id_in_dirs(&[good.clone()]), id);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn status_classification() {
