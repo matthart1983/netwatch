@@ -1219,6 +1219,7 @@ pub async fn run<B: Backend>(
                         &app.traffic.interfaces(),
                         &app.health_prober,
                         &app.connection_collector,
+                        app.process_bandwidth.ranked(),
                     );
                 }
             }
@@ -1354,6 +1355,7 @@ pub async fn run_headless(
                         &app.traffic.interfaces(),
                         &app.health_prober,
                         &app.connection_collector,
+                        app.process_bandwidth.ranked(),
                     );
                     publisher.set_collectors_ok(healthy);
                 }
@@ -3152,6 +3154,13 @@ mod tests {
                     tx_bytes: 10000,
                     rtt_ms: Some(50.0),
                     cpu_percent: Some(25.0),
+                    ppid: None,
+                    user: None,
+                    mem_rss_bytes: None,
+                    mem_virt_bytes: None,
+                    state: None,
+                    started_at: None,
+                    cmd: None,
                 },
                 ProcessBandwidth {
                     process_name: "aa".into(),
@@ -3163,6 +3172,13 @@ mod tests {
                     tx_bytes: 1000,
                     rtt_ms: Some(10.0),
                     cpu_percent: Some(5.0),
+                    ppid: None,
+                    user: None,
+                    mem_rss_bytes: None,
+                    mem_virt_bytes: None,
+                    state: None,
+                    started_at: None,
+                    cmd: None,
                 },
             ]
         };
@@ -3196,8 +3212,7 @@ mod tests {
                 tx_rate: 0.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
-                rtt_ms: None,
-                cpu_percent: None,
+                ..Default::default()
             },
             ProcessBandwidth {
                 process_name: "Apple".into(),
@@ -3207,8 +3222,7 @@ mod tests {
                 tx_rate: 0.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
-                rtt_ms: None,
-                cpu_percent: None,
+                ..Default::default()
             },
             ProcessBandwidth {
                 process_name: "brave".into(),
@@ -3218,8 +3232,7 @@ mod tests {
                 tx_rate: 0.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
-                rtt_ms: None,
-                cpu_percent: None,
+                ..Default::default()
             },
         ];
         crate::ui::processes::sort(&mut procs, col(Tab::Processes, "Process"), true);
@@ -3238,8 +3251,7 @@ mod tests {
                 tx_rate: 50.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
-                rtt_ms: None,
-                cpu_percent: None,
+                ..Default::default()
             },
             ProcessBandwidth {
                 process_name: "b".into(),
@@ -3249,8 +3261,7 @@ mod tests {
                 tx_rate: 500.0,
                 rx_bytes: 0,
                 tx_bytes: 0,
-                rtt_ms: None,
-                cpu_percent: None,
+                ..Default::default()
             },
         ];
         crate::ui::processes::sort(&mut procs, col(Tab::Processes, "Total Rate"), false);

@@ -8,8 +8,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::app::safe_lock;
-use crate::collectors::connections::ConnectionCollector;
+use crate::collectors::connections::{Connection, ConnectionCollector};
 use crate::collectors::health::HealthProber;
+use crate::collectors::process_bandwidth::ProcessBandwidth;
 use crate::collectors::traffic::InterfaceTraffic;
 
 mod queue;
@@ -31,6 +32,16 @@ const QUEUE_CAP: usize = 2000;
 
 /// Max snapshots per POST when draining a backlog after reconnect.
 const BATCH_MAX: usize = 50;
+
+/// Per-snapshot cap on the `processes` array. `ranked()` is sorted by total
+/// rate descending, so this keeps the top talkers and bounds the backend's
+/// `process_metrics` row growth per host.
+const PROCESS_MAX: usize = 15;
+
+/// Per-snapshot cap on the `connections` array. Ordered ESTABLISHED-first,
+/// then by observed rate, so the cap sheds idle TIME_WAIT/CLOSE_WAIT churn
+/// before anything a fleet operator would want to see.
+const CONNECTION_MAX: usize = 200;
 
 /// Sender-loop granularity. Small enough that retry backoff is responsive,
 /// large enough to be effectively free.
@@ -275,6 +286,7 @@ impl RemotePublisher {
         interfaces: &[InterfaceTraffic],
         health: &HealthProber,
         connections: &ConnectionCollector,
+        processes: &[ProcessBandwidth],
     ) {
         let ifaces: Vec<serde_json::Value> = interfaces
             .iter()
@@ -306,7 +318,8 @@ impl RemotePublisher {
             })
         };
 
-        let conn_count = connections.connections().len() as u32;
+        let conns = connections.connections();
+        let conn_count = conns.len() as u32;
 
         let tcp_states = collect_tcp_states(connections);
         let system = collect_system_metrics();
@@ -321,6 +334,8 @@ impl RemotePublisher {
             "disk_usage": disk_usage,
             "tcp_time_wait": tcp_states.0,
             "tcp_close_wait": tcp_states.1,
+            "processes": processes_json(processes),
+            "connections": connections_json(&conns),
         });
 
         *safe_lock(&self.snapshot_data, "remote::collect_snapshot::store") = Some(snapshot);
@@ -661,6 +676,70 @@ fn collect_disk_usage() -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Serialize the top-talker processes into the ingest wire shape
+/// (`netwatch-sdk`'s `ProcessBandwidth`: `rx_rate`/`tx_rate` in bytes/sec —
+/// the backend stores them as `rx_rate_bps`/`tx_rate_bps`). `ranked` must be
+/// sorted by total rate descending, which `ProcessBandwidthCollector::ranked()`
+/// guarantees. Process identity is the comm/exe path only, never argv —
+/// command lines can carry secrets and this payload leaves the host.
+fn processes_json(ranked: &[ProcessBandwidth]) -> Vec<serde_json::Value> {
+    ranked
+        .iter()
+        .take(PROCESS_MAX)
+        .map(|p| {
+            json!({
+                "process_name": p.process_name,
+                "pid": p.pid,
+                "rx_bytes": p.rx_bytes,
+                "tx_bytes": p.tx_bytes,
+                "rx_rate": p.rx_rate,
+                "tx_rate": p.tx_rate,
+                "connection_count": p.connection_count,
+                // Process detail from the ps sampler (netwatch-sdk 0.3 wire
+                // fields). Null until the first slow-tick poll completes.
+                "ppid": p.ppid,
+                "user": p.user,
+                "cpu_pct": p.cpu_percent,
+                "mem_rss_bytes": p.mem_rss_bytes,
+                "mem_virt_bytes": p.mem_virt_bytes,
+                "state": p.state,
+                "started_at": p.started_at,
+                "cmd": p.cmd,
+            })
+        })
+        .collect()
+}
+
+/// Serialize connections into the ingest wire shape (`netwatch-sdk`'s
+/// `ConnectionDetail`), capped at [`CONNECTION_MAX`] with ESTABLISHED flows
+/// kept first (then highest observed rate) so the cap drops idle teardown
+/// states rather than live traffic.
+fn connections_json(conns: &[Connection]) -> Vec<serde_json::Value> {
+    let rate = |c: &Connection| c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0);
+    let mut ordered: Vec<&Connection> = conns.iter().collect();
+    ordered.sort_by(|a, b| {
+        let est = |c: &Connection| c.state == "ESTABLISHED";
+        est(b)
+            .cmp(&est(a))
+            .then_with(|| rate(b).total_cmp(&rate(a)))
+    });
+    ordered
+        .iter()
+        .take(CONNECTION_MAX)
+        .map(|c| {
+            json!({
+                "protocol": c.protocol,
+                "local_addr": c.local_addr,
+                "remote_addr": c.remote_addr,
+                "state": c.state,
+                "pid": c.pid,
+                "process_name": c.process_name,
+                "kernel_rtt_us": c.kernel_rtt_us,
+            })
+        })
+        .collect()
+}
+
 fn collect_tcp_states(connections: &ConnectionCollector) -> (u32, u32) {
     let conns = connections.connections();
     let mut time_wait = 0u32;
@@ -733,6 +812,122 @@ mod tests {
         assert_eq!(host_id_in_dirs(&[good.clone()]), id);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn proc(name: &str, rate: f64) -> ProcessBandwidth {
+        ProcessBandwidth {
+            process_name: name.to_string(),
+            pid: Some(42),
+            rx_bytes: 1000,
+            tx_bytes: 2000,
+            rx_rate: rate,
+            tx_rate: rate,
+            connection_count: 3,
+            rtt_ms: Some(1.5),
+            cpu_percent: Some(12.0),
+            ppid: Some(1),
+            user: Some("matt".into()),
+            mem_rss_bytes: Some(184_832 * 1024),
+            mem_virt_bytes: Some(1_048_576 * 1024),
+            state: Some("S".into()),
+            started_at: Some("2026-06-10T12:00:00+00:00".into()),
+            cmd: Some("/usr/sbin/nginx".into()),
+        }
+    }
+
+    fn conn(state: &str, rate: Option<f64>) -> Connection {
+        Connection {
+            protocol: "TCP".into(),
+            local_addr: "10.0.0.1:5000".into(),
+            remote_addr: "93.184.216.34:443".into(),
+            state: state.into(),
+            pid: Some(42),
+            process_name: Some("firefox".into()),
+            kernel_rtt_us: Some(1200.0),
+            rx_rate: rate,
+            tx_rate: rate,
+            attribution: Default::default(),
+            app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
+        }
+    }
+
+    #[test]
+    fn processes_json_caps_and_matches_wire_contract() {
+        let ranked: Vec<ProcessBandwidth> = (0..PROCESS_MAX + 5)
+            .map(|i| proc(&format!("p{i}"), 100.0))
+            .collect();
+        let out = processes_json(&ranked);
+        assert_eq!(out.len(), PROCESS_MAX, "must cap at PROCESS_MAX");
+
+        // Exactly the netwatch-sdk ProcessBandwidth wire fields — local-only
+        // extras (rtt_ms) must not leak, and the local `cpu_percent` name maps
+        // to the wire's `cpu_pct`.
+        let obj = out[0].as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "cmd",
+                "connection_count",
+                "cpu_pct",
+                "mem_rss_bytes",
+                "mem_virt_bytes",
+                "pid",
+                "ppid",
+                "process_name",
+                "rx_bytes",
+                "rx_rate",
+                "started_at",
+                "state",
+                "tx_bytes",
+                "tx_rate",
+                "user"
+            ]
+        );
+        assert_eq!(obj["process_name"], "p0");
+        assert_eq!(obj["rx_rate"], 100.0);
+        assert_eq!(obj["cpu_pct"], 12.0);
+        assert_eq!(obj["user"], "matt");
+        assert_eq!(obj["state"], "S");
+        assert_eq!(obj["cmd"], "/usr/sbin/nginx");
+    }
+
+    #[test]
+    fn connections_json_caps_and_keeps_established_first() {
+        // More TIME_WAIT churn than the cap, plus a few live flows buried at
+        // the end — the live flows must survive the cap, fastest first.
+        let mut conns: Vec<Connection> = (0..CONNECTION_MAX + 10)
+            .map(|_| conn("TIME_WAIT", None))
+            .collect();
+        conns.push(conn("ESTABLISHED", Some(10.0)));
+        conns.push(conn("ESTABLISHED", Some(500.0)));
+
+        let out = connections_json(&conns);
+        assert_eq!(out.len(), CONNECTION_MAX, "must cap at CONNECTION_MAX");
+        assert_eq!(out[0]["state"], "ESTABLISHED");
+        assert_eq!(out[0]["rx_rate"], serde_json::Value::Null); // rx_rate is not a wire field
+        assert_eq!(out[1]["state"], "ESTABLISHED");
+
+        // Wire shape: exactly netwatch-sdk's ConnectionDetail fields.
+        let obj = out[0].as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "kernel_rtt_us",
+                "local_addr",
+                "pid",
+                "process_name",
+                "protocol",
+                "remote_addr",
+                "state"
+            ]
+        );
+        assert_eq!(obj["kernel_rtt_us"], 1200.0);
     }
 
     #[test]

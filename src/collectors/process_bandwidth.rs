@@ -36,13 +36,69 @@ pub struct ProcessBandwidth {
     /// CPU%, populated from a background `ps` poll. None until the first
     /// poll completes (or when the platform doesn't support the sampler).
     pub cpu_percent: Option<f64>,
+    /// Remaining fields come from the same `ps` poll as `cpu_percent` and are
+    /// None under the same conditions.
+    pub ppid: Option<u32>,
+    pub user: Option<String>,
+    pub mem_rss_bytes: Option<u64>,
+    pub mem_virt_bytes: Option<u64>,
+    /// Single-char scheduler state (R / S / I / Z / T…).
+    pub state: Option<String>,
+    /// Process start time, RFC 3339 UTC. Derived from `ps etime` (elapsed),
+    /// so it drifts by up to a sample interval — fine for "started 3 days ago".
+    pub started_at: Option<String>,
+    /// Executable path — macOS `ps comm` / Linux `/proc/<pid>/exe`. Never
+    /// argv: command-line arguments can carry secrets and this leaves the
+    /// host when streaming to a backend.
+    pub cmd: Option<String>,
+}
+
+impl Default for ProcessBandwidth {
+    /// Zero-traffic row with no identity or metadata — a base for
+    /// struct-update syntax in tests. Production code always sets the
+    /// identity fields explicitly.
+    fn default() -> Self {
+        Self {
+            process_name: String::new(),
+            pid: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            connection_count: 0,
+            rtt_ms: None,
+            cpu_percent: None,
+            ppid: None,
+            user: None,
+            mem_rss_bytes: None,
+            mem_virt_bytes: None,
+            state: None,
+            started_at: None,
+            cmd: None,
+        }
+    }
+}
+
+/// Per-pid metadata from the slow `ps` poll. Everything here describes the
+/// process itself rather than its traffic, which is measured per tick.
+#[derive(Debug, Clone)]
+pub struct ProcMeta {
+    pub cpu_percent: f64,
+    pub ppid: Option<u32>,
+    pub user: Option<String>,
+    pub mem_rss_bytes: Option<u64>,
+    pub mem_virt_bytes: Option<u64>,
+    pub state: Option<String>,
+    pub started_at: Option<String>,
+    pub cmd: Option<String>,
 }
 
 pub struct ProcessBandwidthCollector {
     ranked: Vec<ProcessBandwidth>,
-    /// CPU% per-pid cache, populated by a background `ps` thread on a slow
-    /// tick. The mutex is short-lived; reads are O(1) lookups.
-    cpu_cache: Arc<Mutex<HashMap<u32, f64>>>,
+    /// Per-pid process metadata (CPU%, user, memory, state…), populated by a
+    /// background `ps` thread on a slow tick. The mutex is short-lived; reads
+    /// are O(1) lookups.
+    cpu_cache: Arc<Mutex<HashMap<u32, ProcMeta>>>,
     cpu_busy: Arc<AtomicBool>,
     /// Per-(process, pid) cumulative bytes, integrated from observed
     /// rates each tick (`bytes += rate * elapsed`). Survives ticks where
@@ -189,7 +245,7 @@ impl ProcessBandwidthCollector {
                     .map(|t| (t.rx_bytes, t.tx_bytes))
                     .unwrap_or((0, 0));
                 let rtt_ms = process_rtt.get(&key).copied();
-                let cpu_percent = pid.and_then(|p| cpu_cache.get(&p).copied());
+                let meta = pid.and_then(|p| cpu_cache.get(&p));
                 ProcessBandwidth {
                     process_name,
                     pid,
@@ -199,7 +255,14 @@ impl ProcessBandwidthCollector {
                     tx_rate,
                     connection_count: count,
                     rtt_ms,
-                    cpu_percent,
+                    cpu_percent: meta.map(|m| m.cpu_percent),
+                    ppid: meta.and_then(|m| m.ppid),
+                    user: meta.and_then(|m| m.user.clone()),
+                    mem_rss_bytes: meta.and_then(|m| m.mem_rss_bytes),
+                    mem_virt_bytes: meta.and_then(|m| m.mem_virt_bytes),
+                    state: meta.and_then(|m| m.state.clone()),
+                    started_at: meta.and_then(|m| m.started_at.clone()),
+                    cmd: meta.and_then(|m| m.cmd.clone()),
                 }
             })
             .collect();
@@ -217,9 +280,10 @@ impl ProcessBandwidthCollector {
         &self.ranked
     }
 
-    /// Spawn a background `ps` poll to refresh the CPU% cache. Coalesces — if
-    /// a previous poll is still running, this is a no-op. Call from the app
-    /// loop on a slow tick (~5s).
+    /// Spawn a background `ps` poll to refresh the per-pid metadata cache
+    /// (CPU%, user, memory, state, start time). Coalesces — if a previous
+    /// poll is still running, this is a no-op. Call from the app loop on a
+    /// slow tick (~5s).
     pub fn refresh_cpu(&self) {
         if self.cpu_busy.load(Ordering::SeqCst) {
             return;
@@ -228,8 +292,8 @@ impl ProcessBandwidthCollector {
         let cache = Arc::clone(&self.cpu_cache);
         let busy = Arc::clone(&self.cpu_busy);
         thread::spawn(move || {
-            if let Some(pid_cpu) = sample_cpu() {
-                *cache.lock().unwrap() = pid_cpu;
+            if let Some(meta) = sample_proc_meta() {
+                *cache.lock().unwrap() = meta;
             }
             busy.store(false, Ordering::SeqCst);
         });
@@ -237,30 +301,109 @@ impl ProcessBandwidthCollector {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn sample_cpu() -> Option<HashMap<u32, f64>> {
+fn sample_proc_meta() -> Option<HashMap<u32, ProcMeta>> {
     let output = Command::new("ps")
-        .args(["-A", "-o", "pid=,pcpu="])
+        .args([
+            "-A",
+            "-o",
+            "pid=,ppid=,user=,pcpu=,rss=,vsz=,state=,etime=,comm=",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut map: HashMap<u32, f64> = HashMap::new();
+    let now_utc = chrono::Utc::now();
+    let mut map: HashMap<u32, ProcMeta> = HashMap::new();
     for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        let pid: Option<u32> = parts.next().and_then(|s| s.parse().ok());
-        let cpu: Option<f64> = parts.next().and_then(|s| s.parse().ok());
-        if let (Some(pid), Some(cpu)) = (pid, cpu) {
-            map.insert(pid, cpu);
+        if let Some((pid, meta)) = parse_ps_line(line, now_utc) {
+            map.insert(pid, meta);
         }
     }
     Some(map)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn sample_cpu() -> Option<HashMap<u32, f64>> {
+fn sample_proc_meta() -> Option<HashMap<u32, ProcMeta>> {
     None
+}
+
+/// Parse one `ps -o pid=,ppid=,user=,pcpu=,rss=,vsz=,state=,etime=,comm=` row.
+/// The first 8 fields are whitespace-free; `comm` is the remainder and may
+/// contain spaces (macOS reports full bundle paths like
+/// `…/Code Helper (Plugin)`). `now_utc` anchors the etime → start-time math.
+fn parse_ps_line(line: &str, now_utc: chrono::DateTime<chrono::Utc>) -> Option<(u32, ProcMeta)> {
+    let mut rest = line.trim_start();
+    let mut fields = [""; 8];
+    for f in fields.iter_mut() {
+        let end = rest.find(char::is_whitespace)?;
+        *f = &rest[..end];
+        rest = rest[end..].trim_start();
+    }
+    let comm = rest.trim_end();
+
+    let pid: u32 = fields[0].parse().ok()?;
+    let ppid: Option<u32> = fields[1].parse().ok();
+    let user = (!fields[2].is_empty()).then(|| fields[2].to_string());
+    let cpu_percent: f64 = fields[3].parse().unwrap_or(0.0);
+    // rss/vsz are reported in KiB on both platforms.
+    let mem_rss_bytes = fields[4].parse::<u64>().ok().map(|kb| kb * 1024);
+    let mem_virt_bytes = fields[5].parse::<u64>().ok().map(|kb| kb * 1024);
+    // Linux appends modifier chars ("Ssl"); keep the primary state only.
+    let state = fields[6].chars().next().map(|c| c.to_string());
+    let started_at = parse_etime_secs(fields[7])
+        .map(|secs| (now_utc - chrono::Duration::seconds(secs as i64)).to_rfc3339());
+    let cmd = exe_path(pid, comm);
+
+    Some((
+        pid,
+        ProcMeta {
+            cpu_percent,
+            ppid,
+            user,
+            mem_rss_bytes,
+            mem_virt_bytes,
+            state,
+            started_at,
+            cmd,
+        },
+    ))
+}
+
+/// Resolve the executable path for `cmd`. On macOS `ps comm` is already the
+/// full path. On Linux it's the truncated 15-char comm, so prefer the
+/// `/proc/<pid>/exe` symlink (readable for own-uid processes; None when
+/// permission is denied rather than falling back to the truncated name).
+#[cfg(target_os = "linux")]
+fn exe_path(pid: u32, _comm: &str) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exe_path(_pid: u32, comm: &str) -> Option<String> {
+    (!comm.is_empty()).then(|| comm.to_string())
+}
+
+/// Parse `ps etime` — `[[dd-]hh:]mm:ss` — into elapsed seconds.
+fn parse_etime_secs(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (h, m, sec): (u64, u64, u64) = match parts.len() {
+        3 => (
+            parts[0].parse().ok()?,
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
+        ),
+        2 => (0, parts[0].parse().ok()?, parts[1].parse().ok()?),
+        _ => return None,
+    };
+    Some(days * 86400 + h * 3600 + m * 60 + sec)
 }
 
 #[cfg(test)]
@@ -481,6 +624,59 @@ mod tests {
             "cumulative bytes should persist when rate drops to zero",
         );
         assert_eq!(firefox_after.rx_rate, 0.0);
+    }
+
+    #[test]
+    fn etime_parses_all_three_shapes() {
+        assert_eq!(parse_etime_secs("05:42"), Some(5 * 60 + 42));
+        assert_eq!(parse_etime_secs("03:05:42"), Some(3 * 3600 + 5 * 60 + 42));
+        assert_eq!(
+            parse_etime_secs("12-03:05:42"),
+            Some(12 * 86400 + 3 * 3600 + 5 * 60 + 42)
+        );
+        assert_eq!(parse_etime_secs("42"), None);
+        assert_eq!(parse_etime_secs(""), None);
+    }
+
+    #[test]
+    fn ps_line_parses_with_spaces_in_comm() {
+        let now = chrono::Utc::now();
+        // macOS-style row: comm is a full path containing spaces.
+        let line = "  29259   650 matt   3.5 184832 411234016 S 02-01:02:03 /Applications/Code.app/Contents/Code Helper (Plugin)";
+        let (pid, meta) = parse_ps_line(line, now).expect("line should parse");
+        assert_eq!(pid, 29259);
+        assert_eq!(meta.ppid, Some(650));
+        assert_eq!(meta.user.as_deref(), Some("matt"));
+        assert!((meta.cpu_percent - 3.5).abs() < 0.001);
+        assert_eq!(meta.mem_rss_bytes, Some(184832 * 1024));
+        assert_eq!(meta.state.as_deref(), Some("S"));
+        let started = chrono::DateTime::parse_from_rfc3339(meta.started_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expected_secs = 2 * 86400 + 3600 + 2 * 60 + 3;
+        assert_eq!((now - started).num_seconds(), expected_secs);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            meta.cmd.as_deref(),
+            Some("/Applications/Code.app/Contents/Code Helper (Plugin)")
+        );
+    }
+
+    #[test]
+    fn ps_line_keeps_primary_state_char_only() {
+        let now = chrono::Utc::now();
+        // Linux-style row: multi-char state, truncated comm.
+        let line = "1234 1 postgres 12.0 524288 1048576 Ssl 10:00 postgres";
+        let (_, meta) = parse_ps_line(line, now).expect("line should parse");
+        assert_eq!(meta.state.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn malformed_ps_lines_are_skipped() {
+        let now = chrono::Utc::now();
+        assert!(parse_ps_line("", now).is_none());
+        assert!(parse_ps_line("garbage", now).is_none());
+        assert!(parse_ps_line("notanumber 1 u 0.0 1 1 S 0:01 x", now).is_none());
     }
 
     #[test]
