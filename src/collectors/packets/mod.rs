@@ -894,9 +894,8 @@ impl StreamTracker {
                     tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cr_prefix=%hex_prefix(&cr), "retry: server_random not observed yet");
                     return None;
                 };
-                let (client, server) = crate::dpi::tls_decrypt::Tls12DirectionKeys::derive(
-                    suite, master, &cr, &sr,
-                );
+                let (client, server) =
+                    crate::dpi::tls_decrypt::Tls12DirectionKeys::derive(suite, master, &cr, &sr);
                 TlsStreamKeys::V12 { client, server }
             } else {
                 tracing::trace!(target: "netwatch::dpi::tls_decrypt", stream_index, cr_prefix=%hex_prefix(&cr), "retry: keylog hit but secrets incomplete");

@@ -670,7 +670,13 @@ fn p_hash(alg: hmac::Algorithm, secret: &[u8], seed: &[u8], out_len: usize) -> V
 
 /// TLS 1.2 PRF (RFC 5246 §5): `PRF(secret, label, seed) = P_hash(secret,
 /// label || seed)`.
-fn tls12_prf(alg: hmac::Algorithm, secret: &[u8], label: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
+fn tls12_prf(
+    alg: hmac::Algorithm,
+    secret: &[u8],
+    label: &[u8],
+    seed: &[u8],
+    out_len: usize,
+) -> Vec<u8> {
     let mut label_seed = Vec::with_capacity(label.len() + seed.len());
     label_seed.extend_from_slice(label);
     label_seed.extend_from_slice(seed);
