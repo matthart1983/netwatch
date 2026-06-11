@@ -43,7 +43,7 @@ NetWatch currently exposes these runtime tabs:
 - Active connections with process attribution (Linux eBPF kprobe / macOS PKTAP / lsof fallback)
 - Network config discovery for gateway, DNS, and hostname
 - Health probing for gateway and DNS targets
-- Packet capture with 17 L7 decoders (`src/dpi/`), display filters, BPF filters, bookmarks, PCAP export
+- Packet capture with 15 L7 classifiers (`src/dpi/`), display filters, BPF filters, bookmarks, PCAP export
 - TLS 1.3 decryption via `SSLKEYLOGFILE` and JA4/JA4Q fingerprinting
 - Threat detection (port scan, beaconing, DNS tunnel) via `network_intel.rs`
 - Stream reassembly with text and hex views
@@ -121,7 +121,7 @@ The main loop is tick-driven.
 - `src/collectors/config.rs` discovers gateway, DNS servers, and hostname
 - `src/collectors/health.rs` performs gateway and DNS probe collection
 - `src/collectors/packets/` owns capture, decode orchestration, the filter DSL, dns cache, and PCAP export
-- `src/dpi/` holds the 17 L7 classifiers plus `tls_decrypt.rs` (SSLKEYLOGFILE) and `ja4.rs`
+- `src/dpi/` holds the 15 L7 classifiers plus `tls_decrypt.rs` (SSLKEYLOGFILE) and `ja4.rs`
 - `src/ebpf/` holds the Linux kprobe connection tracker and RTT monitor
 - `src/sandbox/` implements the Landlock filesystem + capability sandbox
 - `src/collectors/process_bandwidth.rs` ranks processes by RX/TX activity
