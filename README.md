@@ -35,13 +35,11 @@ Think of it as **one zero-config binary that does the job of a bandwidth meter, 
 <samp>500+ tests · Landlock-sandboxed · safely parses hostile traffic</samp>
 
 <p align="center">
-  <a href="demo-tour.mp4">
-    <img src="demo-tour-poster.jpg" alt="▶ Watch the NetWatch tour: dashboard, live packet capture and decode, network topology with traceroute, and automatic alerting" width="820">
-  </a>
+  <img src="demo-tour.gif" alt="A tour of the live NetWatch TUI: dashboard, live packet capture and decode, network topology with traceroute, and automatic alerting" width="820">
 </p>
 
 <p align="center">
-  <em>▶ A quick tour of the live TUI — dashboard, deep packet inspection, network topology with traceroute, and automatic alerting. <a href="demo-tour.mp4">Click to play.</a></em>
+  <em>A quick tour of the live TUI — dashboard, deep packet inspection, network topology with traceroute, and automatic alerting, all in one terminal.</em>
 </p>
 
 ## Why NetWatch
