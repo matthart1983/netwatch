@@ -378,10 +378,10 @@ fn overlay_pktap_attribution(connections: &mut [Connection], pktap: &PktapAttrib
     }
 }
 
-/// Overlay (pid, comm) from netwatch-sdk's `tcp_v4_connect` kprobe onto
-/// matching connections. Cache key is `(daddr, dport)` — the kprobe can't
-/// read the socket's source addr/port at connect-entry. Only IPv4 TCP rows
-/// are candidates; everything else is left untouched.
+/// Overlay (pid, comm) from netwatch-sdk's `tcp_v4_connect`/`tcp_v6_connect`
+/// kprobes onto matching connections. Cache key is `(daddr, dport)` — the
+/// kprobes can't read the socket's source addr/port at connect-entry. Only
+/// TCP rows are candidates; everything else is left untouched.
 #[cfg(feature = "ebpf")]
 fn overlay_ebpf_attribution(
     connections: &mut [Connection],
@@ -391,9 +391,9 @@ fn overlay_ebpf_attribution(
         if !conn.protocol.eq_ignore_ascii_case("tcp") {
             continue;
         }
-        // Keyed on the destination only — the kprobe can't see the source at
-        // connect-entry (see conn_tracker::AttrKey).
-        let (Some(daddr), Some(dport)) = parse_ipv4_endpoint(&conn.remote_addr) else {
+        // Keyed on the destination only — the kprobes can't see the source
+        // at connect-entry (see conn_tracker::AttrKey).
+        let (Some(daddr), Some(dport)) = parse_endpoint(&conn.remote_addr) else {
             continue;
         };
         if let Some(attr) = ebpf.lookup(daddr, dport) {
@@ -404,19 +404,36 @@ fn overlay_ebpf_attribution(
     }
 }
 
-/// Parse `"1.2.3.4:5678"` (or bracketed IPv6, which we reject by returning
-/// None) into `(Ipv4Addr, port)`. Either component may be `None` if the
-/// underlying string was missing it (LISTEN sockets often have remote = "*:*").
+/// Parse `"1.2.3.4:5678"` or a bracketed IPv6 endpoint (`"[2606:4700::1]:443"`,
+/// the form ss/lsof print) into `(IpAddr, port)`. Bare IPv6 with a trailing
+/// `:port` is handled as a fallback by splitting on the last colon. Either
+/// component may be `None` if the underlying string was missing it (LISTEN
+/// sockets often have remote = "*:*").
+///
+/// v4-mapped IPv6 addresses (`::ffff:a.b.c.d`, common in ss output for
+/// dual-stack sockets) are canonicalised to `IpAddr::V4` — the SDK does
+/// the same on the kprobe side, so cache keys agree on a single family.
 #[cfg(feature = "ebpf")]
-fn parse_ipv4_endpoint(addr: &str) -> (Option<std::net::Ipv4Addr>, Option<u16>) {
-    if addr.starts_with('[') || addr.contains("::") {
-        return (None, None);
-    }
-    let (host, port) = match addr.rsplit_once(':') {
-        Some((h, p)) => (h, p),
-        None => (addr, ""),
+fn parse_endpoint(addr: &str) -> (Option<std::net::IpAddr>, Option<u16>) {
+    use std::net::IpAddr;
+
+    let (host, port) = if let Some(rest) = addr.strip_prefix('[') {
+        // "[v6]:port"
+        match rest.split_once(']') {
+            Some((h, p)) => (h, p.strip_prefix(':').unwrap_or("")),
+            None => (rest, ""),
+        }
+    } else {
+        match addr.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => (addr, ""),
+        }
     };
-    let ip = host.parse::<std::net::Ipv4Addr>().ok();
+
+    let ip = host.parse::<IpAddr>().ok().map(|ip| match ip {
+        IpAddr::V6(v6) => v6.to_canonical(),
+        v4 => v4,
+    });
     let port = port.parse::<u16>().ok();
     (ip, port)
 }
@@ -1177,6 +1194,111 @@ mod tests {
             retransmits: 0,
             out_of_order: 0,
         }
+    }
+
+    #[cfg(feature = "ebpf")]
+    mod parse_endpoint {
+        use super::super::parse_endpoint;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        #[test]
+        fn parses_ipv4_host_port() {
+            assert_eq!(
+                parse_endpoint("1.2.3.4:5678"),
+                (Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))), Some(5678))
+            );
+        }
+
+        #[test]
+        fn parses_bracketed_ipv6() {
+            assert_eq!(
+                parse_endpoint("[2606:4700::6810:85e5]:443"),
+                (
+                    Some("2606:4700::6810:85e5".parse::<IpAddr>().unwrap()),
+                    Some(443)
+                )
+            );
+        }
+
+        #[test]
+        fn parses_bare_ipv6_with_trailing_port() {
+            assert_eq!(
+                parse_endpoint("2606:4700::6810:85e5:443"),
+                (
+                    Some("2606:4700::6810:85e5".parse::<IpAddr>().unwrap()),
+                    Some(443)
+                )
+            );
+        }
+
+        #[test]
+        fn canonicalises_v4_mapped_ipv6_to_v4() {
+            // ss prints dual-stack peers in v4-mapped form; the kprobe
+            // cache stores them canonicalised to V4, so the parser must
+            // agree or those rows never attribute.
+            assert_eq!(
+                parse_endpoint("[::ffff:93.184.216.34]:80"),
+                (Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))), Some(80))
+            );
+        }
+
+        #[test]
+        fn loopback_v6_without_port_yields_no_ip() {
+            assert_eq!(parse_endpoint("::1").0, None);
+            assert_eq!(
+                parse_endpoint("[::1]:8080"),
+                (Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), Some(8080))
+            );
+        }
+
+        #[test]
+        fn wildcard_remote_yields_none() {
+            assert_eq!(parse_endpoint("*:*"), (None, None));
+        }
+    }
+
+    /// Live seam test: make a real `::1` connection, run the actual `ss`
+    /// collector path, and check the verbatim remote_addr it stored parses
+    /// back to the same `(IpAddr, port)` the eBPF cache would be keyed on.
+    /// Unit tests cover the formats we *expect* ss to emit; this catches
+    /// the format it *actually* emits on the host. No root needed.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[test]
+    fn live_ss_v6_remote_addr_round_trips_through_parse_endpoint() {
+        use std::net::{IpAddr, Ipv6Addr, TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("[::1]:0").expect("bind ::1 listener");
+        let port = listener.local_addr().unwrap().port();
+        let _conn = TcpStream::connect((Ipv6Addr::LOCALHOST, port)).expect("connect to ::1");
+
+        let conns = parse_linux_connections();
+        if conns.is_empty() {
+            eprintln!("ss produced no rows (not installed?); skipping");
+            return;
+        }
+
+        // Our client row: TCP, established, remote port == the listener's.
+        // Locating it *via parse_endpoint* is the point — if ss's v6
+        // format defeats the parser, the row is unfindable and we fail.
+        let row = conns
+            .iter()
+            .find(|c| {
+                c.protocol.eq_ignore_ascii_case("tcp")
+                    && c.state == "ESTABLISHED"
+                    && parse_endpoint(&c.remote_addr)
+                        == (Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), Some(port))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no ss row parsed back to ([::1], {port}); raw remotes: {:?}",
+                    conns
+                        .iter()
+                        .filter(|c| c.protocol.eq_ignore_ascii_case("tcp"))
+                        .map(|c| c.remote_addr.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        eprintln!("matched ss row remote_addr={:?}", row.remote_addr);
     }
 
     #[test]

@@ -878,9 +878,7 @@ dependencies = [
 
 [[package]]
 name = "netwatch-sdk"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59d5835f19b8545a56c08a0a4001b4beac39d7dd2ed6e1594caac9352825f218"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aya",
