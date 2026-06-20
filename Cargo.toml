@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.25.7"
+version = "0.25.8"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -70,14 +70,15 @@ ring = "0.17"
 # and shaves a meaningful chunk off our steady-state baseline. Two-line
 # wire-up: this dep + `#[global_allocator]` in src/main.rs.
 mimalloc = { version = "0.1", default-features = false }
-# Default: pulls in netwatch-sdk's Phase 1 BPF event source (a kprobe on
-# `tcp_v4_connect` emitting per-(pid, comm, 5-tuple) connect events into
-# a ring buffer for userspace). The SDK gates aya behind its own Linux
-# target deps so this builds clean on macOS/Windows; the runtime path
-# returns `EbpfError::UnsupportedPlatform` and we fall back to lsof/ss
+# Default: pulls in netwatch-sdk's BPF event source (Phase 1: a kprobe
+# on `tcp_v4_connect`; Phase 2 adds its `tcp_v6_connect` twin), emitting
+# per-(pid, comm, 5-tuple) connect events into a ring buffer for
+# userspace. The SDK gates aya behind its own Linux target deps so this
+# builds clean on macOS/Windows; the runtime path returns
+# `EbpfError::UnsupportedPlatform` and we fall back to lsof/ss
 # attribution. The Linux runtime path also gracefully falls back when
 # the BPF object is missing or CAP_BPF/CAP_PERFMON aren't granted.
-netwatch-sdk = { version = "0.1.3", features = ["ebpf"], optional = true }
+netwatch-sdk = { version = "0.4.0", features = ["ebpf"], optional = true }
 # File-only structured logging. The TUI owns stdout/stderr in alternate-screen
 # mode, so logs must never go to the terminal — they land in a daily-rotated
 # file under the user's cache dir. Default level is WARN; users can override
@@ -101,6 +102,15 @@ brotli = "8"
 # SDK build), so users always get *some* attribution.
 default = ["ebpf"]
 ebpf = ["dep:netwatch-sdk"]
+
+# Live eBPF IPv6-attribution smokes; reference the ebpf-only conn_tracker.
+[[example]]
+name = "ebpf_v6_smoke"
+required-features = ["ebpf"]
+
+[[example]]
+name = "ebpf_udp_v6_smoke"
+required-features = ["ebpf"]
 
 [build-dependencies]
 # Embeds a Windows application manifest (activeCodePage = UTF-8) so libpcap /

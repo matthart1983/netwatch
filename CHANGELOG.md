@@ -4,6 +4,11 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.25.8] - 2026-06-20
+
+### Added
+- **eBPF Phase 2: IPv6 + connected-UDP process attribution.** Kernel-side connect attribution, previously IPv4 TCP only (`tcp_v4_connect`), now also covers IPv6 TCP (`tcp_v6_connect`) and **connected UDP — including QUIC** (`ip{4,6}_datagram_connect` and their `__`-prefixed inner workers). This closes the loop on "decrypt the QUIC flow **and** name the process that owns it": QUIC/UDP flows where the client `connect()`s its socket (browsers, quiche) are now attributed via eBPF instead of falling back to `/proc` polling that misses short flows. The attribution cache is keyed on `(protocol, daddr, dport)` so a TCP and a UDP flow to the same destination (e.g. both to `:443`) never cross-attribute. Both the datagram-connect wrapper and its inner are attached best-effort because kernel builds disagree on which is on the connect path (the other is inlined or absent); a double-fire is idempotent. **Unconnected UDP** (`sendto`/`sendmsg` without a prior `connect()`) is not yet attributed. Linux-only; degrades to lsof/ss attribution where the kernel won't load the probes.
+
 ## [0.25.7] - 2026-06-11
 
 ### Added
