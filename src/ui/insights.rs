@@ -439,7 +439,13 @@ fn render_card(f: &mut Frame, t: &crate::theme::Theme, area: Rect, card: &Card) 
 }
 
 fn card_bg(sev: Severity, t: &crate::theme::Theme) -> Color {
-    let _ = t;
+    // ANSI has no "slightly red background" — the nearest option is a
+    // full-intensity fill, far louder than the subtle card tint this is.
+    // Under the terminal theme the severity reads from the card's
+    // foreground instead, which is how terminal-native tools convey it.
+    if t.defers_to_terminal() {
+        return Color::Reset;
+    }
     match sev {
         Severity::Crit => Color::Rgb(0x3a, 0x1c, 0x1c),
         Severity::Warn => Color::Rgb(0x3a, 0x2c, 0x14),

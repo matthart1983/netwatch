@@ -313,7 +313,12 @@ fn render_process_row(
     let line = if (row_alpha - 1.0).abs() < f32::EPSILON {
         line
     } else {
-        Line::from(crate::graph::fade_spans_fg(line.spans, t.bg, row_alpha))
+        Line::from(crate::graph::fade_spans_fg(
+            line.spans,
+            t.bg,
+            row_alpha,
+            t.defers_to_terminal(),
+        ))
     };
     f.render_widget(Paragraph::new(line).style(bg), row_area);
 }

@@ -689,7 +689,7 @@ fn render_conn_row(
     let proc_label = format!("{:<14} {:>5}", truncate(process, 14), pid_str);
 
     let proto_color = if conn.protocol.eq_ignore_ascii_case("UDP") {
-        Color::Rgb(217, 122, 255) // magenta-ish for UDP, matches mockup
+        t.proto_udp()
     } else {
         t.status_info
     };
@@ -811,7 +811,7 @@ fn render_conn_row(
     let faded_spans = if (row_alpha - 1.0).abs() < f32::EPSILON {
         spans
     } else {
-        crate::graph::fade_spans_fg(spans, t.bg, row_alpha)
+        crate::graph::fade_spans_fg(spans, t.bg, row_alpha, t.defers_to_terminal())
     };
     let line = Line::from(faded_spans);
 
@@ -1293,7 +1293,7 @@ fn format_hop_line(
             } else if *ms < 50.0 {
                 theme.status_warn
             } else if *ms < 100.0 {
-                Color::Rgb(255, 165, 0)
+                theme.accent_amber()
             } else {
                 theme.status_error
             }

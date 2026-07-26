@@ -56,6 +56,11 @@ pub struct GraphOpts {
     /// interpolating column colors and as the fallback when no Rgb
     /// information is available.
     pub bg: Color,
+    /// True under the `terminal` theme, where every color must resolve
+    /// through the user's own palette. Fade and the grid interpolate in
+    /// RGB, so they switch off rather than emit 24-bit values the theme
+    /// exists to avoid.
+    pub terminal_palette: bool,
 }
 
 impl Default for GraphOpts {
@@ -63,6 +68,7 @@ impl Default for GraphOpts {
         Self {
             fade: false,
             bg: Color::Reset,
+            terminal_palette: false,
         }
     }
 }
@@ -121,7 +127,7 @@ pub fn render_with_max(
         return;
     }
     if opts.fade && area.width >= GRID_MIN_W && area.height >= GRID_MIN_H {
-        render_grid(f.buffer_mut(), area, opts.bg);
+        render_grid(f.buffer_mut(), area, opts.bg, opts.terminal_palette);
     }
     match style {
         GraphStyle::Bars => render_bars(f.buffer_mut(), area, data, max, base, opts),
@@ -155,7 +161,7 @@ fn render_bars(buf: &mut Buffer, area: Rect, data: &[u64], max: u64, base: Color
 
         let color = if opts.fade {
             let alpha = MIN_FADE_ALPHA + (1.0 - MIN_FADE_ALPHA) * (i as f32 / n_minus_1);
-            fade_color(base, opts.bg, alpha)
+            fade_color(base, opts.bg, alpha, opts.terminal_palette)
         } else {
             base
         };
@@ -236,7 +242,7 @@ fn render_dots(
             }
             let cell_color = if opts.fade {
                 let alpha = MIN_FADE_ALPHA + (1.0 - MIN_FADE_ALPHA) * (x as f32 / n_minus_1);
-                fade_color(color, opts.bg, alpha)
+                fade_color(color, opts.bg, alpha, opts.terminal_palette)
             } else {
                 color
             };
@@ -254,7 +260,14 @@ fn render_dots(
 /// works in RGB; named/indexed colors are returned unchanged so we don't
 /// silently lose them. Themes ship with `Color::Rgb` everywhere, so this
 /// is the common path.
-pub fn fade_color(base: Color, bg: Color, alpha: f32) -> Color {
+pub fn fade_color(base: Color, bg: Color, alpha: f32, defer_to_terminal: bool) -> Color {
+    // No 16-color equivalent of a gradient exists, so fade degrades to off
+    // rather than to wrong. Interpolating would also be doubly wrong here:
+    // `bg` is Reset under that theme, so it would fade toward an assumed
+    // black regardless of the terminal's real background.
+    if defer_to_terminal {
+        return base;
+    }
     let alpha = alpha.clamp(0.0, 1.0);
     let (br, bgc, bb) = match to_rgb_or_default(base, (255, 255, 255)) {
         rgb => rgb,
@@ -322,12 +335,17 @@ pub fn row_fade_alpha(row_idx: usize, total_visible_rows: usize) -> f32 {
 /// touching every per-cell color computation upstream. Spans without an
 /// explicit fg are left untouched so unstyled text doesn't suddenly
 /// pick up a fade color it wasn't supposed to have.
-pub fn fade_spans_fg(spans: Vec<Span<'_>>, bg: Color, alpha: f32) -> Vec<Span<'_>> {
+pub fn fade_spans_fg(
+    spans: Vec<Span<'_>>,
+    bg: Color,
+    alpha: f32,
+    defer_to_terminal: bool,
+) -> Vec<Span<'_>> {
     spans
         .into_iter()
         .map(|mut s| {
             if let Some(fg) = s.style.fg {
-                s.style = s.style.fg(fade_color(fg, bg, alpha));
+                s.style = s.style.fg(fade_color(fg, bg, alpha, defer_to_terminal));
             }
             s
         })
@@ -338,10 +356,17 @@ pub fn fade_spans_fg(spans: Vec<Span<'_>>, bg: Color, alpha: f32) -> Vec<Span<'_
 /// cell overwrites a grid cell; the empty regions of the chart show the
 /// grid through. Only runs on charts at least `GRID_MIN_W` × `GRID_MIN_H`
 /// to avoid making narrow sparklines look noisy.
-fn render_grid(buf: &mut Buffer, area: Rect, bg: Color) {
+fn render_grid(buf: &mut Buffer, area: Rect, bg: Color, defer_to_terminal: bool) {
     // Grid color: half-way between bg and a neutral gray, so it sits well
     // below the data on every theme.
-    let grid_color = fade_color(Color::Rgb(150, 150, 150), bg, 0.20);
+    // The grid's base is a fixed grey, so it would survive fade_color's
+    // passthrough as raw RGB. DarkGray is the palette's own answer to
+    // "faint chrome" and tracks whatever the user's theme defines.
+    let grid_color = if defer_to_terminal {
+        Color::DarkGray
+    } else {
+        fade_color(Color::Rgb(150, 150, 150), bg, 0.20, false)
+    };
     let cell_w = area.width as usize;
     let cell_h = area.height as usize;
     if cell_w < GRID_MIN_W as usize || cell_h < GRID_MIN_H as usize {
@@ -395,13 +420,34 @@ mod tests {
     }
 
     #[test]
+    fn fade_passes_base_through_untouched_for_terminal_theme() {
+        // Fade interpolates in RGB. Under the `terminal` theme that would
+        // emit 24-bit color for every faded cell and silently undo the one
+        // guarantee the theme makes. Measured at 623 escapes per frame in
+        // syswatch, which shares this fade design, before it was fixed.
+        let base = Color::Cyan;
+        for alpha in [0.0, 0.3, 0.55, 1.0] {
+            assert_eq!(
+                fade_color(base, Color::Reset, alpha, true),
+                base,
+                "alpha {alpha} must pass through under the terminal theme"
+            );
+        }
+        // Every other theme keeps its gradient.
+        assert!(matches!(
+            fade_color(Color::Rgb(200, 100, 50), Color::Rgb(0, 0, 0), 0.5, false),
+            Color::Rgb(..)
+        ));
+    }
+
+    #[test]
     fn fade_color_endpoints_match_inputs() {
         let base = Color::Rgb(200, 100, 50);
         let bg = Color::Rgb(0, 0, 0);
         // alpha = 1.0 → fully base
-        assert_eq!(fade_color(base, bg, 1.0), base);
+        assert_eq!(fade_color(base, bg, 1.0, false), base);
         // alpha = 0.0 → fully bg
-        assert_eq!(fade_color(base, bg, 0.0), bg);
+        assert_eq!(fade_color(base, bg, 0.0, false), bg);
     }
 
     #[test]
@@ -409,7 +455,7 @@ mod tests {
         let base = Color::Rgb(200, 100, 50);
         let bg = Color::Rgb(0, 0, 0);
         // alpha = 0.5 → midpoint
-        let mid = fade_color(base, bg, 0.5);
+        let mid = fade_color(base, bg, 0.5, false);
         assert_eq!(mid, Color::Rgb(100, 50, 25));
     }
 
@@ -417,8 +463,8 @@ mod tests {
     fn fade_color_clamps_out_of_range_alpha() {
         let base = Color::Rgb(200, 100, 50);
         let bg = Color::Rgb(0, 0, 0);
-        assert_eq!(fade_color(base, bg, 2.0), base);
-        assert_eq!(fade_color(base, bg, -1.0), bg);
+        assert_eq!(fade_color(base, bg, 2.0, false), base);
+        assert_eq!(fade_color(base, bg, -1.0, false), bg);
     }
 
     #[test]
@@ -426,7 +472,7 @@ mod tests {
         let base = Color::Green;
         let bg = Color::Reset;
         // Both unresolvable → result still RGB (fallback white → fallback black)
-        let faded = fade_color(base, bg, 0.5);
+        let faded = fade_color(base, bg, 0.5, false);
         assert!(matches!(faded, Color::Rgb(_, _, _)));
     }
 
@@ -441,9 +487,9 @@ mod tests {
         let base = Color::Green;
         let bg = Color::Reset;
         // Full intensity → standard ANSI green.
-        assert_eq!(fade_color(base, bg, 1.0), Color::Rgb(0, 170, 0));
+        assert_eq!(fade_color(base, bg, 1.0, false), Color::Rgb(0, 170, 0));
         // Dim end → still green, just darker.
-        let dim = fade_color(base, bg, 0.3);
+        let dim = fade_color(base, bg, 0.3, false);
         match dim {
             Color::Rgb(r, g, b) => {
                 assert_eq!(r, 0, "red channel should stay zero");

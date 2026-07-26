@@ -430,7 +430,12 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 if (row_alpha - 1.0).abs() < f32::EPSILON {
                     s
                 } else if let Some(fg) = s.fg {
-                    s.fg(crate::graph::fade_color(fg, app.theme.bg, row_alpha))
+                    s.fg(crate::graph::fade_color(
+                        fg,
+                        app.theme.bg,
+                        row_alpha,
+                        app.theme.defers_to_terminal(),
+                    ))
                 } else {
                     s
                 }

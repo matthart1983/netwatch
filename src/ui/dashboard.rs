@@ -719,7 +719,7 @@ fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
         // bottom-dim like the other tables when fade is on.
         let spans = if app.user_config.graph_fade && i > 0 {
             let alpha = crate::graph::row_fade_alpha(i, rendered_rows);
-            crate::graph::fade_spans_fg(spans, t.bg, alpha)
+            crate::graph::fade_spans_fg(spans, t.bg, alpha, t.defers_to_terminal())
         } else {
             spans
         };

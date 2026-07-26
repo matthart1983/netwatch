@@ -423,7 +423,7 @@ fn render_breakdown_panel(
         ];
         let spans = if app.user_config.graph_fade {
             let alpha = crate::graph::row_fade_alpha(i, rendered);
-            crate::graph::fade_spans_fg(spans, t.bg, alpha)
+            crate::graph::fade_spans_fg(spans, t.bg, alpha, t.defers_to_terminal())
         } else {
             spans
         };
@@ -482,7 +482,7 @@ fn classify_protocol(p: &str) -> &'static str {
 fn protocol_palette(label: &str, t: &crate::theme::Theme) -> Color {
     match label {
         "TCP" => t.status_info,
-        "UDP" => Color::Rgb(217, 122, 255),
+        "UDP" => t.proto_udp(),
         "DNS" => t.status_good,
         "ICMP" => t.status_warn,
         "ARP" => t.brand,
@@ -623,7 +623,7 @@ fn remote_palette(t: &crate::theme::Theme) -> Vec<Color> {
         t.rx_rate,
         t.status_info,
         t.brand,
-        Color::Rgb(217, 122, 255),
+        t.proto_udp(),
     ]
 }
 

@@ -717,6 +717,7 @@ impl App {
         crate::graph::GraphOpts {
             fade: self.user_config.graph_fade,
             bg: self.theme.bg,
+            terminal_palette: self.theme.defers_to_terminal(),
         }
     }
 

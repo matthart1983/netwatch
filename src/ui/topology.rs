@@ -681,7 +681,7 @@ fn render_hop_row(
     let rtt_color = match avg_rtt {
         Some(r) if r < 10.0 => t.status_good,
         Some(r) if r < 50.0 => t.status_warn,
-        Some(r) if r < 200.0 => Color::Rgb(255, 165, 0),
+        Some(r) if r < 200.0 => t.accent_amber(),
         Some(_) => t.status_error,
         None => t.text_muted,
     };

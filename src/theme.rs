@@ -42,6 +42,41 @@ pub struct Theme {
     pub bg: Color,
 }
 
+impl Theme {
+    /// True when every slot resolves through the terminal's own palette
+    /// rather than fixed RGB. Effects that synthesize colors — the graph
+    /// fade, the chart grid — must switch off rather than emit 24-bit
+    /// values that ignore the user's theme.
+    pub fn defers_to_terminal(&self) -> bool {
+        self.name == "terminal"
+    }
+
+    /// Accent for UDP rows in the connections and stats tables.
+    ///
+    /// This isn't a `Theme` field because it predates the theme system and
+    /// every palette hardcoded the same value at the call site. Routing it
+    /// through here changes nothing for the existing themes and lets
+    /// `terminal` resolve it to an ANSI slot, which is what its
+    /// no-fixed-RGB guarantee requires.
+    pub fn proto_udp(&self) -> Color {
+        if self.defers_to_terminal() {
+            Color::Magenta
+        } else {
+            Color::Rgb(217, 122, 255)
+        }
+    }
+
+    /// Mid-severity amber, one step past `status_warn` but short of
+    /// `status_error` — used for RTT banding. Same story as `proto_udp`.
+    pub fn accent_amber(&self) -> Color {
+        if self.defers_to_terminal() {
+            Color::LightRed
+        } else {
+            Color::Rgb(255, 165, 0)
+        }
+    }
+}
+
 // ── Built-in themes ────────────────────────────────────────
 
 pub const THEME_NAMES: &[&str] = &[
@@ -104,13 +139,13 @@ pub fn by_name(name: &str) -> Theme {
 /// selection bar; that is a property of the user's theme, and the
 /// alternative — a saturated color slot — is worse everywhere else.
 ///
-/// Known gap: the chart dot-grid (`graph::render_grid`) still derives its
-/// color by interpolating a fixed grey toward `bg`. With `bg: Reset` the
-/// real background is unknown, so it assumes black and renders dark dots —
-/// invisible on dark terminals, too heavy on light ones. This predates
-/// this theme and affects every `bg: Reset` palette here (dark, ocean,
-/// solarized, dracula, nord); fixing it properly means giving `Theme` its
-/// own grid slot rather than inferring one.
+/// Effects that synthesize colors are switched off under this theme rather
+/// than allowed to emit 24-bit values it exists to avoid — see
+/// `defers_to_terminal`. That covers the graph fade, the chart dot-grid,
+/// and the insights card tints. Fade in particular interpolates in RGB and
+/// is applied across most of a frame, so leaving it on would have defeated
+/// the theme entirely (measured at 623 escapes per frame in syswatch, which
+/// shares this fade design).
 pub fn terminal() -> Theme {
     Theme {
         name: "terminal",
