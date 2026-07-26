@@ -4,6 +4,9 @@ pub mod linux;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod pktap;
+/// Kernel-derived process identity — every platform, including the fallback
+/// that returns nothing so callers keep the name they already had.
+pub mod procname;
 #[cfg(target_os = "windows")]
 pub mod windows;
 

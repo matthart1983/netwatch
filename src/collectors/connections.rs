@@ -360,11 +360,53 @@ impl ConnectionCollector {
                 overlay_proc_snapshot(&mut result, snap);
             }
 
+            // Last, after every attribution source has had its say: replace
+            // the scraped name with the kernel's, which is neither truncated
+            // nor version-stamped. Runs on the final (pid, name) pairs so it
+            // corrects PKTAP and eBPF names too, not just lsof's.
+            canonicalize_process_names(&mut result);
+
             let count = result.len();
             *safe_write(&snapshot, "connections::publish") = Arc::new(result);
             tracing::trace!(target: "netwatch::connections", count, "published connection snapshot");
             busy.store(false, Ordering::SeqCst);
         });
+    }
+}
+
+/// Replace each connection's process name with the identity derived from the
+/// kernel's executable path for its pid.
+///
+/// This is what makes a process's name stable enough to key an egress policy
+/// on. The scraped names are not: `comm` is truncated at 16 bytes (macOS) or
+/// 15 (Linux), so `Google Chrome Helper` and `Google Chrome Helper (GPU)`
+/// collapse together, while lsof reports the executable's filename, which for
+/// version-installed tools is the version itself — Claude Code appeared under
+/// eight different "process names", one per release it had run.
+///
+/// Resolution is per-tick cached by pid: a few hundred connections typically
+/// share a few dozen processes, and a pid cannot be recycled inside one
+/// snapshot. Nothing is cached across ticks, so a recycled pid can never
+/// inherit the previous occupant's name.
+///
+/// A pid the kernel won't answer for keeps whatever name it already had —
+/// this only ever upgrades attribution, never erases it.
+fn canonicalize_process_names(connections: &mut [Connection]) {
+    use std::collections::hash_map::Entry;
+    let mut cache: HashMap<u32, Option<String>> = HashMap::new();
+    for conn in connections {
+        let Some(pid) = conn.pid else {
+            continue;
+        };
+        let resolved = match cache.entry(pid) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(e) => e
+                .insert(crate::platform::procname::stable_name(pid))
+                .clone(),
+        };
+        if let Some(name) = resolved {
+            conn.process_name = Some(name);
+        }
     }
 }
 
@@ -1192,6 +1234,82 @@ pub fn export_csv(connections: &[Connection], path: &str) -> Result<usize, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── process identity (issue: version-named + truncated comm) ────────
+
+    /// The kernel's name wins over whatever lsof/PKTAP scraped — that is
+    /// what collapses `Google Chrome He` and the eight `2.1.x` spellings of
+    /// Claude Code onto one stable identity.
+    #[test]
+    fn canonicalize_replaces_the_scraped_name_for_a_live_pid() {
+        let mut conns = vec![make_conn(
+            "TCP",
+            "1.2.3.4:1",
+            "5.6.7.8:443",
+            "ESTABLISHED",
+            1,
+        )];
+        // Our own pid always resolves, so this asserts the overwrite happens.
+        conns[0].pid = Some(std::process::id());
+        conns[0].process_name = Some("2.1.219".into());
+        canonicalize_process_names(&mut conns);
+        let got = conns[0].process_name.as_deref().unwrap();
+        assert_ne!(got, "2.1.219", "scraped name survived");
+        assert!(
+            got.contains("netwatch"),
+            "expected the test binary, got {got:?}"
+        );
+    }
+
+    /// A pid the kernel won't answer for must keep its existing name. This
+    /// only ever upgrades attribution — it must never blank it.
+    #[test]
+    fn canonicalize_keeps_the_existing_name_when_the_pid_is_gone() {
+        let mut conns = vec![make_conn(
+            "TCP",
+            "1.2.3.4:1",
+            "5.6.7.8:443",
+            "ESTABLISHED",
+            1,
+        )];
+        conns[0].pid = Some(u32::MAX);
+        conns[0].process_name = Some("was-here".into());
+        canonicalize_process_names(&mut conns);
+        assert_eq!(conns[0].process_name.as_deref(), Some("was-here"));
+    }
+
+    /// Connections with no pid are left entirely alone.
+    #[test]
+    fn canonicalize_ignores_connections_without_a_pid() {
+        let mut conns = vec![make_conn(
+            "TCP",
+            "1.2.3.4:1",
+            "5.6.7.8:443",
+            "ESTABLISHED",
+            1,
+        )];
+        conns[0].pid = None;
+        conns[0].process_name = Some("keep-me".into());
+        canonicalize_process_names(&mut conns);
+        assert_eq!(conns[0].process_name.as_deref(), Some("keep-me"));
+    }
+
+    /// Two connections from one process resolve to the same name — the
+    /// per-tick cache must not diverge between rows.
+    #[test]
+    fn canonicalize_is_consistent_across_rows_of_one_process() {
+        let me = std::process::id();
+        let mut conns = vec![
+            make_conn("TCP", "1.2.3.4:1", "5.6.7.8:443", "ESTABLISHED", 1),
+            make_conn("TCP", "1.2.3.4:2", "5.6.7.9:443", "ESTABLISHED", 1),
+        ];
+        conns[0].pid = Some(me);
+        conns[1].pid = Some(me);
+        conns[0].process_name = Some("Google Chrome He".into());
+        conns[1].process_name = Some("Google Chrome Helper".into());
+        canonicalize_process_names(&mut conns);
+        assert_eq!(conns[0].process_name, conns[1].process_name);
+    }
 
     fn make_conn(proto: &str, local: &str, remote: &str, state: &str, pid: u32) -> Connection {
         Connection {
