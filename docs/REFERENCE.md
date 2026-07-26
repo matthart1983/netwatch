@@ -400,10 +400,15 @@ you can tell at a glance which path is live.
 
 ## Themes
 
-7 built-in themes with instant switching via `t`:
-**Dark** (default) · **Ocean** · **Solarized** · **Dracula** · **Nord** · **Sky** · **Paper**
+8 built-in themes with instant switching via `t`:
+**Dark** (default) · **Terminal** · **Ocean** · **Solarized** · **Dracula** · **Nord** · **Sky** · **Paper**
 
 Theme changes apply immediately. Persist them from the Settings overlay with `S`.
+
+**Terminal** pins no colors of its own — every slot resolves to an ANSI palette entry, and
+foreground and background use your terminal's own defaults. If you theme your whole desktop
+with pywal, matugen, or a terminal profile, this is the one that follows along. It's also
+accepted under the names `system` and `ansi` in a config file.
 
 ---
 
