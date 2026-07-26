@@ -1191,30 +1191,33 @@ impl App {
     }
 }
 
+/// Split `host:port` (in the form ss/lsof/netstat print) into its parts.
+///
+/// A missing part is `None` — including when it is *present but empty*, as in
+/// `":443"`. Returning `Some("")` there let an empty host flow downstream as
+/// if it were a real address: the egress profiler recorded destinations with
+/// a blank IP, which then rendered as an unnamed row and warned as policy
+/// drift against a rule it could never match.
 pub(crate) fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
+    /// `"*"` is the wildcard ss/lsof print for "unbound"; empty is a
+    /// malformed or partially-populated address. Neither is a value.
+    fn part(s: &str) -> Option<String> {
+        if s == "*" || s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    }
+
     if addr == "*:*" || addr.is_empty() {
         return (None, None);
     }
     if let Some(bracket_end) = addr.rfind("]:") {
-        let ip = addr[1..bracket_end].to_string();
-        let port = addr[bracket_end + 2..].to_string();
-        (Some(ip), Some(port))
+        (part(&addr[1..bracket_end]), part(&addr[bracket_end + 2..]))
     } else if let Some(colon) = addr.rfind(':') {
-        let ip = &addr[..colon];
-        let port = &addr[colon + 1..];
-        let ip = if ip == "*" {
-            None
-        } else {
-            Some(ip.to_string())
-        };
-        let port = if port == "*" {
-            None
-        } else {
-            Some(port.to_string())
-        };
-        (ip, port)
+        (part(&addr[..colon]), part(&addr[colon + 1..]))
     } else {
-        (Some(addr.to_string()), None)
+        (part(addr), None)
     }
 }
 

@@ -98,9 +98,13 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
     let mut total = 0usize;
 
     for profile in &profiles {
-        let mut dests: Vec<_> = profile.dests.values().collect();
-        dests.sort_by_key(|d| std::cmp::Reverse(d.count));
-        for dest in dests {
+        // Iterate entries, not values: the key's label is the destination's
+        // original identity (SNI, ASN org, or the IP) and is the only copy
+        // that survives when `last_ip` is missing — baselines written before
+        // the `ip` field existed, or rows an unreadable address blanked.
+        let mut dests: Vec<_> = profile.dests.iter().collect();
+        dests.sort_by_key(|(_, d)| std::cmp::Reverse(d.count));
+        for ((label, _), dest) in dests {
             total += 1;
             if total <= start || shown >= body_rows {
                 continue;
@@ -109,11 +113,24 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
             // Never hide the endpoint: a nameless row shows its real IP, not
             // a useless "(ip)" placeholder. Named rows show the name; the
             // concrete IP is always in its own column and in the export.
+            // The key label is the last resort — it repairs rows whose
+            // `last_ip` is blank without needing a migration.
             let name = match (&dest.sni, &dest.asn_org, dest.ech) {
                 (Some(s), _, _) => s.clone(),
                 (None, Some(a), _) => a.clone(),
                 (None, None, true) => "(ech — name encrypted)".to_string(),
-                (None, None, false) => dest.last_ip.clone(),
+                (None, None, false) if !dest.last_ip.is_empty() => dest.last_ip.clone(),
+                (None, None, false) => label.clone(),
+            };
+            // The label is only an address when neither name was recorded —
+            // otherwise it holds the SNI, and showing it here would put a
+            // hostname in the IP column. Same guard as `load_profiles`.
+            let ip_cell = if !dest.last_ip.is_empty() {
+                dest.last_ip.clone()
+            } else if dest.sni.is_none() && dest.asn_org.is_none() {
+                label.clone()
+            } else {
+                "—".to_string()
             };
             let (verdict, vstyle) = match app.egress_profiler.dest_allowed(&profile.process, dest) {
                 Some(true) => ("✓ ok", Style::default().fg(t.status_good)),
@@ -129,7 +146,7 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
             let row = Row::new(vec![
                 Cell::from(profile.process.clone()).style(Style::default().fg(t.text_primary)),
                 Cell::from(name).style(Style::default().fg(t.text_primary)),
-                Cell::from(dest.last_ip.clone()).style(Style::default().fg(t.text_muted)),
+                Cell::from(ip_cell).style(Style::default().fg(t.text_muted)),
                 Cell::from(dest.port.to_string()).style(Style::default().fg(t.text_secondary)),
                 Cell::from(dest.count.to_string()).style(Style::default().fg(t.text_secondary)),
                 Cell::from(fmt_age(dest.first_seen, now)).style(Style::default().fg(t.text_muted)),

@@ -26,6 +26,16 @@ use crate::dpi::AppProtocol;
 /// Cap on distinct processes profiled. A fork-storm of short-lived
 /// process names can't grow the map without bound.
 pub(crate) const MAX_PROCESSES: usize = 256;
+/// Length at which the kernel truncates a process's `comm`. PKTAP carries
+/// `pth_comm[MAXCOMLEN+1]` on macOS and procfs `comm` is `TASK_COMM_LEN-1`
+/// on Linux, while `lsof` reports the untruncated name — so the same program
+/// arrives under two spellings depending on which attribution source won the
+/// tick, and gets two profiles. A name of exactly this length is therefore
+/// *suspected* truncation; see `canonical_process`.
+#[cfg(target_os = "macos")]
+const COMM_TRUNCATE_LEN: usize = 16;
+#[cfg(not(target_os = "macos"))]
+const COMM_TRUNCATE_LEN: usize = 15;
 /// Cap on distinct destinations tracked per process.
 const MAX_DESTS_PER_PROCESS: usize = 128;
 /// Re-warn at most this often for the same (process, destination, port)
@@ -72,6 +82,14 @@ pub struct EgressDest {
 /// Identity of a destination within a process profile: the most specific
 /// name available (SNI → ASN org → raw IP) paired with the port. Mirrors the
 /// roadmap's rule granularity — prefer SNI, fall back to ASN, avoid raw IP.
+/// `(label, port)`, where `label` is `sni.or(asn_org).unwrap_or(ip)` at the
+/// moment the destination was first seen.
+///
+/// The label is not a redundant copy of the fields below it — when a
+/// destination has neither an SNI nor an ASN, it is the *only* surviving
+/// record of the address it was learned from, and both `load_profiles` and
+/// the Egress table fall back to it to repair rows whose `last_ip` is blank.
+/// Don't "simplify" it away.
 type DestKey = (String, u16);
 
 /// Per-process egress profile: the set of distinct destinations observed.
@@ -213,7 +231,11 @@ impl EgressProfiler {
             let (Some(ip), Some(port_str)) = crate::app::parse_addr_parts(&conn.remote_addr) else {
                 continue;
             };
-            if is_private_ip(&ip) {
+            // Belt and braces with `parse_addr_parts`, which no longer yields
+            // an empty host — but `is_private_ip("")` is false, so an empty IP
+            // would otherwise clear every guard here and be recorded as a real
+            // destination with no name and no address.
+            if ip.is_empty() || is_private_ip(&ip) {
                 continue;
             }
             let Ok(port) = port_str.parse::<u16>() else {
@@ -248,10 +270,20 @@ impl EgressProfiler {
         ech: bool,
         now: Instant,
     ) {
+        // A policy may be authored against either spelling of a truncated
+        // name — the user promoted whichever one the baseline held. Try the
+        // observed name first, then its canonical form, so a flow attributed
+        // under the truncated `comm` still matches a rule declared under the
+        // full name (and vice versa). Computed before borrowing the policy.
+        let canonical = self.canonical_process(process);
         let Some(policy) = &self.policy else {
             return;
         };
-        let Some(rule) = policy.process.get(process) else {
+        let Some(rule) = policy
+            .process
+            .get(process)
+            .or_else(|| policy.process.get(canonical.as_str()))
+        else {
             return;
         };
         let Some(mut reason) = rule.violation(sni.as_deref(), asn_org.as_deref(), ip, port) else {
@@ -320,7 +352,14 @@ impl EgressProfiler {
     /// no policy is loaded or the process has no rule (nothing to check),
     /// `Some(true)` when allowed, `Some(false)` when it drifts.
     pub fn dest_allowed(&self, process: &str, dest: &EgressDest) -> Option<bool> {
-        let rule = self.policy.as_ref()?.process.get(process)?;
+        let policy = self.policy.as_ref()?;
+        // Same both-spellings lookup as `check_policy`, so the table verdict
+        // and the warnings panel can never disagree about a truncated name.
+        let canonical = self.canonical_process(process);
+        let rule = policy
+            .process
+            .get(process)
+            .or_else(|| policy.process.get(canonical.as_str()))?;
         Some(
             rule.violation(
                 dest.sni.as_deref(),
@@ -399,6 +438,111 @@ impl EgressProfiler {
         self.upsert(process, (label, port), sni, asn_org, port, ip, ech, now);
     }
 
+    /// Resolve the profile key for an observed process name, folding a
+    /// kernel-truncated `comm` into the full name when we've already seen it.
+    ///
+    /// Only a name of exactly `COMM_TRUNCATE_LEN` bytes is a truncation
+    /// candidate — that's the one length the kernel could have cut. A shorter
+    /// name is complete and must never be merged, which is what keeps VS
+    /// Code's `Code Helper` (11 bytes, a real distinct process) separate from
+    /// `Code Helper (Plu` (16 bytes, truncated `Code Helper (Plugin)`).
+    ///
+    /// When several known names share the prefix the truncation is genuinely
+    /// ambiguous (`Google Chrome Helper` vs `Google Chrome Helper (GPU)` both
+    /// truncate to `Google Chrome He`). Pick the shortest match so the choice
+    /// is deterministic across runs rather than HashMap-order dependent.
+    fn canonical_process(&self, process: &str) -> String {
+        if process.len() != COMM_TRUNCATE_LEN {
+            return process.to_string();
+        }
+        self.profiles
+            .keys()
+            .filter(|k| k.len() > process.len() && k.starts_with(process))
+            .min_by(|a, b| {
+                a.len()
+                    .cmp(&b.len())
+                    .then_with(|| a.as_str().cmp(b.as_str()))
+            })
+            .cloned()
+            .unwrap_or_else(|| process.to_string())
+    }
+
+    /// Fold an existing truncated profile into `full` when the untruncated
+    /// name shows up later. Called when a longer name arrives and a profile
+    /// keyed by its truncated form already exists — without this the merge
+    /// only works in one direction and the split survives whichever order the
+    /// two spellings happened to appear in.
+    fn absorb_truncated(&mut self, full: &str) {
+        if full.len() <= COMM_TRUNCATE_LEN {
+            return;
+        }
+        let truncated = match full.get(..COMM_TRUNCATE_LEN) {
+            Some(t) => t.to_string(),
+            // Not a char boundary — a multi-byte name the kernel would have
+            // cut mid-character. Leave it alone rather than guess.
+            None => return,
+        };
+        // Only fold when `full` is the name the truncation most plausibly
+        // belongs to. Ambiguity is resolved the same way as
+        // `canonical_process`: shortest candidate wins, ties broken
+        // alphabetically, so the choice is stable across runs. `full` is a
+        // candidate whether or not it already has a profile — it usually
+        // doesn't yet, since this runs on the way to creating it.
+        let shortest_claimant = self
+            .profiles
+            .keys()
+            .map(String::as_str)
+            .filter(|k| k.len() > COMM_TRUNCATE_LEN && k.starts_with(&truncated))
+            .chain(std::iter::once(full))
+            .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        if shortest_claimant != Some(full) {
+            return;
+        }
+        let Some(old) = self.profiles.remove(&truncated) else {
+            return;
+        };
+        let target = self
+            .profiles
+            .entry(full.to_string())
+            .or_insert_with(|| EgressProfile {
+                process: full.to_string(),
+                dests: HashMap::new(),
+                last_seen: old.last_seen,
+            });
+        target.last_seen = target.last_seen.max(old.last_seen);
+        for (key, dest) in old.dests {
+            match target.dests.get_mut(&key) {
+                // Same destination under both spellings: keep one row with
+                // the summed hit count and the widest time span.
+                Some(existing) => {
+                    existing.count += dest.count;
+                    existing.first_seen = existing.first_seen.min(dest.first_seen);
+                    existing.last_seen = existing.last_seen.max(dest.last_seen);
+                    existing.ech |= dest.ech;
+                    if existing.sni.is_none() {
+                        existing.sni = dest.sni;
+                    }
+                    if existing.asn_org.is_none() {
+                        existing.asn_org = dest.asn_org;
+                    }
+                    if existing.last_ip.is_empty() {
+                        existing.last_ip = dest.last_ip;
+                    }
+                }
+                None => {
+                    if target.dests.len() < MAX_DESTS_PER_PROCESS {
+                        target.dests.insert(key, dest);
+                    }
+                }
+            }
+        }
+        // Violation tallies follow the profile, or the counter resets to zero
+        // the moment the two spellings merge.
+        if let Some(n) = self.violation_totals.remove(&truncated) {
+            *self.violation_totals.entry(full.to_string()).or_insert(0) += n;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn upsert(
         &mut self,
@@ -411,6 +555,12 @@ impl EgressProfiler {
         ech: bool,
         now: SystemTime,
     ) {
+        // Fold kernel-truncated and untruncated spellings of the same program
+        // onto one key, in whichever order they arrive.
+        self.absorb_truncated(process);
+        let process = self.canonical_process(process);
+        let process = process.as_str();
+
         let profile = self
             .profiles
             .entry(process.to_string())
@@ -425,7 +575,12 @@ impl EgressProfiler {
             dest.last_seen = now;
             dest.count += 1;
             dest.ech |= ech;
-            dest.last_ip = ip.to_string();
+            // Only ever upgrade the endpoint. A flow whose address we couldn't
+            // read must not downgrade a destination we already know the IP for
+            // — that turned named rows into blank ones on disk.
+            if !ip.is_empty() {
+                dest.last_ip = ip.to_string();
+            }
             // Backfill a name/ASN that wasn't resolved on first sight (SNI
             // appears once the ClientHello is parsed; ASN once geo resolves).
             if dest.sni.is_none() {
@@ -650,6 +805,7 @@ impl EgressProfiler {
             }
         };
         let now = SystemTime::now();
+        let mut dropped: HashMap<String, usize> = HashMap::new();
         for profile in persisted.profiles {
             for dest in profile.dests {
                 let last_seen = from_unix_secs(dest.last_seen);
@@ -670,8 +826,26 @@ impl EgressProfiler {
                     });
                 entry.last_seen = entry.last_seen.max(last_seen);
                 if entry.dests.len() >= MAX_DESTS_PER_PROCESS {
+                    // Silently dropping these is what makes a capped profile
+                    // look like drift later: the destination is gone from the
+                    // baseline but the traffic keeps happening. Count them and
+                    // say so once per load rather than per row.
+                    *dropped.entry(profile.process.clone()).or_insert(0usize) += 1;
                     continue;
                 }
+                // Repair a blank IP from the key label. `label` is
+                // `sni.or(asn_org).unwrap_or(ip)`, so when neither name is
+                // present the label *is* the address it was learned from.
+                // This recovers two cases without a migration: baselines
+                // written before the `ip` field existed (it defaults to ""),
+                // and rows an unreadable address blanked. Guarded on both
+                // names being absent so a hostname never lands in the IP.
+                let last_ip = if dest.ip.is_empty() && dest.sni.is_none() && dest.asn_org.is_none()
+                {
+                    dest.label.clone()
+                } else {
+                    dest.ip
+                };
                 entry
                     .dests
                     .entry((dest.label, dest.port))
@@ -679,13 +853,42 @@ impl EgressProfiler {
                         sni: dest.sni,
                         asn_org: dest.asn_org,
                         port: dest.port,
-                        last_ip: dest.ip,
+                        last_ip,
                         ech: dest.ech,
                         first_seen: from_unix_secs(dest.first_seen),
                         last_seen,
                         count: dest.count,
                     });
             }
+        }
+        // A baseline saved before truncated names were folded holds both
+        // spellings. Merge them once, on load, rather than waiting for new
+        // traffic to arrive under the full name.
+        let full_names: Vec<String> = self
+            .profiles
+            .keys()
+            .filter(|k| k.len() > COMM_TRUNCATE_LEN)
+            .cloned()
+            .collect();
+        for full in full_names {
+            self.absorb_truncated(&full);
+        }
+        if !dropped.is_empty() {
+            let total: usize = dropped.values().sum();
+            let mut worst: Vec<_> = dropped.into_iter().collect();
+            worst.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            worst.truncate(3);
+            let detail = worst
+                .iter()
+                .map(|(p, n)| format!("{p} (+{n})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target: "netwatch::egress",
+                dropped = total,
+                cap = MAX_DESTS_PER_PROCESS,
+                "egress baseline truncated at the per-process destination cap: {detail}"
+            );
         }
         self.evict_processes_if_needed();
     }
@@ -829,7 +1032,18 @@ impl ProcessRule {
                 asn_org.is_some_and(|a| self.allow_asn.iter().any(|x| x.eq_ignore_ascii_case(a)));
             let ip_ok = self.allow_ip.iter().any(|x| x == ip);
             if !sni_ok && !asn_ok && !ip_ok {
-                let dest = sni.or(asn_org).unwrap_or(ip);
+                // Never build a message with an empty subject: a destination
+                // with no SNI, no ASN and no readable IP used to warn as
+                // " not in allowlist", which reads as a bug rather than a
+                // finding. Name the gap instead.
+                let dest = sni
+                    .or(asn_org)
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or(if ip.is_empty() {
+                        "unknown destination"
+                    } else {
+                        ip
+                    });
                 return Some(format!("{dest} not in allowlist"));
             }
         }
@@ -2083,5 +2297,243 @@ mod tests {
             "+1 SNI, +0 ASN, +0 IP, +0 ports"
         );
         assert_eq!(rule_diff(Some(&new), &new), "no additions");
+    }
+}
+
+/// Regressions for the blank-destination / split-profile defects found in the
+/// 2026-07-26 review. Each test names the failure it locks out.
+#[cfg(test)]
+mod blank_and_split_regressions {
+    use super::*;
+
+    fn sni(host: &str) -> Option<String> {
+        Some(host.to_string())
+    }
+
+    fn dest(sni: Option<&str>, asn: Option<&str>, ip: &str) -> EgressDest {
+        EgressDest {
+            sni: sni.map(str::to_string),
+            asn_org: asn.map(str::to_string),
+            port: 443,
+            last_ip: ip.to_string(),
+            ech: false,
+            first_seen: SystemTime::now(),
+            last_seen: SystemTime::now(),
+            count: 1,
+        }
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nw-egress-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // ── blank destinations (Finding 2) ──────────────────────────────────
+
+    /// An address with an empty host is not an address. Returning `Some("")`
+    /// here is what let blank destinations into the baseline at all.
+    #[test]
+    fn empty_host_parses_as_no_host() {
+        assert_eq!(crate::app::parse_addr_parts(":443").0, None);
+        assert_eq!(
+            crate::app::parse_addr_parts(":443").1.as_deref(),
+            Some("443")
+        );
+        // The wildcard and well-formed cases are unchanged.
+        assert_eq!(crate::app::parse_addr_parts("*:443").0, None);
+        assert_eq!(
+            crate::app::parse_addr_parts("1.2.3.4:443").0.as_deref(),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            crate::app::parse_addr_parts("[2001:db8::1]:443")
+                .0
+                .as_deref(),
+            Some("2001:db8::1")
+        );
+    }
+
+    /// `is_private_ip("")` is false, so an empty IP clears every guard in
+    /// `observe` unless it is rejected explicitly.
+    #[test]
+    fn empty_ip_is_not_mistaken_for_public() {
+        assert!(!is_private_ip(""), "empty IP is not private…");
+        // …which is exactly why observe() needs its own emptiness check.
+        let mut p = EgressProfiler::new();
+        p.record("curl", "", 443, None, None, SystemTime::now());
+        // record() bypasses observe()'s guard, so this asserts the *storage*
+        // shape the guard is protecting: nothing else should ever see it.
+        assert_eq!(p.dest_count(), 1);
+    }
+
+    /// A flow whose address couldn't be read must not erase an endpoint we
+    /// already resolved — this is what blanked named rows on disk.
+    #[test]
+    fn unreadable_address_does_not_erase_a_known_ip() {
+        let mut p = EgressProfiler::new();
+        let t = SystemTime::now();
+        p.record("curl", "203.0.113.7", 443, sni("api.example.com"), None, t);
+        p.record("curl", "", 443, sni("api.example.com"), None, t);
+        let snap = p.snapshot();
+        let d = snap[0].dests.values().next().unwrap();
+        assert_eq!(d.last_ip, "203.0.113.7", "known IP was downgraded");
+        assert_eq!(d.count, 2, "both flows counted");
+    }
+
+    /// A destination with nothing readable must not warn with an empty
+    /// subject — " not in allowlist" reads as a bug, not a finding.
+    #[test]
+    fn violation_never_names_an_empty_destination() {
+        let rule = ProcessRule {
+            allow_sni: vec!["api.example.com".into()],
+            allow_asn: vec![],
+            allow_ip: vec![],
+            allow_ports: vec![],
+        };
+        let msg = rule.violation(None, None, "", 443).unwrap();
+        assert_eq!(msg, "unknown destination not in allowlist");
+        assert!(!msg.starts_with(' '), "no empty subject");
+    }
+
+    // ── baseline repair (Findings 2c + 3) ───────────────────────────────
+
+    /// A baseline written before the `ip` field existed has the address only
+    /// in the key label. Loading must recover it rather than surfacing a
+    /// blank row that warns as drift.
+    #[test]
+    fn legacy_baseline_recovers_the_ip_from_the_label() {
+        let dir = tmpdir("legacy");
+        let path = dir.join("legacy.json");
+        let now = unix_secs(SystemTime::now());
+        let legacy = format!(
+            r#"{{"version":1,"profiles":[{{"process":"curl","dests":[
+               {{"label":"203.0.113.7","port":443,"sni":null,"asn_org":null,
+                 "first_seen":{now},"last_seen":{now},"count":5}}]}}]}}"#
+        );
+        std::fs::write(&path, legacy).unwrap();
+
+        let mut p = EgressProfiler::new();
+        p.load_profiles(&path);
+        let snap = p.snapshot();
+        let d = snap[0].dests.values().next().unwrap();
+        assert_eq!(d.last_ip, "203.0.113.7", "IP recovered from label");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The label repair must never put a *hostname* in the IP column — it
+    /// only applies when neither name was recorded.
+    #[test]
+    fn label_repair_does_not_put_a_hostname_in_the_ip_field() {
+        let dir = tmpdir("named");
+        let path = dir.join("named.json");
+        let now = unix_secs(SystemTime::now());
+        let body = format!(
+            r#"{{"version":1,"profiles":[{{"process":"curl","dests":[
+               {{"label":"api.example.com","port":443,"sni":"api.example.com",
+                 "asn_org":null,"ip":"","first_seen":{now},"last_seen":{now},"count":1}}]}}]}}"#
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let mut p = EgressProfiler::new();
+        p.load_profiles(&path);
+        let snap = p.snapshot();
+        let d = snap[0].dests.values().next().unwrap();
+        assert_eq!(d.last_ip, "", "hostname must not masquerade as an IP");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── truncated process names (Finding 1a) ────────────────────────────
+
+    /// The core split: PKTAP's 16-byte `comm` and lsof's full name are the
+    /// same program and must share one profile, in either arrival order.
+    #[test]
+    fn truncated_and_full_names_merge_in_both_directions() {
+        let full = "Google Chrome Helper";
+        let trunc = &full[..COMM_TRUNCATE_LEN];
+        let t = SystemTime::now();
+
+        // truncated first, then full
+        let mut a = EgressProfiler::new();
+        a.record(trunc, "203.0.113.1", 443, sni("a.example.com"), None, t);
+        a.record(full, "203.0.113.2", 443, sni("b.example.com"), None, t);
+        assert_eq!(a.process_count(), 1, "did not merge (truncated first)");
+        assert_eq!(a.snapshot()[0].process, full);
+        assert_eq!(a.dest_count(), 2, "both destinations kept");
+
+        // full first, then truncated
+        let mut b = EgressProfiler::new();
+        b.record(full, "203.0.113.2", 443, sni("b.example.com"), None, t);
+        b.record(trunc, "203.0.113.1", 443, sni("a.example.com"), None, t);
+        assert_eq!(b.process_count(), 1, "did not merge (full first)");
+        assert_eq!(b.snapshot()[0].process, full);
+    }
+
+    /// The guard that keeps the merge honest: a name shorter than the
+    /// truncation length is complete, so VS Code's real `Code Helper` must
+    /// stay separate from the truncated `Code Helper (Plugin)`.
+    #[test]
+    fn a_complete_short_name_is_never_merged() {
+        let t = SystemTime::now();
+        let mut p = EgressProfiler::new();
+        p.record("Code Helper", "203.0.113.1", 443, None, None, t);
+        p.record("Code Helper (Plugin)", "203.0.113.2", 443, None, None, t);
+        assert_eq!(
+            p.process_count(),
+            2,
+            "'Code Helper' is 11 bytes — complete, not truncated"
+        );
+    }
+
+    /// Merging must carry the hit counts, not silently reset them.
+    #[test]
+    fn merge_sums_counts_for_a_shared_destination() {
+        let full = "Google Chrome Helper";
+        let trunc = &full[..COMM_TRUNCATE_LEN];
+        let t = SystemTime::now();
+        let mut p = EgressProfiler::new();
+        p.record(trunc, "203.0.113.1", 443, sni("a.example.com"), None, t);
+        p.record(trunc, "203.0.113.1", 443, sni("a.example.com"), None, t);
+        p.record(full, "203.0.113.1", 443, sni("a.example.com"), None, t);
+        assert_eq!(p.process_count(), 1);
+        let snap = p.snapshot();
+        assert_eq!(snap[0].dests.values().next().unwrap().count, 3);
+    }
+
+    /// A policy promoted under the full name must cover a flow attributed
+    /// under the truncated one — otherwise promote doesn't cover its own
+    /// baseline, which is the whole promise of warn-on-drift.
+    #[test]
+    fn policy_under_the_full_name_covers_the_truncated_spelling() {
+        let full = "Google Chrome Helper";
+        let trunc = &full[..COMM_TRUNCATE_LEN];
+        let mut p = EgressProfiler::new();
+        let mut policy = EgressPolicy::default();
+        policy.process.insert(
+            full.into(),
+            ProcessRule {
+                allow_sni: vec!["a.example.com".into()],
+                allow_asn: vec![],
+                allow_ip: vec![],
+                allow_ports: vec![],
+            },
+        );
+        p.set_policy(Some(policy));
+        // Seed the full-name profile so the truncated form resolves to it.
+        p.record(
+            full,
+            "203.0.113.1",
+            443,
+            sni("a.example.com"),
+            None,
+            SystemTime::now(),
+        );
+
+        let allowed = dest(Some("a.example.com"), None, "203.0.113.1");
+        assert_eq!(
+            p.dest_allowed(trunc, &allowed),
+            Some(true),
+            "declared destination warned as drift under the truncated name"
+        );
     }
 }
