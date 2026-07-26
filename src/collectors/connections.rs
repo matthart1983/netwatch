@@ -1240,6 +1240,11 @@ mod tests {
     /// The kernel's name wins over whatever lsof/PKTAP scraped — that is
     /// what collapses `Google Chrome He` and the eight `2.1.x` spellings of
     /// Claude Code onto one stable identity.
+    ///
+    /// Unix only: Windows has no executable-path resolver, so `stable_name`
+    /// returns None there by design and names are left as scraped — asserted
+    /// separately in `canonicalize_is_inert_without_a_resolver`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn canonicalize_replaces_the_scraped_name_for_a_live_pid() {
         let mut conns = vec![make_conn(
@@ -1278,6 +1283,24 @@ mod tests {
         assert_eq!(conns[0].process_name.as_deref(), Some("was-here"));
     }
 
+    /// On a platform with no executable-path resolver, canonicalisation is
+    /// a no-op rather than a name-eraser — the scraped name is all there is.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn canonicalize_is_inert_without_a_resolver() {
+        let mut conns = vec![make_conn(
+            "TCP",
+            "1.2.3.4:1",
+            "5.6.7.8:443",
+            "ESTABLISHED",
+            1,
+        )];
+        conns[0].pid = Some(std::process::id());
+        conns[0].process_name = Some("scraped-name".into());
+        canonicalize_process_names(&mut conns);
+        assert_eq!(conns[0].process_name.as_deref(), Some("scraped-name"));
+    }
+
     /// Connections with no pid are left entirely alone.
     #[test]
     fn canonicalize_ignores_connections_without_a_pid() {
@@ -1295,7 +1318,9 @@ mod tests {
     }
 
     /// Two connections from one process resolve to the same name — the
-    /// per-tick cache must not diverge between rows.
+    /// per-tick cache must not diverge between rows. Unix only, for the same
+    /// reason as above.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn canonicalize_is_consistent_across_rows_of_one_process() {
         let me = std::process::id();
