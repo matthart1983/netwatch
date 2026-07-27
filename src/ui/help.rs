@@ -289,6 +289,56 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(theme, "e", "Export connections to JSON + CSV"));
     lines.push(Line::raw(""));
 
+    // EGRESS
+    lines.push(section_header(theme, "EGRESS (Tab 0)"));
+    lines.push(key_line(
+        theme,
+        "↑↓ / j/k",
+        "Move cursor (click also selects)",
+    ));
+    lines.push(key_line(
+        theme,
+        "space",
+        "Fold / unfold a process (or click its ▼)",
+    ));
+    lines.push(key_line(
+        theme,
+        "s",
+        "Cycle sort (volume / active / process / last seen / risk)",
+    ));
+    lines.push(key_line(theme, "/", "Filter by process or destination"));
+    lines.push(key_line(theme, "d", "Toggle destination detail pane"));
+    lines.push(key_line(
+        theme,
+        "Enter",
+        "Promote selected process into policy",
+    ));
+    lines.push(key_line(theme, "P (shift)", "Promote every process"));
+    lines.push(key_line(theme, "e", "Export baseline to NDJSON"));
+    lines.push(Line::raw(""));
+    lines.push(key_line(
+        theme,
+        "✓ sni / ✓ ip",
+        "Matched a declared name or address",
+    ));
+    lines.push(key_line(
+        theme,
+        "~ asn",
+        "Admitted by autonomous system — broad, not one endpoint",
+    ));
+    lines.push(key_line(
+        theme,
+        "? ech",
+        "Name encrypted (ECH) — cannot judge",
+    ));
+    lines.push(key_line(theme, "✗ drift", "Outside the allowlist"));
+    lines.push(key_line(
+        theme,
+        "— no rule",
+        "Process undeclared — nothing was checked",
+    ));
+    lines.push(Line::raw(""));
+
     // DISPLAY FILTER SYNTAX
     lines.push(section_header(theme, "DISPLAY FILTER SYNTAX"));
     lines.push(key_line(

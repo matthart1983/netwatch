@@ -850,6 +850,29 @@ impl App {
         self.ui.export_status_tick = 0;
     }
 
+    /// Collapse or expand the process under the cursor.
+    ///
+    /// Works from a destination row too — folding the group you are inside
+    /// is the common case, and requiring the user to first navigate up to
+    /// the header would be busywork.
+    fn toggle_egress_fold(&mut self) {
+        let Some(process) = crate::ui::egress::selected_process(self) else {
+            return;
+        };
+        if !self.ui.egress_collapsed.remove(&process) {
+            self.ui.egress_collapsed.insert(process.clone());
+            // Folding removes rows below the cursor; park it on the header
+            // so the selection stays on something visible.
+            let rows = crate::ui::egress::visible_rows(self);
+            if let Some(idx) = rows.iter().position(|r| {
+                matches!(r, crate::ui::egress::EgressRow::Process { profile, .. }
+                         if profile.process == process)
+            }) {
+                self.ui.scroll.egress_scroll = idx;
+            }
+        }
+    }
+
     /// Promote only the process under the cursor on the Egress tab —
     /// selective ratification, with a diff of what the promotion adds.
     fn promote_selected_egress(&mut self) {
@@ -1936,6 +1959,47 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                             app.ui.scroll.process_scroll = idx;
                         }
                     }
+                    Tab::Egress => {
+                        // Map against the same window the renderer computes,
+                        // not `scroll + visible_row` — that was issue #28 on
+                        // the Connections tab and the bug is identical here.
+                        let inner = crate::ui::egress::table_inner_area(area);
+                        if row < inner.y || row >= inner.y + inner.height {
+                            return;
+                        }
+                        let row_within = (row - inner.y) as usize;
+                        if row_within == 0 {
+                            return; // column-header row
+                        }
+                        let visible_row = row_within - 1;
+                        // Resolve the click to an index and whether that row
+                        // is a process header, then drop the borrow before
+                        // mutating — `visible_rows` borrows the whole App.
+                        let (idx, is_process) = {
+                            let rows = crate::ui::egress::visible_rows(app);
+                            if rows.is_empty() {
+                                return;
+                            }
+                            let body = inner.height.saturating_sub(1) as usize;
+                            let selected = app.ui.scroll.egress_scroll.min(rows.len() - 1);
+                            let start = (selected + 1).saturating_sub(body.max(1));
+                            let idx = (start + visible_row).min(rows.len() - 1);
+                            let is_process = matches!(
+                                rows.get(idx),
+                                Some(crate::ui::egress::EgressRow::Process { .. })
+                            );
+                            (idx, is_process)
+                        };
+                        app.ui.scroll.egress_scroll = idx;
+
+                        // Clicking the chevron folds the group. The glyph is
+                        // drawn at the first cell of a process row, so a
+                        // click in the leading two columns is unambiguous —
+                        // anywhere else just selects.
+                        if is_process && col <= inner.x + 1 {
+                            app.toggle_egress_fold();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2029,7 +2093,11 @@ fn scroll_tab(app: &mut App, delta: isize) {
             };
         }
         Tab::Egress => {
-            let max = app.egress_profiler.dest_count().saturating_sub(1);
+            // Clamp against the rows the tree actually draws — process rows
+            // plus the destinations of expanded groups — not the raw
+            // destination count, or the cursor runs off the end whenever a
+            // group is collapsed or a filter is applied.
+            let max = crate::ui::egress::visible_rows(app).len().saturating_sub(1);
             app.ui.scroll.egress_scroll = clamp_scroll(app.ui.scroll.egress_scroll, delta, max);
         }
         Tab::Dashboard => {}
@@ -2103,6 +2171,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     }
     if app.ui.connection_filter_input && app.ui.current_tab == Tab::Connections {
         handle_connection_filter_input(app, key);
+        return false;
+    }
+    if app.ui.egress_filter_input && app.ui.current_tab == Tab::Egress {
+        handle_egress_filter_input(app, key);
         return false;
     }
     handle_main_key(app, key)
@@ -2357,6 +2429,44 @@ fn handle_connection_filter_input(app: &mut App, key: crossterm::event::KeyEvent
         }
         KeyCode::Char(c) => {
             app.ui.connection_filter_text.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_egress_filter_input(app: &mut App, key: crossterm::event::KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            app.ui.egress_filter_input = false;
+            app.ui.egress_filter_active = if app.ui.egress_filter_text.trim().is_empty() {
+                None
+            } else {
+                Some(app.ui.egress_filter_text.clone())
+            };
+            app.ui.scroll.egress_scroll = 0;
+        }
+        KeyCode::Esc => {
+            // Esc abandons the edit *and* the filter — matching the Procs
+            // tab, where Esc means "show me everything again".
+            app.ui.egress_filter_input = false;
+            app.ui.egress_filter_text.clear();
+            app.ui.egress_filter_active = None;
+            app.ui.scroll.egress_scroll = 0;
+        }
+        KeyCode::Backspace => {
+            app.ui.egress_filter_text.pop();
+            app.ui.egress_filter_active = if app.ui.egress_filter_text.is_empty() {
+                None
+            } else {
+                Some(app.ui.egress_filter_text.clone())
+            };
+            app.ui.scroll.egress_scroll = 0;
+        }
+        KeyCode::Char(c) => {
+            // Live-apply so the tree narrows as the user types.
+            app.ui.egress_filter_text.push(c);
+            app.ui.egress_filter_active = Some(app.ui.egress_filter_text.clone());
+            app.ui.scroll.egress_scroll = 0;
         }
         _ => {}
     }
@@ -2727,6 +2837,20 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
             app.ui.export_status_tick = 0;
+        }
+        KeyCode::Char('s') if app.ui.current_tab == Tab::Egress => {
+            app.ui.egress_sort = app.ui.egress_sort.next();
+            app.ui.scroll.egress_scroll = 0;
+        }
+        KeyCode::Char('d') if app.ui.current_tab == Tab::Egress => {
+            app.ui.egress_detail = !app.ui.egress_detail;
+        }
+        KeyCode::Char('/') if app.ui.current_tab == Tab::Egress => {
+            app.ui.egress_filter_input = true;
+            app.ui.egress_filter_text = app.ui.egress_filter_active.clone().unwrap_or_default();
+        }
+        KeyCode::Char(' ') if app.ui.current_tab == Tab::Egress => {
+            app.toggle_egress_fold();
         }
         KeyCode::Char('s') => {
             let tab = app.ui.current_tab;

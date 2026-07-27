@@ -13,7 +13,7 @@
 //! ClientHello, so meaningful profiles form on the vast majority of traffic
 //! with no decryption and no keylog.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,9 @@ pub(crate) const MAX_PROCESSES: usize = 256;
 const COMM_TRUNCATE_LEN: usize = 16;
 #[cfg(not(target_os = "macos"))]
 const COMM_TRUNCATE_LEN: usize = 15;
+/// Samples kept per destination for the inline activity sparkline — one
+/// per connection tick, so roughly the last minute at the 1 s default.
+pub(crate) const ACTIVITY_SAMPLES: usize = 40;
 /// Cap on distinct destinations tracked per process.
 const MAX_DESTS_PER_PROCESS: usize = 128;
 /// Re-warn at most this often for the same (process, destination, port)
@@ -49,7 +52,7 @@ const PERSIST_INTERVAL_SECS: u64 = 60;
 /// Schema tag stamped on the NDJSON export's `_meta` line. Bump the minor
 /// when adding fields (additive/back-compatible), the major on a breaking
 /// change — the managed ingest keys off this.
-pub const EGRESS_EXPORT_SCHEMA: &str = "netwatch.egress.v1";
+pub const EGRESS_EXPORT_SCHEMA: &str = "netwatch.egress.v1.1";
 
 /// One observed destination for a process.
 #[derive(Clone, Debug)]
@@ -76,7 +79,25 @@ pub struct EgressDest {
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
     /// Number of observations (connection-refresh ticks this dest appeared).
+    ///
+    /// Because `observe` runs once per ~1 s connection tick, this is really a
+    /// *dwell time in ticks*, not an event count — a single long-lived
+    /// connection accrues one per second it stays open. The UI renders it as
+    /// a duration for exactly that reason; don't relabel it "hits".
     pub count: u64,
+    /// Bytes attributed to this destination, accumulated from the per-tick
+    /// rates on the connection table (`rate × elapsed`). Approximate by
+    /// construction — the rates are themselves per-tick averages — and only
+    /// populated when packet capture is running, since that is what produces
+    /// the rates. Zero with no capture, which the UI shows as `—` rather
+    /// than a misleading 0 B.
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+    /// Recent per-tick outbound bytes, newest last, for the inline
+    /// sparkline. Bounded to `ACTIVITY_SAMPLES`. Deliberately not persisted
+    /// — it is a live-session signal, and restoring one would be a lie
+    /// about what is happening now.
+    pub activity: VecDeque<u64>,
 }
 
 /// Identity of a destination within a process profile: the most specific
@@ -91,6 +112,56 @@ pub struct EgressDest {
 /// the Egress table fall back to it to repair rows whose `last_ip` is blank.
 /// Don't "simplify" it away.
 type DestKey = (String, u16);
+
+/// How a destination stands against the declared policy.
+///
+/// The distinction that matters is `Sni`/`Ip` versus `Asn`. A hostname or
+/// address match is a statement about *one endpoint*; an autonomous-system
+/// match admits everything that AS operates, which for a hyperscaler is
+/// effectively unbounded. Collapsing both into a single "ok" is what let a
+/// promoted rule quietly allow all of Google Cloud, so they are separate
+/// states and render differently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Matched a declared hostname — precise.
+    Sni,
+    /// Matched a declared IP — precise.
+    Ip,
+    /// Matched only by autonomous system — broad. Carries the org so the UI
+    /// can name what was actually admitted.
+    Asn(String),
+    /// Encrypted ClientHello: the real name is hidden by design, so this is
+    /// "cannot judge", not "bad".
+    Ech,
+    /// Outside the allowlist.
+    Drift,
+    /// The process has no rule, so nothing was checked. Distinct from
+    /// `NoPolicy` — here the operator has a policy and simply never declared
+    /// this program.
+    NoRule,
+    /// No policy loaded at all; observe-only.
+    NoPolicy,
+}
+
+impl Verdict {
+    /// Short glyph + label for the table's verdict column.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Verdict::Sni => "\u{2713} sni",
+            Verdict::Ip => "\u{2713} ip",
+            Verdict::Asn(_) => "~ asn",
+            Verdict::Ech => "? ech",
+            Verdict::Drift => "\u{2717} drift",
+            Verdict::NoRule => "\u{2014} no rule",
+            Verdict::NoPolicy => "\u{2014}",
+        }
+    }
+    /// True for states the operator should look at: broad matches and
+    /// outright drift. Drives colour and the header tally.
+    pub fn is_notable(&self) -> bool {
+        matches!(self, Verdict::Asn(_) | Verdict::Drift | Verdict::NoRule)
+    }
+}
 
 /// Per-process egress profile: the set of distinct destinations observed.
 #[derive(Clone, Debug)]
@@ -123,6 +194,18 @@ pub struct EgressRecord {
     /// Policy verdict at export time: `ok` | `drift` | `unreadable` (ECH,
     /// name hidden) | `unchecked` (no rule for this process).
     pub verdict: String,
+    /// Which dimension admitted an `ok` verdict — `sni` | `ip` | `asn`.
+    /// `None` for anything not admitted.
+    ///
+    /// Additive in schema v1.1. This is the breadth signal: `asn` means the
+    /// rule admitted an entire autonomous system, not one endpoint, so a
+    /// consumer can distinguish a precise allowlist from a rule that lets
+    /// through everything a hyperscaler operates.
+    pub matched_by: Option<String>,
+    /// Bytes attributed to this destination. Approximate (derived from
+    /// per-tick rates) and zero when packet capture isn't running.
+    pub bytes_out: u64,
+    pub bytes_in: u64,
 }
 
 /// A flow that violated a declared egress rule. Surfaced as a warning —
@@ -166,6 +249,8 @@ pub struct EgressProfiler {
     /// Retained recent violations for the on-screen warnings panel (bounded
     /// ring). Distinct from `pending`, which the caller drains each tick.
     recent: std::collections::VecDeque<RecentViolation>,
+    /// When `observe` last ran, so byte deltas can be derived from rates.
+    last_observe: Option<Instant>,
     /// Cumulative violation count per process (post-cooldown, so it tracks
     /// the alert stream). Bounded: only processes with a declared rule can
     /// violate. Feeds `netwatch_policy_violations_total` on /metrics.
@@ -183,6 +268,7 @@ impl Default for EgressProfiler {
             cooldown: Duration::from_secs(VIOLATION_COOLDOWN_SECS),
             pending: Vec::new(),
             recent: std::collections::VecDeque::new(),
+            last_observe: None,
             violation_totals: HashMap::new(),
             last_persist: None,
         }
@@ -221,6 +307,15 @@ impl EgressProfiler {
     pub fn observe(&mut self, connections: &[Connection], geo: &GeoCache) {
         let now = Instant::now();
         let wall = SystemTime::now();
+        // Seconds since the previous observe, used to turn the connection
+        // table's per-second rates into a byte delta for this tick. Clamped:
+        // a long stall (laptop sleep, a slow lsof) must not credit a
+        // destination with minutes of traffic it may not have sent.
+        let elapsed = self
+            .last_observe
+            .map(|t| now.duration_since(t).as_secs_f64().clamp(0.0, 5.0))
+            .unwrap_or(0.0);
+        self.last_observe = Some(now);
         for conn in connections {
             let Some(process) = conn.process_name.as_deref() else {
                 continue;
@@ -245,7 +340,22 @@ impl EgressProfiler {
             let sni = dest_hostname(&conn.app_protocol);
             let ech = flow_ech(&conn.app_protocol);
             let asn_org = geo.lookup(&ip).map(|g| g.org).filter(|o| !o.is_empty());
-            self.record_flow(process, &ip, port, sni.clone(), asn_org.clone(), ech, wall);
+            // Rates are present only while packet capture is running, so
+            // without it these stay zero and the UI shows "—" rather than a
+            // confident 0 B.
+            let out = (conn.tx_rate.unwrap_or(0.0) * elapsed).max(0.0) as u64;
+            let inb = (conn.rx_rate.unwrap_or(0.0) * elapsed).max(0.0) as u64;
+            self.record_flow(
+                process,
+                &ip,
+                port,
+                sni.clone(),
+                asn_org.clone(),
+                ech,
+                wall,
+                out,
+                inb,
+            );
             self.check_policy(process, &ip, port, &sni, &asn_org, ech, now);
         }
         self.evict_processes_if_needed();
@@ -352,23 +462,71 @@ impl EgressProfiler {
     /// no policy is loaded or the process has no rule (nothing to check),
     /// `Some(true)` when allowed, `Some(false)` when it drifts.
     pub fn dest_allowed(&self, process: &str, dest: &EgressDest) -> Option<bool> {
-        let policy = self.policy.as_ref()?;
+        match self.verdict(process, dest) {
+            Verdict::NoPolicy | Verdict::NoRule => None,
+            // ECH is a policy *miss* whose cause is an encrypted name. It
+            // stays `false` here so the export keeps reporting it as
+            // "unreadable"; only the presentation differs from real drift.
+            Verdict::Drift | Verdict::Ech => Some(false),
+            _ => Some(true),
+        }
+    }
+
+    /// Full verdict for a destination, naming *why* it passed.
+    ///
+    /// `dest_allowed` flattens this to a bool for callers that only need
+    /// pass/fail; the UI wants the reason, because "matched a hostname" and
+    /// "matched an entire autonomous system" are very different assurances.
+    pub fn verdict(&self, process: &str, dest: &EgressDest) -> Verdict {
+        let Some(policy) = self.policy.as_ref() else {
+            return Verdict::NoPolicy;
+        };
         // Same both-spellings lookup as `check_policy`, so the table verdict
         // and the warnings panel can never disagree about a truncated name.
         let canonical = self.canonical_process(process);
-        let rule = policy
+        let Some(rule) = policy
             .process
             .get(process)
-            .or_else(|| policy.process.get(canonical.as_str()))?;
-        Some(
-            rule.violation(
+            .or_else(|| policy.process.get(canonical.as_str()))
+        else {
+            return Verdict::NoRule;
+        };
+        if rule
+            .violation(
                 dest.sni.as_deref(),
                 dest.asn_org.as_deref(),
                 &dest.last_ip,
                 dest.port,
             )
-            .is_none(),
-        )
+            .is_some()
+        {
+            // An ECH flow's inner name is encrypted, so a miss is "can't
+            // read it", not "shouldn't be there".
+            return if dest.ech && dest.sni.is_none() {
+                Verdict::Ech
+            } else {
+                Verdict::Drift
+            };
+        }
+        // Admitted — report the most precise dimension that did it, in the
+        // same order `violation` checks them.
+        if dest
+            .sni
+            .as_deref()
+            .is_some_and(|h| rule.allow_sni.iter().any(|p| sni_matches(p, h)))
+        {
+            return Verdict::Sni;
+        }
+        if rule.allow_ip.iter().any(|x| x == &dest.last_ip) {
+            return Verdict::Ip;
+        }
+        if let Some(org) = dest.asn_org.as_deref() {
+            if rule.allow_asn.iter().any(|x| x.eq_ignore_ascii_case(org)) {
+                return Verdict::Asn(org.to_string());
+            }
+        }
+        // Admitted because the rule declares no name restriction at all.
+        Verdict::Sni
     }
 
     /// Drain the violations detected since the last call.
@@ -417,7 +575,7 @@ impl EgressProfiler {
         asn_org: Option<String>,
         now: SystemTime,
     ) {
-        self.record_flow(process, ip, port, sni, asn_org, false, now);
+        self.record_flow(process, ip, port, sni, asn_org, false, now, 0, 0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -430,12 +588,25 @@ impl EgressProfiler {
         asn_org: Option<String>,
         ech: bool,
         now: SystemTime,
+        bytes_out: u64,
+        bytes_in: u64,
     ) {
         let label = sni
             .clone()
             .or_else(|| asn_org.clone())
             .unwrap_or_else(|| ip.to_string());
-        self.upsert(process, (label, port), sni, asn_org, port, ip, ech, now);
+        self.upsert(
+            process,
+            (label, port),
+            sni,
+            asn_org,
+            port,
+            ip,
+            ech,
+            now,
+            bytes_out,
+            bytes_in,
+        );
     }
 
     /// Resolve the profile key for an observed process name, folding a
@@ -554,6 +725,8 @@ impl EgressProfiler {
         ip: &str,
         ech: bool,
         now: SystemTime,
+        bytes_out: u64,
+        bytes_in: u64,
     ) {
         // Fold kernel-truncated and untruncated spellings of the same program
         // onto one key, in whichever order they arrive.
@@ -580,6 +753,12 @@ impl EgressProfiler {
             // — that turned named rows into blank ones on disk.
             if !ip.is_empty() {
                 dest.last_ip = ip.to_string();
+            }
+            dest.bytes_out = dest.bytes_out.saturating_add(bytes_out);
+            dest.bytes_in = dest.bytes_in.saturating_add(bytes_in);
+            dest.activity.push_back(bytes_out);
+            while dest.activity.len() > ACTIVITY_SAMPLES {
+                dest.activity.pop_front();
             }
             // Backfill a name/ASN that wasn't resolved on first sight (SNI
             // appears once the ClientHello is parsed; ASN once geo resolves).
@@ -613,6 +792,9 @@ impl EgressProfiler {
                 first_seen: now,
                 last_seen: now,
                 count: 1,
+                bytes_out,
+                bytes_in,
+                activity: VecDeque::from(vec![bytes_out]),
             },
         );
     }
@@ -654,6 +836,17 @@ impl EgressProfiler {
         self.profiles.values().map(|p| p.dests.len()).sum()
     }
 
+    /// Borrowed view of the profiles, sorted by process name.
+    ///
+    /// `snapshot` clones every profile, which the Egress tab used to do once
+    /// per frame; the tree view borrows instead so rendering allocates
+    /// nothing beyond the row list.
+    pub fn profiles_ref(&self) -> Vec<&EgressProfile> {
+        let mut out: Vec<&EgressProfile> = self.profiles.values().collect();
+        out.sort_by(|a, b| a.process.cmp(&b.process));
+        out
+    }
+
     /// Snapshot of all profiles, sorted by process name. Each profile's
     /// destinations can be sorted by the caller; the map is returned as-is.
     pub fn snapshot(&self) -> Vec<EgressProfile> {
@@ -675,13 +868,20 @@ impl EgressProfiler {
         let mut out = Vec::new();
         for profile in self.snapshot() {
             for dest in profile.dests.values() {
-                let verdict = match self.dest_allowed(&profile.process, dest) {
-                    Some(true) => "ok",
-                    Some(false) if dest.ech && dest.sni.is_none() => "unreadable",
-                    Some(false) => "drift",
-                    None => "unchecked",
+                let v = self.verdict(&profile.process, dest);
+                let verdict = match &v {
+                    Verdict::Ech => "unreadable",
+                    Verdict::Drift => "drift",
+                    Verdict::NoRule | Verdict::NoPolicy => "unchecked",
+                    _ => "ok",
                 }
                 .to_string();
+                let matched_by = match &v {
+                    Verdict::Sni => Some("sni".to_string()),
+                    Verdict::Ip => Some("ip".to_string()),
+                    Verdict::Asn(_) => Some("asn".to_string()),
+                    _ => None,
+                };
                 out.push(EgressRecord {
                     process: profile.process.clone(),
                     sni: dest.sni.clone(),
@@ -694,6 +894,9 @@ impl EgressProfiler {
                     last_seen: unix_secs(dest.last_seen),
                     count: dest.count,
                     verdict,
+                    matched_by,
+                    bytes_out: dest.bytes_out,
+                    bytes_in: dest.bytes_in,
                 });
             }
         }
@@ -776,6 +979,8 @@ impl EgressProfiler {
                             first_seen: unix_secs(d.first_seen),
                             last_seen: unix_secs(d.last_seen),
                             count: d.count,
+                            bytes_out: d.bytes_out,
+                            bytes_in: d.bytes_in,
                         })
                         .collect(),
                 })
@@ -858,6 +1063,11 @@ impl EgressProfiler {
                         first_seen: from_unix_secs(dest.first_seen),
                         last_seen,
                         count: dest.count,
+                        bytes_out: dest.bytes_out,
+                        bytes_in: dest.bytes_in,
+                        // Activity is a live signal; a restored spark would
+                        // claim traffic that isn't happening.
+                        activity: VecDeque::new(),
                     });
             }
         }
@@ -964,6 +1174,10 @@ struct PersistedDest {
     first_seen: u64,
     last_seen: u64,
     count: u64,
+    #[serde(default)]
+    bytes_out: u64,
+    #[serde(default)]
+    bytes_in: u64,
 }
 
 /// Default learned-baseline location: `<state_dir>/netwatch/egress-profiles.json`
@@ -1874,6 +2088,8 @@ mod tests {
             Some("Cloudflare".into()),
             true,
             now,
+            0,
+            0,
         );
         p.record_flow(
             "chrome",
@@ -1883,6 +2099,8 @@ mod tests {
             Some("Cloudflare".into()),
             false,
             now,
+            0,
+            0,
         );
         let snap = p.snapshot();
         let dest = snap[0].dests.get(&("Cloudflare".to_string(), 443)).unwrap();
@@ -2007,6 +2225,8 @@ mod tests {
             Some("Cloudflare".into()),
             true,
             SystemTime::now(),
+            0,
+            0,
         );
         let mut policy = EgressPolicy::default();
         policy.process.insert(
@@ -2320,6 +2540,9 @@ mod blank_and_split_regressions {
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,
+            bytes_out: 0,
+            bytes_in: 0,
+            activity: VecDeque::new(),
         }
     }
 
@@ -2535,5 +2758,170 @@ mod blank_and_split_regressions {
             Some(true),
             "declared destination warned as drift under the truncated name"
         );
+    }
+}
+
+/// The verdict vocabulary: `✓ sni` and `~ asn` are both "admitted", but only
+/// one of them is a statement about a single endpoint. Collapsing them is
+/// what let a promoted rule quietly allow an entire hyperscaler.
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    fn rule(sni: &[&str], asn: &[&str], ip: &[&str], ports: &[u16]) -> ProcessRule {
+        ProcessRule {
+            allow_sni: sni.iter().map(|s| s.to_string()).collect(),
+            allow_asn: asn.iter().map(|s| s.to_string()).collect(),
+            allow_ip: ip.iter().map(|s| s.to_string()).collect(),
+            allow_ports: ports.to_vec(),
+        }
+    }
+
+    fn profiler(r: ProcessRule) -> EgressProfiler {
+        let mut p = EgressProfiler::new();
+        let mut policy = EgressPolicy::default();
+        policy.process.insert("app".into(), r);
+        p.set_policy(Some(policy));
+        p
+    }
+
+    fn dest(sni: Option<&str>, asn: Option<&str>, ip: &str, ech: bool) -> EgressDest {
+        EgressDest {
+            sni: sni.map(str::to_string),
+            asn_org: asn.map(str::to_string),
+            port: 443,
+            last_ip: ip.to_string(),
+            ech,
+            first_seen: SystemTime::now(),
+            last_seen: SystemTime::now(),
+            count: 1,
+            bytes_out: 0,
+            bytes_in: 0,
+            activity: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn exact_hostname_is_reported_as_precise() {
+        let p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        assert_eq!(
+            p.verdict(
+                "app",
+                &dest(Some("api.example.com"), None, "1.2.3.4", false)
+            ),
+            Verdict::Sni
+        );
+    }
+
+    /// The finding this whole vocabulary exists for: admitted, but by an
+    /// autonomous system rather than a name. Must not read as `Sni`.
+    #[test]
+    fn asn_match_is_distinguished_from_a_name_match() {
+        let p = profiler(rule(&["api.example.com"], &["Google LLC"], &[], &[]));
+        let v = p.verdict("app", &dest(None, Some("Google LLC"), "1.2.3.4", false));
+        assert_eq!(v, Verdict::Asn("Google LLC".into()));
+        assert!(v.is_notable(), "an ASN-wide match must be flagged");
+        assert_ne!(v, Verdict::Sni);
+    }
+
+    /// A destination with a readable name that isn't declared, admitted only
+    /// because its ASN is — the silent over-admission. It must surface as
+    /// `Asn`, not a clean tick.
+    #[test]
+    fn undeclared_hostname_admitted_by_asn_is_flagged_not_clean() {
+        let p = profiler(rule(&["api.example.com"], &["Google LLC"], &[], &[]));
+        let v = p.verdict(
+            "app",
+            &dest(
+                Some("evil.appspot.com"),
+                Some("Google LLC"),
+                "1.2.3.4",
+                false,
+            ),
+        );
+        assert_eq!(v, Verdict::Asn("Google LLC".into()));
+        assert!(v.is_notable());
+    }
+
+    #[test]
+    fn declared_ip_is_precise() {
+        let p = profiler(rule(&[], &[], &["1.2.3.4"], &[]));
+        assert_eq!(
+            p.verdict("app", &dest(None, None, "1.2.3.4", false)),
+            Verdict::Ip
+        );
+    }
+
+    #[test]
+    fn outside_the_allowlist_is_drift() {
+        let p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        assert_eq!(
+            p.verdict(
+                "app",
+                &dest(Some("evil.example.net"), None, "9.9.9.9", false)
+            ),
+            Verdict::Drift
+        );
+    }
+
+    /// ECH hides the real name, so a miss is "cannot judge" — never drift.
+    #[test]
+    fn ech_miss_is_unreadable_not_drift() {
+        let p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        assert_eq!(
+            p.verdict("app", &dest(None, None, "9.9.9.9", true)),
+            Verdict::Ech
+        );
+    }
+
+    /// The critical coverage gap, made explicit: a process with no rule is
+    /// never checked, and that must be a distinct visible state rather than
+    /// looking like approval.
+    #[test]
+    fn undeclared_process_is_unchecked_not_approved() {
+        let p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        let v = p.verdict("other", &dest(Some("anything.com"), None, "9.9.9.9", false));
+        assert_eq!(v, Verdict::NoRule);
+        assert!(v.is_notable(), "unchecked must be visible");
+        assert_ne!(v, Verdict::Sni);
+    }
+
+    #[test]
+    fn no_policy_is_its_own_state() {
+        let p = EgressProfiler::new();
+        assert_eq!(
+            p.verdict("app", &dest(Some("x.com"), None, "1.2.3.4", false)),
+            Verdict::NoPolicy
+        );
+    }
+
+    /// A port outside the allowlist is drift regardless of the name.
+    #[test]
+    fn port_outside_the_allowlist_is_drift() {
+        let p = profiler(rule(&["api.example.com"], &[], &[], &[8443]));
+        assert_eq!(
+            p.verdict(
+                "app",
+                &dest(Some("api.example.com"), None, "1.2.3.4", false)
+            ),
+            Verdict::Drift
+        );
+    }
+
+    #[test]
+    fn bytes_accumulate_and_never_downgrade() {
+        let mut p = EgressProfiler::new();
+        let t = SystemTime::now();
+        p.record_flow("app", "1.2.3.4", 443, sni("a.com"), None, false, t, 100, 10);
+        p.record_flow("app", "1.2.3.4", 443, sni("a.com"), None, false, t, 50, 5);
+        let snap = p.snapshot();
+        let d = snap[0].dests.values().next().unwrap();
+        assert_eq!(d.bytes_out, 150);
+        assert_eq!(d.bytes_in, 15);
+        assert_eq!(d.activity.len(), 2, "one activity sample per observation");
+    }
+
+    fn sni(h: &str) -> Option<String> {
+        Some(h.to_string())
     }
 }

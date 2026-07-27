@@ -89,6 +89,41 @@ pub struct LiteState {
 /// Future tests can construct an `AppUiState` directly and exercise event
 /// handlers (filter parsing, settings cursor movement, status fade timers)
 /// without needing to spin up any collector threads.
+/// Ordering for the Egress tree. Volume first by default: on a screen whose
+/// job is "what left this machine", the biggest talker is the story.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EgressSort {
+    #[default]
+    Volume,
+    Active,
+    Process,
+    LastSeen,
+    Risk,
+}
+
+impl EgressSort {
+    pub const ALL: &'static [EgressSort] = &[
+        EgressSort::Volume,
+        EgressSort::Active,
+        EgressSort::Process,
+        EgressSort::LastSeen,
+        EgressSort::Risk,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            EgressSort::Volume => "volume",
+            EgressSort::Active => "active",
+            EgressSort::Process => "process",
+            EgressSort::LastSeen => "last seen",
+            EgressSort::Risk => "risk",
+        }
+    }
+    pub fn next(self) -> EgressSort {
+        let i = EgressSort::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        EgressSort::ALL[(i + 1) % EgressSort::ALL.len()]
+    }
+}
+
 pub struct AppUiState {
     pub current_tab: Tab,
     /// Full tabbed TUI vs the single-screen Lite view. Opt-in only.
@@ -117,6 +152,19 @@ pub struct AppUiState {
     pub connection_filter_input: bool,
     pub connection_filter_text: String,
     pub connection_filter_active: Option<String>,
+    pub egress_filter_input: bool,
+    pub egress_filter_text: String,
+    pub egress_filter_active: Option<String>,
+
+    // ── Egress-tab specifics ──
+    /// Processes whose destination rows are collapsed. Collapsed is the
+    /// exception, so an empty set means "everything expanded" and a fresh
+    /// session shows all the detail.
+    pub egress_collapsed: std::collections::HashSet<String>,
+    /// Column the Egress tree is ordered by.
+    pub egress_sort: EgressSort,
+    /// Whether the destination detail pane is open (`d`).
+    pub egress_detail: bool,
 
     // ── Packet-tab specifics ──
     pub packet_follow: bool,
@@ -182,6 +230,12 @@ impl AppUiState {
             connection_filter_input: false,
             connection_filter_text: String::new(),
             connection_filter_active: None,
+            egress_filter_input: false,
+            egress_filter_text: String::new(),
+            egress_filter_active: None,
+            egress_collapsed: std::collections::HashSet::new(),
+            egress_sort: EgressSort::default(),
+            egress_detail: false,
 
             packet_follow: cfg.packet_follow,
             packet_detail_expanded: false,
