@@ -337,6 +337,17 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
         "— no rule",
         "Process undeclared — nothing was checked",
     ));
+    lines.push(key_line(
+        theme,
+        "✗ undeclared",
+        "No rule, under strict = true — the absence is the finding",
+    ));
+    lines.push(Line::raw(""));
+    lines.push(key_line(
+        theme,
+        "strict = true",
+        "Set in egress-policy.toml to warn on any undeclared process",
+    ));
     lines.push(Line::raw(""));
 
     // DISPLAY FILTER SYNTAX

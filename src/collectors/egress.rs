@@ -49,6 +49,15 @@ const VIOLATION_COOLDOWN_SECS: u64 = 300;
 const STALE_DEST_SECS: u64 = 30 * 24 * 3600;
 /// Write the learned baseline to disk at most this often (plus once at quit).
 const PERSIST_INTERVAL_SECS: u64 = 60;
+/// Under `strict = true`, how many observation ticks (~1 s each) a process
+/// must persist before its lack of a rule is reported.
+///
+/// Set low on purpose. The noise it exists to suppress is a fork storm of
+/// short-lived build tooling, each member appearing for a single tick; the
+/// thing it must *not* suppress is a burst of exfiltration, which cannot
+/// move meaningful volume in under a few seconds. Erring high would trade
+/// the feature's whole point for tidiness.
+const UNDECLARED_SETTLE_TICKS: u64 = 3;
 /// Schema tag stamped on the NDJSON export's `_meta` line. Bump the minor
 /// when adding fields (additive/back-compatible), the major on a breaking
 /// change — the managed ingest keys off this.
@@ -139,6 +148,11 @@ pub enum Verdict {
     /// `NoPolicy` — here the operator has a policy and simply never declared
     /// this program.
     NoRule,
+    /// The process has no rule and the policy claims to be complete
+    /// (`strict = true`), so the absence *is* the finding. Distinct from
+    /// `NoRule`, which is the same fact without the claim: unchecked versus
+    /// checked-and-unexpected.
+    Undeclared,
     /// No policy loaded at all; observe-only.
     NoPolicy,
 }
@@ -153,13 +167,17 @@ impl Verdict {
             Verdict::Ech => "? ech",
             Verdict::Drift => "\u{2717} drift",
             Verdict::NoRule => "\u{2014} no rule",
+            Verdict::Undeclared => "\u{2717} undeclared",
             Verdict::NoPolicy => "\u{2014}",
         }
     }
     /// True for states the operator should look at: broad matches and
     /// outright drift. Drives colour and the header tally.
     pub fn is_notable(&self) -> bool {
-        matches!(self, Verdict::Asn(_) | Verdict::Drift | Verdict::NoRule)
+        matches!(
+            self,
+            Verdict::Asn(_) | Verdict::Drift | Verdict::NoRule | Verdict::Undeclared
+        )
     }
 }
 
@@ -192,7 +210,8 @@ pub struct EgressRecord {
     pub last_seen: u64,
     pub count: u64,
     /// Policy verdict at export time: `ok` | `drift` | `unreadable` (ECH,
-    /// name hidden) | `unchecked` (no rule for this process).
+    /// name hidden) | `unchecked` (no rule for this process, observe mode) |
+    /// `undeclared` (no rule, under a policy declaring itself complete).
     pub verdict: String,
     /// Which dimension admitted an `ok` verdict — `sni` | `ip` | `asn`.
     /// `None` for anything not admitted.
@@ -365,9 +384,12 @@ impl EgressProfiler {
             .retain(|_, &mut t| now.duration_since(t) < cooldown);
     }
 
-    /// Compare one observed flow against the loaded policy. Only processes
-    /// that *have* a declared rule are checked — an unlisted process has no
-    /// rule to violate, so it never warns (deterministic, low-noise). A new
+    /// Compare one observed flow against the loaded policy.
+    ///
+    /// By default only processes that *have* a declared rule are checked — an
+    /// unlisted process has no rule to violate, so it never warns
+    /// (deterministic, low-noise). Under `strict = true` the policy claims to
+    /// be complete, so an undeclared process is itself the finding. A new
     /// violation is queued (subject to the per-flow cooldown).
     #[allow(clippy::too_many_arguments)]
     fn check_policy(
@@ -386,18 +408,29 @@ impl EgressProfiler {
         // under the truncated `comm` still matches a rule declared under the
         // full name (and vice versa). Computed before borrowing the policy.
         let canonical = self.canonical_process(process);
+        // Under strict mode, has this process been around long enough to be
+        // worth reporting? Computed before the policy borrow.
+        let settled = self.process_is_settled(process);
         let Some(policy) = &self.policy else {
             return;
         };
-        let Some(rule) = policy
+        let rule = policy
             .process
             .get(process)
-            .or_else(|| policy.process.get(canonical.as_str()))
-        else {
-            return;
-        };
-        let Some(mut reason) = rule.violation(sni.as_deref(), asn_org.as_deref(), ip, port) else {
-            return;
+            .or_else(|| policy.process.get(canonical.as_str()));
+        let mut reason = match rule {
+            Some(rule) => match rule.violation(sni.as_deref(), asn_org.as_deref(), ip, port) {
+                Some(r) => r,
+                None => return,
+            },
+            // No rule. In observe mode that is silence by design; in strict
+            // mode it is the whole point of the feature.
+            None => {
+                if !policy.strict || !settled {
+                    return;
+                }
+                format!("{process} has no rule in the egress policy")
+            }
         };
         // An ECH flow's inner SNI is hidden by design — the miss may be
         // "name unreadable", not real drift. Say so in the alert.
@@ -437,6 +470,19 @@ impl EgressProfiler {
         self.recent.truncate(RECENT_VIOLATIONS_CAP);
     }
 
+    /// Whether a process has been observed long enough for strict mode to
+    /// report it as undeclared.
+    ///
+    /// `count` is dwell in observation ticks, so the longest-lived
+    /// destination is how long the process has been talking. Because the
+    /// baseline persists, a program seen for hours in a previous session is
+    /// settled immediately on restart — which is right: it is not new.
+    fn process_is_settled(&self, process: &str) -> bool {
+        self.profiles
+            .get(process)
+            .is_some_and(|p| p.dests.values().any(|d| d.count >= UNDECLARED_SETTLE_TICKS))
+    }
+
     /// Recent violations retained for the on-screen warnings panel, newest
     /// first. Independent of `take_violations` (which drains the alert feed).
     pub fn recent_violations(&self) -> impl Iterator<Item = &RecentViolation> {
@@ -467,7 +513,9 @@ impl EgressProfiler {
             // ECH is a policy *miss* whose cause is an encrypted name. It
             // stays `false` here so the export keeps reporting it as
             // "unreadable"; only the presentation differs from real drift.
-            Verdict::Drift | Verdict::Ech => Some(false),
+            // `Undeclared` is a miss too — under a policy that claims to be
+            // complete, "no rule" is a finding rather than a blind spot.
+            Verdict::Drift | Verdict::Ech | Verdict::Undeclared => Some(false),
             _ => Some(true),
         }
     }
@@ -489,7 +537,13 @@ impl EgressProfiler {
             .get(process)
             .or_else(|| policy.process.get(canonical.as_str()))
         else {
-            return Verdict::NoRule;
+            // Same fact, two readings: unchecked when the policy is partial,
+            // a finding when it claims to be complete.
+            return if policy.strict {
+                Verdict::Undeclared
+            } else {
+                Verdict::NoRule
+            };
         };
         if rule
             .violation(
@@ -872,6 +926,11 @@ impl EgressProfiler {
                 let verdict = match &v {
                     Verdict::Ech => "unreadable",
                     Verdict::Drift => "drift",
+                    // Its own value, not folded into `drift`: nothing was
+                    // compared, so calling it drift would overstate what the
+                    // linter knows. A consumer that wants findings takes
+                    // `drift | undeclared`.
+                    Verdict::Undeclared => "undeclared",
                     Verdict::NoRule | Verdict::NoPolicy => "unchecked",
                     _ => "ok",
                 }
@@ -1104,26 +1163,50 @@ impl EgressProfiler {
     }
 }
 
+/// Whether an ASN org string names an actual organisation.
+///
+/// The geo database uses `Unassigned` as its *failure* label, and a lookup
+/// that finds nothing yields an empty string. Allowlisting either admits
+/// every destination whose ASN lookup failed — the opposite of an allowlist.
+/// Checked wherever a rule is generated; a hand-written policy is still
+/// honoured verbatim, because the file should do what it says.
+fn is_identifying_asn(org: &str) -> bool {
+    let t = org.trim();
+    !t.is_empty() && !t.eq_ignore_ascii_case("unassigned") && !t.eq_ignore_ascii_case("unknown")
+}
+
 /// Build the allowlist rule a profile's observations imply.
+///
+/// Promotion never widens a rule to an autonomous system. An ASN match
+/// admits everything that AS operates — for a hyperscaler, effectively the
+/// whole internet — so learning one nameless Google flow would have handed
+/// the process every host Google runs, permanently and invisibly. Identity
+/// is taken from the SNI where there is one and the address otherwise; an
+/// ASN entry is only ever reached when a destination has *no* other
+/// identity at all, and even then only if the org actually names someone.
+/// Widening to an AS remains available, but as a deliberate hand edit.
 fn rule_from_profile(profile: &EgressProfile) -> ProcessRule {
     let mut allow_sni = BTreeSet::new();
     let mut allow_asn = BTreeSet::new();
     let mut allow_ip = BTreeSet::new();
     let mut allow_ports = BTreeSet::new();
     for dest in profile.dests.values() {
-        match (&dest.sni, &dest.asn_org) {
-            (Some(s), _) => {
+        match &dest.sni {
+            Some(s) => {
                 allow_sni.insert(s.clone());
             }
-            (None, Some(a)) => {
-                allow_asn.insert(a.clone());
-            }
-            // No name at all: the IP is the only identity we have, so admit
-            // it by IP — otherwise this dest would drift against its own
-            // promoted rule the moment a sibling dest contributed an SNI.
-            (None, None) => {
+            // No readable name: the address is the precise identity we have,
+            // so admit that. This also keeps a promoted baseline admitting
+            // its own members — without it a nameless dest would drift
+            // against its own rule the moment a sibling contributed an SNI.
+            None => {
                 if !dest.last_ip.is_empty() {
                     allow_ip.insert(dest.last_ip.clone());
+                } else if let Some(a) = dest.asn_org.as_deref().filter(|a| is_identifying_asn(a)) {
+                    // Neither name nor address survived. The AS is the last
+                    // identity left, and admitting it beats emitting a rule
+                    // that flags its own baseline.
+                    allow_asn.insert(a.to_string());
                 }
             }
         }
@@ -1195,6 +1278,21 @@ pub fn default_profiles_path() -> Option<PathBuf> {
 /// it — a sentence no firewall ruleset can express. It never blocks.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EgressPolicy {
+    /// Treat the policy as *complete*: a process with no rule is a finding,
+    /// not a blind spot. Off by default, because it is only meaningful once
+    /// the operator believes they have declared everything.
+    ///
+    /// This is the difference between "netwatch tells me when my declared
+    /// software misbehaves" and "netwatch tells me when something is
+    /// exfiltrating". Without it the linter cannot see the one thing a
+    /// compromise actually introduces — a binary nobody declared — because
+    /// an undeclared process has no rule to violate and so warns never.
+    ///
+    /// Lives in the policy file rather than config.toml deliberately: it is
+    /// a claim about *this policy*, travels with it, and is meaningless
+    /// without one.
+    #[serde(default)]
+    pub strict: bool,
     #[serde(default)]
     pub process: HashMap<String, ProcessRule>,
 }
@@ -1385,7 +1483,16 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 const POLICY_HEADER: &str = "# netwatch egress policy (observe → promote → warn).\n\
                              # Generated from the observed baseline; review before trusting.\n\
-                             # The linter WARNS on drift — it never blocks.\n\n";
+                             # The linter WARNS on drift — it never blocks.\n\
+                             #\n\
+                             # strict = true treats this policy as complete: any process\n\
+                             # WITHOUT a rule below is then reported as undeclared. Off by\n\
+                             # default. Turn it on once you believe the list is complete —\n\
+                             # it is what lets the linter see a binary nobody declared.\n\
+                             #\n\
+                             # Promotion never writes allow_asn from an observation: an AS\n\
+                             # entry admits every host that AS operates. Widen by hand if\n\
+                             # you mean it.\n\n";
 
 /// Union the string entries already declared under `key` in an existing
 /// TOML process table with the newly-promoted ones. Deduped, sorted, stable.
@@ -1761,8 +1868,12 @@ mod tests {
         let chrome = policy.process.get("chrome").unwrap();
         assert!(chrome.allow_sni.contains(&"www.google.com".to_string()));
         assert_eq!(chrome.allow_ports, vec![443]);
+        // A nameless destination is promoted by *address*, never by its
+        // autonomous system — admitting all of Quad9 is not what observing
+        // one Quad9 address means.
         let curl = policy.process.get("curl").unwrap();
-        assert!(curl.allow_asn.contains(&"Quad9".to_string()));
+        assert!(curl.allow_ip.contains(&"9.9.9.9".to_string()));
+        assert!(curl.allow_asn.is_empty());
 
         // The promoted policy must not flag the very baseline it came from.
         assert!(chrome
@@ -1772,6 +1883,9 @@ mod tests {
                 "142.250.1.1",
                 443
             )
+            .is_none());
+        assert!(curl
+            .violation(None, Some("Quad9"), "9.9.9.9", 443)
             .is_none());
     }
 
@@ -2906,6 +3020,227 @@ mod verdict_tests {
             ),
             Verdict::Drift
         );
+    }
+
+    /// Under a policy that declares itself complete, the same absence is a
+    /// finding rather than a blind spot — and must not be confused with
+    /// drift, which is a *declared* process going somewhere new.
+    #[test]
+    fn strict_mode_reports_an_undeclared_process_as_a_finding() {
+        let mut p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        let mut policy = p.policy.clone().unwrap();
+        policy.strict = true;
+        p.set_policy(Some(policy));
+
+        let v = p.verdict("other", &dest(Some("anything.com"), None, "9.9.9.9", false));
+        assert_eq!(v, Verdict::Undeclared);
+        assert!(v.is_notable());
+        assert_ne!(v, Verdict::Drift, "nothing was compared — don't say drift");
+        assert_eq!(
+            p.dest_allowed("other", &dest(Some("anything.com"), None, "9.9.9.9", false)),
+            Some(false),
+            "strict turns 'unchecked' into 'not allowed'"
+        );
+        // A process that IS declared is unaffected.
+        assert_eq!(
+            p.verdict(
+                "app",
+                &dest(Some("api.example.com"), None, "1.2.3.4", false)
+            ),
+            Verdict::Sni
+        );
+    }
+
+    /// Strict mode is opt-in: the same profiler without the flag stays silent
+    /// about processes it was never told about.
+    #[test]
+    fn strict_is_off_by_default_and_observe_mode_stays_silent() {
+        let mut p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        assert!(!p.policy.as_ref().unwrap().strict);
+        let now = Instant::now();
+        for _ in 0..10 {
+            p.record_flow(
+                "unknown",
+                "203.0.113.9",
+                443,
+                sni("evil.example.com"),
+                None,
+                false,
+                SystemTime::now(),
+                0,
+                0,
+            );
+            p.check_policy(
+                "unknown",
+                "203.0.113.9",
+                443,
+                &sni("evil.example.com"),
+                &None,
+                false,
+                now,
+            );
+        }
+        assert!(
+            p.take_violations().is_empty(),
+            "observe mode must not warn about an undeclared process"
+        );
+    }
+
+    /// The warning strict mode exists to produce, plus the settle threshold
+    /// that keeps a fork storm of one-tick build tooling from storming.
+    #[test]
+    fn strict_warns_on_an_undeclared_process_once_it_has_settled() {
+        let mut p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        let mut policy = p.policy.clone().unwrap();
+        policy.strict = true;
+        p.set_policy(Some(policy));
+        p.set_violation_cooldown(0);
+        let now = Instant::now();
+
+        let step = |p: &mut EgressProfiler| {
+            p.record_flow(
+                "backdoor",
+                "203.0.113.9",
+                443,
+                sni("evil.example.com"),
+                None,
+                false,
+                SystemTime::now(),
+                0,
+                0,
+            );
+            p.check_policy(
+                "backdoor",
+                "203.0.113.9",
+                443,
+                &sni("evil.example.com"),
+                &None,
+                false,
+                now,
+            );
+        };
+
+        // A single-tick appearance is below the settle threshold.
+        step(&mut p);
+        assert!(
+            p.take_violations().is_empty(),
+            "a one-tick process must not warn"
+        );
+
+        // Sustained presence crosses it.
+        for _ in 0..UNDECLARED_SETTLE_TICKS {
+            step(&mut p);
+        }
+        let v = p.take_violations();
+        assert!(!v.is_empty(), "a settled undeclared process must warn");
+        assert_eq!(v[0].process, "backdoor");
+        assert!(
+            v[0].reason.contains("no rule"),
+            "the reason must name the actual finding, got {:?}",
+            v[0].reason
+        );
+        assert_eq!(
+            p.violation_totals_sorted()
+                .iter()
+                .find(|(n, _)| n == "backdoor")
+                .map(|(_, c)| *c),
+            Some(v.len() as u64),
+            "strict findings feed the same violation counter as drift"
+        );
+    }
+
+    /// Strict findings export under their own verdict rather than being
+    /// folded into `drift` — the consumer should be able to tell "went
+    /// somewhere new" from "was never accounted for".
+    #[test]
+    fn strict_finding_exports_as_undeclared() {
+        let mut p = profiler(rule(&["api.example.com"], &[], &[], &[]));
+        let mut policy = p.policy.clone().unwrap();
+        policy.strict = true;
+        p.set_policy(Some(policy));
+        p.record_flow(
+            "backdoor",
+            "203.0.113.9",
+            443,
+            sni("evil.example.com"),
+            None,
+            false,
+            SystemTime::now(),
+            0,
+            0,
+        );
+        let recs = p.export_records();
+        let rec = recs.iter().find(|r| r.process == "backdoor").unwrap();
+        assert_eq!(rec.verdict, "undeclared");
+        assert_eq!(rec.matched_by, None);
+    }
+
+    /// Promotion must not widen a rule to an entire autonomous system: one
+    /// nameless flow to a hyperscaler would otherwise admit every host that
+    /// hyperscaler operates, for that process, permanently and invisibly.
+    #[test]
+    fn promotion_never_widens_to_an_autonomous_system() {
+        let mut p = EgressProfiler::new();
+        let now = SystemTime::now();
+        p.record(
+            "app",
+            "35.190.46.17",
+            443,
+            None,
+            Some("Google LLC".into()),
+            now,
+        );
+
+        let rule = p.promote_one("app").unwrap();
+        assert!(
+            rule.allow_asn.is_empty(),
+            "promoted an ASN: {:?}",
+            rule.allow_asn
+        );
+        assert_eq!(rule.allow_ip, vec!["35.190.46.17".to_string()]);
+
+        // The narrower rule still admits the baseline it came from...
+        assert!(rule
+            .violation(None, Some("Google LLC"), "35.190.46.17", 443)
+            .is_none());
+        // ...but a different Google-hosted endpoint is now drift, where the
+        // ASN-wide rule would have rendered it a clean tick.
+        assert!(rule
+            .violation(
+                Some("evil.appspot.com"),
+                Some("Google LLC"),
+                "35.190.46.99",
+                443
+            )
+            .is_some());
+    }
+
+    /// `Unassigned` is the geo database's *failure* label, not an
+    /// organisation. Allowlisting it would admit every destination whose ASN
+    /// lookup failed — an allowlist that grows by not working.
+    #[test]
+    fn a_failed_asn_lookup_is_never_promoted_as_an_identity() {
+        for label in ["Unassigned", "unassigned", "  ", "Unknown"] {
+            assert!(!is_identifying_asn(label), "{label:?} is not an identity");
+        }
+        assert!(is_identifying_asn("Google LLC"));
+
+        // Even on the last-resort path — no name and no address — a failure
+        // label must not become a rule.
+        let mut p = EgressProfiler::new();
+        p.record_flow(
+            "app",
+            "",
+            443,
+            None,
+            Some("Unassigned".into()),
+            false,
+            SystemTime::now(),
+            0,
+            0,
+        );
+        let rule = p.promote_one("app").unwrap_or_default();
+        assert!(rule.allow_asn.is_empty());
     }
 
     #[test]

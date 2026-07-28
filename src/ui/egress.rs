@@ -51,6 +51,25 @@ pub enum EgressRow<'a> {
     },
 }
 
+/// Attention ordering over verdicts — lower is more urgent. Drives both the
+/// risk sort and the rollup verdict a collapsed process shows.
+///
+/// `Undeclared` outranks `Drift`: drift is declared software reaching
+/// somewhere new, whereas an undeclared process is a program the operator
+/// never accounted for at all, under a policy that says they accounted for
+/// everything. `NoRule` is the same absence without that claim, so it sits
+/// below both — worth surfacing, not yet a finding.
+fn verdict_rank(v: &Verdict) -> u8 {
+    match v {
+        Verdict::Undeclared => 0,
+        Verdict::Drift => 1,
+        Verdict::NoRule => 2,
+        Verdict::Asn(_) => 3,
+        Verdict::Ech => 4,
+        _ => 5,
+    }
+}
+
 /// Flatten the profiles into the visible row list, honouring filter,
 /// collapse state and sort. Public so the mouse handler maps clicks against
 /// exactly the rows the renderer drew.
@@ -132,15 +151,9 @@ pub fn visible_rows(app: &App) -> Vec<EgressRow<'_>> {
         EgressSort::Risk => groups.sort_by(|a, b| {
             let rank = |g: &Group<'_>| {
                 g.1.iter()
-                    .map(|(_, _, v)| match v {
-                        Verdict::Drift => 0,
-                        Verdict::NoRule => 1,
-                        Verdict::Asn(_) => 2,
-                        Verdict::Ech => 3,
-                        _ => 4,
-                    })
+                    .map(|(_, _, v)| verdict_rank(v))
                     .min()
-                    .unwrap_or(4)
+                    .unwrap_or(u8::MAX)
             };
             rank(a).cmp(&rank(b)).then_with(|| key(b).0.cmp(&key(a).0))
         }),
@@ -154,13 +167,7 @@ pub fn visible_rows(app: &App) -> Vec<EgressRow<'_>> {
         let worst = dests
             .iter()
             .map(|(_, _, v)| v.clone())
-            .min_by_key(|v| match v {
-                Verdict::Drift => 0,
-                Verdict::NoRule => 1,
-                Verdict::Asn(_) => 2,
-                Verdict::Ech => 3,
-                _ => 4,
-            })
+            .min_by_key(verdict_rank)
             .unwrap_or(Verdict::NoPolicy);
         rows.push(EgressRow::Process {
             profile,
@@ -331,32 +338,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             _ => None,
         })
         .sum();
-    // The two counts the policy analysis called critical, on the default
-    // screen: how much is unchecked, and how much is admitted ASN-wide.
-    let unchecked = rows
-        .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                EgressRow::Process {
-                    worst: Verdict::NoRule,
-                    ..
-                }
-            )
-        })
-        .count();
-    let asn_wide = rows
-        .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                EgressRow::Dest {
-                    verdict: Verdict::Asn(_),
-                    ..
-                }
-            )
-        })
-        .count();
+    // The counts the policy analysis called critical, on the default screen:
+    // what was never checked, what a complete policy failed to declare, and
+    // what is admitted ASN-wide.
+    let Tally {
+        undeclared,
+        no_rule,
+        asn_wide,
+    } = tally(&rows);
 
     let mut extra = vec![
         Span::raw("  "),
@@ -374,9 +363,15 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     if app.egress_profiler.has_policy() {
-        if unchecked > 0 {
+        if undeclared > 0 {
             extra.push(Span::styled(
-                format!("  ·  {unchecked} undeclared"),
+                format!("  ·  {undeclared} undeclared"),
+                Style::default().fg(t.status_error).bold(),
+            ));
+        }
+        if no_rule > 0 {
+            extra.push(Span::styled(
+                format!("  ·  {no_rule} unchecked"),
                 Style::default().fg(t.status_warn).bold(),
             ));
         }
@@ -386,7 +381,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.status_warn).bold(),
             ));
         }
-        if unchecked == 0 && asn_wide == 0 {
+        if undeclared == 0 && no_rule == 0 && asn_wide == 0 {
             extra.push(Span::styled(
                 "  ·  policy: all precise",
                 Style::default().fg(t.status_good),
@@ -399,6 +394,46 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     widgets::render_header_with_extra(f, app, area, extra);
+}
+
+/// The attention counts, shared by the header line and the panel title so
+/// the two can never disagree.
+///
+/// `undeclared` and `no_rule` are the same underlying absence read under
+/// different policies, and they are counted separately on purpose: one is a
+/// finding the operator asked for, the other is coverage they haven't
+/// claimed yet. Both are per *process*; `asn_wide` is per destination,
+/// because breadth is a property of the individual match.
+struct Tally {
+    undeclared: usize,
+    no_rule: usize,
+    asn_wide: usize,
+}
+
+fn tally(rows: &[EgressRow<'_>]) -> Tally {
+    let mut out = Tally {
+        undeclared: 0,
+        no_rule: 0,
+        asn_wide: 0,
+    };
+    for r in rows {
+        match r {
+            EgressRow::Process {
+                worst: Verdict::Undeclared,
+                ..
+            } => out.undeclared += 1,
+            EgressRow::Process {
+                worst: Verdict::NoRule,
+                ..
+            } => out.no_rule += 1,
+            EgressRow::Dest {
+                verdict: Verdict::Asn(_),
+                ..
+            } => out.asn_wide += 1,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The counts that decide whether the operator needs to care, rendered for
@@ -424,30 +459,11 @@ fn summary_line(app: &App, rows: &[EgressRow<'_>]) -> Line<'static> {
             _ => None,
         })
         .sum();
-    let unchecked = rows
-        .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                EgressRow::Process {
-                    worst: Verdict::NoRule,
-                    ..
-                }
-            )
-        })
-        .count();
-    let asn_wide = rows
-        .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                EgressRow::Dest {
-                    verdict: Verdict::Asn(_),
-                    ..
-                }
-            )
-        })
-        .count();
+    let Tally {
+        undeclared,
+        no_rule,
+        asn_wide,
+    } = tally(rows);
 
     let mut spans = vec![
         Span::styled(" Egress ", Style::default().fg(t.brand).bold()),
@@ -463,9 +479,15 @@ fn summary_line(app: &App, rows: &[EgressRow<'_>]) -> Line<'static> {
         ));
     }
     if app.egress_profiler.has_policy() {
-        if unchecked > 0 {
+        if undeclared > 0 {
             spans.push(Span::styled(
-                format!(" · {unchecked} undeclared"),
+                format!(" · {undeclared} undeclared"),
+                Style::default().fg(t.status_error).bold(),
+            ));
+        }
+        if no_rule > 0 {
+            spans.push(Span::styled(
+                format!(" · {no_rule} unchecked"),
                 Style::default().fg(t.status_warn).bold(),
             ));
         }
@@ -475,7 +497,7 @@ fn summary_line(app: &App, rows: &[EgressRow<'_>]) -> Line<'static> {
                 Style::default().fg(t.status_warn).bold(),
             ));
         }
-        if unchecked == 0 && asn_wide == 0 {
+        if undeclared == 0 && no_rule == 0 && asn_wide == 0 {
             spans.push(Span::styled(
                 " · all precise",
                 Style::default().fg(t.status_good),
@@ -672,6 +694,8 @@ fn verdict_style(t: &crate::theme::Theme, v: &Verdict, rollup: bool) -> (Color, 
         Verdict::Ech => (t.status_warn, v.label().to_string()),
         Verdict::Drift => (t.status_error, v.label().to_string()),
         Verdict::NoRule => (t.status_warn, v.label().to_string()),
+        // A finding, not a gap — the policy said it was complete.
+        Verdict::Undeclared => (t.status_error, v.label().to_string()),
         Verdict::NoPolicy => (t.text_muted, v.label().to_string()),
     }
 }

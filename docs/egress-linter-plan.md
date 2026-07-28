@@ -1,6 +1,14 @@
 # Plan: Horizon 3 — egress policy linter (observe → promote → warn)
 
 **Drafted:** 2026-07-04
+**Status (2026-07-28):** shipped through v0.27.0. Since then, on
+`feat/egress-tree-ux`: byte accounting, the grouped tree and the verdict
+vocabulary; on `feat/egress-policy-criticals`: the two policy-model criticals —
+strict mode for undeclared processes, and promotion no longer widening to an
+autonomous system (see the amended invariants below). Still open from the
+2026-07-28 analysis: `--egress-lint` breadth report, exec-path rule keys, CGNAT
++ IPv4-mapped private ranges, destination-scoped ports, metrics expansion.
+
 **Status (2026-07-04):** Phases 0–2 ✅ and **Phase 3 step 1 (OSS export) ✅**
 implemented on `feat/h3-egress-linter` (commits `bedd447` foundation, `777cb22`
 tab, `38a83bb` Phase 1, `1ea0d75` Phase 2, + NDJSON export), all unreleased —
@@ -18,12 +26,21 @@ uncommitted Egress tab (`src/ui/egress.rs` + wiring in app.rs/ui/mod.rs/widgets.
 
 **Invariants (hold in every phase):**
 - Warn, never block. No inline data path, no new capabilities held after init.
-- Deterministic and low-noise: only processes with a declared rule are checked;
-  a violation names the rule it broke.
+- Deterministic and low-noise: by default only processes with a declared rule
+  are checked, and a violation names the rule it broke. **Amended 2026-07-28:**
+  `strict = true` in the policy file opts into reporting *undeclared* processes
+  too. The default is unchanged; the opt-in exists because the thing a
+  compromise introduces is a new binary, which the default can never see.
 - The baseline is how you author the config (AppArmor-style profile generation,
   applied to egress). Resist iptables-in-TOML; let real use pull complexity.
-- SNI-first matching (cleartext ClientHello — no keylog required); ASN fallback;
-  never raw IP (CDN fronting makes IP rules noise).
+- SNI-first matching (cleartext ClientHello — no keylog required), then the
+  address. **Amended 2026-07-28:** promotion no longer falls back to the ASN.
+  An AS entry admits every host that AS operates, so learning one nameless
+  hyperscaler flow silently handed the process the whole hyperscaler — measured
+  at 12 of 25 rules on a real baseline. Rules match on ASN when a human writes
+  one; nothing generates one. The original "never raw IP" line was reversed
+  earlier (a nameless dest has no other identity, and would otherwise drift
+  against its own promoted rule); IP is the narrow choice, not the loose one.
 
 ---
 
