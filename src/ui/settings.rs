@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-pub const SETTINGS_COUNT: usize = 18;
+pub const SETTINGS_COUNT: usize = 19;
 
 pub const TAB_NAMES: &[&str] = &[
     "dashboard",
@@ -39,6 +39,7 @@ pub mod cursor {
     pub const GRAPH_STYLE: usize = 15;
     pub const GRAPH_FADE: usize = 16;
     pub const SANDBOX: usize = 17;
+    pub const GROUPS_COLLAPSED: usize = 18;
 }
 
 struct SettingRow {
@@ -57,6 +58,7 @@ fn is_cycle_through(cursor: usize) -> bool {
             | cursor::GRAPH_STYLE
             | cursor::GRAPH_FADE
             | cursor::SANDBOX
+            | cursor::GROUPS_COLLAPSED
     )
 }
 
@@ -149,6 +151,15 @@ fn build_rows(cfg: &NetwatchConfig) -> Vec<SettingRow> {
         SettingRow {
             label: "Sandbox",
             value: cfg.sandbox.clone(),
+        },
+        SettingRow {
+            label: "Groups Start Folded",
+            value: if cfg.groups_start_collapsed {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
         },
     ]
 }
@@ -352,6 +363,12 @@ pub fn get_edit_value(cfg: &NetwatchConfig, cursor: usize) -> String {
         15 => cfg.graph_style.clone(),
         16 => if cfg.graph_fade { "on" } else { "off" }.into(),
         17 => cfg.sandbox.clone(),
+        18 => if cfg.groups_start_collapsed {
+            "on"
+        } else {
+            "off"
+        }
+        .into(),
         _ => String::new(),
     }
 }
@@ -485,6 +502,14 @@ pub fn apply_edit(cfg: &mut NetwatchConfig, cursor: usize, value: &str) -> Resul
                 }
                 _ => Err("Use on / strict / off".into()),
             }
+        }
+        18 => {
+            match value.to_lowercase().as_str() {
+                "on" | "true" | "yes" | "1" => cfg.groups_start_collapsed = true,
+                "off" | "false" | "no" | "0" => cfg.groups_start_collapsed = false,
+                _ => return Err("Use on / off".into()),
+            }
+            Ok(())
         }
         _ => Err("Unknown setting".into()),
     }

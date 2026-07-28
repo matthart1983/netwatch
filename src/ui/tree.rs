@@ -92,13 +92,10 @@ where
 /// This is the single definition of "what is on screen, in order". Both the
 /// renderer and the input handlers go through it, so a click, an arrow key
 /// and a drawn row can never disagree about what row 7 is.
-pub fn flatten<'a, R, C>(
-    groups: &'a [Group<R, C>],
-    collapsed: &HashSet<String>,
-) -> Vec<Row<'a, R, C>> {
+pub fn flatten<'a, R, C>(groups: &'a [Group<R, C>], fold: &FoldState) -> Vec<Row<'a, R, C>> {
     let mut rows = Vec::new();
     for group in groups {
-        let is_collapsed = collapsed.contains(&group.key);
+        let is_collapsed = fold.is_collapsed(&group.key);
         rows.push(Row::Parent {
             group,
             collapsed: is_collapsed,
@@ -112,13 +109,72 @@ pub fn flatten<'a, R, C>(
     rows
 }
 
-/// Toggle a group's fold state. Returns true if it is now collapsed.
-pub fn toggle(collapsed: &mut HashSet<String>, key: &str) -> bool {
-    if collapsed.remove(key) {
-        false
-    } else {
-        collapsed.insert(key.to_string());
-        true
+/// Which groups are folded.
+///
+/// Stored as a default plus the keys that differ from it, rather than a set of
+/// collapsed names. The distinction matters because groups appear and vanish
+/// while you are looking at the screen: with a plain collapsed-set, a process
+/// that starts talking *after* you collapsed everything would arrive expanded,
+/// and "fold all" would quietly come undone one row at a time. Here a new
+/// group inherits the default, so the screen stays as the user arranged it.
+///
+/// It also makes fold-all and expand-all exact rather than best-effort — they
+/// set the default and drop the exceptions, so they cannot leave a straggler.
+#[derive(Debug, Clone, Default)]
+pub struct FoldState {
+    /// What a group does when nothing specific has been said about it.
+    default_collapsed: bool,
+    /// Keys whose state is the opposite of `default_collapsed`.
+    exceptions: HashSet<String>,
+}
+
+impl FoldState {
+    /// A fold state where groups start collapsed (or not), per config.
+    pub fn new(default_collapsed: bool) -> Self {
+        Self {
+            default_collapsed,
+            exceptions: HashSet::new(),
+        }
+    }
+
+    pub fn is_collapsed(&self, key: &str) -> bool {
+        self.default_collapsed != self.exceptions.contains(key)
+    }
+
+    /// Toggle one group. Returns true if it is now collapsed.
+    pub fn toggle(&mut self, key: &str) -> bool {
+        if !self.exceptions.remove(key) {
+            self.exceptions.insert(key.to_string());
+        }
+        self.is_collapsed(key)
+    }
+
+    pub fn collapse_all(&mut self) {
+        self.default_collapsed = true;
+        self.exceptions.clear();
+    }
+
+    pub fn expand_all(&mut self) {
+        self.default_collapsed = false;
+        self.exceptions.clear();
+    }
+
+    /// Whether every group is currently collapsed — what a single fold-all
+    /// key needs in order to decide which way to go.
+    pub fn all_collapsed(&self) -> bool {
+        self.default_collapsed && self.exceptions.is_empty()
+    }
+
+    /// Collapse everything if anything is open, otherwise open everything.
+    /// Returns true if the result is collapsed.
+    pub fn toggle_all(&mut self) -> bool {
+        if self.all_collapsed() {
+            self.expand_all();
+            false
+        } else {
+            self.collapse_all();
+            true
+        }
     }
 }
 
@@ -157,7 +213,7 @@ mod tests {
     #[test]
     fn flatten_emits_a_parent_then_its_children() {
         let g = groups();
-        let rows = flatten(&g, &HashSet::new());
+        let rows = flatten(&g, &FoldState::new(false));
         assert_eq!(rows.len(), 5);
         assert!(rows[0].is_parent());
         assert_eq!(rows[0].key(), "curl");
@@ -172,9 +228,9 @@ mod tests {
     #[test]
     fn collapsing_hides_children_but_never_the_parent() {
         let g = groups();
-        let mut collapsed = HashSet::new();
-        collapsed.insert("curl".to_string());
-        let rows = flatten(&g, &collapsed);
+        let mut fold = FoldState::new(false);
+        fold.toggle("curl");
+        let rows = flatten(&g, &fold);
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|r| r.is_parent() || r.key() == "gh"));
         assert!(rows[0].is_parent() && rows[0].key() == "curl");
@@ -182,11 +238,70 @@ mod tests {
 
     #[test]
     fn toggle_round_trips() {
-        let mut collapsed = HashSet::new();
-        assert!(toggle(&mut collapsed, "curl"));
-        assert!(collapsed.contains("curl"));
-        assert!(!toggle(&mut collapsed, "curl"));
-        assert!(collapsed.is_empty());
+        let mut fold = FoldState::new(false);
+        assert!(fold.toggle("curl"));
+        assert!(fold.is_collapsed("curl"));
+        assert!(!fold.toggle("curl"));
+        assert!(!fold.is_collapsed("curl"));
+    }
+
+    /// Starting collapsed must mean *every* group, including ones that did
+    /// not exist yet. A collapsed-set model gets this wrong: a process that
+    /// starts talking after you folded everything arrives expanded, and the
+    /// screen you arranged unpicks itself one row at a time.
+    #[test]
+    fn a_group_first_seen_later_inherits_the_default() {
+        let fold = FoldState::new(true);
+        assert!(fold.is_collapsed("never-seen-before"));
+        let open = FoldState::new(false);
+        assert!(!open.is_collapsed("never-seen-before"));
+    }
+
+    /// Toggling one group under a collapsed default expands just that one,
+    /// and leaves everything else — present and future — folded.
+    #[test]
+    fn an_exception_does_not_disturb_the_default() {
+        let mut fold = FoldState::new(true);
+        assert!(!fold.toggle("curl"), "toggling a collapsed group opens it");
+        assert!(!fold.is_collapsed("curl"));
+        assert!(fold.is_collapsed("gh"));
+        assert!(fold.is_collapsed("appears-later"));
+        assert!(!fold.all_collapsed(), "one group is open");
+    }
+
+    /// Fold-all and expand-all must be exact, not best-effort — they drop the
+    /// exceptions rather than trying to enumerate what is currently open.
+    #[test]
+    fn fold_all_leaves_no_stragglers() {
+        let mut fold = FoldState::new(false);
+        fold.toggle("curl");
+        fold.toggle("gh");
+        fold.collapse_all();
+        assert!(fold.all_collapsed());
+        for k in ["curl", "gh", "brand-new"] {
+            assert!(fold.is_collapsed(k), "{k} should be folded");
+        }
+
+        fold.expand_all();
+        for k in ["curl", "gh", "brand-new"] {
+            assert!(!fold.is_collapsed(k), "{k} should be open");
+        }
+    }
+
+    #[test]
+    fn toggle_all_flips_between_fully_folded_and_fully_open() {
+        let mut fold = FoldState::new(false);
+        assert!(fold.toggle_all(), "anything open → fold everything");
+        assert!(fold.all_collapsed());
+        assert!(!fold.toggle_all(), "all folded → open everything");
+        assert!(!fold.is_collapsed("curl"));
+
+        // A single open group is still "not all collapsed", so the next
+        // toggle folds rather than expanding a screen that is mostly folded.
+        fold.collapse_all();
+        fold.toggle("curl");
+        assert!(fold.toggle_all());
+        assert!(fold.all_collapsed());
     }
 
     #[test]

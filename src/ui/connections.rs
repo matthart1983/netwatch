@@ -690,7 +690,7 @@ pub fn build_view(app: &App) -> ConnView {
 impl ConnView {
     /// The visible rows, honouring fold state. Single source of truth for
     /// "what is row N" — renderer and input handlers both go through it.
-    pub fn rows(&self, collapsed: &std::collections::HashSet<String>) -> Vec<ConnRow<'_>> {
+    pub fn rows(&self, fold: &crate::ui::tree::FoldState) -> Vec<ConnRow<'_>> {
         if self.groups.is_empty() {
             return self
                 .flat
@@ -698,7 +698,7 @@ impl ConnView {
                 .map(|conn| ConnRow::Conn { conn })
                 .collect();
         }
-        crate::ui::tree::flatten(&self.groups, collapsed)
+        crate::ui::tree::flatten(&self.groups, fold)
             .into_iter()
             .map(|row| match row {
                 crate::ui::tree::Row::Parent { group, collapsed } => {
@@ -1629,6 +1629,15 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(app.theme.key_hint).bold(),
             ));
             v.push(Span::raw(":Fold  "));
+            v.push(Span::styled(
+                "z",
+                Style::default().fg(app.theme.key_hint).bold(),
+            ));
+            v.push(Span::raw(if app.ui.connection_collapsed.all_collapsed() {
+                ":Expand all  "
+            } else {
+                ":Fold all  "
+            }));
         }
         v.extend([
             Span::styled("T", Style::default().fg(app.theme.key_hint).bold()),
@@ -1985,15 +1994,15 @@ mod tests {
             flat: Vec::new(),
         };
 
-        let rows = view.rows(&std::collections::HashSet::new());
+        let rows = view.rows(&crate::ui::tree::FoldState::new(false));
         assert_eq!(rows.len(), 5);
         assert!(matches!(rows[0], ConnRow::Parent { .. }));
         assert!(matches!(rows[1], ConnRow::Conn { .. }));
         assert!(matches!(rows[3], ConnRow::Parent { .. }));
 
-        let mut collapsed = std::collections::HashSet::new();
-        collapsed.insert("claude".to_string());
-        let rows = view.rows(&collapsed);
+        let mut fold = crate::ui::tree::FoldState::new(false);
+        fold.toggle("claude");
+        let rows = view.rows(&fold);
         assert_eq!(rows.len(), 3, "claude's two children are hidden");
         assert!(
             matches!(&rows[0], ConnRow::Parent { group, collapsed } if group.key == "claude" && *collapsed),
@@ -2012,7 +2021,7 @@ mod tests {
                 conn("b", "ESTABLISHED", "2.2.2.2:443"),
             ],
         };
-        let rows = view.rows(&std::collections::HashSet::new());
+        let rows = view.rows(&crate::ui::tree::FoldState::new(false));
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| matches!(r, ConnRow::Conn { .. })));
     }
@@ -2030,7 +2039,7 @@ mod tests {
             )],
             flat: Vec::new(),
         };
-        let rows = view.rows(&std::collections::HashSet::new());
+        let rows = view.rows(&crate::ui::tree::FoldState::new(false));
         assert!(
             !matches!(rows[0], ConnRow::Conn { .. }),
             "row 0 is the header, not the connection beneath it"

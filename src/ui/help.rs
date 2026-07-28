@@ -199,6 +199,7 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
         "space",
         "Fold/expand the group under the cursor (grouped modes)",
     ));
+    lines.push(key_line(theme, "z", "Fold/expand every group"));
     lines.push(key_line(
         theme,
         "Enter",
@@ -324,6 +325,12 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
         "x / Del",
         "Remove selected process from policy (confirm with y)",
     ));
+    lines.push(key_line(
+        theme,
+        "space",
+        "Fold/expand the process under the cursor",
+    ));
+    lines.push(key_line(theme, "z", "Fold/expand every process"));
     lines.push(key_line(theme, "e", "Export baseline to NDJSON"));
     lines.push(Line::raw(""));
     lines.push(key_line(

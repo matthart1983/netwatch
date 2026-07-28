@@ -157,19 +157,19 @@ pub struct AppUiState {
     pub egress_filter_active: Option<String>,
 
     // ── Egress-tab specifics ──
-    /// Processes whose destination rows are collapsed. Collapsed is the
-    /// exception, so an empty set means "everything expanded" and a fresh
-    /// session shows all the detail.
-    pub egress_collapsed: std::collections::HashSet<String>,
+    /// Which processes' destination rows are folded. Carries a default plus
+    /// exceptions rather than a set of names, so a process first seen after
+    /// the user folded everything arrives folded too — see
+    /// [`crate::ui::tree::FoldState`].
+    pub egress_collapsed: crate::ui::tree::FoldState,
     /// Column the Egress tree is ordered by.
     pub egress_sort: EgressSort,
     /// Whether the destination detail pane is open (`d`).
     pub egress_detail: bool,
-    /// Groups whose connection rows are collapsed on the Connections tab.
-    /// Keyed by group value (process name or remote host), so the fold
-    /// survives re-sorting and the list churning between ticks. Collapsed is
-    /// the exception, so an empty set means everything expanded.
-    pub connection_collapsed: std::collections::HashSet<String>,
+    /// Which connection groups are folded. Keyed by group value (process
+    /// name or remote host), so the fold survives re-sorting and the list
+    /// churning between ticks.
+    pub connection_collapsed: crate::ui::tree::FoldState,
 
     /// Process whose rule removal is awaiting confirmation (`x`, then `y`).
     ///
@@ -247,10 +247,10 @@ impl AppUiState {
             egress_filter_input: false,
             egress_filter_text: String::new(),
             egress_filter_active: None,
-            egress_collapsed: std::collections::HashSet::new(),
+            egress_collapsed: crate::ui::tree::FoldState::new(cfg.groups_start_collapsed),
             egress_sort: EgressSort::default(),
             egress_detail: false,
-            connection_collapsed: std::collections::HashSet::new(),
+            connection_collapsed: crate::ui::tree::FoldState::new(cfg.groups_start_collapsed),
             egress_pending_removal: None,
 
             packet_follow: cfg.packet_follow,

@@ -859,7 +859,7 @@ impl App {
         let Some(process) = crate::ui::egress::selected_process(self) else {
             return;
         };
-        if crate::ui::tree::toggle(&mut self.ui.egress_collapsed, &process) {
+        if self.ui.egress_collapsed.toggle(&process) {
             // Folding removes rows below the cursor; park it on the header
             // so the selection stays on something visible.
             let rows = crate::ui::egress::visible_rows(self);
@@ -881,7 +881,7 @@ impl App {
         let Some(key) = crate::ui::connections::selected_group_key(self) else {
             return;
         };
-        if crate::ui::tree::toggle(&mut self.ui.connection_collapsed, &key) {
+        if self.ui.connection_collapsed.toggle(&key) {
             // Collapsing removes the rows below the cursor, so park it on the
             // header to keep the selection on something visible.
             let view = crate::ui::connections::build_view(self);
@@ -2013,7 +2013,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         app.ui.scroll.connection_scroll = idx;
                         if clicked_header {
                             if let Some(k) = key {
-                                crate::ui::tree::toggle(&mut app.ui.connection_collapsed, &k);
+                                app.ui.connection_collapsed.toggle(&k);
                             }
                         }
                     }
@@ -2455,6 +2455,34 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.ui.settings_status = Some(format!(
                     "Graph fade: {}",
                     if app.user_config.graph_fade {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ));
+                app.ui.settings_status_tick = 0;
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Char(' ')
+                if app.ui.settings_cursor == ui::settings::cursor::GROUPS_COLLAPSED =>
+            {
+                app.user_config.groups_start_collapsed = !app.user_config.groups_start_collapsed;
+                // Apply to the live screens too. A preference that only takes
+                // effect next launch reads as a broken toggle when the tab
+                // behind the overlay visibly disagrees with it.
+                if app.user_config.groups_start_collapsed {
+                    app.ui.egress_collapsed.collapse_all();
+                    app.ui.connection_collapsed.collapse_all();
+                } else {
+                    app.ui.egress_collapsed.expand_all();
+                    app.ui.connection_collapsed.expand_all();
+                }
+                app.ui.settings_status = Some(format!(
+                    "Groups start folded: {}",
+                    if app.user_config.groups_start_collapsed {
                         "on"
                     } else {
                         "off"
@@ -2978,6 +3006,24 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Char(' ') if app.ui.current_tab == Tab::Connections => {
             app.toggle_connection_fold();
+        }
+        // Fold/unfold everything. One key rather than two because the state
+        // is binary at the screen level: either you want the overview or you
+        // want the detail. Resets the cursor, since the row it pointed at has
+        // almost certainly moved.
+        KeyCode::Char('z') if app.ui.current_tab == Tab::Egress => {
+            let collapsed = app.ui.egress_collapsed.toggle_all();
+            app.ui.scroll.egress_scroll = 0;
+            app.ui.export_status = Some(if collapsed {
+                "Folded all processes".into()
+            } else {
+                "Expanded all processes".into()
+            });
+            app.ui.export_status_tick = 0;
+        }
+        KeyCode::Char('z') if app.ui.current_tab == Tab::Connections => {
+            app.ui.connection_collapsed.toggle_all();
+            app.ui.scroll.connection_scroll = 0;
         }
         // Must stay ahead of the unguarded `s`/`S` sort arms below — match
         // arms are ordered, and a guarded Egress arm placed after an

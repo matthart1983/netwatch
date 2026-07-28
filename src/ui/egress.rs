@@ -161,7 +161,7 @@ pub fn visible_rows(app: &App) -> Vec<EgressRow<'_>> {
 
     let mut rows = Vec::new();
     for (profile, dests) in groups {
-        let collapsed = app.ui.egress_collapsed.contains(&profile.process);
+        let collapsed = app.ui.egress_collapsed.is_collapsed(&profile.process);
         let bytes_out = dests.iter().map(|(_, d, _)| d.bytes_out).sum();
         let bytes_in = dests.iter().map(|(_, d, _)| d.bytes_in).sum();
         let worst = dests
@@ -580,8 +580,11 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
                             .bg(bg)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Cell::from(format!("{dests} dests"))
-                        .style(Style::default().fg(t.text_muted).bg(bg)),
+                    Cell::from(format!(
+                        "{dests} dest{}",
+                        if *dests == 1 { "" } else { "s" }
+                    ))
+                    .style(Style::default().fg(t.text_muted).bg(bg)),
                     Cell::from(vol(*bytes_out)).style(Style::default().fg(t.tx_rate).bg(bg)),
                     Cell::from(vol(*bytes_in)).style(Style::default().fg(t.rx_rate).bg(bg)),
                     Cell::from(spark(activity, spark_w))
@@ -904,6 +907,14 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     nav.extend(hint("s", "sort"));
     nav.extend(hint("/", "filter"));
     nav.extend(hint("space", "fold"));
+    nav.extend(hint(
+        "z",
+        if app.ui.egress_collapsed.all_collapsed() {
+            "expand all"
+        } else {
+            "fold all"
+        },
+    ));
     nav.extend(hint("d", "detail"));
     // Teach the two glyphs that aren't self-evident, rather than restating
     // that the linter never blocks — that belongs in the docs, not on every

@@ -96,6 +96,17 @@ pub struct NetwatchConfig {
     /// 0 warns on every connection refresh. Default 300 (5 minutes).
     #[serde(default = "default_egress_cooldown")]
     pub egress_violation_cooldown_secs: u64,
+
+    /// Whether the grouped tables (Connections, Egress) open with every group
+    /// folded. Default true: a folded screen answers "what is on this machine"
+    /// in one glance, and expanding is one keystroke. Set false to open with
+    /// everything visible, which is closer to the old flat tables.
+    #[serde(default = "default_groups_collapsed")]
+    pub groups_start_collapsed: bool,
+}
+
+fn default_groups_collapsed() -> bool {
+    true
 }
 
 fn default_sandbox() -> String {
@@ -139,6 +150,7 @@ impl Default for NetwatchConfig {
             sandbox: default_sandbox(),
             tls_keylog_path: String::new(),
             egress_violation_cooldown_secs: default_egress_cooldown(),
+            groups_start_collapsed: default_groups_collapsed(),
         }
     }
 }
@@ -305,6 +317,7 @@ show_geo = false
             sandbox: "strict".into(),
             tls_keylog_path: "/tmp/sslkeylog.txt".into(),
             egress_violation_cooldown_secs: 120,
+            groups_start_collapsed: false,
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();
