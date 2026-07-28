@@ -196,8 +196,13 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(theme, "Esc", "Clear active filter"));
     lines.push(key_line(
         theme,
+        "space",
+        "Fold/expand the group under the cursor (grouped modes)",
+    ));
+    lines.push(key_line(
+        theme,
         "Enter",
-        "Jump to Packets tab with filter for selected connection",
+        "Jump to Packets tab with filter for selected connection; on a group row, fold it",
     ));
     lines.push(key_line(
         theme,

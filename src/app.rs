@@ -859,8 +859,7 @@ impl App {
         let Some(process) = crate::ui::egress::selected_process(self) else {
             return;
         };
-        if !self.ui.egress_collapsed.remove(&process) {
-            self.ui.egress_collapsed.insert(process.clone());
+        if crate::ui::tree::toggle(&mut self.ui.egress_collapsed, &process) {
             // Folding removes rows below the cursor; park it on the header
             // so the selection stays on something visible.
             let rows = crate::ui::egress::visible_rows(self);
@@ -869,6 +868,29 @@ impl App {
                          if profile.process == process)
             }) {
                 self.ui.scroll.egress_scroll = idx;
+            }
+        }
+    }
+
+    /// Collapse or expand the connection group under the cursor.
+    ///
+    /// Works from a child row as well as the header — folding the group you
+    /// are inside is the common case, and making the user navigate up first
+    /// would be busywork. Same behaviour as the Egress tab, deliberately.
+    fn toggle_connection_fold(&mut self) {
+        let Some(key) = crate::ui::connections::selected_group_key(self) else {
+            return;
+        };
+        if crate::ui::tree::toggle(&mut self.ui.connection_collapsed, &key) {
+            // Collapsing removes the rows below the cursor, so park it on the
+            // header to keep the selection on something visible.
+            let view = crate::ui::connections::build_view(self);
+            let rows = view.rows(&self.ui.connection_collapsed);
+            if let Some(idx) = rows.iter().position(|r| {
+                matches!(r, crate::ui::connections::ConnRow::Parent { group, .. }
+                         if group.key == key)
+            }) {
+                self.ui.scroll.connection_scroll = idx;
             }
         }
     }
@@ -1957,20 +1979,43 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                         let visible_row = row_within - 1;
 
-                        let conns = crate::ui::connections::filtered_sorted_conns(app);
-                        if conns.is_empty() {
+                        // Against the *row* list, not the connection list —
+                        // under a group mode those differ by the header rows,
+                        // and indexing the wrong one is issue #28 again.
+                        let view = crate::ui::connections::build_view(app);
+                        let rows = view.rows(&app.ui.connection_collapsed);
+                        if rows.is_empty() {
                             return;
                         }
                         let visible_rows = inner.height.saturating_sub(1) as usize;
-                        let max_idx = conns.len().saturating_sub(1);
+                        let max_idx = rows.len().saturating_sub(1);
                         let selected = app.ui.scroll.connection_scroll.min(max_idx);
                         let window_top = crate::ui::connections::compute_window_top(
                             selected,
-                            conns.len(),
+                            rows.len(),
                             visible_rows,
                         );
                         let idx = (window_top + visible_row).min(max_idx);
+                        // Clicking a header folds it, matching the Egress
+                        // tab's chevron behaviour.
+                        let clicked_header = matches!(
+                            rows.get(idx),
+                            Some(crate::ui::connections::ConnRow::Parent { .. })
+                        );
+                        let key = match rows.get(idx) {
+                            Some(crate::ui::connections::ConnRow::Parent { group, .. }) => {
+                                Some(group.key.clone())
+                            }
+                            _ => None,
+                        };
+                        drop(rows);
+                        drop(view);
                         app.ui.scroll.connection_scroll = idx;
+                        if clicked_header {
+                            if let Some(k) = key {
+                                crate::ui::tree::toggle(&mut app.ui.connection_collapsed, &k);
+                            }
+                        }
                     }
                     Tab::Packets if !app.ui.stream_view_open => {
                         if clicked_row > 0 {
@@ -2090,11 +2135,10 @@ fn scroll_tab(app: &mut App, delta: isize) {
                 app.ui.scroll.traceroute_scroll =
                     clamp_scroll(app.ui.scroll.traceroute_scroll, delta, usize::MAX);
             } else {
-                // Clamp against the filtered list so PgDn/arrows can't
-                // land on rows the user isn't seeing (issue #26).
-                let max = crate::ui::connections::filtered_sorted_conns(app)
-                    .len()
-                    .saturating_sub(1);
+                // Clamp against the visible rows so PgDn/arrows can't land
+                // on rows the user isn't seeing (issue #26) — which under a
+                // group mode means rows including headers, not connections.
+                let max = crate::ui::connections::visible_row_count(app).saturating_sub(1);
                 app.ui.scroll.connection_scroll =
                     clamp_scroll(app.ui.scroll.connection_scroll, delta, max);
             }
@@ -2843,9 +2887,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Char('W') if app.ui.current_tab == Tab::Connections => {
-            // Operate on what the user sees, not the unfiltered list.
-            let conns = crate::ui::connections::filtered_sorted_conns(app);
-            if let Some(conn) = conns.get(app.ui.scroll.connection_scroll) {
+            // Operate on what the user sees, not the unfiltered list — and
+            // on a connection, never a group header.
+            if let Some(conn) = crate::ui::connections::selected_connection(app) {
                 let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
                 if let Some(ip) = remote_ip {
                     app.whois_cache.request(&ip);
@@ -2855,8 +2899,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('T')
             if app.ui.current_tab == Tab::Connections && !app.ui.traceroute_view_open =>
         {
-            let conns = crate::ui::connections::filtered_sorted_conns(app);
-            if let Some(conn) = conns.get(app.ui.scroll.connection_scroll) {
+            if let Some(conn) = crate::ui::connections::selected_connection(app) {
                 let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
                 if let Some(ip) = remote_ip {
                     app.traceroute_runner.run(&ip);
@@ -2933,6 +2976,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char(' ') if app.ui.current_tab == Tab::Egress => {
             app.toggle_egress_fold();
         }
+        KeyCode::Char(' ') if app.ui.current_tab == Tab::Connections => {
+            app.toggle_connection_fold();
+        }
         // Must stay ahead of the unguarded `s`/`S` sort arms below — match
         // arms are ordered, and a guarded Egress arm placed after an
         // unguarded one silently never fires.
@@ -2987,9 +3033,14 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Enter if app.ui.current_tab == Tab::Connections => {
-            let conns = crate::ui::connections::filtered_sorted_conns(app);
-            if let Some(conn) = conns.get(app.ui.scroll.connection_scroll) {
-                let filter = build_connection_filter(conn);
+            // A group header has no single flow to drill into, so Enter does
+            // the other obvious thing there rather than nothing at all.
+            let Some(conn) = crate::ui::connections::selected_connection(app) else {
+                app.toggle_connection_fold();
+                return false;
+            };
+            {
+                let filter = build_connection_filter(&conn);
                 app.ui.packet_filter_text = filter.clone();
                 app.ui.packet_filter_active = Some(filter);
                 app.ui.packet_filter_input = false;

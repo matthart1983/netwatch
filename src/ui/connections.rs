@@ -91,12 +91,7 @@ pub(crate) fn table_inner_area(area: Rect) -> Rect {
 /// Centered-on-selected window top, matching the renderer's auto-scroll
 /// behaviour. Pure function so both sides can compute the same value.
 pub(crate) fn compute_window_top(selected: usize, total: usize, visible_rows: usize) -> usize {
-    if selected < visible_rows {
-        return 0;
-    }
-    selected
-        .saturating_sub(visible_rows / 2)
-        .min(total.saturating_sub(visible_rows))
+    crate::ui::tree::window_top(selected, total, visible_rows)
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -538,6 +533,227 @@ pub(crate) fn filtered_sorted_conns(app: &App) -> Vec<Connection> {
     conns
 }
 
+// ── Grouped tree ────────────────────────────────────────────────────────
+//
+// `group: process` and `group: remote` used to be sort orders wearing the
+// word "group": rows clustered, but the key was still restated on every one.
+// On a real machine that meant `claude` down eleven consecutive rows and the
+// process column so starved of width it rendered `Google Chrome…`. These are
+// now actual trees — one parent row carrying the rollup, children foldable
+// beneath — built on `ui::tree`, the same machinery as the Egress tab.
+//
+// `group: none` stays a flat list. It is the mode you pick precisely when you
+// want every connection as a peer, and a tree with one child per parent would
+// be strictly worse.
+
+/// Summary shown on a group's parent row.
+pub struct ConnRollup {
+    pub conns: usize,
+    /// Distinct PIDs (process grouping) or distinct processes (remote
+    /// grouping) — the count that says "this row is more than one thing".
+    pub facets: usize,
+    pub rx_rate: f64,
+    pub tx_rate: f64,
+    /// Best (lowest) handshake RTT across the group, if any was measured.
+    pub rtt_us: Option<f64>,
+    /// Dominant connection state, and how many of the group share it.
+    pub state: String,
+    pub state_count: usize,
+    /// True when any member carries retransmits — a rollup must not hide a
+    /// problem that would be visible on an expanded child row.
+    pub degraded: bool,
+    /// True when every member was attributed by the kernel (PKTAP / eBPF),
+    /// so the parent can carry the same `◉` the children would.
+    pub kernel_attributed: bool,
+}
+
+pub type ConnGroup = crate::ui::tree::Group<ConnRollup, Connection>;
+
+/// One line of the Connections table.
+pub enum ConnRow<'a> {
+    Parent {
+        group: &'a ConnGroup,
+        collapsed: bool,
+    },
+    Conn {
+        conn: &'a Connection,
+    },
+}
+
+/// The connection list in whatever shape the current group mode implies.
+///
+/// Owns its data so the borrowed row list can be derived from it repeatedly —
+/// the renderer, the mouse handler and the key handlers all need the same
+/// numbering, and recomputing it independently is how they drift apart.
+pub struct ConnView {
+    pub groups: Vec<ConnGroup>,
+    pub flat: Vec<Connection>,
+}
+
+/// The most common *named* state in a group, and how many share it.
+///
+/// Connectionless rows (UDP) carry an empty state, so counting them would
+/// make "" the winner and the cell would render as a bare `11/13` — a
+/// fraction of nothing. Only named states compete; a group with none at all
+/// says so with an em-dash.
+fn dominant_state(conns: &[Connection]) -> (String, usize) {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for c in conns.iter().filter(|c| !c.state.is_empty()) {
+        *counts.entry(c.state.as_str()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(s, n)| (s.to_string(), n))
+        .unwrap_or_else(|| ("—".to_string(), conns.len()))
+}
+
+fn rollup(key_is_process: bool, conns: &[Connection]) -> ConnRollup {
+    let facets: std::collections::BTreeSet<String> = if key_is_process {
+        conns
+            .iter()
+            .filter_map(|c| c.pid.map(|p| p.to_string()))
+            .collect()
+    } else {
+        conns
+            .iter()
+            .map(|c| c.process_name.clone().unwrap_or_else(|| "—".into()))
+            .collect()
+    };
+    let (state, state_count) = dominant_state(conns);
+    ConnRollup {
+        conns: conns.len(),
+        facets: facets.len(),
+        rx_rate: conns.iter().filter_map(|c| c.rx_rate).sum(),
+        tx_rate: conns.iter().filter_map(|c| c.tx_rate).sum(),
+        rtt_us: conns
+            .iter()
+            .filter_map(|c| c.handshake_rtt_us)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+        state,
+        state_count,
+        degraded: conns.iter().any(|c| c.retransmits > 0),
+        kernel_attributed: !conns.is_empty()
+            && conns.iter().all(|c| {
+                matches!(
+                    c.attribution,
+                    AttributionSource::Pktap | AttributionSource::Ebpf
+                )
+            }),
+    }
+}
+
+/// Build the current view: grouped into a tree, or flat under `group: none`.
+pub fn build_view(app: &App) -> ConnView {
+    let conns = filtered_sorted_conns(app);
+    let group_mode = app.ui.connection_group;
+    if matches!(group_mode, ConnectionGroup::None) {
+        return ConnView {
+            groups: Vec::new(),
+            flat: conns,
+        };
+    }
+    let key_is_process = matches!(group_mode, ConnectionGroup::Process);
+    let buckets = crate::ui::tree::group_by(conns, |c: &Connection| {
+        if key_is_process {
+            c.process_name.clone().unwrap_or_else(|| "—".into())
+        } else {
+            host_only(&c.remote_addr)
+        }
+    });
+    // `filtered_sorted_conns` already ordered by the group key then by rate,
+    // so first-seen bucket order is the order the user asked for; only the
+    // rollup-level ranking is left, and busiest-first is what a rate column
+    // is for.
+    let mut groups: Vec<ConnGroup> = buckets
+        .into_iter()
+        .map(|(key, children)| ConnGroup {
+            key,
+            rollup: rollup(key_is_process, &children),
+            children,
+        })
+        .collect();
+    groups.sort_by(|a, b| {
+        cmp_f64(
+            a.rollup.rx_rate + a.rollup.tx_rate,
+            b.rollup.rx_rate + b.rollup.tx_rate,
+        )
+        .reverse()
+        .then_with(|| cmp_case_insensitive(&a.key, &b.key))
+    });
+    ConnView {
+        groups,
+        flat: Vec::new(),
+    }
+}
+
+impl ConnView {
+    /// The visible rows, honouring fold state. Single source of truth for
+    /// "what is row N" — renderer and input handlers both go through it.
+    pub fn rows(&self, collapsed: &std::collections::HashSet<String>) -> Vec<ConnRow<'_>> {
+        if self.groups.is_empty() {
+            return self
+                .flat
+                .iter()
+                .map(|conn| ConnRow::Conn { conn })
+                .collect();
+        }
+        crate::ui::tree::flatten(&self.groups, collapsed)
+            .into_iter()
+            .map(|row| match row {
+                crate::ui::tree::Row::Parent { group, collapsed } => {
+                    ConnRow::Parent { group, collapsed }
+                }
+                crate::ui::tree::Row::Child { item, .. } => ConnRow::Conn { conn: item },
+            })
+            .collect()
+    }
+}
+
+/// The connection under the cursor, or `None` when a group header is selected.
+///
+/// Every action that operates on "the selected connection" — traceroute,
+/// whois, drill to packets, the detail strip — resolves through here, so a
+/// parent row can never be mistaken for the first connection beneath it.
+pub fn selected_connection(app: &App) -> Option<Connection> {
+    let view = build_view(app);
+    let rows = view.rows(&app.ui.connection_collapsed);
+    let idx = app
+        .ui
+        .scroll
+        .connection_scroll
+        .min(rows.len().saturating_sub(1));
+    match rows.get(idx)? {
+        ConnRow::Conn { conn } => Some((*conn).clone()),
+        ConnRow::Parent { .. } => None,
+    }
+}
+
+/// The group key under the cursor, from a parent row or any of its children.
+pub fn selected_group_key(app: &App) -> Option<String> {
+    let view = build_view(app);
+    if view.groups.is_empty() {
+        return None;
+    }
+    let rows = view.rows(&app.ui.connection_collapsed);
+    let idx = app
+        .ui
+        .scroll
+        .connection_scroll
+        .min(rows.len().saturating_sub(1));
+    // Walk back to the nearest header so folding works from a child row —
+    // navigating up to the parent first would be busywork.
+    rows.get(..=idx)?.iter().rev().find_map(|r| match r {
+        ConnRow::Parent { group, .. } => Some(group.key.clone()),
+        ConnRow::Conn { .. } => None,
+    })
+}
+
+/// Number of visible rows, for clamping scroll against what is on screen.
+pub fn visible_row_count(app: &App) -> usize {
+    build_view(app).rows(&app.ui.connection_collapsed).len()
+}
+
 /// Compact geo string for the Connections GEO column. Prefers
 /// `country_code-city` (e.g. "US-Ashburn"), falls back to country code, and
 /// returns an em-dash for private/unresolved IPs so the column always has a
@@ -574,13 +790,27 @@ fn host_only(addr: &str) -> String {
 
 fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let conns = filtered_sorted_conns(app);
+    let view = build_view(app);
+    let rows = view.rows(&app.ui.connection_collapsed);
+    let conn_count = if view.groups.is_empty() {
+        view.flat.len()
+    } else {
+        view.groups.iter().map(|g| g.rollup.conns).sum()
+    };
 
-    let title_right = format!(
-        " {} shown  group: {} ",
-        conns.len(),
-        app.ui.connection_group.label()
-    );
+    let title_right = if view.groups.is_empty() {
+        format!(" {conn_count} shown  group: none ")
+    } else {
+        let noun = match app.ui.connection_group {
+            ConnectionGroup::Remote => "hosts",
+            _ => "processes",
+        };
+        format!(
+            " {} {noun} · {conn_count} conns  group: {} ",
+            view.groups.len(),
+            app.ui.connection_group.label()
+        )
+    };
     let block = Block::default()
         .title(Line::from(Span::styled(
             " CONNECTIONS ",
@@ -622,12 +852,12 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     );
 
     let visible_rows = inner.height.saturating_sub(1) as usize;
-    let max_idx = conns.len().saturating_sub(1);
+    let max_idx = rows.len().saturating_sub(1);
     let selected = app.ui.scroll.connection_scroll.min(max_idx);
-    let window_top = compute_window_top(selected, conns.len(), visible_rows);
+    let window_top = compute_window_top(selected, rows.len(), visible_rows);
 
-    let rendered = conns.iter().skip(window_top).take(visible_rows).count();
-    for (i, conn) in conns.iter().skip(window_top).take(visible_rows).enumerate() {
+    let rendered = rows.iter().skip(window_top).take(visible_rows).count();
+    for (i, row) in rows.iter().skip(window_top).take(visible_rows).enumerate() {
         let abs_idx = window_top + i;
         let is_selected = abs_idx == selected;
         let row_y = inner.y + 1 + i as u16;
@@ -638,10 +868,24 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         } else {
             1.0
         };
-        render_conn_row(f, app, inner, row_y, conn, is_selected, row_alpha);
+        match row {
+            ConnRow::Conn { conn } => {
+                render_conn_row(f, app, inner, row_y, conn, is_selected, row_alpha)
+            }
+            ConnRow::Parent { group, collapsed } => render_group_row(
+                f,
+                app,
+                inner,
+                row_y,
+                group,
+                *collapsed,
+                is_selected,
+                row_alpha,
+            ),
+        }
     }
 
-    if conns.is_empty() {
+    if rows.is_empty() {
         let empty_area = Rect {
             x: inner.x + 2,
             y: inner.y + 1,
@@ -656,6 +900,174 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
             empty_area,
         );
     }
+}
+
+/// A group header: the key named once, with the rollup of everything folded
+/// beneath it.
+///
+/// Laid out on the same column grid as `render_conn_row` so an expanded tree
+/// still reads as one table — a header with its own private alignment would
+/// make the children look like a different screen. Each cell answers the
+/// question its column asks, at group scale: PROTO becomes the child count,
+/// REMOTE becomes how many distinct things are inside, STATE becomes the
+/// dominant state, and the rates are sums.
+#[allow(clippy::too_many_arguments)]
+fn render_group_row(
+    f: &mut Frame,
+    app: &App,
+    inner: Rect,
+    row_y: u16,
+    group: &ConnGroup,
+    collapsed: bool,
+    is_selected: bool,
+    row_alpha: f32,
+) {
+    let t = &app.theme;
+    let r = &group.rollup;
+    let chevron = if collapsed { "▶ " } else { "▼ " };
+    // The group name gets the full 20-char cell the child rows split between
+    // process and PID — the point of the tree is that the name is legible.
+    let name = truncate(&group.key, 20);
+
+    let facet_label = match app.ui.connection_group {
+        ConnectionGroup::Remote => {
+            if r.facets == 1 {
+                "1 proc".to_string()
+            } else {
+                format!("{} procs", r.facets)
+            }
+        }
+        _ => {
+            if r.facets == 1 {
+                "1 pid".to_string()
+            } else {
+                format!("{} pids", r.facets)
+            }
+        }
+    };
+
+    let state_cell = if r.state_count == r.conns {
+        truncate(&r.state, 12).to_string()
+    } else {
+        // Mixed states: say which dominates and how many, rather than
+        // picking one and implying the group is uniform.
+        format!("{} {}/{}", truncate(&r.state, 6), r.state_count, r.conns)
+    };
+    let state_color = match r.state.as_str() {
+        "ESTABLISHED" => t.status_good,
+        "LISTEN" => t.status_info,
+        "TIME_WAIT" | "TIME-WAIT" => t.status_warn,
+        _ => t.text_muted,
+    };
+
+    let rx_str = if r.rx_rate > 0.0 {
+        crate::ui::widgets::format_bytes_rate(r.rx_rate)
+    } else {
+        "—".into()
+    };
+    let tx_str = if r.tx_rate > 0.0 {
+        crate::ui::widgets::format_bytes_rate(r.tx_rate)
+    } else {
+        "—".into()
+    };
+    let rtt_str = r
+        .rtt_us
+        .map(|us| {
+            let ms = us / 1000.0;
+            if ms < 1.0 {
+                format!("{ms:.1}ms")
+            } else {
+                format!("{ms:.0}ms")
+            }
+        })
+        .unwrap_or_else(|| "—".into());
+
+    let mut spans: Vec<Span> = vec![
+        // The chevron stays on the selected row: fold state is information
+        // the selection highlight already conveys separately, and swapping it
+        // for a cursor glyph would hide whether the group is open.
+        Span::styled(chevron, Style::default().fg(t.brand)),
+        // The group name carries the row's weight; the children sit at
+        // normal intensity beneath it.
+        Span::styled(
+            format!("{name:<20}"),
+            Style::default().fg(t.text_primary).bold(),
+        ),
+        // PROTO belongs to an individual flow, so a rollup leaves it empty
+        // rather than putting a count under a header that promises a
+        // protocol. The summary goes in the REMOTE cell, which is where the
+        // eye already is and which has the width to spell it out.
+        Span::raw(" "),
+        Span::styled("     ".to_string(), Style::default().fg(t.text_muted)),
+        Span::raw(" "),
+        Span::styled(
+            format!(
+                "{:<32}",
+                truncate(
+                    &format!(
+                        "{} conn{} · {facet_label}",
+                        r.conns,
+                        if r.conns == 1 { "" } else { "s" }
+                    ),
+                    32
+                )
+            ),
+            Style::default().fg(t.text_secondary),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<22}", if r.degraded { "retransmits" } else { "" }),
+            Style::default().fg(if r.degraded {
+                t.status_error
+            } else {
+                t.text_muted
+            }),
+        ),
+    ];
+
+    if app.ui.show_geo {
+        // Geo is a property of one endpoint, so a rollup has nothing honest
+        // to put here. Hold the column so the children stay aligned.
+        spans.push(Span::styled(
+            format!(" {:<12}", ""),
+            Style::default().fg(t.text_muted),
+        ));
+    }
+
+    spans.extend([
+        Span::styled(
+            format!(" {:<12}", truncate(&state_cell, 12)),
+            Style::default().fg(state_color),
+        ),
+        Span::styled(format!(" {rx_str:>10}"), Style::default().fg(t.rx_rate)),
+        Span::raw(" "),
+        Span::styled(format!(" {tx_str:>9}"), Style::default().fg(t.tx_rate)),
+        Span::raw(" "),
+        Span::styled(
+            format!(" {rtt_str:>5}"),
+            Style::default().fg(t.text_primary),
+        ),
+        Span::raw(" "),
+        Span::styled(format!(" {:>4}", ""), Style::default().fg(t.text_muted)),
+    ]);
+
+    let faded_spans = if (row_alpha - 1.0).abs() < f32::EPSILON {
+        spans
+    } else {
+        crate::graph::fade_spans_fg(spans, t.bg, row_alpha, t.defers_to_terminal())
+    };
+    let row_area = Rect {
+        x: inner.x + 1,
+        y: row_y,
+        width: inner.width.saturating_sub(2),
+        height: 1,
+    };
+    let para = if is_selected {
+        Paragraph::new(Line::from(faded_spans)).style(Style::default().bg(t.selection_bg))
+    } else {
+        Paragraph::new(Line::from(faded_spans))
+    };
+    f.render_widget(para, row_area);
 }
 
 fn render_conn_row(
@@ -686,7 +1098,14 @@ fn render_conn_row(
         .map(|p| p.to_string())
         .unwrap_or_else(|| "—".into());
     let process = conn.process_name.as_deref().unwrap_or("—");
-    let proc_label = format!("{:<14} {:>5}", truncate(process, 14), pid_str);
+    // Under a tree, the parent row already names the group. Restating it on
+    // every child is what made the flat table unreadable — `claude` eleven
+    // times down a column too narrow to spell `Google Chrome Helper`. Indent
+    // instead, and spend the width on what actually differs.
+    let proc_label = match app.ui.connection_group {
+        ConnectionGroup::Process => format!("    {:>5}{:<10}", pid_str, ""),
+        _ => format!("{:<14} {:>5}", truncate(process, 14), pid_str),
+    };
 
     let proto_color = if conn.protocol.eq_ignore_ascii_case("UDP") {
         t.proto_udp()
@@ -748,7 +1167,24 @@ fn render_conn_row(
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:<32}", truncate(&conn.remote_addr, 32)),
+            // Same reasoning under `group: remote`: the host is the parent's
+            // name, so the child shows the port that distinguishes it.
+            match app.ui.connection_group {
+                ConnectionGroup::Remote => {
+                    let host = host_only(&conn.remote_addr);
+                    let port = conn
+                        .remote_addr
+                        .rsplit_once(':')
+                        .map(|(_, p)| p.to_string())
+                        .unwrap_or_default();
+                    if port.is_empty() {
+                        format!("    {:<28}", truncate(&host, 28))
+                    } else {
+                        format!("    :{port:<27}")
+                    }
+                }
+                _ => format!("{:<32}", truncate(&conn.remote_addr, 32)),
+            },
             Style::default().fg(t.text_primary),
         ),
         Span::raw(" "),
@@ -872,20 +1308,21 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let conns = filtered_sorted_conns(app);
+    let view = build_view(app);
+    let rows = view.rows(&app.ui.connection_collapsed);
     let selected_idx = app
         .ui
         .scroll
         .connection_scroll
-        .min(conns.len().saturating_sub(1));
-    let selected = if conns.is_empty() {
+        .min(rows.len().saturating_sub(1));
+    let selected = if rows.is_empty() {
         None
     } else {
-        conns.get(selected_idx)
+        rows.get(selected_idx)
     };
 
     let title_left = match selected {
-        Some(c) => {
+        Some(ConnRow::Conn { conn: c }) => {
             let proc = c.process_name.as_deref().unwrap_or("—");
             let host = host_only(&c.remote_addr);
             format!(
@@ -895,6 +1332,12 @@ fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
                 host,
             )
         }
+        // A group header has no single flow to detail, so the title carries
+        // the rollup rather than pretending one child stands for all of them.
+        Some(ConnRow::Parent { group, .. }) => format!(
+            " DETAIL  {}  {} connections ",
+            group.key, group.rollup.conns
+        ),
         None => " DETAIL ".to_string(),
     };
 
@@ -919,7 +1362,7 @@ fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let Some(conn) = selected else {
+    let hint = |f: &mut Frame, msg: &str| {
         let hint_area = Rect {
             x: inner.x + 2,
             y: inner.y + 1,
@@ -928,12 +1371,34 @@ fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No connection selected",
+                msg.to_string(),
                 Style::default().fg(t.text_muted),
             ))),
             hint_area,
         );
-        return;
+    };
+    let conn = match selected {
+        Some(ConnRow::Conn { conn }) => conn,
+        Some(ConnRow::Parent { group, collapsed }) => {
+            let r = &group.rollup;
+            hint(
+                f,
+                &format!(
+                    "{} · {} connections · {} in, {} out{}   —   space to {}",
+                    group.key,
+                    r.conns,
+                    crate::ui::widgets::format_bytes_rate(r.rx_rate),
+                    crate::ui::widgets::format_bytes_rate(r.tx_rate),
+                    if r.degraded { " · retransmits" } else { "" },
+                    if *collapsed { "expand" } else { "fold" },
+                ),
+            );
+            return;
+        }
+        None => {
+            hint(f, "No connection selected");
+            return;
+        }
     };
 
     // Two-column body: left FLOW + STATS, right RX 30s sparkline placeholder
@@ -1150,16 +1615,28 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(":Quit"),
         ]
     } else {
-        vec![
+        let mut v = vec![
             Span::styled("s", Style::default().fg(app.theme.key_hint).bold()),
             Span::raw(":Sort  "),
             Span::styled("/", Style::default().fg(app.theme.key_hint).bold()),
             Span::raw(":Filter  "),
+        ];
+        // Only advertise folding when there is something to fold — under
+        // `group: none` the key does nothing and the hint would be a lie.
+        if !matches!(app.ui.connection_group, ConnectionGroup::None) {
+            v.push(Span::styled(
+                "space",
+                Style::default().fg(app.theme.key_hint).bold(),
+            ));
+            v.push(Span::raw(":Fold  "));
+        }
+        v.extend([
             Span::styled("T", Style::default().fg(app.theme.key_hint).bold()),
             Span::raw(":Traceroute  "),
             Span::styled("Enter", Style::default().fg(app.theme.key_hint).bold()),
             Span::raw(":→Packets"),
-        ]
+        ]);
+        v
     };
     crate::ui::widgets::render_footer(f, app, area, hints);
 }
@@ -1428,6 +1905,139 @@ mod tests {
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,
+        }
+    }
+
+    // ── Grouped tree ────────────────────────────────────────────────────
+
+    fn group_of(key: &str, conns: Vec<Connection>, by_process: bool) -> ConnGroup {
+        ConnGroup {
+            key: key.into(),
+            rollup: rollup(by_process, &conns),
+            children: conns,
+        }
+    }
+
+    /// The parent row must summarise its children accurately — a rollup that
+    /// undercounts is worse than no rollup, because the user stops expanding.
+    #[test]
+    fn rollup_summarises_its_children() {
+        let mut a = conn("claude", "ESTABLISHED", "1.2.3.4:443");
+        a.pid = Some(10);
+        a.rx_rate = Some(100.0);
+        a.tx_rate = Some(10.0);
+        a.handshake_rtt_us = Some(5000.0);
+        let mut b = conn("claude", "ESTABLISHED", "5.6.7.8:443");
+        b.pid = Some(11);
+        b.rx_rate = Some(50.0);
+        b.handshake_rtt_us = Some(2000.0);
+        let r = rollup(true, &[a, b]);
+        assert_eq!(r.conns, 2);
+        assert_eq!(r.facets, 2, "two distinct pids");
+        assert_eq!(r.rx_rate, 150.0);
+        assert_eq!(r.tx_rate, 10.0);
+        assert_eq!(r.rtt_us, Some(2000.0), "best RTT, not the first one");
+        assert_eq!(r.state, "ESTABLISHED");
+        assert_eq!(r.state_count, 2);
+        assert!(!r.degraded);
+    }
+
+    /// A rollup must never hide a problem that an expanded child would show.
+    #[test]
+    fn rollup_surfaces_retransmits_from_any_child() {
+        let a = conn("curl", "ESTABLISHED", "1.2.3.4:443");
+        let mut b = conn("curl", "ESTABLISHED", "5.6.7.8:443");
+        b.retransmits = 3;
+        assert!(rollup(true, &[a, b]).degraded);
+    }
+
+    /// UDP rows carry an empty state. Counting them would make "" the winner
+    /// and render the cell as a bare fraction of nothing.
+    #[test]
+    fn dominant_state_ignores_stateless_rows() {
+        let udp = conn("chrome", "", "*:*");
+        let tcp = conn("chrome", "ESTABLISHED", "1.2.3.4:443");
+        let (state, n) = dominant_state(&[udp.clone(), udp.clone(), udp.clone(), tcp]);
+        assert_eq!(state, "ESTABLISHED");
+        assert_eq!(n, 1, "1 of 4 has a named state");
+
+        // All stateless: say so rather than emitting an empty cell.
+        let (state, n) = dominant_state(&[udp.clone(), udp]);
+        assert_eq!(state, "—");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rows_emit_a_header_then_its_children_and_fold_hides_only_children() {
+        let groups = vec![
+            group_of(
+                "claude",
+                vec![
+                    conn("claude", "ESTABLISHED", "1.2.3.4:443"),
+                    conn("claude", "ESTABLISHED", "5.6.7.8:443"),
+                ],
+                true,
+            ),
+            group_of("gh", vec![conn("gh", "ESTABLISHED", "9.9.9.9:443")], true),
+        ];
+        let view = ConnView {
+            groups,
+            flat: Vec::new(),
+        };
+
+        let rows = view.rows(&std::collections::HashSet::new());
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[0], ConnRow::Parent { .. }));
+        assert!(matches!(rows[1], ConnRow::Conn { .. }));
+        assert!(matches!(rows[3], ConnRow::Parent { .. }));
+
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert("claude".to_string());
+        let rows = view.rows(&collapsed);
+        assert_eq!(rows.len(), 3, "claude's two children are hidden");
+        assert!(
+            matches!(&rows[0], ConnRow::Parent { group, collapsed } if group.key == "claude" && *collapsed),
+            "the header itself must survive folding"
+        );
+    }
+
+    /// `group: none` is a flat peer list — a tree with one child per parent
+    /// would be strictly worse, so it must not grow headers.
+    #[test]
+    fn ungrouped_view_has_no_header_rows() {
+        let view = ConnView {
+            groups: Vec::new(),
+            flat: vec![
+                conn("a", "ESTABLISHED", "1.1.1.1:443"),
+                conn("b", "ESTABLISHED", "2.2.2.2:443"),
+            ],
+        };
+        let rows = view.rows(&std::collections::HashSet::new());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| matches!(r, ConnRow::Conn { .. })));
+    }
+
+    /// Row indices now include headers, so anything that resolves "the
+    /// selected connection" by indexing the *connection* list would silently
+    /// act on the wrong flow. A header must resolve to no connection at all.
+    #[test]
+    fn a_header_row_is_not_a_connection() {
+        let view = ConnView {
+            groups: vec![group_of(
+                "claude",
+                vec![conn("claude", "ESTABLISHED", "1.2.3.4:443")],
+                true,
+            )],
+            flat: Vec::new(),
+        };
+        let rows = view.rows(&std::collections::HashSet::new());
+        assert!(
+            !matches!(rows[0], ConnRow::Conn { .. }),
+            "row 0 is the header, not the connection beneath it"
+        );
+        match &rows[1] {
+            ConnRow::Conn { conn } => assert_eq!(conn.remote_addr, "1.2.3.4:443"),
+            ConnRow::Parent { .. } => panic!("row 1 should be the connection"),
         }
     }
 

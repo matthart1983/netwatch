@@ -13,4 +13,5 @@ pub mod sort_picker;
 pub mod stats;
 pub mod timeline;
 pub mod topology;
+pub mod tree;
 pub mod widgets;
