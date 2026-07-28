@@ -907,6 +907,65 @@ impl App {
         self.ui.export_status_tick = 0;
     }
 
+    /// Ask before removing the selected process's rule. Answered by
+    /// `confirm_egress_removal` / `cancel_egress_removal`.
+    fn request_egress_removal(&mut self) {
+        let Some(process) = crate::ui::egress::selected_process(self) else {
+            self.ui.export_status = Some("Egress remove: nothing selected".into());
+            self.ui.export_status_tick = 0;
+            return;
+        };
+        // Nothing declared for it — say so now rather than after a pointless
+        // confirmation prompt.
+        if self.egress_profiler.declared_rule(&process).is_none() {
+            self.ui.export_status = Some(format!("{process} has no rule to remove"));
+            self.ui.export_status_tick = 0;
+            return;
+        }
+        self.ui.egress_pending_removal = Some(process);
+    }
+
+    fn cancel_egress_removal(&mut self) {
+        self.ui.egress_pending_removal = None;
+    }
+
+    /// Delete the confirmed process's rule from `egress-policy.toml` and
+    /// reload, so the tab reflects the file immediately.
+    ///
+    /// Under `strict = true` the process does not go quiet — it moves from
+    /// declared to `✗ undeclared`, which is the honest reading: coverage was
+    /// withdrawn, not granted.
+    fn confirm_egress_removal(&mut self) {
+        use crate::collectors::egress;
+        let Some(process) = self.ui.egress_pending_removal.take() else {
+            return;
+        };
+        let Some(path) = egress::default_policy_path() else {
+            self.ui.export_status = Some("Egress remove failed: no config dir".into());
+            self.ui.export_status_tick = 0;
+            return;
+        };
+        match egress::remove_rules_from_policy_file(std::slice::from_ref(&process), &path) {
+            Ok(removed) if removed.is_empty() => {
+                self.ui.export_status = Some(format!("{process} had no rule in the policy file"));
+            }
+            Ok(_) => {
+                let loaded = egress::load_policy_file(&path);
+                let ok = loaded.is_some();
+                self.egress_profiler.set_policy(loaded);
+                self.ui.export_status = Some(if ok {
+                    format!("Removed {process} from policy — no longer checked")
+                } else {
+                    format!("Removed {process} but reload failed — check file permissions")
+                });
+            }
+            Err(e) => {
+                self.ui.export_status = Some(format!("Egress remove failed: {e}"));
+            }
+        }
+        self.ui.export_status_tick = 0;
+    }
+
     fn disarm_incident_recorder(&mut self) {
         self.incident_recorder.disarm();
         if self.incident_capture_started && self.packet_collector.is_capturing() {
@@ -2177,7 +2236,29 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         handle_egress_filter_input(app, key);
         return false;
     }
+    // Ahead of `handle_main_key`, so the confirmation swallows `y` before the
+    // yank binding sees it — and so any other key cancels rather than doing
+    // something unrelated while a destructive prompt is on screen.
+    if app.ui.egress_pending_removal.is_some() && app.ui.current_tab == Tab::Egress {
+        if confirms_removal(key.code) {
+            app.confirm_egress_removal();
+        } else {
+            app.cancel_egress_removal();
+        }
+        return false;
+    }
     handle_main_key(app, key)
+}
+
+/// Whether a key answers "yes" to the egress removal prompt.
+///
+/// Only an explicit yes counts; everything else cancels, so a stray keystroke
+/// against a destructive prompt is always the safe outcome. `Enter` is
+/// deliberately *not* a yes — on this tab it is the add-to-policy binding, and
+/// a key that adds in one state and deletes in another is how people delete
+/// things they meant to keep.
+fn confirms_removal(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'))
 }
 
 fn handle_help_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
@@ -2852,6 +2933,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char(' ') if app.ui.current_tab == Tab::Egress => {
             app.toggle_egress_fold();
         }
+        // Must stay ahead of the unguarded `s`/`S` sort arms below — match
+        // arms are ordered, and a guarded Egress arm placed after an
+        // unguarded one silently never fires.
+        KeyCode::Char('x') | KeyCode::Delete if app.ui.current_tab == Tab::Egress => {
+            app.request_egress_removal();
+        }
         KeyCode::Char('s') => {
             let tab = app.ui.current_tab;
             let keys = sort_columns_for_tab(tab);
@@ -3094,6 +3181,25 @@ mod tests {
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,
+        }
+    }
+
+    /// Only an explicit yes deletes a policy rule. In particular `Enter` must
+    /// not — it is the add-to-policy key on this same tab, and one keystroke
+    /// meaning both "add" and "delete" is a trap.
+    #[test]
+    fn only_an_explicit_yes_confirms_a_policy_removal() {
+        assert!(confirms_removal(KeyCode::Char('y')));
+        assert!(confirms_removal(KeyCode::Char('Y')));
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+            KeyCode::Char('x'),
+            KeyCode::Char('q'),
+            KeyCode::Down,
+        ] {
+            assert!(!confirms_removal(code), "{code:?} must not delete a rule");
         }
     }
 

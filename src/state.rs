@@ -165,6 +165,14 @@ pub struct AppUiState {
     pub egress_sort: EgressSort,
     /// Whether the destination detail pane is open (`d`).
     pub egress_detail: bool,
+    /// Process whose rule removal is awaiting confirmation (`x`, then `y`).
+    ///
+    /// Removal is the only destructive action on this tab — it can discard
+    /// hand-written allowlist entries that no amount of re-observation will
+    /// bring back, since promotion only ever regenerates what was *seen*. So
+    /// it asks, unlike promote, which is additive and therefore safe to fire
+    /// on a single keystroke.
+    pub egress_pending_removal: Option<String>,
 
     // ── Packet-tab specifics ──
     pub packet_follow: bool,
@@ -236,6 +244,7 @@ impl AppUiState {
             egress_collapsed: std::collections::HashSet::new(),
             egress_sort: EgressSort::default(),
             egress_detail: false,
+            egress_pending_removal: None,
 
             packet_follow: cfg.packet_follow,
             packet_detail_expanded: false,

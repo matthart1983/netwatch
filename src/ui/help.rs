@@ -311,9 +311,14 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(
         theme,
         "Enter",
-        "Promote selected process into policy",
+        "Add selected process to policy (from its observed baseline)",
     ));
-    lines.push(key_line(theme, "P (shift)", "Promote every process"));
+    lines.push(key_line(theme, "P (shift)", "Add every observed process"));
+    lines.push(key_line(
+        theme,
+        "x / Del",
+        "Remove selected process from policy (confirm with y)",
+    ));
     lines.push(key_line(theme, "e", "Export baseline to NDJSON"));
     lines.push(Line::raw(""));
     lines.push(key_line(

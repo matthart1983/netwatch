@@ -1523,12 +1523,99 @@ fn union_ports(existing: Option<&toml_edit::Item>, key: &str, add: &[u16]) -> Ve
     set.into_iter().collect()
 }
 
+/// Delete the named processes' rules from the policy file, preserving
+/// everything else. The counterpart to `merge_rules_into_policy_file`, which
+/// only ever grows an allowlist.
+///
+/// Returns the names actually removed — a name with no rule is not an error,
+/// it is simply nothing to do, and the caller says so rather than claiming a
+/// removal that didn't happen.
+///
+/// Removing a rule is the one destructive operation in the linter: it can
+/// discard hand-written entries the baseline cannot regenerate. So it refuses
+/// an unparseable file for the same reason promotion does, writes owner-only,
+/// and the caller is expected to confirm first.
+///
+/// A comment sitting immediately above a rule goes with it — such a comment
+/// documents that rule, and leaving it behind would orphan a note about
+/// something no longer in the file. The one exception is the file's own
+/// leading comment block, which `toml_edit` happens to store as the first
+/// table's prefix: removing the first (or only) rule would otherwise delete
+/// the header explaining `strict` and the promotion semantics, leaving a file
+/// with no hint of how to get it back. That block is restored explicitly.
+pub fn remove_rules_from_policy_file(
+    names: &[String],
+    path: &Path,
+) -> std::io::Result<Vec<String>> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        // Nothing declared anywhere: removing is vacuously done. Creating the
+        // file here just to delete from it would be absurd.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("existing policy does not parse (fix it by hand first): {e}"),
+        )
+    })?;
+
+    let mut removed = Vec::new();
+    if let Some(tbl) = doc.get_mut("process").and_then(|p| p.as_table_mut()) {
+        for name in names {
+            if tbl.remove(name.as_str()).is_some() {
+                removed.push(name.clone());
+            }
+        }
+        // Leave `[process]` implicit so an emptied policy renders as the
+        // header and nothing else, rather than a stray bare table.
+        tbl.set_implicit(true);
+    }
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    let mut body = doc.to_string();
+    let head = leading_comment_block(&existing);
+    if !head.is_empty() && !body.starts_with(&head) {
+        body.insert_str(0, &head);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_owner_only(path, body.as_bytes())?;
+    Ok(removed)
+}
+
+/// The run of comment and blank lines at the very top of a policy file — its
+/// header. Returned with the trailing newline so it can be re-prepended
+/// verbatim.
+fn leading_comment_block(src: &str) -> String {
+    let mut out = String::new();
+    for line in src.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') || t.is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            break;
+        }
+    }
+    // A file that is *only* comments has no rules to remove, so preserving
+    // "everything" would be a no-op anyway; more usefully, this stops a
+    // comment-only file from being duplicated onto itself.
+    if out.len() == src.len() {
+        return String::new();
+    }
+    out
+}
+
 /// Upsert `rules` into the policy file, preserving everything else — hand
 /// edits, comments, and rules for processes not being promoted. Promotion
 /// is additive per process: it unions the observed entries with those already
-/// declared (it never shrinks or deletes an allowlist). Refuses (rather than
-/// clobbers) a file that no longer parses, so a broken hand edit is never
-/// silently thrown away.
+/// declared (it never shrinks or deletes an allowlist). Removal is
+/// `remove_rules_from_policy_file`. Refuses (rather than clobbers) a file that
+/// no longer parses, so a broken hand edit is never silently thrown away.
 pub fn merge_rules_into_policy_file(
     rules: &[(String, ProcessRule)],
     path: &Path,
@@ -2126,6 +2213,185 @@ mod tests {
         assert!(body.contains("# my hand-written note"));
         assert!(body.contains("gstatic"));
         assert!(body.contains("[process.ssh]"));
+    }
+
+    /// Removal is surgical: the named rule goes, everything a human put in
+    /// the file stays.
+    #[test]
+    fn remove_deletes_only_the_named_rule() {
+        let path = scratch("remove.toml");
+        std::fs::write(
+            &path,
+            "# my hand-written note\n\n\
+             [process.ssh]\nallow_ports = [22] # keep tight\n\n\
+             [process.chrome]\nallow_sni = [\"*.google.com\"]\nallow_ports = [443]\n",
+        )
+        .unwrap();
+
+        let removed = remove_rules_from_policy_file(&["chrome".to_string()], &path).unwrap();
+        assert_eq!(removed, vec!["chrome".to_string()]);
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("chrome"), "the rule is gone: {body}");
+        assert!(body.contains("# my hand-written note"), "comments survive");
+        assert!(body.contains("# keep tight"), "inline comments survive");
+        let parsed: EgressPolicy = toml::from_str(&body).unwrap();
+        assert!(!parsed.process.contains_key("chrome"));
+        assert_eq!(parsed.process.get("ssh").unwrap().allow_ports, vec![22]);
+    }
+
+    /// Removing the last (or first) rule must not take the file's header with
+    /// it. `toml_edit` stores the leading comment block as the first table's
+    /// prefix, so a naive removal emptied the file completely — leaving the
+    /// user with no record of what `strict` does or how to promote again.
+    #[test]
+    fn removing_the_only_rule_keeps_the_file_header() {
+        let path = scratch("remove-header.toml");
+        let rules = vec![("chrome".to_string(), ProcessRule::default())];
+        merge_rules_into_policy_file(&rules, &path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.contains("observe → promote → warn"));
+
+        remove_rules_from_policy_file(&["chrome".to_string()], &path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("observe → promote → warn"),
+            "the generated header must survive: {after:?}"
+        );
+        assert!(
+            after.contains("strict = true"),
+            "including the part documenting strict mode: {after:?}"
+        );
+        assert!(!after.contains("[process.chrome]"), "the rule is gone");
+        // Still a valid, loadable policy — not a pile of comments plus junk.
+        let parsed: EgressPolicy = toml::from_str(&after).unwrap();
+        assert!(parsed.process.is_empty());
+        // And promoting again reproduces a normal file, not a doubled header.
+        merge_rules_into_policy_file(&rules, &path).unwrap();
+        let again = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            again.matches("observe → promote → warn").count(),
+            1,
+            "header must not be duplicated: {again:?}"
+        );
+    }
+
+    /// Removing something that was never declared is not an error — but the
+    /// caller must be able to tell, so it doesn't report a removal that
+    /// didn't happen. The file is left untouched.
+    #[test]
+    fn removing_an_undeclared_process_reports_nothing_removed() {
+        let path = scratch("remove-absent.toml");
+        let original = "[process.ssh]\nallow_ports = [22]\n";
+        std::fs::write(&path, original).unwrap();
+
+        let removed = remove_rules_from_policy_file(&["nothere".to_string()], &path).unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // No file at all is likewise vacuously done, and must not create one.
+        let missing = path.parent().unwrap().join("does-not-exist.toml");
+        assert!(remove_rules_from_policy_file(&["x".to_string()], &missing)
+            .unwrap()
+            .is_empty());
+        assert!(!missing.exists(), "removal must not create a policy file");
+    }
+
+    /// Same guard as promotion: a file that no longer parses is refused, not
+    /// rewritten. Losing a broken hand edit is worse than failing loudly.
+    #[test]
+    fn remove_refuses_to_clobber_unparseable_policy() {
+        let path = scratch("remove-broken.toml");
+        std::fs::write(&path, "[process.ssh\nallow_ports = [22]").unwrap();
+        let err = remove_rules_from_policy_file(&["ssh".to_string()], &path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .starts_with("[process.ssh\n"));
+    }
+
+    /// Remove-then-re-add is the round trip a user will actually perform, and
+    /// the rewritten file must still be loadable — including its permissions,
+    /// since `load_policy_file` refuses a group/world-writable policy.
+    #[test]
+    fn removed_process_stops_being_checked_and_can_be_re_added() {
+        let path = scratch("remove-roundtrip.toml");
+        let rules = vec![(
+            "chrome".to_string(),
+            ProcessRule {
+                allow_sni: vec!["api.example.com".into()],
+                allow_asn: vec![],
+                allow_ip: vec![],
+                allow_ports: vec![443],
+            },
+        )];
+        merge_rules_into_policy_file(&rules, &path).unwrap();
+        assert!(load_policy_file(&path)
+            .unwrap()
+            .process
+            .contains_key("chrome"));
+
+        remove_rules_from_policy_file(&["chrome".to_string()], &path).unwrap();
+        let policy = load_policy_file(&path).expect("policy still loads after removal");
+        assert!(policy.process.is_empty());
+
+        // The destination that was declared now reads as unchecked rather
+        // than allowed — coverage was withdrawn, not granted.
+        let mut p = EgressProfiler::new();
+        p.set_policy(Some(policy));
+        let d = EgressDest {
+            sni: Some("api.example.com".into()),
+            asn_org: None,
+            port: 443,
+            last_ip: "1.2.3.4".into(),
+            ech: false,
+            first_seen: SystemTime::now(),
+            last_seen: SystemTime::now(),
+            count: 1,
+            bytes_out: 0,
+            bytes_in: 0,
+            activity: VecDeque::new(),
+        };
+        assert_eq!(p.verdict("chrome", &d), Verdict::NoRule);
+
+        // And it can be put back.
+        merge_rules_into_policy_file(&rules, &path).unwrap();
+        p.set_policy(load_policy_file(&path));
+        assert_eq!(p.verdict("chrome", &d), Verdict::Sni);
+    }
+
+    /// Under a policy declaring itself complete, removing a rule does not make
+    /// a process go quiet — it makes it a finding.
+    #[test]
+    fn removal_under_strict_surfaces_the_process_as_undeclared() {
+        let path = scratch("remove-strict.toml");
+        std::fs::write(
+            &path,
+            "strict = true\n\n[process.chrome]\nallow_sni = [\"api.example.com\"]\n",
+        )
+        .unwrap();
+        write_owner_only(&path, std::fs::read(&path).unwrap().as_slice()).unwrap();
+
+        remove_rules_from_policy_file(&["chrome".to_string()], &path).unwrap();
+        let policy = load_policy_file(&path).expect("loads after removal");
+        assert!(policy.strict, "the strict flag is not collateral damage");
+
+        let mut p = EgressProfiler::new();
+        p.set_policy(Some(policy));
+        let d = EgressDest {
+            sni: Some("api.example.com".into()),
+            asn_org: None,
+            port: 443,
+            last_ip: "1.2.3.4".into(),
+            ech: false,
+            first_seen: SystemTime::now(),
+            last_seen: SystemTime::now(),
+            count: 1,
+            bytes_out: 0,
+            bytes_in: 0,
+            activity: VecDeque::new(),
+        };
+        assert_eq!(p.verdict("chrome", &d), Verdict::Undeclared);
     }
 
     #[test]

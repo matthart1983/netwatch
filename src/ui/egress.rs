@@ -659,7 +659,10 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
                 Constraint::Length(9),  // in
                 Constraint::Length(8),  // activity
                 Constraint::Length(7),  // active
-                Constraint::Length(11), // policy
+                // 12 fits the longest verdict, `✗ undeclared` — at 11 it
+                // rendered as "✗ undeclare", which reads as a rendering bug
+                // on the column whose whole job is to be believed.
+                Constraint::Length(12), // policy
             ],
         )
         .header(header)
@@ -861,39 +864,83 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(line).style(Style::default().bg(t.bg)), area);
         return;
     }
+    // A destructive edit takes the whole footer and names the part that
+    // cannot be undone, rather than a bare "are you sure".
+    if let Some(process) = &app.ui.egress_pending_removal {
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(" Remove ", Style::default().fg(t.status_error).bold()),
+                Span::styled(process.clone(), Style::default().fg(t.text_primary).bold()),
+                Span::styled(
+                    " from the egress policy?",
+                    Style::default().fg(t.text_primary),
+                ),
+            ]),
+            Line::from(vec![Span::styled(
+                " Hand-written entries are discarded — re-adding only restores what was observed.",
+                Style::default().fg(t.text_muted),
+            )]),
+            Line::from(vec![
+                Span::styled(" y", Style::default().fg(t.key_hint).bold()),
+                Span::raw(" remove   "),
+                Span::styled("any other key", Style::default().fg(t.key_hint).bold()),
+                Span::raw(" cancel"),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg)), area);
+        return;
+    }
     let hint = |k: &'static str, label: &'static str| {
         vec![
             Span::styled(k, Style::default().fg(t.key_hint).bold()),
             Span::raw(format!(" {label}   ")),
         ]
     };
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(hint("s", "sort"));
-    spans.extend(hint("/", "filter"));
-    spans.extend(hint("space", "fold"));
-    spans.extend(hint("d", "detail"));
-    spans.extend(hint("↵", "promote"));
-    spans.extend(hint("e", "export"));
+    // Navigation on the first line, the actions that write to the policy file
+    // on the second. Two lines because the policy actions deserve their real
+    // names — "promote" is jargon for "add to policy", and a destructive
+    // action should not be a bare letter buried in a run of six.
+    let mut nav = vec![Span::raw(" ")];
+    nav.extend(hint("s", "sort"));
+    nav.extend(hint("/", "filter"));
+    nav.extend(hint("space", "fold"));
+    nav.extend(hint("d", "detail"));
     // Teach the two glyphs that aren't self-evident, rather than restating
     // that the linter never blocks — that belongs in the docs, not on every
     // frame.
-    spans.push(Span::styled("~ asn", Style::default().fg(t.status_warn)));
-    spans.push(Span::styled(
+    nav.push(Span::styled("~ asn", Style::default().fg(t.status_warn)));
+    nav.push(Span::styled(
         " = whole-AS match   ",
         Style::default().fg(t.text_muted),
     ));
-    spans.push(Span::styled(
+    nav.push(Span::styled(
         "— no rule",
         Style::default().fg(t.status_warn),
     ));
-    spans.push(Span::styled(
+    nav.push(Span::styled(
         " = unchecked",
         Style::default().fg(t.text_muted),
     ));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(t.bg)),
-        area,
-    );
+
+    let mut actions = vec![Span::raw(" ")];
+    actions.extend(hint("↵", "add to policy"));
+    actions.extend(hint("x", "remove from policy"));
+    actions.extend(hint("P", "add all"));
+    actions.extend(hint("e", "export"));
+
+    // The shared header slot for `export_status` sits on the row the tab bar
+    // consumes at any ordinary width, so on this tab the outcome of a policy
+    // edit was never actually visible — a key that declines to act looked
+    // identical to a key that does nothing. Say it here, where there is room.
+    let mut lines = vec![Line::from(nav), Line::from(actions)];
+    if let Some(status) = &app.ui.export_status {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(status.clone(), Style::default().fg(t.status_good)),
+        ]));
+    }
+
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg)), area);
 }
 
 #[cfg(test)]
