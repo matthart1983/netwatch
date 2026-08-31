@@ -78,7 +78,7 @@ const UNDECLARED_SETTLE_TICKS: u64 = 3;
 /// Schema tag stamped on the NDJSON export's `_meta` line. Bump the minor
 /// when adding fields (additive/back-compatible), the major on a breaking
 /// change — the managed ingest keys off this.
-pub const EGRESS_EXPORT_SCHEMA: &str = "netwatch.egress.v1.1";
+pub const EGRESS_EXPORT_SCHEMA: &str = "netwatch.egress.v1.2";
 
 /// One observed destination for a process.
 #[derive(Clone, Debug)]
@@ -242,6 +242,20 @@ pub struct EgressRecord {
     /// per-tick rates) and zero when packet capture isn't running.
     pub bytes_out: u64,
     pub bytes_in: u64,
+    /// Adjudicated reading of this destination — `benign` | `expected` |
+    /// `unexpected` | `suspicious`. `None` when nothing has judged it, which
+    /// is the normal case for a row policy already admits.
+    ///
+    /// Additive in schema v1.2. This is the corpus field: `verdict` says
+    /// whether a destination was declared, `label` says what it appears to
+    /// *be*. A consumer needs both — "undeclared" and "suspicious" are very
+    /// different findings and only one of them is worth waking someone for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Where `label` came from — `catalog` | `model` | `human`. A label
+    /// without provenance is not evidence, so the two always travel together.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_source: Option<String>,
 }
 
 /// A flow that violated a declared egress rule. Surfaced as a warning —
@@ -340,6 +354,9 @@ impl EgressProfiler {
         }
         if let Some(path) = default_profiles_path() {
             profiler.load_profiles(&path);
+        }
+        if let Some(path) = default_verdicts_path() {
+            profiler.load_verdicts(&path);
         }
         profiler
     }
@@ -532,6 +549,40 @@ impl EgressProfiler {
         self.worker = AdjudicationWorker::spawn(&cfg);
         self.adjudicator = Adjudicator::new(cfg);
         self.policy = policy;
+    }
+
+    /// Restore cached adjudication verdicts. A missing or malformed file is
+    /// not an error — the verdicts are derived data and re-earn themselves.
+    pub fn load_verdicts(&mut self, path: &Path) {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return;
+        };
+        match serde_json::from_str::<Vec<adjudicate::PersistedVerdict>>(&contents) {
+            Ok(v) => {
+                let n = v.len();
+                self.adjudicator.restore(v);
+                tracing::debug!(target: "netwatch::egress", count = n, "restored adjudication verdicts");
+            }
+            Err(e) => {
+                tracing::warn!(target: "netwatch::egress", path = %path.display(), error = %e, "verdict cache parse failed; re-adjudicating");
+            }
+        }
+    }
+
+    /// Write the verdict cache. Owner-only: it records which destinations a
+    /// machine reached, which is the same class of information as the
+    /// baseline beside it.
+    pub fn save_verdicts(&self, path: &Path) -> std::io::Result<()> {
+        let verdicts = self.adjudicator.persistable();
+        if verdicts.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(&verdicts)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        policy::write_owner_only(path, &json)
     }
 
     /// Advance drift adjudication by one tick.
@@ -1034,7 +1085,7 @@ impl EgressProfiler {
     pub fn export_records(&self) -> Vec<EgressRecord> {
         let mut out = Vec::new();
         for profile in self.snapshot() {
-            for dest in profile.dests.values() {
+            for ((dest_label, _), dest) in &profile.dests {
                 let v = self.verdict(&profile.process, dest);
                 let verdict = match &v {
                     Verdict::Ech => "unreadable",
@@ -1054,6 +1105,14 @@ impl EgressProfiler {
                     Verdict::Asn(_) => Some("asn".to_string()),
                     _ => None,
                 };
+                // Only the label a tier actually produced. `lookup` is pure —
+                // exporting must not enqueue model work or spend budget.
+                // Key off the stored DestKey label, not a freshly-derived
+                // one. They diverge once an SNI backfills onto a destination
+                // first seen by address, and a mismatch here would silently
+                // export `label: null` for a destination that has a cached
+                // verdict under its original name.
+                let adj = self.adjudicator.lookup(&profile.process, dest_label, dest);
                 out.push(EgressRecord {
                     process: profile.process.clone(),
                     sni: dest.sni.clone(),
@@ -1069,6 +1128,12 @@ impl EgressProfiler {
                     matched_by,
                     bytes_out: dest.bytes_out,
                     bytes_in: dest.bytes_in,
+                    label: adj.as_ref().map(|a| a.label.tag().to_string()),
+                    label_source: adj.as_ref().map(|a| match a.provenance {
+                        adjudicate::Provenance::Catalog => "catalog".to_string(),
+                        adjudicate::Provenance::Model => "model".to_string(),
+                        adjudicate::Provenance::Human => "human".to_string(),
+                    }),
                 });
             }
         }
@@ -1125,6 +1190,13 @@ impl EgressProfiler {
         };
         if let Err(e) = self.save_profiles(&path) {
             tracing::warn!(target: "netwatch::egress", path = %path.display(), error = %e, "egress baseline save failed");
+        }
+        // Verdicts ride the same cadence as the baseline they describe. A
+        // separate file so deleting one doesn't take the other with it.
+        if let Some(vpath) = default_verdicts_path() {
+            if let Err(e) = self.save_verdicts(&vpath) {
+                tracing::warn!(target: "netwatch::egress", path = %vpath.display(), error = %e, "verdict cache save failed");
+            }
         }
         self.last_persist = Some(Instant::now());
     }
@@ -1378,6 +1450,14 @@ struct PersistedDest {
 
 /// Default learned-baseline location: `<state_dir>/netwatch/egress-profiles.json`
 /// (`~/.local/state` on Linux; falls back to the local data dir on macOS).
+/// Where adjudication verdicts are cached. State, not config — it is derived
+/// data that can be deleted at any time and will simply be recomputed.
+pub fn default_verdicts_path() -> Option<PathBuf> {
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .map(|d| d.join("netwatch").join("egress-verdicts.json"))
+}
+
 pub fn default_profiles_path() -> Option<PathBuf> {
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
@@ -2237,6 +2317,33 @@ mod tests {
     }
 
     // ── Phase 3: structured export ──
+
+    #[test]
+    fn export_records_carry_the_adjudicated_label_and_its_provenance() {
+        let mut p = EgressProfiler::new();
+        let now = SystemTime::now();
+        // A catalogued destination and an unknown one.
+        p.record("cargo", "1.2.3.4", 443, sni("crates.io"), None, now);
+        p.record("curl", "5.6.7.8", 443, sni("paste.ee"), None, now);
+
+        let recs = p.export_records();
+        let cargo = recs.iter().find(|r| r.process == "cargo").unwrap();
+        assert_eq!(cargo.label.as_deref(), Some("benign"));
+        assert_eq!(cargo.label_source.as_deref(), Some("catalog"));
+
+        // Nothing has judged the unknown one, and export must not enqueue
+        // work to find out.
+        let curl = recs.iter().find(|r| r.process == "curl").unwrap();
+        assert_eq!(curl.label, None);
+        assert_eq!(curl.label_source, None);
+    }
+
+    #[test]
+    fn the_export_schema_version_moves_when_fields_are_added() {
+        // The managed ingest keys off this string; adding `label` without
+        // bumping it would hand consumers a field they never agreed to.
+        assert_eq!(EGRESS_EXPORT_SCHEMA, "netwatch.egress.v1.2");
+    }
 
     #[test]
     fn export_records_carry_verdicts_and_sort_stably() {

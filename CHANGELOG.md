@@ -4,6 +4,53 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Drift adjudication — the Egress tab now says what a drifting destination
+  appears to *be*, not just that it drifted.** The linter already decided, in
+  code, that a destination sits outside a process's allowlist. What it couldn't
+  say was whether that destination is a CDN the vendor uses, routine telemetry,
+  or a paste site — a judgment you previously made by eye, one row at a time,
+  which is why a long drift table got skimmed rather than worked.
+
+  Two tiers answer it. A shipped catalog of 66 well-known destinations —
+  package registries, CDNs, certificate infrastructure, NTP, OS vendors,
+  telemetry, inference APIs — resolves the boring majority with no network and
+  no model, and `netwatch --egress-catalog` prints the whole table, because a
+  label you can't inspect is a label you can't trust. Hostname matching is
+  label-boundary aware: `evil-github.com` and `github.com.evil.io` do not match
+  `github.com`, so a benign label can't be bought for the price of a domain
+  registration.
+
+  For the tail the catalog can't resolve, an optional local model over Ollama.
+  Off unless you turn it on with `[adjudication] model = true` in
+  `egress-policy.toml`, and **loopback only** — a non-local endpoint spawns no
+  client and no thread. The analysis never leaves the box; that is the point,
+  not a default to override.
+
+  The model never detects. Drift is decided in code, as before, and a label may
+  only ever make a row *louder* — a classifier that tries to talk a row down is
+  ignored. Its input is treated as hostile, because it is: hostnames are chosen
+  by whoever registered the domain, so values are stripped of control and fence
+  characters, delimited, and declared untrusted, and text inside them that reads
+  like an instruction counts as evidence *for* the `suspicious` label. Responses
+  are parsed against a strict schema and discarded on any deviation — a parse
+  failure leaves the row unclassified rather than defaulting it to benign.
+  Inference runs on its own thread with a bounded queue, one call in flight, a
+  hard timeout, a per-session ceiling and a backoff after failure, so a slow or
+  absent model costs a blank column and never a dropped frame.
+
+  Verdicts are cached to `egress-verdicts.json` and invalidated by a model or
+  prompt change. Catalog verdicts are deliberately *not* persisted — they are
+  free to recompute, and a stale file shouldn't outlive the table entry that
+  justified it.
+
+### Changed
+- Egress NDJSON export is now schema `netwatch.egress.v1.2`, adding `label` and
+  `label_source`. Additive and optional; both are omitted when nothing has
+  judged a destination. `verdict` says whether a destination was *declared*;
+  `label` says what it appears to *be*. Consumers need both — "undeclared" and
+  "suspicious" are very different findings.
+
 ## [0.29.2] - 2026-08-16
 
 ### Fixed

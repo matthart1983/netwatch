@@ -324,7 +324,19 @@ fn vol(b: u64) -> String {
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let has_warnings = app.egress_profiler.recent_violation_count() > 0;
     let warn_h: u16 = if has_warnings { 6 } else { 0 };
-    let detail_h: u16 = if app.ui.egress_detail { 7 } else { 0 };
+    // 7 fits the five lines a destination always has, plus borders. A row
+    // carrying an adjudication adds two more (the reading and its
+    // provenance), and a clipped provenance line is worse than no pane —
+    // it is the half that makes the label traceable.
+    let detail_h: u16 = if app.ui.egress_detail {
+        if selected_has_reading(app) {
+            9
+        } else {
+            7
+        }
+    } else {
+        0
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -814,6 +826,29 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Whether the selected row has an adjudication to show, so the detail pane
+/// can be sized before it is rendered.
+fn selected_has_reading(app: &App) -> bool {
+    let rows = visible_rows(app);
+    let sel = app
+        .ui
+        .scroll
+        .egress_scroll
+        .min(rows.len().saturating_sub(1));
+    match rows.get(sel) {
+        Some(EgressRow::Dest {
+            process,
+            label,
+            dest,
+            ..
+        }) => app
+            .egress_profiler
+            .adjudication(process, label, dest)
+            .is_some(),
+        _ => false,
+    }
+}
+
 fn render_detail(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let rows = visible_rows(app);
@@ -849,10 +884,10 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             kv(t, "Worst verdict", worst.label().to_string()),
         ],
         EgressRow::Dest {
+            process,
             label,
             dest,
             verdict,
-            ..
         } => {
             // The whole point of the pane: the untruncated name.
             let mut v = vec![
@@ -901,6 +936,45 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
                 ]),
                 other => kv(t, "Verdict", other.label().to_string()),
             });
+            // The reading, and — critically — where it came from. The column
+            // has room for a tag; this is the only place the rationale and
+            // its provenance are legible, and a label nobody can trace back
+            // is not evidence.
+            if let Some(a) = app.egress_profiler.adjudication(process, label, dest) {
+                use crate::collectors::egress::adjudicate::{Label, Provenance};
+                let color = match a.label {
+                    Label::Benign | Label::Expected => t.text_secondary,
+                    Label::Unexpected => t.status_warn,
+                    Label::Suspicious => t.status_error,
+                };
+                let origin = match a.provenance {
+                    Provenance::Catalog => format!("catalog: {}", a.source),
+                    Provenance::Model => match a.confidence {
+                        Some(c) => format!("{} · confidence {:.0}%", a.source, c * 100.0),
+                        None => a.source.clone(),
+                    },
+                    Provenance::Human => "set by hand".to_string(),
+                };
+                v.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<14}", "Reading"),
+                        Style::default().fg(t.text_muted),
+                    ),
+                    Span::styled(a.label.tag().to_string(), Style::default().fg(color)),
+                    Span::styled(
+                        if a.reason.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", a.reason)
+                        },
+                        Style::default().fg(t.text_secondary),
+                    ),
+                ]));
+                v.push(Line::from(vec![
+                    Span::styled(format!("{:<14}", ""), Style::default().fg(t.text_muted)),
+                    Span::styled(origin, Style::default().fg(t.text_muted)),
+                ]));
+            }
             v
         }
     };

@@ -224,6 +224,15 @@ struct CacheEntry {
     prompt_version: u32,
 }
 
+/// One cached verdict as written to disk.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedVerdict {
+    pub id: DestId,
+    pub adjudication: Adjudication,
+    pub model: String,
+    pub prompt_version: u32,
+}
+
 /// Outcome of asking for a label. `Pending` is a real answer: the row renders
 /// unclassified, exactly as it does today, and may resolve on a later tick.
 #[derive(Clone, Debug, PartialEq)]
@@ -346,6 +355,46 @@ impl Adjudicator {
 
         self.queue.push((id, build_prompt(process, dest, d, peers)));
         Outcome::Pending
+    }
+
+    /// Serialize the cache for persistence.
+    ///
+    /// Catalog verdicts are deliberately *excluded*. They are recomputed from
+    /// the shipped table in microseconds, and persisting them would mean a
+    /// stale file could keep asserting a label after the table that justified
+    /// it was edited. Only the expensive, unreproducible verdicts are stored.
+    pub fn persistable(&self) -> Vec<PersistedVerdict> {
+        self.cache
+            .iter()
+            .filter(|(_, e)| e.adjudication.provenance != Provenance::Catalog)
+            .map(|(id, e)| PersistedVerdict {
+                id: id.clone(),
+                adjudication: e.adjudication.clone(),
+                model: e.model.clone(),
+                prompt_version: e.prompt_version,
+            })
+            .collect()
+    }
+
+    /// Restore persisted verdicts. Entries from another model or prompt
+    /// version are dropped at load rather than carried and filtered later —
+    /// a cache that silently holds two vocabularies is worse than a cold one.
+    pub fn restore(&mut self, verdicts: Vec<PersistedVerdict>) {
+        for v in verdicts {
+            if v.adjudication.provenance == Provenance::Model
+                && (v.model != self.cfg.model_name || v.prompt_version != PROMPT_VERSION)
+            {
+                continue;
+            }
+            self.cache.insert(
+                v.id,
+                CacheEntry {
+                    adjudication: v.adjudication,
+                    model: v.model,
+                    prompt_version: v.prompt_version,
+                },
+            );
+        }
     }
 
     /// Read-only lookup, for the render path.
@@ -1064,6 +1113,94 @@ mod tests {
         a.cfg.model_name = "different-model".into();
         assert_eq!(a.adjudicate("curl", host, &d, &[]), Outcome::Pending);
         let _ = id;
+    }
+
+    // ---- persistence ----
+
+    #[test]
+    fn catalog_verdicts_are_not_persisted() {
+        let cfg = AdjudicationConfig {
+            model: true,
+            ..Default::default()
+        };
+        let mut a = Adjudicator::new(cfg);
+        let d = dest(Some("crates.io"), None, 443);
+        a.adjudicate("cargo", "crates.io", &d, &[]);
+        assert!(
+            a.persistable().is_empty(),
+            "a catalog verdict was written to disk; a stale file would then \
+             outlive the table entry that justified it"
+        );
+    }
+
+    #[test]
+    fn model_verdicts_survive_a_round_trip() {
+        let cfg = AdjudicationConfig {
+            model: true,
+            ..Default::default()
+        };
+        let mut a = Adjudicator::new(cfg.clone());
+        let host = "paste.ee";
+        let d = dest(Some(host), None, 443);
+        a.adjudicate("curl", host, &d, &[]);
+        let (id, _) = a.next_job().unwrap();
+        a.record(
+            id,
+            Ok(Adjudication {
+                label: Label::Suspicious,
+                provenance: Provenance::Model,
+                reason: "paste site".into(),
+                confidence: Some(0.9),
+                source: format!("{}@{}", cfg.model_name, PROMPT_VERSION),
+            }),
+        );
+
+        let saved = a.persistable();
+        assert_eq!(saved.len(), 1);
+        let json = serde_json::to_string(&saved).unwrap();
+
+        let mut fresh = Adjudicator::new(cfg);
+        fresh.restore(serde_json::from_str(&json).unwrap());
+        match fresh.adjudicate("curl", host, &d, &[]) {
+            Outcome::Resolved(adj) => {
+                assert_eq!(adj.label, Label::Suspicious);
+                assert_eq!(adj.reason, "paste site");
+            }
+            other => panic!("verdict did not survive the round trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_restored_verdict_from_another_model_is_dropped_at_load() {
+        let cfg = AdjudicationConfig {
+            model: true,
+            ..Default::default()
+        };
+        let stale = vec![PersistedVerdict {
+            id: DestId {
+                process: "curl".into(),
+                dest: "paste.ee".into(),
+                asn_org: None,
+                port: 443,
+            },
+            adjudication: Adjudication {
+                label: Label::Benign,
+                provenance: Provenance::Model,
+                reason: "from an older model".into(),
+                confidence: Some(0.5),
+                source: "ancient@1".into(),
+            },
+            model: "some-other-model".into(),
+            prompt_version: PROMPT_VERSION,
+        }];
+        let mut a = Adjudicator::new(cfg);
+        a.restore(stale);
+        let d = dest(Some("paste.ee"), None, 443);
+        assert_eq!(
+            a.adjudicate("curl", "paste.ee", &d, &[]),
+            Outcome::Pending,
+            "a verdict from a different model was served as current"
+        );
     }
 
     #[test]
