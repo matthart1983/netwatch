@@ -23,11 +23,14 @@ use super::connections::Connection;
 use super::geo::{is_private_ip, GeoCache};
 use crate::dpi::AppProtocol;
 
+pub mod adjudicate;
+pub mod catalog;
 mod policy;
 
 // Re-exported so `collectors::egress::EgressPolicy` (and friends) keep
 // resolving for every existing caller — the split is an internal
 // reorganisation, not an API change.
+use adjudicate::{Adjudication, AdjudicationWorker, Adjudicator, Outcome};
 #[cfg(test)]
 use policy::write_owner_only;
 pub use policy::{
@@ -290,6 +293,12 @@ pub struct EgressProfiler {
     violation_totals: HashMap<String, u64>,
     /// Last time the baseline was written to disk (rate-limits `maybe_persist`).
     last_persist: Option<Instant>,
+    /// Drift adjudication: catalog + cache, and the budget for the model tier.
+    /// Always present — the catalog tier needs no configuration.
+    adjudicator: Adjudicator,
+    /// The model tier's thread. `None` unless the policy enabled it, so a
+    /// default install spawns nothing.
+    worker: Option<AdjudicationWorker>,
 }
 
 impl Default for EgressProfiler {
@@ -304,6 +313,8 @@ impl Default for EgressProfiler {
             last_observe: None,
             violation_totals: HashMap::new(),
             last_persist: None,
+            adjudicator: Adjudicator::new(Default::default()),
+            worker: None,
         }
     }
 }
@@ -510,7 +521,95 @@ impl EgressProfiler {
 
     /// Install (or clear) the declared egress policy.
     pub fn set_policy(&mut self, policy: Option<EgressPolicy>) {
+        // Rebuild the adjudication tier from the incoming policy. Dropping the
+        // old worker closes its channel, which ends its thread — so a reload
+        // that turns the model tier off actually stops it, rather than leaving
+        // an orphan blocked on `recv`.
+        let cfg = policy
+            .as_ref()
+            .map(|p| p.adjudication.clone())
+            .unwrap_or_default();
+        self.worker = AdjudicationWorker::spawn(&cfg);
+        self.adjudicator = Adjudicator::new(cfg);
         self.policy = policy;
+    }
+
+    /// Advance drift adjudication by one tick.
+    ///
+    /// Call after [`Self::observe`]. Does three bounded things and never
+    /// blocks: bank whatever the worker has answered, classify the
+    /// destinations that are currently drifting, and hand at most one job
+    /// back to the worker.
+    ///
+    /// Only drifting destinations are adjudicated. A row that policy already
+    /// admits needs no second opinion, and asking for one would spend the
+    /// call budget on the answer we already have.
+    pub fn adjudicate_tick(&mut self) {
+        if let Some(w) = &self.worker {
+            for (id, result) in w.drain() {
+                self.adjudicator.record(id, result);
+            }
+        }
+
+        // Snapshot first: `adjudicate` needs `&mut self.adjudicator` while the
+        // profiles are borrowed, so collect the work before doing it.
+        let mut pending: Vec<(String, String, EgressDest, Vec<String>)> = Vec::new();
+        for profile in self.profiles.values() {
+            let peers: Vec<String> = self
+                .policy
+                .as_ref()
+                .and_then(|p| p.process.get(&profile.process))
+                .map(|r| r.allow_sni.clone())
+                .unwrap_or_default();
+            for ((label, _), dest) in &profile.dests {
+                if self.verdict(&profile.process, dest) == Verdict::Drift {
+                    pending.push((
+                        profile.process.clone(),
+                        label.clone(),
+                        dest.clone(),
+                        peers.clone(),
+                    ));
+                }
+            }
+        }
+
+        for (process, label, dest, peers) in pending {
+            if let Outcome::Resolved(_) =
+                self.adjudicator.adjudicate(&process, &label, &dest, &peers)
+            {
+                continue;
+            }
+        }
+
+        if let Some(w) = &self.worker {
+            if let Some((id, prompt)) = self.adjudicator.next_job() {
+                if let Err(e) = w.submit(id.clone(), prompt) {
+                    self.adjudicator.record(id, Err(e));
+                }
+            }
+        }
+    }
+
+    /// The label for one destination, if anything has judged it. `None` is the
+    /// normal case for a row that policy admits, and renders blank.
+    pub fn adjudication(
+        &self,
+        process: &str,
+        label: &str,
+        dest: &EgressDest,
+    ) -> Option<Adjudication> {
+        self.adjudicator.lookup(process, label, dest)
+    }
+
+    /// Why the model tier is inert, if it is. Surfaced so "no labels" is never
+    /// a silent failure.
+    pub fn adjudication_disabled_reason(&self) -> Option<&str> {
+        self.adjudicator.disabled_reason()
+    }
+
+    /// Whether the model tier is configured on.
+    pub fn adjudication_model_enabled(&self) -> bool {
+        self.adjudicator.config().model
     }
 
     /// Whether a policy is currently loaded.

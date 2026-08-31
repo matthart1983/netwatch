@@ -37,6 +37,13 @@ pub struct EgressPolicy {
     /// without one.
     #[serde(default)]
     pub strict: bool,
+    /// Drift adjudication. The catalog tier is always on; this block only
+    /// governs the local-model tier, which is off unless asked for.
+    ///
+    /// Lives here rather than in `config.toml` for the same reason `strict`
+    /// does — it describes how *this policy's* findings should be read.
+    #[serde(default)]
+    pub adjudication: super::adjudicate::AdjudicationConfig,
     #[serde(default)]
     pub process: HashMap<String, ProcessRule>,
 }

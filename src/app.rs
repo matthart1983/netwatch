@@ -1189,6 +1189,10 @@ impl App {
                     format!("{} (port {})", v.reason, v.port),
                 );
             }
+            // Classify whatever is currently drifting. Bounded and
+            // non-blocking: the catalog answers inline, the model tier is a
+            // channel to another thread.
+            self.egress_profiler.adjudicate_tick();
             // Persist the learned baseline (rate-limited internally) so it
             // survives restarts — a 20-minute session isn't a baseline.
             self.egress_profiler.maybe_persist();

@@ -647,13 +647,14 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
                         .style(Style::default().fg(t.text_secondary).bg(bg)),
                     Cell::from("").style(Style::default().bg(bg)),
                     Cell::from(vtext).style(Style::default().fg(vcol).bg(bg)),
+                    Cell::from("").style(Style::default().bg(bg)),
                 ])
             }
             EgressRow::Dest {
+                process,
                 label,
                 dest,
                 verdict,
-                ..
             } => {
                 // host:port in one cell — the form everyone reads. The IP is
                 // only shown when it adds something, i.e. when the label is
@@ -678,6 +679,10 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
                     Cell::from(dwell(dest.count))
                         .style(Style::default().fg(t.text_secondary).bg(bg)),
                     Cell::from(vtext).style(Style::default().fg(vcol).bg(bg)),
+                    {
+                        let (atext, acol) = adjudication_cell(app, t, process, label, dest);
+                        Cell::from(atext).style(Style::default().fg(acol).bg(bg))
+                    },
                 ])
             }
         });
@@ -691,6 +696,7 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
         "Activity",
         "Active",
         "Policy",
+        "Reading",
     ])
     .style(Style::default().fg(t.key_hint).bold());
 
@@ -722,6 +728,8 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
                 // rendered as "✗ undeclare", which reads as a rendering bug
                 // on the column whose whole job is to be believed.
                 Constraint::Length(12), // policy
+                // Widest tag is `suspicious` (10) plus a leading marker.
+                Constraint::Length(12), // adjudication
             ],
         )
         .header(header)
@@ -737,6 +745,42 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
         ),
         area,
     );
+}
+
+/// Colour + text for the adjudication column.
+///
+/// Blank is the common and correct case: a row policy already admits has
+/// nothing to explain, and an empty cell says that more honestly than a tick
+/// would. Only a drifting row that something has actually judged gets text.
+///
+/// The colours deliberately do not mirror the policy column. `benign` here is
+/// muted, not green — this column is an *opinion about* a row the policy
+/// column has already called drift, and painting it green would read as though
+/// the drift had been cleared. Nothing here clears anything.
+fn adjudication_cell(
+    app: &App,
+    t: &crate::theme::Theme,
+    process: &str,
+    label: &str,
+    dest: &crate::collectors::egress::EgressDest,
+) -> (String, Color) {
+    use crate::collectors::egress::adjudicate::{Label, Provenance};
+    let Some(a) = app.egress_profiler.adjudication(process, label, dest) else {
+        return (String::new(), t.text_muted);
+    };
+    // A catalog verdict is traceable to a table entry; a model verdict is an
+    // inference. The reader is entitled to know which they are looking at
+    // without opening the detail pane, so the model's carries a marker.
+    let marker = match a.provenance {
+        Provenance::Catalog | Provenance::Human => "",
+        Provenance::Model => "~",
+    };
+    let color = match a.label {
+        Label::Benign | Label::Expected => t.text_muted,
+        Label::Unexpected => t.status_warn,
+        Label::Suspicious => t.status_error,
+    };
+    (format!("{marker}{}", a.label.tag()), color)
 }
 
 /// Colour + text for a verdict. `~ asn` and `— no rule` are deliberately

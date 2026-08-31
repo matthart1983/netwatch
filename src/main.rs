@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
              --sandbox-strict          Refuse to start if the sandbox can't be enforced\n    \
              --metrics-addr <addr>     (daemon) Serve Prometheus /metrics + /healthz on addr\n    \
              --metrics                 (daemon) Serve metrics on the default 127.0.0.1:9464\n    \
+             --egress-catalog          Print the drift-adjudication catalog and exit\n    \
              -h, --help                Print help\n    -V, --version             Print version\n\n\
              KEYS (in TUI):\n    1-7   Switch tabs    /     Filter    q   Quit\n    \
              V     Cycle view (full → lite → dense)\n    \
@@ -45,6 +46,14 @@ async fn main() -> Result<()> {
              Shift+R/F/E   Flight Recorder: arm / freeze / export",
             env!("CARGO_PKG_VERSION")
         );
+        return Ok(());
+    }
+    // Print the adjudication catalog and exit. Before pcap, like the other
+    // flags that answer without touching the network — and because a user
+    // should be able to audit what the tool considers "well known" without
+    // running it as root.
+    if args.iter().any(|a| a == "--egress-catalog") {
+        print!("{}", netwatch::collectors::egress::catalog::render());
         return Ok(());
     }
     if args.iter().any(|a| a == "--generate-config") {
