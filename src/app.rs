@@ -725,7 +725,14 @@ impl App {
         #[cfg(target_os = "linux")]
         let connection_collector = {
             let snapshot = crate::collectors::connections::capture_proc_snapshot();
-            connection_collector.with_proc_snapshot(Arc::new(snapshot))
+            // The broker thread starts here, unconfined, because workers that
+            // poll sockets run sandboxed and cannot read other processes' fds.
+            let broker = crate::collectors::connections::ProcBroker::start(
+                std::time::Duration::from_millis(user_config.refresh_rate_ms.clamp(500, 5000)),
+            );
+            connection_collector
+                .with_proc_snapshot(Arc::new(snapshot))
+                .with_proc_broker(broker)
         };
 
         let ui = AppUiState::from_config(&user_config);

@@ -23,6 +23,21 @@ pub struct ProcessIdentity {
     pub executable: Option<String>,
     pub network_namespace: Option<String>,
 }
+/// Whether a fresh observation is the process `expected` describes. The start
+/// token (from `/proc/<pid>/stat`, readable everywhere) rules out PID reuse;
+/// executable and namespace are compared only when this thread could read
+/// them, since a sandboxed worker cannot see them for other processes.
+pub fn same_process(observed: Option<&ProcessIdentity>, expected: &ProcessIdentity) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    observed.session == expected.session
+        && observed.pid == expected.pid
+        && observed.start_token == expected.start_token
+        && (observed.executable.is_none() || observed.executable == expected.executable)
+        && (observed.network_namespace.is_none()
+            || observed.network_namespace == expected.network_namespace)
+}
 /// Read start identity on both sides of executable discovery. No persistent PID cache.
 #[cfg(target_os = "linux")]
 pub fn process_identity(pid: u32) -> Option<ProcessIdentity> {
@@ -220,5 +235,41 @@ mod tests {
         let first = process_identity(std::process::id()).unwrap();
         assert_eq!(Some(first), process_identity(std::process::id()));
         assert!(process_identity(u32::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod same_process_tests {
+    use super::*;
+    fn identity() -> ProcessIdentity {
+        ProcessIdentity {
+            session: "s".into(),
+            pid: 7,
+            start_token: "100".into(),
+            executable: Some("exe".into()),
+            network_namespace: Some("net:[1]".into()),
+        }
+    }
+    #[test]
+    fn sandboxed_observer_verifies_by_start_token_but_never_accepts_reuse() {
+        let expected = identity();
+        let sandboxed = ProcessIdentity {
+            executable: None,
+            network_namespace: None,
+            ..identity()
+        };
+        assert!(same_process(Some(&sandboxed), &expected));
+        assert!(same_process(Some(&identity()), &expected));
+        let reused = ProcessIdentity {
+            start_token: "200".into(),
+            ..sandboxed.clone()
+        };
+        assert!(!same_process(Some(&reused), &expected));
+        let other_exe = ProcessIdentity {
+            executable: Some("other".into()),
+            ..identity()
+        };
+        assert!(!same_process(Some(&other_exe), &expected));
+        assert!(!same_process(None, &expected));
     }
 }

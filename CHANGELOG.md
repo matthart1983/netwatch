@@ -4,6 +4,17 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Linux process attribution works with worker confinement on. Since 0.31.0 the
+  Landlock-confined connection worker could not read other processes'
+  `/proc/<pid>/fd`, so `ss -p` and the procfs fallback attributed nothing and every
+  socket showed as unattributed. A socket-ownership broker thread now starts before
+  confinement and scans only kernel procfs tables; the confined worker applies its
+  snapshot when it is under `MAX_MATCH_AGE` and the socket inode still matches the
+  5-tuple. Identity checks compare start token always and executable/namespace only
+  where the checking thread can read them, so PID reuse is still rejected. Sockets
+  owned by other users remain unattributed without privilege.
+
 ## [0.31.3] - 2026-09-14
 
 ### Added
