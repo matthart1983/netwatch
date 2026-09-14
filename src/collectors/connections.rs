@@ -324,13 +324,16 @@ impl ConnectionCollector {
     /// before `sandbox::apply`. Reuse still requires current socket and identity
     /// validation; blocked or expired entries remain unknown.
     #[cfg(target_os = "linux")]
-    pub fn with_proc_broker(mut self, broker: Arc<ProcBroker>) -> Self {
-        self.proc_broker = Some(broker);
+    pub fn with_proc_snapshot(mut self, snapshot: Arc<ProcSnapshot>) -> Self {
+        self.proc_snapshot = Some(snapshot);
         self
     }
 
-    pub fn with_proc_snapshot(mut self, snapshot: Arc<ProcSnapshot>) -> Self {
-        self.proc_snapshot = Some(snapshot);
+    /// Attach the unconfined socket-ownership broker (see [`ProcBroker`]),
+    /// started in `App::prepare` before any worker confinement.
+    #[cfg(target_os = "linux")]
+    pub fn with_proc_broker(mut self, broker: Arc<ProcBroker>) -> Self {
+        self.proc_broker = Some(broker);
         self
     }
 
