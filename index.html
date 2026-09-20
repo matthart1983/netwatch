@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>netwatch apt repository</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; --fg:#111; --bg:#fff; --mut:#555; --pre:#f4f4f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e7e7e9; --bg:#0d0d0f; --mut:#a0a0a8; --pre:#17171b; }
+  }
+  body { background:var(--bg); color:var(--fg); margin:0 auto; padding:2.5rem 16px; max-width:46rem;
+         font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  pre { background:var(--pre); padding:1rem; border-radius:8px; overflow-x:auto; font-size:14px; }
+  p.m { color:var(--mut); }
+  a { color:inherit; }
+</style>
+<h1>netwatch apt repository</h1>
+<p class="m">Debian and Ubuntu packages for
+<a href="https://github.com/matthart1983/netwatch">netwatch</a>, for amd64 and arm64.
+The binary is statically linked, so the packages depend on nothing and install on any
+current Debian or Ubuntu.</p>
+
+<pre><code>curl -fsSL https://matthart1983.github.io/netwatch/apt/netwatch.gpg \
+  | sudo tee /usr/share/keyrings/netwatch.gpg &gt;/dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/netwatch.gpg] \
+https://matthart1983.github.io/netwatch/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/netwatch.list
+
+sudo apt update &amp;&amp; sudo apt install netwatch</code></pre>
+
+<p class="m">Packet capture needs elevated access. Run <code>sudo netwatch</code>, or grant
+the capabilities once:</p>
+<pre><code>sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' /usr/bin/netwatch</code></pre>
+
+<p class="m">The package deliberately does not do this for you. Capabilities attach to the
+file, so re-apply after each upgrade.</p>
+
+<p class="m">Other ways to install — Homebrew, Fedora COPR, the container image, plain
+binaries — are in the
+<a href="https://github.com/matthart1983/netwatch#install">README</a>.</p>
