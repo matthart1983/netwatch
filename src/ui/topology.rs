@@ -198,7 +198,7 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
         .gateway
         .clone()
         .unwrap_or_else(|| "—".to_string());
-    let gw_health = health_dot(hs.gateway_rtt_ms, hs.gateway_loss_pct, t);
+    let gw_health = health_dot(hs.gateway_rtt_ms, hs.gateway_loss.pct().unwrap_or(0.0), t);
     let gw_color = gw_health.1;
     let router_h = 4u16;
     let router_y = mid_y.saturating_sub(router_h / 2);
@@ -309,7 +309,7 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
 
     // Suppress unused-warning: rtt_str is rendered as part of ROUTER box,
     // and gateway_loss_pct is not shown on the trunk in this layout.
-    let _ = (&rtt_str, hs.gateway_loss_pct, gw_color);
+    let _ = (&rtt_str, hs.gateway_loss, gw_color);
     drop(hs);
 
     // Cursor index spans both columns: [local..., public...]

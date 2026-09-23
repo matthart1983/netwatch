@@ -28,7 +28,11 @@ pub struct Thresholds {
     /// A socket verdict must persist this long before it becomes an issue.
     pub verdict_hold_secs: u64,
     /// Absolute DNS ceiling — a resolver this slow is a problem whatever its
-    /// baseline says, which is what makes the rule work on a first run.
+    /// baseline says, which is what makes the rule work on a first run. It
+    /// has to sit above what ordinary resolvers do: the previous 20 ms was
+    /// inside the normal range of ISP and mobile resolvers, so every first
+    /// run on such a network opened a finding with no baseline behind it.
+    /// Anything the baseline can catch, the 3σ test catches once it is ready.
     pub dns_ceiling_ms: f64,
     /// Socket rtt above this, with retransmits, reads as receiver-side queue.
     pub socket_rtt_ms: f64,
@@ -62,7 +66,7 @@ impl Default for Thresholds {
             sigma_k: 3.0,
             consecutive_n: 3,
             verdict_hold_secs: 30,
-            dns_ceiling_ms: 20.0,
+            dns_ceiling_ms: 100.0,
             socket_rtt_ms: 100.0,
             loaded_rtt_delta_ms: 100.0,
             saturation_pct: 90.0,
@@ -389,7 +393,7 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     let mut out = Vec::new();
     out.extend(super::active::detect(&obs.active));
     out.extend(super::kernel::detect(obs.kernel.as_ref()));
-    out.extend(detect_link(obs));
+    out.extend(detect_link(obs, t));
     out.extend(detect_gateway(obs, base, t));
     out.extend(detect_dns(obs, base, t));
     out.extend(detect_paths(obs, base, t));
@@ -1080,7 +1084,7 @@ fn ids_are_valid(d: &Detection) -> Result<(), String> {
 
 // ---------------------------------------------------------------- link
 
-fn detect_link(obs: &Observations) -> Vec<Detection> {
+fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
     let Some(iface) = &obs.iface else {
         return vec![];
     };
@@ -1130,7 +1134,6 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
         return out;
     }
 
-    let t = Thresholds::default();
     if iface.errors_per_min as f64 >= t.iface_error_floor
         || iface.drops_per_min as f64 >= t.iface_drop_floor
     {
@@ -1296,7 +1299,7 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
     }
 
     if let Some(util) = iface.utilisation_pct() {
-        if util >= Thresholds::default().saturation_pct {
+        if util >= t.saturation_pct {
             let mut d = Detection::new(
                 "iface.saturated",
                 Subject::Iface {
@@ -1510,11 +1513,15 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             Cause::new(
                 "resolver_down",
                 "resolver is down",
+                // `icmp_rtt_ms` is `None` when the probe has not run, which
+                // on the live path is always. Reading that as "no reply" made
+                // every failing resolver rank as down; a check that was never
+                // made is skipped, and the next-test suggester can offer it.
                 vec![match dns.icmp_rtt_ms {
-                    None => CheckResult::pass(
+                    None => CheckResult::skipped(
                         "resolver_unreachable",
                         "resolver unreachable",
-                        "no icmp reply from the resolver",
+                        "no icmp probe of the resolver has run",
                     ),
                     Some(rtt) => CheckResult::fail(
                         "resolver_unreachable",
@@ -1532,10 +1539,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "resolver reachable",
                         format!("icmp {rtt:.1}ms but queries fail — udp/53 may be filtered"),
                     ),
-                    None => CheckResult::fail(
+                    None => CheckResult::skipped(
                         "resolver_reachable",
                         "resolver reachable",
-                        "no icmp reply either",
+                        "no icmp probe of the resolver has run",
                     ),
                 }],
             ),
@@ -2327,7 +2334,7 @@ fn detect_sockets(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
         if s.verdict_age_secs < t.verdict_hold_secs {
             continue;
         }
-        if let Some(d) = socket_detection(s, verdict, obs) {
+        if let Some(d) = socket_detection(s, verdict, obs, t) {
             out.push(d);
         }
     }
@@ -2338,6 +2345,7 @@ fn socket_detection(
     s: &SocketObs,
     verdict: SocketVerdict,
     obs: &Observations,
+    t: &Thresholds,
 ) -> Option<Detection> {
     let subject = Subject::Socket {
         local: s.local.clone(),
@@ -2345,9 +2353,7 @@ fn socket_detection(
     };
     let rtt = s.rtt_ms.unwrap_or(0.0);
     let link_test_passed = match (obs.idle_rtt_ms, obs.loaded_rtt_ms) {
-        (Some(idle), Some(loaded)) => {
-            Some(loaded - idle < Thresholds::default().loaded_rtt_delta_ms)
-        }
+        (Some(idle), Some(loaded)) => Some(loaded - idle < t.loaded_rtt_delta_ms),
         _ => None,
     };
 
@@ -2455,6 +2461,10 @@ fn socket_detection(
                 // line most people read and the only one a copied summary
                 // carries.
                 d.title = "socket queueing, side unmeasured".into();
+                // And it is not a Medium finding either: until the loaded-rtt
+                // test places the queue, "rtt is high while sending" is an
+                // observation to act on by running that test, not a fault.
+                d.severity = Severity::Info;
                 d.scope.note = Some(
                     "rtt is high while this socket sends, but no loaded-rtt test has \
                      run — a distant peer looks the same as a queue"
@@ -2915,11 +2925,50 @@ mod tests {
     }
 
     #[test]
-    fn the_absolute_ceiling_fires_without_any_baseline() {
-        // First run on a new network: no baseline at all, but 40ms of DNS
-        // latency is still worth saying out loud.
+    fn an_ordinary_resolver_does_not_trip_the_ceiling_on_a_first_run() {
+        // No baseline and a 40ms median: an ISP or mobile resolver on day
+        // one. The old 20ms ceiling opened a finding here on every such
+        // network; the rule now waits for a baseline to say what slow is.
         let base = store();
         let obs = obs_with_dns(slow_dns());
+        let found = detect(&obs, &base, &Thresholds::default());
+        assert!(
+            !found.iter().any(|d| d.rule == "dns.slow_resolver"),
+            "40ms with no baseline is not a finding"
+        );
+    }
+
+    #[test]
+    fn a_failing_resolver_with_no_icmp_probe_does_not_claim_it_is_down() {
+        let mut dns = slow_dns();
+        dns.failure_rate_pct = 40.0;
+        dns.failed = 15;
+        dns.icmp_rtt_ms = None; // the live path never runs this probe
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        let d = found.iter().find(|d| d.rule == "dns.failing").unwrap();
+        assert!(
+            d.causes
+                .iter()
+                .all(|c| c.confidence() != super::super::issue::Confidence::Strong),
+            "an unrun icmp probe was read as evidence: {:?}",
+            d.causes
+                .iter()
+                .map(|c| (c.label.clone(), c.confidence()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_absolute_ceiling_fires_without_any_baseline() {
+        // First run on a new network: no baseline at all, but a 160ms median
+        // is worth saying out loud anywhere. 40ms is not — that is an
+        // ordinary ISP or mobile resolver — which is why the ceiling sits at
+        // 100ms and the baseline test carries everything below it.
+        let base = store();
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(160.0);
+        dns.rtt_p95_ms = Some(190.0);
+        let obs = obs_with_dns(dns);
         let found = detect(&obs, &base, &Thresholds::default());
         let d = found
             .iter()
@@ -3011,6 +3060,24 @@ mod tests {
             classify_socket(&s, &Thresholds::default()),
             SocketVerdict::ReceiverLimited
         );
+    }
+
+    #[test]
+    fn an_unplaced_socket_queue_is_information_not_a_finding() {
+        // Only the loaded-rtt test can say which end is queueing. Until it
+        // runs, "rtt is high while this socket sends" is something to test,
+        // not a fault to report at Medium — a distant peer looks identical.
+        let obs = Observations {
+            sockets: vec![bloated_socket()],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "tcp.bufferbloat_remote")
+            .expect("the socket rule still fires");
+        assert_eq!(d.severity, Severity::Info);
+        assert_eq!(d.title, "socket queueing, side unmeasured");
     }
 
     #[test]

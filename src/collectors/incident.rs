@@ -27,9 +27,10 @@ pub enum RecorderState {
 pub struct HealthSnapshot {
     pub timestamp: String,
     pub gateway_rtt_ms: Option<f64>,
-    pub gateway_loss_pct: f64,
+    /// `None` when the probe had not completed or could not be sent.
+    pub gateway_loss_pct: Option<f64>,
     pub dns_rtt_ms: Option<f64>,
-    pub dns_loss_pct: f64,
+    pub dns_loss_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,9 +330,9 @@ impl IncidentRecorder {
             HealthSnapshot {
                 timestamp: format_timestamp(now),
                 gateway_rtt_ms: health.gateway_rtt_ms,
-                gateway_loss_pct: health.gateway_loss_pct,
+                gateway_loss_pct: health.gateway_loss.pct(),
                 dns_rtt_ms: health.dns_rtt_ms,
-                dns_loss_pct: health.dns_loss_pct,
+                dns_loss_pct: health.dns_loss.pct(),
             },
         );
         push_snapshot(
@@ -487,14 +488,14 @@ impl IncidentRecorder {
         out.push_str("## Health\n\n");
         if let Some(health) = latest_health {
             out.push_str(&format!(
-                "- Gateway: RTT {}  Loss {:.0}%\n",
+                "- Gateway: RTT {}  Loss {}\n",
                 format_rtt(health.gateway_rtt_ms),
-                health.gateway_loss_pct
+                format_loss(health.gateway_loss_pct)
             ));
             out.push_str(&format!(
-                "- DNS: RTT {}  Loss {:.0}%\n",
+                "- DNS: RTT {}  Loss {}\n",
                 format_rtt(health.dns_rtt_ms),
-                health.dns_loss_pct
+                format_loss(health.dns_loss_pct)
             ));
         } else {
             out.push_str("- No health samples captured\n");
@@ -650,6 +651,11 @@ fn format_timestamp(timestamp: DateTime<Utc>) -> String {
         .to_string()
 }
 
+fn format_loss(pct: Option<f64>) -> String {
+    pct.map(|p| format!("{p:.0}%"))
+        .unwrap_or_else(|| "unmeasured".into())
+}
+
 fn format_rtt(rtt: Option<f64>) -> String {
     rtt.map(|value| format!("{value:.1}ms"))
         .unwrap_or_else(|| "—".to_string())
@@ -722,11 +728,11 @@ mod tests {
         HealthStatus {
             completed: Default::default(),
             gateway_rtt_ms: Some(2.5),
-            gateway_loss_pct: 0.0,
+            gateway_loss: super::super::health::Loss::Measured(0.0),
             dns_rtt_ms: Some(14.0),
-            dns_loss_pct: 0.0,
+            dns_loss: super::super::health::Loss::Measured(0.0),
             internet_rtt_ms: Some(18.0),
-            internet_loss_pct: 0.0,
+            internet_loss: super::super::health::Loss::Measured(0.0),
             gateway_rtt_history: VecDeque::new(),
             dns_rtt_history: VecDeque::new(),
             internet_rtt_history: VecDeque::new(),

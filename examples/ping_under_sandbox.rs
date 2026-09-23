@@ -48,8 +48,8 @@ fn main() {
         let s = prober.status();
         if let Some(rtt) = s.gateway_rtt_ms {
             println!(
-                "OK   gateway rtt = {rtt:.2} ms, loss = {:.1}%",
-                s.gateway_loss_pct
+                "OK   gateway rtt = {rtt:.2} ms, loss = {}",
+                s.gateway_loss.label(1)
             );
             return;
         }
@@ -57,8 +57,8 @@ fn main() {
 
     let s = prober.status();
     eprintln!(
-        "FAIL no rtt sample within 5 s (loss = {:.1}%) — ping likely blocked under sandbox",
-        s.gateway_loss_pct
+        "FAIL no rtt sample within 5 s (loss = {}) — ping likely blocked under sandbox",
+        s.gateway_loss.label(1)
     );
     std::process::exit(1);
 }

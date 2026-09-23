@@ -248,9 +248,9 @@ impl RemotePublisher {
             let status = health.status();
             json!({
                 "gateway_rtt_ms": status.gateway_rtt_ms,
-                "gateway_loss_pct": status.gateway_loss_pct,
+                "gateway_loss_pct": status.gateway_loss.pct(),
                 "dns_rtt_ms": status.dns_rtt_ms,
-                "dns_loss_pct": status.dns_loss_pct,
+                "dns_loss_pct": status.dns_loss.pct(),
             })
         };
 

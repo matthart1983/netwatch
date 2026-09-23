@@ -121,9 +121,9 @@ impl MetricsExporter {
         let snap = MetricsSnapshot {
             interfaces: ifaces,
             gateway_rtt_ms: status.gateway_rtt_ms,
-            gateway_loss_pct: Some(status.gateway_loss_pct),
+            gateway_loss_pct: status.gateway_loss.pct(),
             dns_rtt_ms: status.dns_rtt_ms,
-            dns_loss_pct: Some(status.dns_loss_pct),
+            dns_loss_pct: status.dns_loss.pct(),
             connection_count: conns.len() as u64,
             tcp_time_wait: time_wait,
             tcp_close_wait: close_wait,

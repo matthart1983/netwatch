@@ -628,9 +628,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let paused = app.ui.paused;
 
     let health = app.health_prober.status();
-    let unhealthy = health.gateway_loss_pct > 0.0
-        || health.dns_loss_pct > 0.0
-        || health.gateway_rtt_ms.is_none();
+    // A probe that has not completed, or could not be sent, is not a fault:
+    // only a measured probe can degrade the verdict.
+    let unhealthy =
+        health.gateway_loss.degrades(health.gateway_rtt_ms) || health.dns_loss.is_lossy();
 
     render_header(f, app, &l, &health, unhealthy, paused);
     render_throughput(f, app, &l, paused);
@@ -725,7 +726,7 @@ fn render_header(
         .gateway_rtt_ms
         .map(|v| format!("{v:.1}ms"))
         .unwrap_or_else(|| "—".into());
-    let loss = format!("{:.0}% loss", health.gateway_loss_pct);
+    let loss = format!("{} loss", health.gateway_loss.label(0));
     let dot = if unhealthy { "▲" } else { "●" };
     let dot_style = Style::default().fg(if unhealthy {
         t.status_error
@@ -896,17 +897,17 @@ fn render_health_line(
         (
             "gateway",
             fmt(health.gateway_rtt_ms),
-            health.gateway_loss_pct > 0.0 || health.gateway_rtt_ms.is_none(),
+            health.gateway_loss.degrades(health.gateway_rtt_ms),
         ),
         (
             "dns",
             fmt(health.dns_rtt_ms),
-            health.dns_loss_pct > 0.0 || health.dns_rtt_ms.is_none(),
+            health.dns_loss.degrades(health.dns_rtt_ms),
         ),
         (
             "internet",
             fmt(health.internet_rtt_ms),
-            health.internet_loss_pct > 0.0 || health.internet_rtt_ms.is_none(),
+            health.internet_loss.degrades(health.internet_rtt_ms),
         ),
     ] {
         put(
@@ -929,12 +930,11 @@ fn render_health_line(
         x += val.width() as u16 + 3;
     }
 
-    let (verdict_text, style) = if health.gateway_loss_pct > 0.0 || health.gateway_rtt_ms.is_none()
-    {
+    let (verdict_text, style) = if health.gateway_loss.degrades(health.gateway_rtt_ms) {
         ("gateway degraded", Style::default().fg(t.status_error))
-    } else if health.dns_loss_pct > 0.0 || health.dns_rtt_ms.is_none() {
+    } else if health.dns_loss.degrades(health.dns_rtt_ms) {
         ("dns degraded", Style::default().fg(t.status_error))
-    } else if health.internet_loss_pct > 0.0 {
+    } else if health.internet_loss.is_lossy() {
         ("internet degraded", Style::default().fg(t.status_error))
     } else if unhealthy {
         ("degraded", Style::default().fg(t.status_error))

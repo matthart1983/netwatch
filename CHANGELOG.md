@@ -2,6 +2,44 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- "100% loss" on a fresh start, and on any host where ICMP is blocked and
+  the gateway answers no TCP port. The prober started every series at 100%
+  and reported 100% when a probe could not be sent at all, so the dashboard
+  tile, Lite's verdict line, the dense view and every export read a working
+  network as dead until the first probe landed — or for good, without
+  privileges. Loss is now a three-state value: pending, unmeasured with the
+  reason ("icmp is blocked here and the gateway answers no tcp port", "the
+  resolver address is not usable by the probe"), or measured. Unmeasured
+  probes no longer enter the rtt history, so Diagnose sees no observation
+  rather than a dead gateway or a resolver failing 100% of queries. The
+  incident report, AI Insights, the remote payload and the metrics endpoint
+  carry "unmeasured" or `null` instead of `100`.
+- Diagnose verdicts that were wrong for reasons no better model would fix:
+  - `dns.failing` read an ICMP probe that has never run on the live path as
+    "no reply", so every failing resolver ranked as *down*. A check that was
+    not made is now skipped for both causes, and the ranking says so.
+  - `dns.slow_resolver`'s first-run ceiling was 20 ms, inside the normal
+    range of ISP and mobile resolvers, so a first run on such a network opened
+    a finding with no baseline behind it. The ceiling is now 100 ms; anything
+    below that waits for the 3σ baseline test. The catalogue text matches.
+  - The `dns.rtt_p50` baseline was learned from the latest single probe while
+    the rule judged the rolling p50 of the probe history — two different
+    statistics under one name. The baseline is now fed the p50 it is asked
+    to judge.
+  - `tcp.bufferbloat_remote` opens at Medium on any sending socket with rtt
+    ≥ 100 ms even when no loaded-rtt test has placed the queue. It was already
+    retitled "side unmeasured" in that case; it is now Info as well, since an
+    unplaced queue is a reason to run the test, not a fault.
+  - The link, saturation and socket detectors read `Thresholds::default()`
+    instead of the engine's thresholds, so tuning the engine did not reach
+    them. They take the engine's thresholds now.
+  - `tcp.retrans_burst`'s catalogue trigger described a 3σ-over-baseline test
+    the code does not implement; it now describes the absolute test it does
+    (5 or more retransmits per minute on a socket under the queueing rtt).
+
 ## [0.32.3] - 2026-09-20
 
 ### Fixed

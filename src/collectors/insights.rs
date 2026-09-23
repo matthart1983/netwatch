@@ -28,9 +28,9 @@ pub struct NetworkSnapshot {
     pub connections_established: usize,
     pub connections_other: usize,
     pub gateway_rtt_ms: Option<f64>,
-    pub gateway_loss_pct: f64,
+    pub gateway_loss_pct: Option<f64>,
     pub dns_rtt_ms: Option<f64>,
-    pub dns_loss_pct: f64,
+    pub dns_loss_pct: Option<f64>,
     pub bandwidth_rx: String,
     pub bandwidth_tx: String,
 }
@@ -135,9 +135,9 @@ impl NetworkSnapshot {
             connections_established,
             connections_other,
             gateway_rtt_ms: health.gateway_rtt_ms,
-            gateway_loss_pct: health.gateway_loss_pct,
+            gateway_loss_pct: health.gateway_loss.pct(),
             dns_rtt_ms: health.dns_rtt_ms,
-            dns_loss_pct: health.dns_loss_pct,
+            dns_loss_pct: health.dns_loss.pct(),
             bandwidth_rx: rx_rate.to_string(),
             bandwidth_tx: tx_rate.to_string(),
         }
@@ -180,14 +180,20 @@ impl NetworkSnapshot {
 
         if let Some(gw_rtt) = self.gateway_rtt_ms {
             parts.push(format!(
-                "Gateway: {:.1}ms RTT, {:.0}% loss",
-                gw_rtt, self.gateway_loss_pct
+                "Gateway: {:.1}ms RTT, {} loss",
+                gw_rtt,
+                self.gateway_loss_pct
+                    .map(|p| format!("{p:.0}%"))
+                    .unwrap_or_else(|| "unmeasured".into())
             ));
         }
         if let Some(dns_rtt) = self.dns_rtt_ms {
             parts.push(format!(
-                "DNS: {:.1}ms RTT, {:.0}% loss",
-                dns_rtt, self.dns_loss_pct
+                "DNS: {:.1}ms RTT, {} loss",
+                dns_rtt,
+                self.dns_loss_pct
+                    .map(|p| format!("{p:.0}%"))
+                    .unwrap_or_else(|| "unmeasured".into())
             ));
         }
 
@@ -547,11 +553,11 @@ mod tests {
         HealthStatus {
             completed: Default::default(),
             gateway_rtt_ms: Some(5.0),
-            gateway_loss_pct: 0.0,
+            gateway_loss: crate::collectors::health::Loss::Measured(0.0),
             dns_rtt_ms: Some(10.0),
-            dns_loss_pct: 0.0,
+            dns_loss: crate::collectors::health::Loss::Measured(0.0),
             internet_rtt_ms: Some(12.0),
-            internet_loss_pct: 0.0,
+            internet_loss: crate::collectors::health::Loss::Measured(0.0),
             gateway_rtt_history: VecDeque::new(),
             dns_rtt_history: VecDeque::new(),
             internet_rtt_history: VecDeque::new(),

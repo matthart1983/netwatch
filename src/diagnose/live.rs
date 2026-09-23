@@ -209,7 +209,16 @@ impl LiveSampler {
         let cfg = &app.config_collector.config;
         let mut out = Vec::new();
 
-        if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), health.dns_rtt_ms) {
+        // Learn the statistic the rule judges. `dns.slow_resolver` compares
+        // the rolling p50 of the probe history against this baseline, so the
+        // baseline has to be fed that p50 — feeding it the latest single probe
+        // taught it a noisier, lower number than the one it was later asked
+        // to judge, and the 3σ test drifted with the difference.
+        let dns_p50 = {
+            let samples: Vec<f64> = health.dns_rtt_history.iter().flatten().copied().collect();
+            percentile(&samples, 0.5).or(health.dns_rtt_ms)
+        };
+        if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), dns_p50) {
             if health.completed.dns_target.as_ref() == Some(&resolver) {
                 if let Some(at) = self.fresh_reading("dns", health.completed.dns) {
                     out.push(Reading::new(resolver, "dns.rtt_p50", rtt, at));
@@ -561,18 +570,20 @@ fn gateway(app: &App) -> Option<GatewayObs> {
     let addr = cfg.gateway.clone()?;
     let health = app.health_prober.status();
 
-    // `HealthProber` starts every series at 100% loss, so the loss figure
-    // alone cannot distinguish "unreachable" from "not probed yet" — and on a
-    // fresh start that difference is a `critical` finding against a working
-    // router. The history deques are the honest signal: they are empty until
-    // a probe has actually published a result.
+    // No observation until a probe has actually measured something: the
+    // history deques only record measurements, and `gateway_loss` says when
+    // the latest cycle could not be sent at all. On a fresh start, or on a
+    // host where ICMP is blocked and the router answers no TCP port, there is
+    // nothing here to judge — not a `critical` finding against a working
+    // router.
     if health.gateway_rtt_history.is_empty()
         || !crate::collectors::health::ProbeTimes::fresh(health.completed.gateway, 30)
         || health.completed.gateway_target.as_ref() != Some(&addr)
     {
         return None;
     }
-    let icmp_ok = health.gateway_rtt_ms.is_some() && health.gateway_loss_pct < 100.0;
+    let loss_pct = health.gateway_loss.pct()?;
+    let icmp_ok = health.gateway_rtt_ms.is_some() && loss_pct < 100.0;
 
     // Corroborating evidence for a gateway verdict, on the same footing:
     // unknown until the internet probe has run at least once.
@@ -581,12 +592,15 @@ fn gateway(app: &App) -> Option<GatewayObs> {
     {
         None
     } else {
-        Some(health.internet_rtt_ms.is_some() && health.internet_loss_pct < 100.0)
+        health
+            .internet_loss
+            .pct()
+            .map(|p| health.internet_rtt_ms.is_some() && p < 100.0)
     };
     Some(GatewayObs {
         addr: Some(addr),
         rtt_ms: health.gateway_rtt_ms,
-        loss_pct: health.gateway_loss_pct,
+        loss_pct,
         internet_reachable,
         // No ARP probe yet, so this stays unknown. Mirroring the ICMP result
         // here made the checks assert "no arp reply from the gateway" about a
@@ -607,6 +621,10 @@ fn dns(app: &App) -> Option<DnsObs> {
     {
         return None;
     }
+
+    // A resolver the probe could not query (a scoped link-local address, no
+    // socket) is not a resolver failing 100% of queries; it is no observation.
+    let failure_rate_pct = health.dns_loss.pct()?;
 
     let samples: Vec<f64> = health.dns_rtt_history.iter().flatten().copied().collect();
     // One sample per probe, so the window is samples × the probe interval —
@@ -654,7 +672,7 @@ fn dns(app: &App) -> Option<DnsObs> {
         resolver,
         rtt_p50_ms: percentile(&samples, 0.5).or(health.dns_rtt_ms),
         rtt_p95_ms: percentile(&samples, 0.95),
-        failure_rate_pct: health.dns_loss_pct,
+        failure_rate_pct,
         truncation_rate_pct,
         queries: replies.max(health.dns_rtt_history.len() as u32),
         failed: health

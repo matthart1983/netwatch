@@ -181,7 +181,7 @@ These rules have detectors and can open issues. What they have not had is a writ
 
 | Rule | Category | Fires when | Status |
 |---|---|---|---|
-| `dns.slow_resolver` | dns | resolver p50 > 3σ above baseline for 3 samples, or pipeline dns stage > 20ms | active |
+| `dns.slow_resolver` | dns | resolver p50 > 3σ above baseline for 3 samples, or p50 > 100ms with no baseline | active |
 | `dns.failing` | dns | servfail/timeout rate > 5%, or the pipeline dns stage fails | active |
 | `dns.truncation_retry` | dns | more than 10% of probe replies carry the TC bit | active |
 | `link.down` | link | interface carrier lost | active |
@@ -192,7 +192,7 @@ These rules have detectors and can open issues. What they have not had is a writ
 | `path.changed` | path | a hop differs between consecutive traces to the same target | active |
 | `path.rtt_spike` | path | end-to-end rtt > 3σ above baseline | active |
 | `tcp.bufferbloat_local` | tcp | rtt under load exceeds idle rtt by more than 100ms | active |
-| `tcp.retrans_burst` | tcp | retrans/min more than 3σ above the socket's baseline | active |
+| `tcp.retrans_burst` | tcp | 5 or more retransmits per minute on a socket whose rtt is under the queueing threshold | active |
 | `tcp.zero_window` | tcp | rwnd is zero, or cwnd greatly exceeds rwnd | active |
 | `tcp.connect_failures` | tcp | more than 5 failed active or passive TCP handshakes per minute in this namespace | active |
 | `tcp.timewait_exhaustion` | tcp | distinct TIME_WAIT local ports exceed 60% of the ephemeral range for one address; not exhaustion proof | active |

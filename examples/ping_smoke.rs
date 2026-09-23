@@ -16,12 +16,13 @@ fn main() {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let s = prober.status();
-        if s.gateway_rtt_ms.is_some() || s.gateway_loss_pct < 100.0 {
+        if s.gateway_rtt_ms.is_some() || s.gateway_loss.pct().is_some_and(|p| p < 100.0) {
             println!(
-                "target={target} rtt={:?} ms, loss={:.1}%",
-                s.gateway_rtt_ms, s.gateway_loss_pct
+                "target={target} rtt={:?} ms, loss={}",
+                s.gateway_rtt_ms,
+                s.gateway_loss.label(1)
             );
-            if s.gateway_loss_pct >= 100.0 {
+            if s.gateway_loss.pct().is_some_and(|p| p >= 100.0) {
                 eprintln!("FAIL 100% loss — native ICMP path is broken on this OS");
                 std::process::exit(1);
             }
@@ -30,6 +31,6 @@ fn main() {
     }
 
     let s = prober.status();
-    eprintln!("FAIL no rtt within 5 s; loss={:.1}%", s.gateway_loss_pct);
+    eprintln!("FAIL no rtt within 5 s; loss={}", s.gateway_loss.label(1));
     std::process::exit(1);
 }

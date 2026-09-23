@@ -283,33 +283,52 @@ fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
     // Loss has no learned distribution: the only healthy value is zero, so
     // there is nothing to be σ away from. It says what window it measured
     // over instead, which is the thing a reader would otherwise assume wrong.
-    let max_loss = hs.gateway_loss_pct.max(hs.dns_loss_pct);
-    let loss_color = if max_loss < 1.0 {
-        t.status_good
-    } else if max_loss < 50.0 {
-        t.status_warn
-    } else {
-        t.status_error
+    //
+    // And a probe that has not completed, or could not be sent, has no loss
+    // figure at all. The tile says so — with the reason — instead of the 100%
+    // that used to greet every fresh start and every host with ICMP blocked.
+    let measured = [hs.gateway_loss.pct(), hs.dns_loss.pct()]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max);
+    let (loss_value, loss_detail, loss_color) = match measured {
+        Some(max_loss) => {
+            let color = if max_loss < 1.0 {
+                t.status_good
+            } else if max_loss < 50.0 {
+                t.status_warn
+            } else {
+                t.status_error
+            };
+            // Health samples are one per probe, not one per second: counting
+            // them as seconds under-reported the window by the probe cadence,
+            // so a five-minute loss figure was labelled "60s".
+            // Clamped to the sparkline beside it: the label names the window
+            // the reader is looking at, not everything retained behind it.
+            let detail = format!(
+                "{}s window",
+                probe_window_secs(app, hs.gateway_rtt_history.len()).min(KPI_WINDOW_SECS)
+            );
+            (Some(format!("{max_loss:.0}")), detail, color)
+        }
+        None => {
+            let detail = hs
+                .gateway_loss
+                .note()
+                .or(hs.dns_loss.note())
+                .map(|why| format!("unmeasured: {why}"))
+                .unwrap_or_else(|| "probing".to_string());
+            (None, detail, t.text_muted)
+        }
     };
     render_kpi_tile(
         f,
         app,
         cols[3],
         "loss",
-        Some(format!("{max_loss:.0}")),
+        loss_value,
         "%",
-        Reading::plain(
-            // Health samples are one per probe, not one per second: counting
-            // them as seconds under-reported the window by the probe cadence,
-            // so a five-minute loss figure was labelled "60s".
-            // Clamped to the sparkline beside it: the label names the window
-            // the reader is looking at, not everything retained behind it.
-            format!(
-                "{}s window",
-                probe_window_secs(app, hs.gateway_rtt_history.len()).min(KPI_WINDOW_SECS)
-            ),
-            loss_color,
-        ),
+        Reading::plain(loss_detail, loss_color),
         &loss_history,
         probe_secs,
         &["path.high_loss", "gateway.unreachable"],

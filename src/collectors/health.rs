@@ -14,16 +14,16 @@ const RTT_HISTORY_MAX: usize = crate::app::probe_history_len(1000);
 pub struct HealthStatus {
     pub completed: ProbeTimes,
     pub gateway_rtt_ms: Option<f64>,
-    pub gateway_loss_pct: f64,
+    pub gateway_loss: Loss,
     pub dns_rtt_ms: Option<f64>,
-    pub dns_loss_pct: f64,
+    pub dns_loss: Loss,
     /// Reachability of a fixed public host beyond the local network.
     ///
     /// Distinguishes "my router is fine but the line is down" from "my router
     /// is down" — gateway and DNS alone can't tell those apart, since a
     /// working LAN with a dead uplink looks perfectly healthy on both.
     pub internet_rtt_ms: Option<f64>,
-    pub internet_loss_pct: f64,
+    pub internet_loss: Loss,
     pub gateway_rtt_history: VecDeque<Option<f64>>,
     pub dns_rtt_history: VecDeque<Option<f64>>,
     pub internet_rtt_history: VecDeque<Option<f64>>,
@@ -37,6 +37,64 @@ pub struct HealthStatus {
     pub dns_cross_history: VecDeque<bool>,
     /// The latest STUN mapping probe. Runs every [`STUN_EVERY`] cycles.
     pub nat: Option<NatProbe>,
+}
+
+/// What a probe's loss figure means.
+///
+/// The prober used to start every series at 100% and to report 100% when a
+/// probe could not be sent at all, so a fresh start and a blocked ICMP socket
+/// both read as a dead network — on the dashboard tile, in Lite's verdict
+/// line, and in every export. Loss is a measurement; when there is none, the
+/// value says so and carries the reason.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Loss {
+    /// No probe has completed yet.
+    Pending,
+    /// The probe could not be sent, so loss is unknown — not 100%.
+    Unmeasured(&'static str),
+    /// Measured over the probe's samples, 0.0–100.0.
+    Measured(f64),
+}
+
+impl Loss {
+    pub fn pct(self) -> Option<f64> {
+        match self {
+            Self::Measured(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn is_measured(self) -> bool {
+        matches!(self, Self::Measured(_))
+    }
+
+    /// Measured, and above zero.
+    pub fn is_lossy(self) -> bool {
+        matches!(self, Self::Measured(p) if p > 0.0)
+    }
+
+    /// The probe ran and the target did not answer cleanly: measured loss, or
+    /// a measured probe with no rtt. Pending and unmeasured never degrade —
+    /// "we could not ask" is not "it did not answer".
+    pub fn degrades(self, rtt: Option<f64>) -> bool {
+        matches!(self, Self::Measured(p) if p > 0.0 || rtt.is_none())
+    }
+
+    /// Why there is no figure, when the probe could not be sent.
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Unmeasured(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// The figure for display, or `—` when there is none.
+    pub fn label(self, decimals: usize) -> String {
+        match self {
+            Self::Measured(p) => format!("{p:.decimals$}%"),
+            _ => "—".into(),
+        }
+    }
 }
 
 /// Completion times belong to measurements, not the UI refresh cadence.
@@ -167,11 +225,11 @@ impl HealthProber {
             snapshot: Arc::new(RwLock::new(Arc::new(HealthStatus {
                 completed: Default::default(),
                 gateway_rtt_ms: None,
-                gateway_loss_pct: 100.0,
+                gateway_loss: Loss::Pending,
                 dns_rtt_ms: None,
-                dns_loss_pct: 100.0,
+                dns_loss: Loss::Pending,
                 internet_rtt_ms: None,
-                internet_loss_pct: 100.0,
+                internet_loss: Loss::Pending,
                 gateway_rtt_history: VecDeque::new(),
                 dns_rtt_history: VecDeque::new(),
                 internet_rtt_history: VecDeque::new(),
@@ -229,15 +287,20 @@ impl HealthProber {
                     next.completed.gateway_history.clear();
                 }
                 next.gateway_rtt_ms = rtt;
-                next.gateway_loss_pct = loss;
+                next.gateway_loss = loss;
                 let completed = std::time::Instant::now();
-                next.completed.gateway_history.push_back(completed);
-                next.gateway_rtt_history.push_back(rtt);
-                if next.gateway_rtt_history.len() > RTT_HISTORY_MAX {
-                    next.gateway_rtt_history.pop_front();
-                    next.completed.gateway_history.pop_front();
+                // The history is a series of measurements. A probe that could
+                // not be sent is recorded as such on `gateway_loss`, not as
+                // a lost sample the sparkline and the rules would then read.
+                if loss.is_measured() {
+                    next.completed.gateway_history.push_back(completed);
+                    next.gateway_rtt_history.push_back(rtt);
+                    if next.gateway_rtt_history.len() > RTT_HISTORY_MAX {
+                        next.gateway_rtt_history.pop_front();
+                        next.completed.gateway_history.pop_front();
+                    }
+                    next.gateway_rtt_history.make_contiguous();
                 }
-                next.gateway_rtt_history.make_contiguous();
                 next.completed.gateway = Some(completed);
                 next.completed.gateway_target = Some(gw.to_string());
                 *safe_write(&snapshot, "health::probe::publish_gw") = Arc::new(next);
@@ -267,17 +330,19 @@ impl HealthProber {
                     next.dns_cross_history.clear();
                 }
                 next.dns_rtt_ms = rtt;
-                next.dns_loss_pct = loss;
-                next.completed.dns_history.push_back(completed);
-                next.dns_rtt_history.push_back(rtt);
-                if next.dns_rtt_history.len() > RTT_HISTORY_MAX {
-                    next.dns_rtt_history.pop_front();
-                    next.completed.dns_history.pop_front();
-                }
-                next.dns_rtt_history.make_contiguous();
-                next.dns_probe_history.push_back(flags);
-                if next.dns_probe_history.len() > RTT_HISTORY_MAX {
-                    next.dns_probe_history.pop_front();
+                next.dns_loss = loss;
+                if loss.is_measured() {
+                    next.completed.dns_history.push_back(completed);
+                    next.dns_rtt_history.push_back(rtt);
+                    if next.dns_rtt_history.len() > RTT_HISTORY_MAX {
+                        next.dns_rtt_history.pop_front();
+                        next.completed.dns_history.pop_front();
+                    }
+                    next.dns_rtt_history.make_contiguous();
+                    next.dns_probe_history.push_back(flags);
+                    if next.dns_probe_history.len() > RTT_HISTORY_MAX {
+                        next.dns_probe_history.pop_front();
+                    }
                 }
                 if let Some(c) = &cross {
                     next.dns_cross_history
@@ -312,15 +377,17 @@ impl HealthProber {
                 let (rtt, loss) = run_internet_probe(INTERNET_TARGET);
                 let mut next = (**safe_read(&snapshot, "health::probe::read_inet")).clone();
                 next.internet_rtt_ms = rtt;
-                next.internet_loss_pct = loss;
+                next.internet_loss = loss;
                 let completed = std::time::Instant::now();
-                next.completed.internet_history.push_back(completed);
-                next.internet_rtt_history.push_back(rtt);
-                if next.internet_rtt_history.len() > RTT_HISTORY_MAX {
-                    next.internet_rtt_history.pop_front();
-                    next.completed.internet_history.pop_front();
+                if loss.is_measured() {
+                    next.completed.internet_history.push_back(completed);
+                    next.internet_rtt_history.push_back(rtt);
+                    if next.internet_rtt_history.len() > RTT_HISTORY_MAX {
+                        next.internet_rtt_history.pop_front();
+                        next.completed.internet_history.pop_front();
+                    }
+                    next.internet_rtt_history.make_contiguous();
                 }
-                next.internet_rtt_history.make_contiguous();
                 next.completed.internet = Some(completed);
                 *safe_write(&snapshot, "health::probe::publish_inet") = Arc::new(next);
             }
@@ -346,14 +413,28 @@ impl HealthProber {
 /// We only fall back when ICMP returns 100% loss; partial ICMP success
 /// (e.g. 1/3 probes) is a real signal we should preserve. This also means
 /// the extra TCP work only runs on hosts that actually need it.
-fn run_gateway_probe(target: &str) -> (Option<f64>, f64) {
-    let (rtt, loss) = run_ping(target);
-    if loss < 100.0 {
-        return (rtt, loss);
+///
+/// When ICMP could not be *sent* (`run_ping` returns `None`) and no TCP port
+/// answers either, nothing has been measured: the result says so rather than
+/// reporting 100% loss against a router that may be perfectly healthy. Only
+/// when ICMP was actually sent and both paths went unanswered is 100% a
+/// measurement.
+fn run_gateway_probe(target: &str) -> (Option<f64>, Loss) {
+    let icmp = run_ping(target);
+    if let Some((rtt, loss)) = icmp {
+        if loss < 100.0 {
+            return (rtt, Loss::Measured(loss));
+        }
     }
-    // ICMP completely failed — could be sandbox/kernel restrictions,
-    // could be a genuinely-firewalled host. Try TCP.
-    run_tcp_probe(target)
+    // ICMP blocked, or answered by nothing. Try TCP.
+    let (rtt, loss) = run_tcp_probe(target);
+    if loss < 100.0 || icmp.is_some() {
+        return (rtt, Loss::Measured(loss));
+    }
+    (
+        None,
+        Loss::Unmeasured("icmp is blocked here and the gateway answers no tcp port"),
+    )
 }
 
 /// Internet reachability probe: ICMP first, TCP/443 when ICMP is unavailable.
@@ -361,15 +442,27 @@ fn run_gateway_probe(target: &str) -> (Option<f64>, f64) {
 /// Mirrors [`run_gateway_probe`]'s structure but targets a single well-known
 /// port — unlike a router, a public anycast resolver has a predictable
 /// listener, so there's no port list to walk.
-fn run_internet_probe(target: &str) -> (Option<f64>, f64) {
-    let (rtt, loss) = run_ping(target);
-    if loss < 100.0 {
-        return (rtt, loss);
+fn run_internet_probe(target: &str) -> (Option<f64>, Loss) {
+    let icmp = run_ping(target);
+    if let Some((rtt, loss)) = icmp {
+        if loss < 100.0 {
+            return (rtt, Loss::Measured(loss));
+        }
     }
-    match target.parse::<std::net::IpAddr>() {
-        Ok(addr) => run_tcp_probe_port(addr, 443),
-        Err(_) => (None, 100.0),
+    let Ok(addr) = target.parse::<std::net::IpAddr>() else {
+        return (
+            None,
+            Loss::Unmeasured("the internet probe target is not an address"),
+        );
+    };
+    let (rtt, loss) = run_tcp_probe_port(addr, 443);
+    if loss < 100.0 || icmp.is_some() {
+        return (rtt, Loss::Measured(loss));
     }
+    (
+        None,
+        Loss::Unmeasured("icmp is blocked here and tcp/443 to the probe target did not answer"),
+    )
 }
 
 /// TCP-connect probe used as the gateway-ICMP fallback. Walks a small list
@@ -540,7 +633,7 @@ pub(crate) fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> 
 /// Returns the mean rtt, the loss, and the reply flags — a SERVFAIL or a
 /// truncated reply is still a reply for reachability, but the diagnostic
 /// rules want to know it happened.
-fn run_dns_query(server: &str) -> (Option<f64>, f64, DnsProbe) {
+fn run_dns_query(server: &str) -> (Option<f64>, Loss, DnsProbe) {
     use std::net::{IpAddr, SocketAddr};
 
     const PROBES: usize = 3;
@@ -549,12 +642,21 @@ fn run_dns_query(server: &str) -> (Option<f64>, f64, DnsProbe) {
     // `IpAddr::parse` rejects IPv6 zone identifiers (e.g. `fe80::1%en0`),
     // which means `primary_dns()` should already have skipped link-local
     // entries upstream. If it didn't (only link-local servers configured),
-    // we report 100% loss rather than panic — same as the old ICMP path.
+    // no query was sent: that is not 100% loss, it is a resolver address the
+    // probe cannot use, and the Health widget says which (issue #31).
     let Ok(addr) = server.parse::<IpAddr>() else {
-        return (None, 100.0, DnsProbe::default());
+        return (
+            None,
+            Loss::Unmeasured("the resolver address is not usable by the probe"),
+            DnsProbe::default(),
+        );
     };
     let Some(sock) = dns_socket(addr) else {
-        return (None, 100.0, DnsProbe::default());
+        return (
+            None,
+            Loss::Unmeasured("could not open a udp socket for the dns probe"),
+            DnsProbe::default(),
+        );
     };
     let dest = SocketAddr::new(addr, 53);
 
@@ -581,7 +683,7 @@ fn run_dns_query(server: &str) -> (Option<f64>, f64, DnsProbe) {
     } else {
         Some(rtts.iter().sum::<f64>() / rtts.len() as f64)
     };
-    (avg, lost(rtts.len()), flags)
+    (avg, Loss::Measured(lost(rtts.len())), flags)
 }
 
 /// Not a routable public address: RFC 1918, loopback, link-local, CGNAT,
@@ -783,7 +885,10 @@ fn run_stun_probe(cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe
     })
 }
 
-fn run_ping(target: &str) -> (Option<f64>, f64) {
+/// `None` means no echo request was sent by either path — the kernel refused
+/// the socket and `ping` could not run or could not open one. `Some` is a
+/// measurement, including `Some((None, 100.0))` for three unanswered echoes.
+fn run_ping(target: &str) -> Option<(Option<f64>, f64)> {
     // Prefer native DGRAM ICMP on Unix — works under the sandbox
     // because Landlock sets NO_NEW_PRIVS, which makes the kernel
     // ignore the setcap on /usr/bin/ping and break the subprocess
@@ -791,7 +896,7 @@ fn run_ping(target: &str) -> (Option<f64>, f64) {
     // (default `0 2147483647` on most distros) instead of CAP_NET_RAW.
     #[cfg(unix)]
     if let Some(result) = run_ping_native(target) {
-        return result;
+        return Some(result);
     }
 
     run_ping_subprocess(target)
@@ -942,7 +1047,7 @@ fn icmp_checksum(data: &[u8]) -> u16 {
 /// because Landlock sets NO_NEW_PRIVS and the setcap on `/usr/bin/ping`
 /// is ignored on exec — the native path above is what makes pings
 /// work under sandbox.
-fn run_ping_subprocess(target: &str) -> (Option<f64>, f64) {
+fn run_ping_subprocess(target: &str) -> Option<(Option<f64>, f64)> {
     #[cfg(target_os = "macos")]
     let args = ["-c", "3", "-t", "1", target];
 
@@ -955,16 +1060,25 @@ fn run_ping_subprocess(target: &str) -> (Option<f64>, f64) {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let args = ["-c", "3", "-W", "1", target];
 
-    let output = match Command::new("ping").args(args).output() {
-        Ok(o) => o,
-        Err(_) => return (None, 100.0),
-    };
+    let output = Command::new("ping").args(args).output().ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
+    // `ping` that could not open its socket ("socket: Operation not
+    // permitted" under NO_NEW_PRIVS) prints nothing to stdout and exits
+    // non-zero. No summary line means no echo was sent, which is not loss.
+    if !ping_ran(&text) {
+        return None;
+    }
     let loss = parse_loss(&text);
     let rtt = parse_avg_rtt(&text);
 
-    (rtt, loss)
+    Some((rtt, loss))
+}
+
+/// Whether `ping`'s output carries a transmit summary at all: "3 packets
+/// transmitted" on Linux and macOS, "Packets: Sent = 3" on Windows.
+fn ping_ran(output: &str) -> bool {
+    output.contains("transmitted") || output.contains("Sent =")
 }
 
 fn parse_loss(output: &str) -> f64 {
@@ -1030,6 +1144,60 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── loss model ─────────────────────────────────────────────────────
+    #[test]
+    fn a_fresh_prober_has_measured_nothing() {
+        // The dashboard used to open on "100% loss" because this started at
+        // 100.0. Pending is the whole fix for the fresh-start case.
+        let s = HealthProber::new().status();
+        assert_eq!(s.gateway_loss, Loss::Pending);
+        assert_eq!(s.dns_loss, Loss::Pending);
+        assert_eq!(s.internet_loss, Loss::Pending);
+        assert!(s.gateway_rtt_history.is_empty());
+    }
+
+    #[test]
+    fn a_pending_or_unmeasured_probe_never_degrades() {
+        assert!(!Loss::Pending.degrades(None));
+        assert!(!Loss::Unmeasured("icmp blocked").degrades(None));
+        assert!(
+            Loss::Measured(0.0).degrades(None),
+            "a measured probe with no rtt is a target that did not answer"
+        );
+        assert!(Loss::Measured(33.3).degrades(Some(1.0)));
+        assert!(!Loss::Measured(0.0).degrades(Some(1.0)));
+    }
+
+    #[test]
+    fn only_a_measurement_has_a_figure() {
+        assert_eq!(Loss::Pending.pct(), None);
+        assert_eq!(Loss::Unmeasured("x").pct(), None);
+        assert_eq!(Loss::Measured(12.5).pct(), Some(12.5));
+        assert_eq!(Loss::Pending.label(0), "—");
+        assert_eq!(Loss::Unmeasured("x").label(1), "—");
+        assert_eq!(Loss::Measured(12.5).label(1), "12.5%");
+        assert_eq!(Loss::Measured(0.0).label(0), "0%");
+        assert_eq!(
+            Loss::Unmeasured("icmp blocked").note(),
+            Some("icmp blocked")
+        );
+        assert_eq!(Loss::Pending.note(), None);
+        assert!(!Loss::Unmeasured("x").is_lossy());
+        assert!(Loss::Measured(0.1).is_lossy());
+    }
+
+    #[test]
+    fn ping_that_could_not_open_a_socket_did_not_run() {
+        assert!(!ping_ran(""));
+        assert!(!ping_ran("ping: socket: Operation not permitted"));
+        assert!(ping_ran(
+            "3 packets transmitted, 0 received, 100% packet loss, time 2003ms"
+        ));
+        assert!(ping_ran(
+            "    Packets: Sent = 3, Received = 3, Lost = 0 (0% loss),"
+        ));
+    }
 
     // ── parse_loss tests ──────────────────────────────────────────────
 

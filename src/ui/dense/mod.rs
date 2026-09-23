@@ -1412,7 +1412,7 @@ fn compact_count(n: u64) -> String {
 
 fn is_degraded(app: &App) -> bool {
     let h = app.health_prober.status();
-    h.gateway_loss_pct > 0.0 || h.dns_loss_pct > 0.0 || h.gateway_rtt_ms.is_none()
+    h.gateway_loss.degrades(h.gateway_rtt_ms) || h.dns_loss.is_lossy()
 }
 
 // ── box 2: ifaces ───────────────────────────────────────────────────────────
@@ -1809,8 +1809,8 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
     let kv: [(&str, String, bool); 4] = [
         (
             "packet loss",
-            format!("{:.1}%", h.gateway_loss_pct),
-            h.gateway_loss_pct > 0.0,
+            h.gateway_loss.label(1),
+            h.gateway_loss.is_lossy(),
         ),
         (
             "jitter",
@@ -1840,12 +1840,23 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
             format!("gateway rtt {:.1}× baseline", rtt / mean),
             Style::default().fg(t.status_error),
         ),
-        (None, _) => (
+        // No rtt from a probe that ran is a gateway that did not answer. No
+        // rtt because no probe has run, or none could be sent, is not — the
+        // line says which, instead of the "not responding" that used to greet
+        // every fresh start.
+        (None, _) if h.gateway_loss.is_measured() => (
             "gateway not responding".to_string(),
             Style::default().fg(t.status_error),
         ),
-        _ if h.gateway_loss_pct > 0.0 => (
-            format!("gateway loss {:.1}%", h.gateway_loss_pct),
+        (None, _) => (
+            h.gateway_loss
+                .note()
+                .map(|why| format!("gateway unmeasured: {why}"))
+                .unwrap_or_else(|| "probing gateway".to_string()),
+            faint,
+        ),
+        _ if h.gateway_loss.is_lossy() => (
+            format!("gateway loss {}", h.gateway_loss.label(1)),
             Style::default().fg(t.status_warn),
         ),
         _ => ("no anomalies in window".to_string(), faint),
