@@ -86,3 +86,25 @@ Description: Real-time network diagnostics in your terminal. One command, zero c
  diagnostic engine that learns a per-network baseline and opens an issue when
  that baseline breaks. Runs in a terminal, needs no configuration.
 
+Package: netwatch
+Architecture: amd64
+Version: 0.33.0-1
+Priority: optional
+Section: net
+Maintainer: Matt Hartley <matthew.t.hartley@gmail.com>
+Installed-Size: 13298
+Depends:
+Filename: pool/main/netwatch_0.33.0-1_amd64.deb
+Size: 4173540
+MD5sum: 238e187a55ad40974ea841876d056f9b
+SHA1: 1445c7359a400665db0d897ebcd1d7288a265667
+SHA256: a811c624272ecc770f087ac8ad822bfc261a6a75bed907c782c4a9a16260be2a
+SHA512: 63c1887b9d117f6d15185a41750b211f69c41ffe3b9acf927413c833701347b60b3949c5debd1d6fd848f1d680b7b0144e8167722fda5a1722c0191f528627c6
+Homepage: https://github.com/matthart1983/netwatch
+Description: Real-time network diagnostics in your terminal. One command, zero config,
+ instant visibility.
+ Live per-connection throughput with application-protocol decoding, process
+ attribution where the platform allows it, packet and interface views, and a
+ diagnostic engine that learns a per-network baseline and opens an issue when
+ that baseline breaks. Runs in a terminal, needs no configuration.
+
