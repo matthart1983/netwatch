@@ -11,6 +11,7 @@ hand when a release goes out.
 | crates.io (`netwatch-tui`) | `publish` job in `release.yml` | every tag | this repository |
 | `cargo binstall netwatch-tui` | nothing — reads `[package.metadata.binstall]` | every tag | the release tarballs |
 | GitHub release binaries | `build` job | every tag | musl-static (Linux), native (macOS/Windows) |
+| GitHub release FreeBSD binary | `build-freebsd` job, FreeBSD 13.5 VM | every tag, best-effort | dynamic against base libc/libpcap; runs on 13+ |
 | GitHub release `.deb` / `.rpm` | `build` job, `cargo-deb` + `cargo-generate-rpm` | every tag | the same static binary |
 | Fedora COPR | COPR builders from `packaging/rpm/netwatch.spec` | the `copr` job on each tag | built from source against system libpcap |
 | apt repo on GitHub Pages | the `apt` job, from the release `.deb` files | every tag | the same static binary |

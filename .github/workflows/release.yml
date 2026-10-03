@@ -330,22 +330,45 @@ jobs:
   # (cargo-zigbuild, the armv5te debian:bookworm container, or the host
   # toolchain directly) link against FreeBSD's libc. This builds for real,
   # inside a FreeBSD VM — same approach as the `freebsd` job in ci.yml.
+  #
+  # The VM release is pinned to the oldest one we support (issue #63). FreeBSD
+  # binaries cannot be static: they link the host's libc, and one built on a
+  # newer release asks for symbol versions an older one lacks ("FBSD_1.9 not
+  # found"). Symbol versions only ever grow, so a 13.x build runs on 13, 14
+  # and 15. Do not bump this to follow the latest release; that is the bug.
+  # (13.5 is EOL upstream; move to 14.x only when dropping 13 in the README.)
+  #
+  # libpcap comes from the base system on purpose, so it is NOT pkg-installed:
+  # the ports libpcap lives in /usr/local/lib and would make the binary
+  # depend on a package the user may not have.
+  #
+  # Best-effort: `continue-on-error` keeps a FreeBSD VM hiccup from blocking
+  # the other platforms; `release` then simply ships without this asset.
   build-freebsd:
     needs: guard
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Build inside a FreeBSD VM
+      - name: Build inside a FreeBSD 13 VM
         uses: vmactions/freebsd-vm@v1
         with:
+          release: "13.5"
           usesh: true
           prepare: |
-            pkg install -y rust libpcap pkgconf
+            pkg install -y rust
           run: |
+            set -ex
+            freebsd-version
             cargo build --release
+            ./target/release/netwatch --version
+            # Record what the binary needs from the host. Anything under
+            # /usr/local would mean a ports dependency leaked in.
+            ldd target/release/netwatch
+            ! ldd target/release/netwatch | grep -q /usr/local
             cp target/release/netwatch netwatch-freebsd-x86_64
             tar czf netwatch-freebsd-x86_64.tar.gz netwatch-freebsd-x86_64
 

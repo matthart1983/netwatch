@@ -53,10 +53,16 @@ sudo apt update && sudo apt install netwatch
 
 **Container:** `docker run --rm -it --net=host --pid=host --cap-add=NET_RAW ghcr.io/matthart1983/netwatch`
 
-**Binaries** for macOS, Linux (x86_64, aarch64, armv5te) and Windows are on the
+**Binaries** for macOS, Linux (x86_64, aarch64, armv5te), FreeBSD (x86_64) and
+Windows are on the
 [releases page](https://github.com/matthart1983/netwatch/releases/latest), with
 `.deb`, `.rpm`, checksums and signed provenance. The Linux builds are static and
 need nothing installed; Windows needs [Npcap](https://npcap.com/#download).
+
+**FreeBSD** is best-effort. `netwatch-freebsd-x86_64` is built on FreeBSD 13.5 and
+dynamically links the base system's libc and libpcap, so it needs FreeBSD 13 or
+newer (it cannot be static). On anything older, build from source with
+`cargo install netwatch-tui`.
 [Verifying a download](docs/REFERENCE.md#verifying-a-download) ·
 [every channel](docs/PACKAGING.md).
 
