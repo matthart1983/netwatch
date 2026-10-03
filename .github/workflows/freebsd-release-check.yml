@@ -1,0 +1,34 @@
+name: FreeBSD release build check
+
+# Dry run of release.yml's build-freebsd job. The release workflow only
+# runs on tags and publishes, so edits to it were otherwise untestable.
+# Keep the VM release and build steps identical to release.yml.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/freebsd-release-check.yml'
+  workflow_dispatch:
+
+jobs:
+  build-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inside a FreeBSD 13 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "13.5"
+          usesh: true
+          prepare: |
+            pkg install -y rust
+          run: |
+            set -ex
+            freebsd-version
+            cargo build --release
+            ./target/release/netwatch --version
+            ldd target/release/netwatch
+            ! ldd target/release/netwatch | grep -q /usr/local
+            cp target/release/netwatch netwatch-freebsd-x86_64
+            tar czf netwatch-freebsd-x86_64.tar.gz netwatch-freebsd-x86_64
