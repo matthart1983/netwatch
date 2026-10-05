@@ -16,7 +16,7 @@
 
 use super::{InterfaceInfo, InterfaceStats};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
@@ -78,9 +78,87 @@ fn parse_netstat_output(text: &str) -> HashMap<String, InterfaceStats> {
 }
 
 pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
-    let output = Command::new("ifconfig").output()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_ifconfig_output(&text))
+    // The kernel's own IFF_UP is the authority on "up"; the ifconfig text is
+    // only trusted for addresses, MTU and media. A failed or empty ifconfig
+    // must not blank the dashboard — every panel that lists "up" interfaces
+    // filters on `is_up` — so fall back to bare entries from getifaddrs.
+    let up = up_interfaces_from_getifaddrs();
+    let mut interfaces = match Command::new("ifconfig").output() {
+        Ok(output) => parse_ifconfig_output(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => Vec::new(),
+    };
+    if interfaces.is_empty() {
+        interfaces = up
+            .names
+            .iter()
+            .map(|name| InterfaceInfo {
+                name: name.clone(),
+                ipv4: None,
+                ipv6: None,
+                mac: None,
+                mtu: None,
+                is_up: false,
+                is_wireless: None,
+            })
+            .collect();
+    }
+    for iface in &mut interfaces {
+        if up.up.contains(&iface.name) {
+            iface.is_up = true;
+        }
+    }
+    Ok(interfaces)
+}
+
+struct GetifaddrsFlags {
+    /// Every interface name the kernel reports, in first-seen order.
+    names: Vec<String>,
+    /// The subset with `IFF_UP` set.
+    up: HashSet<String>,
+}
+
+fn up_interfaces_from_getifaddrs() -> GetifaddrsFlags {
+    use std::ffi::CStr;
+
+    let mut out = GetifaddrsFlags {
+        names: Vec::new(),
+        up: HashSet::new(),
+    };
+    let mut ifap: *mut nix::libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `ifap` with an owned list we free below;
+    // every pointer is null-checked before it is read.
+    if unsafe { nix::libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        let entry = unsafe { &*cur };
+        cur = entry.ifa_next;
+        if entry.ifa_name.is_null() {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(entry.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        if (entry.ifa_flags as u32) & (nix::libc::IFF_UP as u32) != 0 {
+            out.up.insert(name.clone());
+        }
+        if !out.names.contains(&name) {
+            out.names.push(name);
+        }
+    }
+    // SAFETY: `ifap` came from a successful `getifaddrs` and is freed once.
+    unsafe { nix::libc::freeifaddrs(ifap) };
+    out
+}
+
+/// True when the `<...>` flag list on an `ifconfig` header line contains the
+/// exact `UP` token. A substring test would also match `LOWER_UP`, so a link
+/// that is administratively down but has carrier would read as up.
+fn header_flags_contain_up(line: &str) -> bool {
+    line.split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .is_some_and(|(flags, _)| flags.split(',').any(|f| f == "UP"))
 }
 
 /// Adapted from macOS's ifconfig parser — same tab-indented continuation
@@ -108,7 +186,7 @@ fn parse_ifconfig_output(text: &str) -> Vec<InterfaceInfo> {
                 interfaces.push(iface);
             }
             let name = line.split(':').next().unwrap_or("").to_string();
-            let is_up = line.contains("UP");
+            let is_up = header_flags_contain_up(line);
             let mtu = line
                 .split_whitespace()
                 .skip_while(|s| *s != "mtu")
@@ -294,6 +372,35 @@ em1: flags=8822<BROADCAST,SIMPLEX,MULTICAST> metric 0 mtu 1500
             !ifaces.iter().find(|i| i.name == "em1").unwrap().is_up,
             "em1 lacks UP flag"
         );
+    }
+
+    #[test]
+    fn up_flag_is_an_exact_token_not_a_substring() {
+        assert!(header_flags_contain_up(
+            "vtnet0: flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500"
+        ));
+        assert!(!header_flags_contain_up(
+            "em1: flags=1008802<BROADCAST,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500"
+        ));
+        assert!(!header_flags_contain_up("em1: no flags here"));
+    }
+
+    /// Runs the real `ifconfig`/`netstat`/`getifaddrs` on the host. Every
+    /// FreeBSD box has `lo0` up, so it must come back up, and every interface
+    /// that carries counters must also have an info entry — the dashboard
+    /// joins the two by name.
+    #[test]
+    fn live_info_marks_loopback_up_and_joins_stats_by_name() {
+        let info = collect_interface_info().expect("interface info");
+        let lo0 = info.iter().find(|i| i.name == "lo0").expect("lo0 in info");
+        assert!(lo0.is_up, "lo0 must be up: {info:?}");
+        let stats = collect_interface_stats().expect("interface stats");
+        for name in stats.keys() {
+            assert!(
+                info.iter().any(|i| &i.name == name),
+                "{name} has counters but no info entry: {info:?}"
+            );
+        }
     }
 
     #[test]
