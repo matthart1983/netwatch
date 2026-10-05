@@ -2,6 +2,17 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- FreeBSD: an interface's up-state now comes from the kernel's `IFF_UP`
+  flag rather than a substring match on `ifconfig` output, and a failed or
+  empty `ifconfig` falls back to `getifaddrs` instead of an empty list.
+  Interfaces wrongly marked down left the dashboard's Interfaces panel at
+  "no interfaces up" and its throughput chart empty, while the Stats tab
+  (which reads `netstat` only) was fine (#63). Not reproduced on a stock
+  FreeBSD 14.4 VM, so this hardens the likely cause.
+
 ## [0.35.2] - 2026-10-04
 
 ### Fixed
