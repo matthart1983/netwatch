@@ -10,7 +10,7 @@
 # below must match Cargo.toml. `spec_version_matches_the_crate` in
 # tests/packaging.rs fails the build if they drift.
 Name:           netwatch
-Version:        0.35.2
+Version:        0.35.3
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -84,6 +84,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Mon Oct 05 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.35.3-1
+- FreeBSD interface up-state from IFF_UP
+
 * Sun Oct 04 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.35.2-1
 - FreeBSD binary builds on 13.5 and runs on 13+
 

@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.35.3] - 2026-10-05
 
 ### Fixed
 - FreeBSD: an interface's up-state now comes from the kernel's `IFF_UP`
