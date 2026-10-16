@@ -2441,7 +2441,9 @@ fn scroll_tab(app: &mut App, delta: isize) {
             app.diagnose.selected = clamp_scroll(app.diagnose.selected, delta, max);
         }
         Tab::Interfaces => {
-            let max = app.traffic.interface_count().saturating_sub(1);
+            // Clamp against the filtered rows the table draws, not every
+            // interface, or the cursor runs past the end under a filter.
+            let max = crate::ui::interfaces::visible_count(app).saturating_sub(1);
             app.ui.selected_interface = match (app.ui.selected_interface, delta < 0) {
                 (Some(0) | None, true) => None,
                 (None, false) => Some(0_usize),
@@ -5060,5 +5062,84 @@ mod diagnose_action_tests {
         );
         let summary = diagnose_summary(&app);
         assert!(summary.ends_with(" · 1 muted"), "{summary}");
+    }
+}
+
+#[cfg(test)]
+mod interface_list_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn iface(name: String, busy: bool) -> crate::collectors::traffic::InterfaceTraffic {
+        let rate = u64::from(busy);
+        crate::collectors::traffic::InterfaceTraffic {
+            name,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            rx_bytes_total: 0,
+            tx_bytes_total: 0,
+            rx_packets: 0,
+            tx_packets: 0,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_drops: 0,
+            tx_drops: 0,
+            signal_dbm: None,
+            tx_retries: None,
+            rx_history: VecDeque::from([rate]),
+            tx_history: VecDeque::from([rate]),
+            sample_times: VecDeque::new(),
+        }
+    }
+
+    /// 40 VLANs, every other one idle, on the Interfaces tab with no sort.
+    fn app_with_vlans() -> App {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let rows = (0..40)
+            .map(|n| iface(format!("vlan{:03}", n), n % 2 == 0))
+            .collect();
+        app.traffic.publish_for_test(rows);
+        app.ui.sort_states.remove(&Tab::Interfaces);
+        app.ui.current_tab = Tab::Interfaces;
+        app
+    }
+
+    fn screen(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| draw_frame(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.get(x, y).symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    /// Issue #66: with more interfaces than rows, the selection scrolled off
+    /// the bottom of the table and stayed there.
+    #[test]
+    fn selection_past_the_first_page_stays_on_screen() {
+        let mut app = app_with_vlans();
+        app.ui.interface_filter = InterfaceFilter::All;
+        app.ui.selected_interface = Some(38);
+        let text = screen(&mut app);
+        assert!(
+            text.contains("▸ vlan038"),
+            "selected row not drawn:\n{text}"
+        );
+        assert!(!text.contains("vlan000"), "table did not scroll:\n{text}");
+    }
+
+    /// The cursor is clamped to the filtered rows, not every interface.
+    #[test]
+    fn cursor_stops_at_the_last_filtered_row() {
+        let mut app = app_with_vlans();
+        app.ui.interface_filter = InterfaceFilter::Idle;
+        app.ui.selected_interface = Some(0);
+        scroll_tab(&mut app, 100);
+        assert_eq!(app.ui.selected_interface, Some(19));
     }
 }

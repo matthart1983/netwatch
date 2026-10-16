@@ -85,6 +85,11 @@ impl TrafficCollector {
         self.snapshot.read().unwrap().0.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, rows: Vec<InterfaceTraffic>) {
+        self.snapshot.write().unwrap().0 = Arc::new(rows);
+    }
+
     pub fn interface_at(&self, index: usize) -> Option<InterfaceTraffic> {
         self.snapshot.read().unwrap().0.get(index).cloned()
     }

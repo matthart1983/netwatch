@@ -90,6 +90,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     render_footer(f, app, chunks[4]);
 }
 
+/// Rows the table draws under the current filter, so the cursor can be
+/// clamped to them rather than to every interface.
+pub fn visible_count(app: &App) -> usize {
+    let mut interfaces: Vec<InterfaceTraffic> = (*app.traffic.interfaces()).clone();
+    apply_filter(&mut interfaces, app);
+    interfaces.len()
+}
+
 fn apply_filter(interfaces: &mut Vec<InterfaceTraffic>, app: &App) {
     interfaces.retain(|i| {
         let info = app.interface_info.iter().find(|info| info.name == i.name);
@@ -226,9 +234,19 @@ fn render_interfaces_table(f: &mut Frame, app: &App, interfaces: &[InterfaceTraf
     };
     f.render_widget(Paragraph::new(header_line), header_area);
 
+    // Scroll so the selection stays on screen when there are more interfaces
+    // than rows — hosts with many VLANs or NICs (#66).
     let max_rows = inner.height.saturating_sub(1) as usize;
-    for (i, iface) in interfaces.iter().take(max_rows).enumerate() {
-        render_interface_row(f, app, inner, i, iface);
+    let selected = app.ui.selected_interface.unwrap_or(0);
+    let top = crate::ui::tree::window_top(selected, interfaces.len(), max_rows);
+    for (row, (i, iface)) in interfaces
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(max_rows)
+        .enumerate()
+    {
+        render_interface_row(f, app, inner, row, i, iface);
     }
 
     if interfaces.is_empty() {
@@ -257,7 +275,14 @@ fn build_header_line(app: &App) -> Line<'static> {
     ))
 }
 
-fn render_interface_row(f: &mut Frame, app: &App, inner: Rect, i: usize, iface: &InterfaceTraffic) {
+fn render_interface_row(
+    f: &mut Frame,
+    app: &App,
+    inner: Rect,
+    row: usize,
+    i: usize,
+    iface: &InterfaceTraffic,
+) {
     let t = &app.theme;
     let info = app.interface_info.iter().find(|inf| inf.name == iface.name);
     let ip = info
@@ -275,7 +300,7 @@ fn render_interface_row(f: &mut Frame, app: &App, inner: Rect, i: usize, iface: 
     };
     let main_color = if active { t.text_primary } else { t.text_muted };
 
-    let row_y = inner.y + 1 + i as u16;
+    let row_y = inner.y + 1 + row as u16;
     let selected = app.ui.selected_interface == Some(i);
 
     let row_area = Rect {

@@ -16,6 +16,11 @@ All notable changes to NetWatch will be documented in this file.
   PowerShell lookups (adapter GUIDs, statistics, default route) now ask for
   UTF-8 output, so non-ASCII adapter names such as "Беспроводная сеть" match
   across all of them.
+- **Interfaces tab: the list now scrolls.** With more interfaces than rows
+  (many VLANs or NICs), the selection moved off the bottom of the table and
+  the list stayed put. The table now scrolls to keep the selection in view,
+  like the other lists, and the cursor stops at the last row the current
+  filter shows instead of running past it (#66).
 
 ## [0.35.2] - 2026-10-04
 
