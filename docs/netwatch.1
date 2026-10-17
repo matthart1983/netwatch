@@ -120,7 +120,10 @@ Diagnose the network for a bounded time, report, and exit. Options:
 .B \-\-target
 (a target named in the configuration) and
 .B \-\-format
-.BR json " or " text .
+.BR json " or " text ,
+and
+.B \-\-include\-beta
+to let issues from beta rules (whose contract is not yet reviewed) set exit 1.
 The exit status is part of the interface: 0, completed with no issue; 1, at
 least one open issue; 2, incomplete, no usable observation inside the budget;
 3, bad arguments or the session could not start.
