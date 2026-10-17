@@ -1246,6 +1246,17 @@ fn coverage_hints(
             hints.insert(rule.into(), (Availability::NotConfigured, error));
         }
     }
+    // Before configuration: no setting makes it runnable here, so the row
+    // must not say "press t".
+    if !cfg!(target_os = "linux") {
+        hints.insert(
+            "ipv6.broken".into(),
+            (
+                Availability::Unsupported,
+                super::active::IPV6_UNSUPPORTED.into(),
+            ),
+        );
+    }
     let tcp_status = if !crate::collectors::tcp_info::platform_supported() {
         Some((
             Availability::Unsupported,

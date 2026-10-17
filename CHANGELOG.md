@@ -39,6 +39,13 @@ All notable changes to NetWatch will be documented in this file.
   `/dev/bpf` access, on Windows Npcap. The fix is one constant, and a test
   checks the README, REFERENCE.md, the man page and the packages against it.
 
+- **Diagnose: the IPv6 experiment is "unsupported" off Linux, not
+  "failed".** It reads its route context from `/proc`, so on macOS, Windows
+  and FreeBSD it showed a red collector-failed row and offered `t` to run
+  it. The coverage row now says "IPv6 route context is read only on Linux"
+  and `t` refuses with the same text. On Linux with IPv6 disabled in the
+  kernel it is "not applicable"; other read errors still fail.
+
 ### Added
 - **`NO_COLOR`.** Set to any non-empty value, the TUI draws no colour in any
   view. The selection, highlighted rows and filled bars switch to reverse

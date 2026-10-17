@@ -148,6 +148,8 @@ pub enum Outcome {
     NotApplicable,
     PermissionDenied,
     Failed,
+    /// This platform cannot run the experiment at all.
+    Unsupported,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResultObs {
@@ -174,6 +176,7 @@ impl ResultObs {
             Outcome::NotApplicable => (Availability::NotApplicable,"no usable IPv6 default-route/address context"),
             Outcome::PermissionDenied => (Availability::PermissionDenied,"probe capability denied; inspect experiment detail"),
             Outcome::Failed => (Availability::CollectorFailed,"experiment could not complete; inspect detail and retry"),
+            Outcome::Unsupported => (Availability::Unsupported, IPV6_UNSUPPORTED),
             Outcome::Inconclusive => (Availability::NotMeasured,"experiment inconclusive; endpoint, filtering, or multiple faults prevent attribution"),
         }
     }
@@ -235,6 +238,9 @@ impl Runner {
         (s.obs.clone(), s.times.clone(), s.progress.clone())
     }
     pub fn start(&self, rule: &str, cfg: &Config) -> Result<(), String> {
+        if rule == "ipv6.broken" && !cfg!(target_os = "linux") {
+            return Err(IPV6_UNSUPPORTED.into());
+        }
         cfg.validate(rule)?;
         let mut s = self.state.lock().unwrap();
         if s.running {
@@ -298,9 +304,37 @@ fn connected(addr: SocketAddr, cancel: &Cancel) -> bool {
 }
 /// Linux route and non-link-local address context. An absent default route is
 /// not evidence of broken IPv6 on an IPv4-only network.
-fn ipv6_context() -> Option<bool> {
-    let routes = std::fs::read_to_string("/proc/net/ipv6_route").ok()?;
-    let addrs = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+/// Why `ipv6.broken` cannot run off Linux: its route and address context
+/// comes from `/proc`.
+pub const IPV6_UNSUPPORTED: &str = "IPv6 route context is read only on Linux";
+
+/// Whether this host has an IPv6 default route and a global address, so the
+/// experiment means something. Off Linux, Unsupported.
+fn ipv6_context() -> Result<bool, (Outcome, &'static str)> {
+    if !cfg!(target_os = "linux") {
+        return Err((Outcome::Unsupported, IPV6_UNSUPPORTED));
+    }
+    context_from(
+        std::fs::read_to_string("/proc/net/ipv6_route"),
+        std::fs::read_to_string("/proc/net/if_inet6"),
+    )
+}
+
+/// [`ipv6_context`] from the two `/proc` files. A missing `if_inet6` means
+/// the kernel has IPv6 off, which makes the experiment not applicable rather
+/// than failed; any other read error is a failure.
+fn context_from(
+    routes: std::io::Result<String>,
+    addrs: std::io::Result<String>,
+) -> Result<bool, (Outcome, &'static str)> {
+    let addrs = match addrs {
+        Ok(addrs) => addrs,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err((Outcome::NotApplicable, "IPv6 is disabled in the kernel"))
+        }
+        Err(_) => return Err((Outcome::Failed, "IPv6 route context unavailable")),
+    };
+    let routes = routes.map_err(|_| (Outcome::Failed, "IPv6 route context unavailable"))?;
     let route = routes.lines().any(|l| {
         let f: Vec<_> = l.split_whitespace().collect();
         f.len() >= 10
@@ -316,23 +350,26 @@ fn ipv6_context() -> Option<bool> {
             && f[5] != "lo"
             && u32::from_str_radix(f[4], 16).is_ok_and(|v| v & 0x48 == 0)
     });
-    Some(route && address)
+    Ok(route && address)
 }
 pub fn run(rule: &str, cfg: &Config, cancel: &Cancel) -> ResultObs {
+    if rule == "ipv6.broken" && !cfg!(target_os = "linux") {
+        return ResultObs::new(Outcome::Unsupported, IPV6_UNSUPPORTED);
+    }
     if let Err(e) = cfg.validate(rule) {
         return ResultObs::new(Outcome::Failed, &e);
     }
     match rule {
         "ipv6.broken" => {
             match ipv6_context() {
-                Some(false) => {
+                Ok(false) => {
                     return ResultObs::new(
                         Outcome::NotApplicable,
                         "IPv6 default route or global address absent",
                     )
                 }
-                None => return ResultObs::new(Outcome::Failed, "IPv6 route context unavailable"),
-                _ => {}
+                Err((outcome, why)) => return ResultObs::new(outcome, why),
+                Ok(true) => {}
             }
             let pairs: Vec<_> = cfg
                 .ipv6_pairs
@@ -644,6 +681,51 @@ mod tests {
         runner.start("captive.portal", &cfg).unwrap();
         runner.cancel();
         assert_eq!(runner.snapshot().0, Observation::default());
+    }
+    #[test]
+    fn unsupported_outcome_maps_to_unsupported_coverage() {
+        let obs = ResultObs::new(Outcome::Unsupported, IPV6_UNSUPPORTED);
+        assert_eq!(
+            obs.coverage(),
+            (Availability::Unsupported, IPV6_UNSUPPORTED)
+        );
+    }
+    #[test]
+    fn missing_ipv6_proc_files_mean_not_applicable() {
+        use std::io::{Error, ErrorKind};
+        let missing = || Err(Error::from(ErrorKind::NotFound));
+        assert_eq!(
+            context_from(missing(), missing()).unwrap_err().0,
+            Outcome::NotApplicable
+        );
+        assert_eq!(
+            context_from(
+                Ok(String::new()),
+                Err(Error::from(ErrorKind::PermissionDenied))
+            )
+            .unwrap_err()
+            .0,
+            Outcome::Failed
+        );
+        assert_eq!(
+            context_from(Ok(String::new()), Ok(String::new())),
+            Ok(false)
+        );
+        let route = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+                     fe800000000000000000000000000001 00000400 00000001 00000000 00000003 eth0";
+        let addr = "20010db8000000000000000000000001 02 40 00 00 eth0";
+        assert_eq!(context_from(Ok(route.into()), Ok(addr.into())), Ok(true));
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn ipv6_experiment_refuses_to_start_off_linux() {
+        let runner = Runner::default();
+        assert_eq!(
+            runner.start("ipv6.broken", &Config::default()),
+            Err(IPV6_UNSUPPORTED.to_string())
+        );
+        let obs = run("ipv6.broken", &Config::default(), &Cancel::default());
+        assert_eq!(obs.outcome, Outcome::Unsupported);
     }
     #[test]
     fn missing_icmp_capability_cannot_be_a_blackhole() {
