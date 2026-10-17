@@ -7,6 +7,7 @@ pub mod help;
 pub mod interfaces;
 pub mod lite;
 pub mod memory_stats;
+pub mod monochrome;
 pub mod packets;
 pub mod processes;
 pub mod sanitize;

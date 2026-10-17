@@ -30,6 +30,12 @@ All notable changes to NetWatch will be documented in this file.
   Dashboard. Settings now offers all ten startup tabs; it was missing
   Processes, Diagnose and Egress.
 
+### Added
+- **`NO_COLOR`.** Set to any non-empty value, the TUI draws no colour in any
+  view. The selection, highlighted rows and filled bars switch to reverse
+  video, so what was marked stays visible. REFERENCE.md gains a section
+  listing the environment variables netwatch reads.
+
 ## [0.35.4] - 2026-10-17
 
 ### Fixed

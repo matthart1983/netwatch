@@ -502,6 +502,23 @@ gradient are both on by default; `graph_style = "bars"` swaps the plot for solid
 your font has no braille coverage, and `graph_fade = false` drops the gradient. Both live in
 [Configuration](#configuration).
 
+`NO_COLOR` set to any non-empty value turns colour off in every view, whatever the theme.
+The selection, highlighted rows and filled bars show in reverse video instead.
+
+---
+
+## Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `NO_COLOR` | Any non-empty value: draw the TUI without colour ([no-color.org](https://no-color.org)). |
+| `NETWATCH_API_KEY` | API key for `--remote`. Preferred over `--api-key`, which leaves the key in the process list and shell history. |
+| `NETWATCH_REMOTE_URL` | Remote backend URL, when `--remote` is not given. |
+| `NETWATCH_METRICS_ADDR` | Address for the daemon's metrics endpoint, when `--metrics-addr` is not given. |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase) | Diagnose records whether a proxy applies to each configured target, and weighs it as evidence: an untrusted certificate behind a proxy points at interception. |
+
+Variables named `NETWATCH_*` that are not listed here are test hooks and may change in any release.
+
 ---
 
 ## Configuration

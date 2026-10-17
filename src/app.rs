@@ -1583,6 +1583,9 @@ fn draw_frame(f: &mut Frame, app: &mut App) {
     // terminal, whichever view or path put it in a cell. Ingest already
     // replaces them in what we collect; this catches whatever it missed.
     ui::sanitize::scrub_buffer(f.buffer_mut());
+    if ui::monochrome::requested() {
+        ui::monochrome::strip(f.buffer_mut(), app.theme.bg);
+    }
 }
 
 static TUI_PANIC_HOOK_INIT: std::sync::Once = std::sync::Once::new();
