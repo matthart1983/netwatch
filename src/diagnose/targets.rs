@@ -1419,10 +1419,20 @@ mod tests {
 
     #[test]
     fn a_closed_port_is_refused_not_timed_out() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        // Bound but never listening: the port stays reserved for the whole
+        // test and refuses connections. Dropping a listener to free a port
+        // let a parallel test bind it before the probe connected, which
+        // failed this test on macOS CI.
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
         let obs = probe(&cfg("127.0.0.1", port), &ProbeEnv::default(), || {
             "now".into()
         });
