@@ -4882,6 +4882,35 @@ mod render_safety_tests {
         terminal.backend().buffer().clone()
     }
 
+    fn rows(buf: &Buffer) -> Vec<String> {
+        let width = buf.area.width as usize;
+        buf.content
+            .chunks(width)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
+    /// A refused capture shows on the first screen, with the fix, instead of
+    /// only on the Packets tab.
+    #[test]
+    fn the_dashboard_names_a_refused_capture_and_its_fix() {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.ui.current_tab = Tab::Dashboard;
+        let banner = |app: &mut App| {
+            rows(&draw(app))
+                .into_iter()
+                .find(|r| r.contains("capture off"))
+        };
+        assert_eq!(banner(&mut app), None);
+
+        *app.packet_collector.error.lock().unwrap() = Some(format!(
+            "not permitted — {}",
+            crate::platform::capture_fix()
+        ));
+        let row = banner(&mut app).expect("no capture banner on the dashboard");
+        assert!(row.contains(crate::platform::capture_fix()), "{row}");
+    }
+
     fn unsafe_cells(buf: &Buffer) -> Vec<String> {
         buf.content
             .iter()

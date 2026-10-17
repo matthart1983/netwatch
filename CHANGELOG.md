@@ -30,6 +30,15 @@ All notable changes to NetWatch will be documented in this file.
   Dashboard. Settings now offers all ten startup tabs; it was missing
   Processes, Diagnose and Egress.
 
+- **A refused capture shows on the Dashboard, with the fix.** Without
+  capture privileges the failure appeared only on the Packets tab, as
+  "Capture failed: libpcap error: … CAP_NET_RAW may be required", and the
+  "run with sudo" hint matched only the BSD wording. The Dashboard header now
+  gains a row, "capture off: not permitted —" followed by the fix for the
+  OS: on Linux the `setcap` line the README gives, on macOS and FreeBSD
+  `/dev/bpf` access, on Windows Npcap. The fix is one constant, and a test
+  checks the README, REFERENCE.md, the man page and the packages against it.
+
 ### Added
 - **`NO_COLOR`.** Set to any non-empty value, the TUI draws no colour in any
   view. The selection, highlighted rows and filled bars switch to reverse

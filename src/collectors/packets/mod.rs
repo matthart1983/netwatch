@@ -1412,6 +1412,20 @@ impl CaptureStats {
     }
 }
 
+/// Whether libpcap's open failed for want of privilege. Its wording differs
+/// by platform: Linux names the missing capability, the BPF platforms report
+/// the device's EACCES. The full message is still logged.
+fn open_refused(message: &str) -> bool {
+    [
+        "Permission denied",
+        "Operation not permitted",
+        "CAP_NET_RAW",
+        "don't have permission",
+    ]
+    .iter()
+    .any(|m| message.contains(m))
+}
+
 /// Open/configure capture resources without reading or decoding traffic.
 /// Called inside the worker for startup and every capture restart.
 pub(crate) fn prepare_capture(
@@ -1429,8 +1443,8 @@ pub(crate) fn prepare_capture(
             .and_then(|c| c.promisc(false).snaplen(CAPTURE_SNAPLEN).timeout(CAPTURE_TIMEOUT_MS).open()))
         .map_err(|error| {
             tracing::error!(target: "netwatch::capture", interface = %iface, %error, "pcap open failed");
-            if error.to_string().contains("Permission denied") {
-                "Permission denied — run with sudo".to_string()
+            if open_refused(&error.to_string()) {
+                format!("not permitted — {}", crate::platform::capture_fix())
             } else { format!("Capture failed: {error}") }
         })?;
     // Blocking reads can hang forever on idle TPACKET_V3 links (#41).
@@ -3044,6 +3058,20 @@ mod tests {
     }
 
     // ── format_mac ──────────────────────────────────────────
+    /// What libpcap prints when the open is refused, per platform.
+    #[test]
+    fn a_refused_open_is_recognised_on_every_platform() {
+        for message in [
+            "libpcap error: Attempt to create packet socket failed - CAP_NET_RAW may be required",
+            "libpcap error: socket: Operation not permitted",
+            "libpcap error: (cannot open BPF device) /dev/bpf0: Permission denied",
+            "libpcap error: You don't have permission to capture on that device",
+        ] {
+            assert!(open_refused(message), "{message}");
+        }
+        assert!(!open_refused("libpcap error: No such device exists"));
+    }
+
     #[test]
     fn test_format_mac_normal() {
         assert_eq!(

@@ -19,6 +19,27 @@ pub mod procname;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// The `setcap` line the README, REFERENCE.md and the man page give for
+/// capture without root on Linux. CAP_BPF and CAP_PERFMON are for eBPF
+/// attribution (`sandbox/mod.rs`).
+pub const LINUX_CAPTURE_FIX: &str =
+    r#"sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)""#;
+
+/// What lets netwatch capture on this OS when opening a capture was refused.
+/// The one place it is written, so the error, the Dashboard banner and the
+/// docs cannot drift apart.
+pub const fn capture_fix() -> &'static str {
+    if cfg!(target_os = "linux") {
+        LINUX_CAPTURE_FIX
+    } else if cfg!(target_os = "macos") {
+        "run with sudo, or give your user read access to /dev/bpf* (Wireshark's ChmodBPF does this)"
+    } else if cfg!(target_os = "windows") {
+        "install Npcap from https://npcap.com/#download, without \"restrict to administrators\""
+    } else {
+        "run with sudo, or give your user read access to /dev/bpf* in devfs.rules"
+    }
+}
+
 use crate::ui::sanitize::display_owned;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -319,5 +340,44 @@ mod interface_name_tests {
             is_wireless: None,
         };
         assert_eq!(displayable_info(vec![info])[0].name, "eth·]0;owned··0");
+    }
+}
+
+#[cfg(test)]
+mod capture_fix_tests {
+    use super::LINUX_CAPTURE_FIX;
+
+    /// The line the banner prints is the line the docs give, and the
+    /// packages grant the same capabilities.
+    #[test]
+    fn the_fix_line_matches_the_docs_and_packages() {
+        for (doc, text) in [
+            ("README.md", include_str!("../../README.md")),
+            ("docs/REFERENCE.md", include_str!("../../docs/REFERENCE.md")),
+            ("docs/netwatch.1", include_str!("../../docs/netwatch.1")),
+        ] {
+            assert!(
+                text.contains(LINUX_CAPTURE_FIX),
+                "{doc} gives another setcap line"
+            );
+        }
+        let caps = LINUX_CAPTURE_FIX.split_whitespace().nth(2).unwrap();
+        assert_eq!(caps, "'cap_net_raw,cap_bpf,cap_perfmon+eip'");
+        for (file, text) in [
+            (
+                "debian/postinst",
+                include_str!("../../packaging/debian/postinst"),
+            ),
+            (
+                "rpm/netwatch.spec",
+                include_str!("../../packaging/rpm/netwatch.spec"),
+            ),
+            (
+                "rpm/post_install.sh",
+                include_str!("../../packaging/rpm/post_install.sh"),
+            ),
+        ] {
+            assert!(text.contains(caps), "{file} grants other capabilities");
+        }
     }
 }

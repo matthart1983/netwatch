@@ -626,8 +626,29 @@ pub fn build_verdict_line(app: &App) -> Line<'static> {
     }
 }
 
+/// Why capture is not running, when opening it failed. `--demo` seeds
+/// packets instead of capturing, so a failure there reports on something the
+/// user did not ask for.
+pub fn capture_failure(app: &App) -> Option<String> {
+    app.packet_collector
+        .get_error()
+        .filter(|_| !app.diagnose.is_demo())
+}
+
+/// The header's capture-failure row: what failed and, for a refused open,
+/// the fix (see [`crate::platform::capture_fix`]).
+pub fn capture_failure_line(app: &App, error: String) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ⚠ capture off: "),
+        Span::styled(error, Style::default().fg(app.theme.status_error).bold()),
+    ])
+}
+
 pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let lines = vec![build_header_line(app, None), build_verdict_line(app)];
+    let mut lines = vec![build_header_line(app, None), build_verdict_line(app)];
+    if let Some(error) = capture_failure(app).filter(|_| area.height > 3) {
+        lines.push(capture_failure_line(app, error));
+    }
     let header = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::BOTTOM)

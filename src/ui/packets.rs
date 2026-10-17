@@ -213,22 +213,9 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
         ));
     }
 
-    // `--demo` seeds the list instead of capturing, so a libpcap failure is
-    // reporting on something the user did not ask for — and it shouted over
-    // eleven packets that are plainly on screen.
-    let capture_error = app
-        .packet_collector
-        .get_error()
-        .filter(|_| !app.diagnose.is_demo());
-    if let Some(e) = capture_error {
+    if let Some(e) = crate::ui::widgets::capture_failure(app) {
         let line1 = crate::ui::widgets::build_header_line(app, Some(extra));
-        let lines = vec![
-            line1,
-            Line::from(vec![
-                Span::raw(" ⚠ "),
-                Span::styled(e, Style::default().fg(app.theme.status_error).bold()),
-            ]),
-        ];
+        let lines = vec![line1, crate::ui::widgets::capture_failure_line(app, e)];
         let header = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::BOTTOM)
