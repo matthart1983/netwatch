@@ -2139,6 +2139,15 @@ impl Drop for PacketCollector {
 
 // ── Packet parsing ──────────────────────────────────────────
 
+/// Decode one Ethernet frame exactly as the capture thread does, for the
+/// fuzz targets in `fuzz/`. No reverse DNS: the cache has no peers and is
+/// never started.
+#[doc(hidden)]
+pub fn fuzz_parse_frame(data: &[u8]) {
+    let counter = Arc::new(Mutex::new(0));
+    let _ = parse_packet(data, &counter, &DnsCache::new());
+}
+
 fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Option<CapturedPacket> {
     if data.len() < 14 {
         return None;

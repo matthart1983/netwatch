@@ -1,0 +1,59 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the parsers that capture traffic reaches
+# (fuzz/fuzz_targets). Briefly on every pull request that touches code, for
+# longer every week. The corpus each run grows is cached and seeds the next,
+# so the weekly run keeps going deeper rather than starting over.
+on:
+  pull_request:
+    branches: [main]
+    paths: ["src/**", "fuzz/**", "Cargo.lock", ".github/workflows/fuzz.yml"]
+  schedule:
+    - cron: "15 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame, classify, tls_handshake, quic_initial, http3, display_filter]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install libpcap and cargo-fuzz
+        run: |
+          sudo apt-get update && sudo apt-get install -y libpcap-dev
+          cargo install cargo-fuzz --locked
+
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      # 60 s on a pull request, 10 min on the weekly run. -rss_limit_mb keeps a
+      # memory blow-up (a decompression bomb, an unbounded resize) a failure
+      # rather than a runner kill.
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          secs=60
+          [ "${{ github.event_name }}" = pull_request ] || secs=600
+          cargo fuzz run ${{ matrix.target }} -- -max_total_time=$secs -rss_limit_mb=2048 -max_len=65536
+
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: fuzz/artifacts/${{ matrix.target }}

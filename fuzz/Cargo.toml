@@ -1,0 +1,68 @@
+# Coverage-guided fuzzing of netwatch's parsers of untrusted network input.
+#
+#   cargo +nightly fuzz run frame        # needs cargo-fuzz
+#
+# Each target is one entry point that capture traffic reaches. CI runs every
+# target briefly on each pull request and longer every week (see
+# .github/workflows/fuzz.yml); a crash fails the job and uploads the input.
+[package]
+name = "netwatch-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# No eBPF: the fuzz targets never load a BPF object.
+netwatch-tui = { path = "..", default-features = false }
+
+# Not part of the main workspace: built on nightly with sanitizer flags.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classify"
+path = "fuzz_targets/classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_handshake"
+path = "fuzz_targets/tls_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_initial"
+path = "fuzz_targets/quic_initial.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http3"
+path = "fuzz_targets/http3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "display_filter"
+path = "fuzz_targets/display_filter.rs"
+test = false
+doc = false
+bench = false

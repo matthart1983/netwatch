@@ -52,6 +52,12 @@ All notable changes to NetWatch will be documented in this file.
   video, so what was marked stays visible. REFERENCE.md gains a section
   listing the environment variables netwatch reads.
 
+- **Coverage-guided fuzzing.** `fuzz/` holds six cargo-fuzz targets for the
+  input netwatch takes from the network: frame decode, every DPI classifier,
+  TLS handshakes, QUIC Initial frames, HTTP/3 frames and body decompression,
+  and the display-filter language. CI fuzzes each for 60 s on pull requests
+  and 10 min weekly, keeping the corpus between runs.
+
 ### Documentation
 - README gains "Without the TUI": `doctor`, `diagnose run` and its exit
   statuses, `daemon --metrics`, `--demo`, and `--remote` marked experimental.

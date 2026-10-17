@@ -21,6 +21,8 @@ exclude = [
     "screenshots/",
     "*.mov",
     "*.cast",
+    # The fuzz crate builds on nightly against this one; nothing to install.
+    "fuzz/",
 ]
 
 [lib]
