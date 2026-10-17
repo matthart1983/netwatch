@@ -131,6 +131,10 @@ part of the interface:
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |
 
+An issue from a beta rule (one whose contract is not yet reviewed; see
+[diagnostic-coverage.md](diagnostic-coverage.md#not-yet-contracted)) is reported, tagged
+`beta`, but sets exit 1 only with `--include-beta`.
+
 Exit 0 and exit 2 are deliberately different. A run that gathered nothing has
 established nothing, and a script that treats silence as health will report a
 dead link as a healthy one. Without `--target`, a measured gateway, a measured

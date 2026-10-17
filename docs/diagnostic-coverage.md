@@ -177,7 +177,7 @@ target returns an error · severity Medium
 
 ## Not yet contracted
 
-These rules have detectors and can open issues. What they have not had is a written statement of the evidence they need and the healthy situations they must not mistake for a fault.
+These rules have detectors and can open issues. What they have not had is a written statement of the evidence they need and the healthy situations they must not mistake for a fault. Until they do they are **beta**: their issues are shown and tagged beta, and set `netwatch diagnose run`'s exit status only with `--include-beta`.
 
 | Rule | Category | Fires when | Status |
 |---|---|---|---|

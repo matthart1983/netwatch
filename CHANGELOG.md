@@ -59,6 +59,16 @@ All notable changes to NetWatch will be documented in this file.
 - CAPABILITIES.md gains a FreeBSD column and a draft of the platform tiers 1.0
   would promise. WIKI.md no longer describes a 9-tab TUI with one CLI helper.
 
+### Changed
+- **Diagnose rules without a reviewed contract are beta.** 22 of the 30
+  rules have detectors but no written statement of the evidence they need
+  and the healthy lookalikes they must rule out. Their issues are still
+  shown, now tagged `beta` in the issue list, the detail pane, `diagnose run`'s
+  text output and its JSON (`"beta": true` on the issue). **`diagnose run`
+  no longer exits 1 for a beta issue alone**; pass `--include-beta` for the
+  old behaviour. The JSON report gains `"include_beta"`. The 8 contracted
+  rules are unchanged. `docs/diagnostic-coverage.md` lists which is which.
+
 ## [0.35.4] - 2026-10-17
 
 ### Fixed

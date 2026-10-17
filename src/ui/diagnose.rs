@@ -1012,9 +1012,12 @@ const MIN_CHRONOLOGY_ROWS: u16 = 3;
 
 /// Width the widest row of an issue actually needs, so the column is sized to
 /// its content instead of to a guess.
+/// After the title of an issue a beta rule opened.
+const BETA_TAG: &str = " beta";
+
 fn issue_row_width(i: &&Issue) -> usize {
     // +1 throughout for the selection rail in column zero.
-    let title = i.title.len() + 7;
+    let title = i.title.len() + 7 + if i.beta { BETA_TAG.len() } else { 0 };
     let mut value = i.subject.label().len() + 6;
     if let Some(e) = i.headline() {
         value += e.value_label().len() + 3;
@@ -1171,6 +1174,9 @@ fn render_issue_list(f: &mut Frame, view: &View, issues: &[&Issue], area: Rect) 
             ),
             Span::styled(issue.title.clone(), title_style),
         ];
+        if issue.beta {
+            head.push(Span::styled(BETA_TAG, Style::default().fg(t.text_muted)));
+        }
         if issue.recurrence > 0 {
             head.push(Span::styled(
                 format!(" ×{}", issue.recurrence + 1),
@@ -1334,6 +1340,12 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
         issue.subject.label(),
         Style::default().fg(t.text_primary).bold(),
     )));
+    if issue.beta {
+        lines.push(Line::from(Span::styled(
+            "beta rule: contract not yet reviewed; not counted in `diagnose run`'s exit status",
+            Style::default().fg(t.text_muted),
+        )));
+    }
     // One row per metric, aligned, instead of every figure on one line.
     let metric_w = issue
         .evidence
@@ -1837,6 +1849,24 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The fixture's issues come from rules without a reviewed contract, so
+    /// they are beta: tagged in the list and explained in the detail pane.
+    #[test]
+    fn beta_issue_is_tagged() {
+        let (engine, _) = fixture::run();
+        let first = engine.primary_issues()[0].clone();
+        assert!(first.beta, "{} should be beta", first.rule);
+        let screen = draw(150, 44, |_| {});
+        assert!(
+            screen.contains(&format!("{} beta", first.title)),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("beta rule: contract not yet reviewed"),
+            "{screen}"
+        );
     }
 
     fn draw_coverage_text(width: u16, selected: usize) -> String {

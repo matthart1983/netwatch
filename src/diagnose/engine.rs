@@ -821,6 +821,7 @@ impl Engine {
             since: format_ts(since),
             last_seen: ts,
             stale_since: None,
+            beta: super::rules::lookup(d.rule).is_some_and(|r| r.beta()),
             state: IssueState::Open,
             evidence: d.evidence,
             scope: d.scope,

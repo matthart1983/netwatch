@@ -71,6 +71,7 @@ _netwatch() {
                         '--budget=[Run time, 5s..10m]:duration:' \
                         '--format=[Output format]:format:(text json)' \
                         '--only=[One corpus entry]:id:' \
+                        '--include-beta[Count beta rules in the exit status]' \
                         '*:file:_files'
                     ;;
                 resolver)

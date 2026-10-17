@@ -52,8 +52,15 @@ impl Outcome {
 /// exits 0. `evidence` is whether the run ever saw a usable observation for
 /// what it was asked about. Without one there is nothing to conclude,
 /// however quiet the issue list looks.
-pub fn outcome(findings: &[Issue], evidence: bool) -> Outcome {
-    if findings.iter().any(|f| f.kind() == Kind::Issue) {
+///
+/// An Issue from a beta rule counts only with `include_beta`: it is shown
+/// either way, but a script's exit status should not rest on a rule whose
+/// contract nobody has reviewed.
+pub fn outcome(findings: &[Issue], evidence: bool, include_beta: bool) -> Outcome {
+    if findings
+        .iter()
+        .any(|f| f.kind() == Kind::Issue && (include_beta || !f.beta))
+    {
         Outcome::Finding
     } else if evidence {
         Outcome::NoFinding
@@ -86,6 +93,7 @@ struct Options {
     target: Option<String>,
     budget: Duration,
     json: bool,
+    include_beta: bool,
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Options> {
@@ -93,6 +101,7 @@ fn parse(args: &[String]) -> anyhow::Result<Options> {
         target: None,
         budget: Duration::from_secs(30),
         json: false,
+        include_beta: false,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -121,6 +130,7 @@ fn parse(args: &[String]) -> anyhow::Result<Options> {
                 }
             }
             "--json" => opts.json = true,
+            "--include-beta" => opts.include_beta = true,
             other => anyhow::bail!("unknown run option: {other}"),
         }
     }
@@ -262,7 +272,7 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
     app.packet_collector.stop_capture();
 
     let findings = select(app.diagnose.engine.issues(), asked.as_ref());
-    let outcome = outcome(&findings, saw_evidence);
+    let outcome = outcome(&findings, saw_evidence, opts.include_beta);
     let sampling = Sampling {
         target: opts.target,
         started_at: started_at.to_rfc3339(),
@@ -277,10 +287,14 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
             &sampling,
             app.diagnose.engine.coverage(),
             &findings,
+            opts.include_beta,
         );
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", text_report(outcome, &sampling, &findings));
+        print!(
+            "{}",
+            text_report(outcome, &sampling, &findings, opts.include_beta)
+        );
     }
     Ok(outcome)
 }
@@ -441,6 +455,7 @@ fn json_report(
     sampling: &Sampling,
     coverage: &Coverage,
     findings: &[Issue],
+    include_beta: bool,
 ) -> serde_json::Value {
     let of = |kind: Kind| -> Vec<Finding> {
         findings
@@ -455,6 +470,7 @@ fn json_report(
         "ruleset": super::rules::CATALOGUE.len(),
         "outcome": outcome.label(),
         "exit": outcome as i32,
+        "include_beta": include_beta,
         "target": sampling.target,
         "started_at": sampling.started_at,
         "window_seconds": sampling.seconds,
@@ -473,7 +489,12 @@ fn json_report(
 
 /// The text report: the outcome, the Issues under it, then the Observations
 /// under their own heading, since they do not set the exit status.
-fn text_report(outcome: Outcome, sampling: &Sampling, findings: &[Issue]) -> String {
+fn text_report(
+    outcome: Outcome,
+    sampling: &Sampling,
+    findings: &[Issue],
+    include_beta: bool,
+) -> String {
     let mut out = format!(
         "{} · {} samples in {:.0}s\n",
         outcome.label(),
@@ -482,8 +503,14 @@ fn text_report(outcome: Outcome, sampling: &Sampling, findings: &[Issue]) -> Str
     );
     let (issues, observations): (Vec<&Issue>, Vec<&Issue>) =
         findings.iter().partition(|f| f.kind() == Kind::Issue);
+    let uncounted_beta = !include_beta && issues.iter().any(|i| i.beta);
     for issue in issues {
         out.push_str(&finding_lines(issue));
+    }
+    if uncounted_beta {
+        out.push_str(
+            "  beta issues are not counted in the exit status; --include-beta counts them\n",
+        );
     }
     if outcome == Outcome::Incomplete {
         out.push_str("  no usable observation arrived inside the budget\n");
@@ -501,7 +528,8 @@ fn text_report(outcome: Outcome, sampling: &Sampling, findings: &[Issue]) -> Str
 /// "service, not network", then its top cause and the check that cause is
 /// still missing.
 fn finding_lines(finding: &Issue) -> String {
-    let mut out = format!("  {}\n", finding.summary_line());
+    let beta = if finding.beta { "beta · " } else { "" };
+    let mut out = format!("  {beta}{}\n", finding.summary_line());
     if let Some(note) = &finding.scope.note {
         out.push_str(&format!("    {note}\n"));
     }
@@ -576,8 +604,8 @@ mod tests {
     fn an_empty_list_without_evidence_is_incomplete_not_healthy() {
         // The distinction the exit statuses exist for. A run that gathered
         // nothing has not established that anything is well.
-        assert_eq!(outcome(&[], false), Outcome::Incomplete);
-        assert_eq!(outcome(&[], true), Outcome::NoFinding);
+        assert_eq!(outcome(&[], false, false), Outcome::Incomplete);
+        assert_eq!(outcome(&[], true, false), Outcome::NoFinding);
         assert_eq!(Outcome::Incomplete as i32, 2);
         assert_eq!(Outcome::NoFinding as i32, 0);
     }
@@ -654,7 +682,7 @@ mod tests {
             assert!(observations.dns.is_none(), "{case}");
             assert!(!evidence(&observations, None), "{case}");
             assert_eq!(
-                outcome(&[], evidence(&observations, None)),
+                outcome(&[], evidence(&observations, None), false),
                 Outcome::Incomplete,
                 "{case}"
             );
@@ -690,7 +718,10 @@ mod tests {
             ..Default::default()
         };
         assert!(evidence(&gateway, None));
-        assert_eq!(outcome(&[], evidence(&gateway, None)), Outcome::NoFinding);
+        assert_eq!(
+            outcome(&[], evidence(&gateway, None), false),
+            Outcome::NoFinding
+        );
         // Total loss is measured too: that is gateway.unreachable's input.
         let dead = Observations {
             gateway: gateway.gateway.clone().map(|g| GatewayObs {
@@ -727,12 +758,58 @@ mod tests {
         assert!(!evidence(&gateway, Some("api")));
     }
 
+    /// Decision B-10, revised: the rules without a reviewed contract are
+    /// beta. Their issues are shown and tagged, and set the exit status only
+    /// with `--include-beta`.
+    #[test]
+    fn beta_issue_does_not_set_exit_code() {
+        let mut issue = crate::diagnose::fixture::report().issues.remove(0);
+        issue.beta = true;
+        let findings = std::slice::from_ref(&issue);
+        assert_eq!(outcome(findings, true, false), Outcome::NoFinding);
+        assert_eq!(outcome(findings, false, false), Outcome::Incomplete);
+
+        let text = text_report(Outcome::NoFinding, &sampling(true), findings, false);
+        assert!(
+            text.contains(&format!("beta · {}", issue.summary_line())),
+            "{text}"
+        );
+        assert!(text.contains("--include-beta counts them"), "{text}");
+        let json = json_report(
+            Outcome::NoFinding,
+            &sampling(true),
+            &Coverage::default(),
+            findings,
+            false,
+        );
+        assert_eq!(json["issues"][0]["beta"], true);
+        assert_eq!(json["include_beta"], false);
+    }
+
+    #[test]
+    fn include_beta_counts_it() {
+        let mut issue = crate::diagnose::fixture::report().issues.remove(0);
+        issue.beta = true;
+        let findings = std::slice::from_ref(&issue);
+        assert_eq!(outcome(findings, true, true), Outcome::Finding);
+        let text = text_report(Outcome::Finding, &sampling(true), findings, true);
+        assert!(!text.contains("--include-beta"), "{text}");
+        issue.beta = false;
+        assert_eq!(
+            outcome(std::slice::from_ref(&issue), true, false),
+            Outcome::Finding,
+            "a contracted rule's issue counts without the flag"
+        );
+    }
+
     #[test]
     fn a_finding_outranks_the_evidence_question() {
         let issue = crate::diagnose::fixture::report().issues.remove(0);
         let issue = std::slice::from_ref(&issue);
-        assert_eq!(outcome(issue, true), Outcome::Finding);
-        assert_eq!(outcome(issue, false), Outcome::Finding);
+        // The fixture's issues come from beta rules; counting them is what
+        // this test is about, not the beta gate (below).
+        assert_eq!(outcome(issue, true, true), Outcome::Finding);
+        assert_eq!(outcome(issue, false, true), Outcome::Finding);
         assert_eq!(Outcome::Finding as i32, 1);
     }
 
@@ -784,18 +861,24 @@ mod tests {
     fn observations_alone_exit_zero() {
         let findings = [symmetric_nat()];
         let nat = &findings[0];
-        let outcome = outcome(&findings, true);
+        let outcome = outcome(&findings, true, false);
         assert_eq!(outcome, Outcome::NoFinding);
         assert_eq!(outcome as i32, 0);
         // An Observation is no evidence either way: with nothing measured
         // the run is still incomplete, not healthy.
-        assert_eq!(super::outcome(&findings, false), Outcome::Incomplete);
+        assert_eq!(super::outcome(&findings, false, false), Outcome::Incomplete);
 
-        let json = json_report(outcome, &sampling(true), &Coverage::default(), &findings);
+        let json = json_report(
+            outcome,
+            &sampling(true),
+            &Coverage::default(),
+            &findings,
+            false,
+        );
         assert_eq!(json["exit"], 0);
         assert_eq!(json["issues"], serde_json::json!([]));
         assert_eq!(json["observations"][0]["rule"], "nat.symmetric");
-        let text = text_report(outcome, &sampling(true), &findings);
+        let text = text_report(outcome, &sampling(true), &findings, false);
         let (above, below) = text
             .split_once("observations · not counted in the exit status\n")
             .expect("observations have their own heading");
@@ -809,10 +892,10 @@ mod tests {
         let (engine, _) = crate::diagnose::fixture::run();
         let issue = engine.primary_issues()[0].clone();
         let findings = [nat.clone(), issue.clone()];
-        assert_eq!(outcome(&findings, true), Outcome::Finding);
-        assert_eq!(outcome(&findings, false), Outcome::Finding);
+        assert_eq!(outcome(&findings, true, true), Outcome::Finding);
+        assert_eq!(outcome(&findings, false, true), Outcome::Finding);
 
-        let text = text_report(Outcome::Finding, &sampling(true), &findings);
+        let text = text_report(Outcome::Finding, &sampling(true), &findings, false);
         let (above, below) = text
             .split_once("observations · not counted in the exit status\n")
             .expect("observations have their own heading");
@@ -828,10 +911,11 @@ mod tests {
         let issues = findings.len();
         findings.push(symmetric_nat());
         let json = json_report(
-            outcome(&findings, true),
+            outcome(&findings, true, false),
             &sampling(true),
             engine.coverage(),
             &findings,
+            false,
         );
         assert_eq!(json["schema"], 2);
         assert_eq!(json["outcome"], "finding");
@@ -855,10 +939,11 @@ mod tests {
         let (engine, _) = crate::diagnose::fixture::run();
         let findings = select(engine.issues(), None);
         let json = json_report(
-            outcome(&findings, true),
+            outcome(&findings, true, false),
             &sampling(true),
             engine.coverage(),
             &findings,
+            false,
         );
         let mut states = std::collections::BTreeSet::new();
         for entry in json["issues"].as_array().unwrap() {
@@ -961,12 +1046,18 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].kind(), Kind::Issue);
         assert_eq!(findings[0].severity, Severity::Medium);
-        let outcome = outcome(&findings, true);
+        let outcome = outcome(&findings, true, false);
         assert_eq!(outcome as i32, 1);
-        let json = json_report(outcome, &sampling(true), engine.coverage(), &findings);
+        let json = json_report(
+            outcome,
+            &sampling(true),
+            engine.coverage(),
+            &findings,
+            false,
+        );
         assert_eq!(json["issues"][0]["kind"], "issue");
         assert_eq!(json["issues"][0]["scope"]["note"], "service, not network");
-        let text = text_report(outcome, &sampling(true), &findings);
+        let text = text_report(outcome, &sampling(true), &findings, false);
         assert!(
             text.contains(&format!(
                 "  {}\n    service, not network\n",
@@ -985,7 +1076,7 @@ mod tests {
         // fault, and a failing service is not.
         let findings = select(engine.issues(), None);
         assert_eq!(findings[0].kind(), Kind::Observation);
-        assert_eq!(super::outcome(&findings, true) as i32, 0);
+        assert_eq!(super::outcome(&findings, true, false) as i32, 0);
     }
 
     /// One sample in which `api` times out on connect and the fixture's
@@ -1051,7 +1142,7 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].rule, "gateway.unreachable");
         assert_eq!(findings[0].consequences, vec![hidden.id.clone()]);
-        assert_eq!(outcome(&findings, true), Outcome::Finding);
+        assert_eq!(outcome(&findings, true, false), Outcome::Finding);
     }
 
     /// P13 review: the gateway above lies on the target's route as well, so
@@ -1087,7 +1178,7 @@ mod tests {
         let findings = select(engine.issues(), Some(&api));
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].rule, "gateway.unreachable");
-        assert_eq!(outcome(&findings, true), Outcome::Finding);
+        assert_eq!(outcome(&findings, true, false), Outcome::Finding);
     }
 
     fn finding(id: &str, rule: &str, subject: Subject) -> Issue {
@@ -1101,6 +1192,7 @@ mod tests {
             since: "2026-09-15 10:00:00".into(),
             last_seen: "2026-09-15 10:00:00".into(),
             stale_since: None,
+            beta: false,
             state: crate::diagnose::issue::IssueState::Open,
             evidence: vec![],
             scope: Default::default(),
@@ -1224,7 +1316,7 @@ mod tests {
         assert!(!evidence(&observations, Some("api")));
         let findings = select(engine.issues(), Some(&api));
         assert!(findings.is_empty(), "{findings:?}");
-        assert_eq!(outcome(&findings, false), Outcome::Incomplete);
+        assert_eq!(outcome(&findings, false, false), Outcome::Incomplete);
 
         // Not vacuous: the host has Issues a probed target would keep.
         let findings = select(engine.issues(), Some(&probed(named, &["10.1.2.3"])));
@@ -1232,7 +1324,7 @@ mod tests {
             findings.iter().any(|f| f.kind() == Kind::Issue),
             "{findings:?}"
         );
-        assert_eq!(outcome(&findings, true), Outcome::Finding);
+        assert_eq!(outcome(&findings, true, true), Outcome::Finding);
     }
 
     #[test]

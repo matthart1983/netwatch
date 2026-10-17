@@ -1011,6 +1011,7 @@ mod tests {
             since: "2026-09-15 10:00:00".into(),
             last_seen: "2026-09-15 10:00:00".into(),
             stale_since: None,
+            beta: false,
             state: crate::diagnose::issue::IssueState::Open,
             evidence: vec![],
             scope: Default::default(),

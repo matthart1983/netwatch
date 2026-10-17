@@ -1010,6 +1010,10 @@ pub struct Issue {
     /// that has gone waits out `expire_after_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_since: Option<String>,
+    /// Opened by a beta rule ([`super::rules::Rule::beta`]). Copied when the
+    /// issue opens, so a later contract review does not rewrite history.
+    #[serde(default)]
+    pub beta: bool,
     pub state: IssueState,
     pub evidence: Vec<Evidence>,
     #[serde(default)]
@@ -1533,6 +1537,7 @@ mod tests {
             since: "2026-09-03 06:48:10".into(),
             last_seen: "2026-09-03 06:51:19".into(),
             stale_since: None,
+            beta: false,
             state: IssueState::Open,
             evidence: vec![dns_evidence()],
             scope: Scope::default(),

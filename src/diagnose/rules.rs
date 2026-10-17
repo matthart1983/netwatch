@@ -64,6 +64,14 @@ impl Rule {
             && !self.recovery.is_empty()
             && !self.platforms.is_empty()
     }
+
+    /// Beta until its contract is reviewed. A beta rule's issues are shown,
+    /// tagged, and leave `diagnose run`'s exit status alone unless asked
+    /// (`--include-beta`): netwatch makes no promise about a rule nobody has
+    /// written the evidence and lookalikes down for.
+    pub fn beta(&self) -> bool {
+        !self.contracted()
+    }
 }
 
 /// Built-in ruleset v1.
@@ -605,7 +613,8 @@ healthy\".\n\n",
     m.push_str(
         "These rules have detectors and can open issues. What they have not had is a \
 written statement of the evidence they need and the healthy situations they must not \
-mistake for a fault.\n\n",
+mistake for a fault. Until they do they are **beta**: their issues are shown and tagged \
+beta, and set `netwatch diagnose run`'s exit status only with `--include-beta`.\n\n",
     );
     m.push_str("| Rule | Category | Fires when | Status |\n|---|---|---|---|\n");
     for rule in CATALOGUE.iter().filter(|r| !r.contracted()) {
@@ -854,6 +863,7 @@ mod tests {
             since: "2026-09-03 06:48:10".into(),
             last_seen: "2026-09-03 06:51:19".into(),
             stale_since: None,
+            beta: false,
             state: IssueState::Open,
             evidence: vec![],
             scope: Scope::default(),
