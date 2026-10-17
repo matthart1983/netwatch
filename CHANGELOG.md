@@ -26,6 +26,9 @@ All notable changes to NetWatch will be documented in this file.
   `d` and `c`, the whole coverage view (`t`, `[`/`]`, `d`, `r`, `x`), `M`
   and `v`, and it printed the Dashboard section twice. Help is now a table,
   and a test reads the key handler and fails on any key without a help line.
+- **`default_tab = "egress"` opens the Egress tab.** It fell back to
+  Dashboard. Settings now offers all ten startup tabs; it was missing
+  Processes, Diagnose and Egress.
 
 ## [0.35.4] - 2026-10-17
 

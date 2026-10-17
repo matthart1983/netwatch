@@ -342,6 +342,7 @@ impl NetwatchConfig {
             // Kept as an alias: the Insights tab folded into Diagnose,
             // and a config naming it should land somewhere sensible.
             "diagnose" | "insights" => Tab::Diagnose,
+            "egress" => Tab::Egress,
             _ => Tab::Dashboard,
         }
     }

@@ -8,6 +8,8 @@ use ratatui::{
 
 pub const SETTINGS_COUNT: usize = ROWS.len();
 
+/// The startup tabs Settings offers, one per tab, in tab-bar order. The
+/// config also accepts `insights`, the old name for Diagnose.
 pub const TAB_NAMES: &[&str] = &[
     "dashboard",
     "connections",
@@ -16,7 +18,9 @@ pub const TAB_NAMES: &[&str] = &[
     "stats",
     "topology",
     "timeline",
-    "insights",
+    "processes",
+    "diagnose",
+    "egress",
 ];
 
 /// Named cursor positions for each settings row.
@@ -782,6 +786,24 @@ mod tests {
             );
             assert_eq!(cfg.default_tab, *name);
         }
+    }
+
+    /// Each name opens a different tab, so all ten are reachable: `egress`
+    /// used to fall through to Dashboard, and Settings offered neither
+    /// Processes, Diagnose nor Egress.
+    #[test]
+    fn tab_names_open_every_tab() {
+        let tabs: std::collections::HashSet<_> = TAB_NAMES
+            .iter()
+            .map(|name| {
+                NetwatchConfig {
+                    default_tab: name.to_string(),
+                    ..NetwatchConfig::default()
+                }
+                .tab()
+            })
+            .collect();
+        assert_eq!(tabs.len(), 10, "{TAB_NAMES:?} open only {tabs:?}");
     }
 
     #[test]

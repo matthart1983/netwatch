@@ -71,8 +71,7 @@ may still outlive it and is reported rather than forcibly interrupted.
 The full view has ten tabs: Dashboard (`1`), Connections (`2`), Interfaces (`3`),
 Packets (`4`), Stats (`5`), Topology (`6`), Timeline (`7`), Processes (`8`), Diagnose
 (`9`) and Egress (`0`). Insights is commentary within Diagnose, not another tab.
-The config value `default_tab = "insights"` is a legacy alias for Diagnose;
-`default_tab = "egress"` is not yet recognized and falls back to Dashboard.
+The config value `default_tab = "insights"` is a legacy alias for Diagnose.
 
 AI is off by default. Enabling it sends packet-derived summaries and network
 metadata to the configured endpoint. Commentary is not validated against findings;
