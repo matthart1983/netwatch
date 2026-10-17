@@ -1,0 +1,77 @@
+name: Attach FreeBSD build to a release
+
+# release.yml's build-freebsd job is continue-on-error: when the FreeBSD VM
+# flakes (v0.35.4: "Error updating repositories!" from pkg), the release
+# ships without netwatch-freebsd-x86_64.tar.gz. Re-running that job would
+# re-run everything that depends on it — release, crates.io publish, apt,
+# COPR, the container — so this builds the tarball alone at an existing
+# tag and adds it to that tag's release, with SHA256SUMS and provenance.
+# Keep the VM release and build steps identical to release.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Released tag missing its FreeBSD tarball (e.g. v0.35.4)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      # Fail before the ~15 minute VM build if there is nothing to attach to.
+      - name: The release exists
+        run: gh release view "$TAG" --json tagName > /dev/null
+
+      - name: Build inside a FreeBSD 13 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "13.5"
+          usesh: true
+          prepare: |
+            n=0
+            until pkg install -y rust; do
+              n=$((n + 1))
+              [ "$n" -ge 3 ] && exit 1
+              sleep 30
+            done
+          run: |
+            set -ex
+            freebsd-version
+            cargo build --release
+            ./target/release/netwatch --version
+            # Record what the binary needs from the host. Anything under
+            # /usr/local would mean a ports dependency leaked in.
+            ldd target/release/netwatch
+            ! ldd target/release/netwatch | grep -q /usr/local
+            cp target/release/netwatch netwatch-freebsd-x86_64
+            tar czf netwatch-freebsd-x86_64.tar.gz netwatch-freebsd-x86_64
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: netwatch-freebsd-x86_64.tar.gz
+
+      # SHA256SUMS keeps release.yml's format: `sha256sum` lines sorted by
+      # file name. Any old FreeBSD line is replaced, not duplicated.
+      - name: Upload the tarball and update SHA256SUMS
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --pattern SHA256SUMS --dir old
+          { grep -v ' netwatch-freebsd-x86_64.tar.gz$' old/SHA256SUMS || true
+            sha256sum netwatch-freebsd-x86_64.tar.gz
+          } | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" netwatch-freebsd-x86_64.tar.gz SHA256SUMS --clobber

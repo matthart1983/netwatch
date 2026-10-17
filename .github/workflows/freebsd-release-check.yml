@@ -22,7 +22,12 @@ jobs:
           release: "13.5"
           usesh: true
           prepare: |
-            pkg install -y rust
+            n=0
+            until pkg install -y rust; do
+              n=$((n + 1))
+              [ "$n" -ge 3 ] && exit 1
+              sleep 30
+            done
           run: |
             set -ex
             freebsd-version
