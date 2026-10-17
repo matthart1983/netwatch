@@ -26,9 +26,11 @@ jobs:
       matrix:
         target: [frame, classify, tls_handshake, quic_initial, http3, display_filter]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch; toolchain from input
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fuzz
       - name: Install libpcap and cargo-fuzz
@@ -36,7 +38,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y libpcap-dev
           cargo install cargo-fuzz --locked
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -53,7 +55,7 @@ jobs:
 
       - name: Upload the crashing input
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-${{ matrix.target }}-artifacts
           path: fuzz/artifacts/${{ matrix.target }}
