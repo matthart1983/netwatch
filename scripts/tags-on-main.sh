@@ -30,4 +30,4 @@ while read -r tag; do
     fi
 done <<< "${tags}"
 [ "${missing}" -eq 0 ] || exit 1
-echo "all $(wc -l <<< "${tags}") release tags are in HEAD's history"
+echo "all $(grep -c . <<< "${tags}") release tags are in HEAD's history"
