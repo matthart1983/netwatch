@@ -74,6 +74,10 @@ All notable changes to NetWatch will be documented in this file.
   no longer exits 1 for a beta issue alone**; pass `--include-beta` for the
   old behaviour. The JSON report gains `"include_beta"`. The 8 contracted
   rules are unchanged. `docs/diagnostic-coverage.md` lists which is which.
+- Every GitHub Action in CI and the release workflow is pinned to a commit
+  SHA, with its version in a comment, so a moved or compromised tag cannot
+  change what builds a release. Workflow tokens are read-only by default;
+  only the release, container and apt jobs, which publish, get write scopes.
 
 ## [0.35.4] - 2026-10-17
 

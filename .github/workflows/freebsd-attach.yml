@@ -27,7 +27,7 @@ jobs:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag }}
 
@@ -36,7 +36,7 @@ jobs:
         run: gh release view "$TAG" --json tagName > /dev/null
 
       - name: Build inside a FreeBSD 13 VM
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           release: "13.5"
           usesh: true
@@ -64,7 +64,7 @@ jobs:
             tar czf netwatch-freebsd-x86_64.tar.gz netwatch-freebsd-x86_64
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: netwatch-freebsd-x86_64.tar.gz
 

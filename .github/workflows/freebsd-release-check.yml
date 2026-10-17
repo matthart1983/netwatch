@@ -10,14 +10,18 @@ on:
       - '.github/workflows/freebsd-release-check.yml'
   workflow_dispatch:
 
+# Read-only token for every job: nothing here writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   build-freebsd:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Build inside a FreeBSD 13 VM
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           release: "13.5"
           usesh: true

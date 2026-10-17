@@ -10,12 +10,11 @@ on:
         required: true
         type: string
 
+# Read-only by default. The jobs that write say so: `release` (assets and
+# attestations), `container` (the image) and `apt` (the gh-pages repo). The
+# build jobs run third-party actions and compilers, and get no write scope.
 permissions:
-  contents: write
-  # Build provenance: `id-token` signs the attestation, `attestations`
-  # records it against the repository so `gh attestation verify` works.
-  id-token: write
-  attestations: write
+  contents: read
 
 # `RELEASE_TAG` unifies the two trigger paths. On a tag push, GitHub sets
 # `github.ref_name` to the tag (e.g. `v0.21.7`); on `workflow_dispatch`,
@@ -38,7 +37,7 @@ jobs:
       # `gh run list` reads CI's runs.
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
 
@@ -117,17 +116,18 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
       # armv5te builds entirely inside a debian:bookworm container (see the
       # matrix comment above), including its own rustup install, so the
       # host-level toolchain/cache setup below is skipped for it.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         if: matrix.target != 'armv5te-unknown-linux-gnueabi'
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: matrix.target != 'armv5te-unknown-linux-gnueabi'
 
       - name: Install zig + cargo-zigbuild (Linux musl)
@@ -274,7 +274,7 @@ jobs:
       # runner is x86_64 and would corrupt the aarch64 binary.
       - name: Install packaging tools
         if: contains(matrix.target, 'linux-musl')
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deb,cargo-generate-rpm
 
@@ -317,7 +317,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.name }}
           path: |
@@ -349,12 +349,12 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Build inside a FreeBSD 13 VM
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           release: "13.5"
           usesh: true
@@ -382,7 +382,7 @@ jobs:
             tar czf netwatch-freebsd-x86_64.tar.gz netwatch-freebsd-x86_64
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: netwatch-freebsd-x86_64
           path: netwatch-freebsd-x86_64.tar.gz
@@ -390,11 +390,17 @@ jobs:
   release:
     needs: [build, build-freebsd]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Build provenance: `id-token` signs the attestation, `attestations`
+      # records it against the repository so `gh attestation verify` works.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
 
@@ -412,7 +418,7 @@ jobs:
       # runner. Verified with:
       #   gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             *.tar.gz
@@ -421,7 +427,7 @@ jobs:
             *.rpm
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           # A tag with a hyphen (v0.33.0-rc.1) is a pre-release: GitHub keeps
@@ -448,10 +454,10 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
 
@@ -465,16 +471,16 @@ jobs:
           mv netwatch-linux-aarch64 packaging/docker/bin/netwatch-arm64
           chmod +x packaging/docker/bin/netwatch-*
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: packaging/docker
           platforms: linux/amd64,linux/arm64
@@ -494,15 +500,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
 
       - name: Check out the published repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: gh-pages
           path: pages
@@ -602,11 +608,13 @@ jobs:
     # Skip cleanly instead of failing the whole workflow.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install libpcap
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
