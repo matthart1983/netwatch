@@ -1419,25 +1419,29 @@ mod tests {
 
     #[test]
     fn a_closed_port_is_refused_not_timed_out() {
-        // Bound but never listening: the port stays reserved for the whole
-        // test and refuses connections. Dropping a listener to free a port
-        // let a parallel test bind it before the probe connected, which
-        // failed this test on macOS CI.
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .unwrap();
-        socket
-            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
-            .unwrap();
-        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
-        let obs = probe(&cfg("127.0.0.1", port), &ProbeEnv::default(), || {
-            "now".into()
-        });
-        assert_eq!(obs.connect.unwrap().error, Some(StageError::Refused));
-        assert!(obs.http_stage.is_none());
+        // A port is free once its listener drops, and a test running in
+        // parallel can bind it before the probe connects; the connect then
+        // succeeds (macOS CI, PR #73). That outcome says nothing about a
+        // closed port, so try a fresh one. A bound socket that does not
+        // listen is no fix: macOS drops the SYN and the probe times out.
+        for _ in 0..5 {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let obs = probe(&cfg("127.0.0.1", port), &ProbeEnv::default(), || {
+                "now".into()
+            });
+            match obs.connect.unwrap().error {
+                None => continue,
+                error => {
+                    assert_eq!(error, Some(StageError::Refused));
+                    assert!(obs.http_stage.is_none());
+                    return;
+                }
+            }
+        }
+        panic!("every freed port was taken before the probe connected");
     }
 
     #[test]
