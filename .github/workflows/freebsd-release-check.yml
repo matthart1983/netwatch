@@ -26,8 +26,11 @@ jobs:
           # toolchains, and libpcap comes from the base system, so the
           # binary still runs on FreeBSD 13 and later.
           prepare: |
-            fetch -o /tmp/rustup-init.sh https://sh.rustup.rs
-            sh /tmp/rustup-init.sh -y --profile minimal
+            # The rustup-init binary, not sh.rustup.rs: that script needs
+            # curl or wget, and the base system has only fetch(1).
+            fetch -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-freebsd/rustup-init
+            chmod +x /tmp/rustup-init
+            /tmp/rustup-init -y --profile minimal
           run: |
             set -ex
             . "$HOME/.cargo/env"
