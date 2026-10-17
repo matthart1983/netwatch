@@ -14,10 +14,10 @@ complete -c netwatch -f
 # ── subcommands ───────────────────────────────────────────────────────
 complete -c netwatch -n __fish_use_subcommand -a daemon -d 'Headless agent, no TUI'
 complete -c netwatch -n __fish_use_subcommand -a doctor -d 'Read-only setup report'
-complete -c netwatch -n __fish_use_subcommand -a diagnose -d 'Diagnose coverage, episodes and exports'
+complete -c netwatch -n __fish_use_subcommand -a diagnose -d 'Diagnose runs, coverage, episodes and exports'
 complete -c netwatch -n __fish_use_subcommand -a resolver -d 'Inspect or change the DNS resolver'
 
-complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -a 'coverage episodes replay features export'
+complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -a 'run coverage episodes replay features export corpus'
 complete -c netwatch -n '__fish_seen_subcommand_from resolver' -a 'status set recover'
 
 # ── options ───────────────────────────────────────────────────────────
@@ -48,5 +48,9 @@ complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l out -r -F -d '
 complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l schema -r -F -d 'Write the feature schema'
 complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l since -x -d 'Days of history'
 complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l dry-run -d 'Preview without writing'
+complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l target -x -d 'Configured target to diagnose'
+complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l budget -x -d 'Run time, 5s..10m'
+complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l format -x -a 'text json' -d 'Output format'
+complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -l only -x -d 'One corpus entry'
 complete -c netwatch -n '__fish_seen_subcommand_from resolver' -l unmanaged -d 'Confirm the resolver file is unmanaged'
 complete -c netwatch -n '__fish_seen_subcommand_from resolver' -l seconds -x -d 'Revert after N seconds, 1..3600'

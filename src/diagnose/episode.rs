@@ -1327,8 +1327,13 @@ pub fn write_corpus(dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<PathBu
     Ok(written)
 }
 
-/// `netwatch diagnose episodes [DIR]` and
-/// `netwatch diagnose replay [--json] <FILE|DIR>...`.
+/// Every `netwatch diagnose` subcommand `command` routes. The shell
+/// completions and the man page are tested against this list.
+pub const SUBCOMMANDS: &[&str] = &[
+    "run", "coverage", "episodes", "replay", "features", "export", "corpus",
+];
+
+/// `netwatch diagnose <SUBCOMMAND>`, one of [`SUBCOMMANDS`].
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("coverage") => super::coverage::command(&args[1..]),
@@ -1411,7 +1416,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         Some("features") => super::features::command(&args[1..]),
         Some("export") => super::export::command(&args[1..]),
         _ => anyhow::bail!(
-            "usage: netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]"
+            "usage: netwatch diagnose run [--target NAME] [--budget 30s] [--format json|text]\n       netwatch diagnose coverage [--json] [--seconds N] [--test ID]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]"
         ),
     }
 }
@@ -1609,6 +1614,21 @@ mod tests {
         s.run(|_| 80.0, 600.0, 5.0);
         s.run(healthy, 1_800.0, 5.0);
         s
+    }
+
+    /// The usage error is the only listing of `diagnose` subcommands a user
+    /// sees without the man page, so it names every one `command` routes.
+    #[test]
+    fn usage_names_every_subcommand() {
+        let err = command(&["no-such-subcommand".to_string()])
+            .unwrap_err()
+            .to_string();
+        for sub in SUBCOMMANDS {
+            assert!(
+                err.contains(&format!("netwatch diagnose {sub} ")),
+                "usage is missing {sub}: {err}"
+            );
+        }
     }
 
     #[test]

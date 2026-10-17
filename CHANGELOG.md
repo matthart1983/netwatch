@@ -14,6 +14,13 @@ All notable changes to NetWatch will be documented in this file.
 - CI now runs `cargo deny check` (advisories, licenses, sources) on every
   change, and Dependabot proposes weekly Cargo and GitHub Actions updates.
 
+### Fixed
+- **Shell completions and the man page now cover `diagnose run`, `diagnose
+  corpus` and `diagnose features`**, with `run`'s `--budget`, `--target` and
+  `--format` and its exit statuses. The usage message for an unknown
+  `diagnose` subcommand lists all seven. A test keeps all three in step with
+  the subcommands netwatch routes.
+
 ## [0.35.4] - 2026-10-17
 
 ### Fixed

@@ -113,6 +113,18 @@ for machine-readable output and
 .B \-\-check\-capture
 to attempt a real capture.
 .TP
+.B diagnose run
+Diagnose the network for a bounded time, report, and exit. Options:
+.B \-\-budget
+(a duration from 5s to 10m, default 30s),
+.B \-\-target
+(a target named in the configuration) and
+.B \-\-format
+.BR json " or " text .
+The exit status is part of the interface: 0, completed with no issue; 1, at
+least one open issue; 2, incomplete, no usable observation inside the budget;
+3, bad arguments or the session could not start.
+.TP
 .B diagnose coverage
 Which diagnostic checks have their inputs, and why the others do not.
 .TP
@@ -122,8 +134,20 @@ List recorded incident episodes.
 .B diagnose replay
 Replay a recorded episode through the engine.
 .TP
+.B diagnose features
+Write the feature table of recorded episodes, with
+.B \-\-out
+and
+.BR \-\-schema .
+.TP
 .B diagnose export
 Write a pseudonymised bundle of recent incidents. Nothing is uploaded.
+.TP
+.B diagnose corpus
+For netwatch's developers: regenerate the pinned test corpus under
+.IR tests/diagnose/corpus ,
+or one entry with
+.BR \-\-only .
 .TP
 .B resolver status
 Report the current DNS resolver and whether netwatch could change it.

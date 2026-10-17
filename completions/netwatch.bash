@@ -42,9 +42,9 @@ _netwatch() {
             ;;
         diagnose)
             if [[ ${COMP_CWORD} -eq 2 ]]; then
-                COMPREPLY=( $(compgen -W "coverage episodes replay features export" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "run coverage episodes replay features export corpus" -- "${cur}") )
             else
-                COMPREPLY=( $(compgen -W "--json --seconds --test --out --schema --since --dry-run" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "--json --seconds --test --out --schema --since --dry-run --target --budget --format --only" -- "${cur}") )
             fi
             return 0
             ;;

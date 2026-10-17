@@ -44,7 +44,7 @@ _netwatch() {
             subcommands=(
                 'daemon:Headless agent, no TUI'
                 'doctor:Read-only setup report'
-                'diagnose:Diagnose coverage, episodes and exports'
+                'diagnose:Diagnose runs, coverage, episodes and exports'
                 'resolver:Inspect or change the DNS resolver'
             )
             _describe 'command' subcommands
@@ -59,7 +59,7 @@ _netwatch() {
                     ;;
                 diagnose)
                     _arguments \
-                        '1: :(coverage episodes replay features export)' \
+                        '1: :(run coverage episodes replay features export corpus)' \
                         '--json[JSON output]' \
                         '--seconds=[Sampling window, 1..120]:seconds:' \
                         '--test=[Run one check]:check:' \
@@ -67,6 +67,10 @@ _netwatch() {
                         '--schema=[Write the feature schema]:file:_files' \
                         '--since=[Days of history]:days:' \
                         '--dry-run[Preview without writing]' \
+                        '--target=[Configured target to diagnose]:target:' \
+                        '--budget=[Run time, 5s..10m]:duration:' \
+                        '--format=[Output format]:format:(text json)' \
+                        '--only=[One corpus entry]:id:' \
                         '*:file:_files'
                     ;;
                 resolver)
