@@ -297,8 +297,10 @@ mod tests {
                     "{what} completion is missing diagnose {sub}"
                 );
             }
+            // By line: a Windows checkout has CRLF endings.
+            let heading = format!(".B diagnose {sub}");
             assert!(
-                MAN.contains(&format!(".B diagnose {sub}\n")),
+                MAN.lines().any(|l| l.trim_end() == heading),
                 "man page is missing diagnose {sub}"
             );
         }
