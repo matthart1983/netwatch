@@ -1987,14 +1987,34 @@ mod tests {
             Some(super::super::attribution::UnknownReason::IdentityChanged)
         );
     }
+    /// A /proc snapshot in which `conn` is attributed to this process.
+    ///
+    /// Between fork and exec, a child spawned by another test shares every
+    /// socket this process holds, and a snapshot taken in that window rightly
+    /// sees two owners and names neither. Capture again rather than race it.
+    #[cfg(target_os = "linux")]
+    fn snapshot_owning(conn: &Connection) -> ProcSnapshot {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snap = capture_proc_snapshot();
+            let mut c = conn.clone();
+            c.pid = None;
+            c.process_name = None;
+            overlay_proc_snapshot(std::slice::from_mut(&mut c), &snap);
+            if c.pid == Some(std::process::id()) || Instant::now() >= deadline {
+                return snap;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn brokered_snapshot_attributes_without_local_fd_scan_and_rejects_stale_or_reused() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.connect("127.0.0.1:45679").unwrap();
         let local = socket.local_addr().unwrap().to_string();
-        let mut snap = capture_proc_snapshot();
         let conn = || make_conn("UDP", &local, "127.0.0.1:45679", "", 1);
+        let mut snap = snapshot_owning(&conn());
 
         let mut c = conn();
         overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
@@ -2053,7 +2073,6 @@ mod tests {
     fn startup_snapshot_expires_and_revalidates_socket_identity() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.connect("127.0.0.1:45678").unwrap();
-        let mut snap = capture_proc_snapshot();
         let mut c = make_conn(
             "UDP",
             &socket.local_addr().unwrap().to_string(),
@@ -2061,6 +2080,7 @@ mod tests {
             "",
             1,
         );
+        let mut snap = snapshot_owning(&c);
         c.pid = None;
         c.process_name = None;
         overlay_proc_snapshot(std::slice::from_mut(&mut c), &snap);
