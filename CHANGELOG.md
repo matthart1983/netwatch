@@ -20,6 +20,12 @@ All notable changes to NetWatch will be documented in this file.
   `--format` and its exit statuses. The usage message for an unknown
   `diagnose` subcommand lists all seven. A test keeps all three in step with
   the subcommands netwatch routes.
+- **Help (`?`) lists every key the full view handles.** It was missing
+  Connections `f` (state filter) and `G` (grouping), Interfaces `f`,
+  Timeline `f`, Stats `t`, Egress `H`, Packets `d` and `y`, Diagnose `t`,
+  `d` and `c`, the whole coverage view (`t`, `[`/`]`, `d`, `r`, `x`), `M`
+  and `v`, and it printed the Dashboard section twice. Help is now a table,
+  and a test reads the key handler and fails on any key without a help line.
 
 ## [0.35.4] - 2026-10-17
 

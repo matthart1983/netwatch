@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, Tab};
 use crate::theme::Theme;
 use crate::ui::widgets;
 use ratatui::{
@@ -185,387 +185,482 @@ fn build_lite_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
+/// Where a section's keys work. The test below reads `handle_main_key` and
+/// requires every key it handles to appear in a section of the matching
+/// scope, so a binding added without a help line fails the build.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Scope {
+    Global,
+    Tab(Tab),
+    StreamView,
+    DiagnoseCoverage,
+    /// Syntax and legends: not keys, and not checked.
+    Reference,
+}
+
+struct Section {
+    title: &'static str,
+    // Read only by the tests, which check it against the key handler.
+    #[cfg_attr(not(test), allow(dead_code))]
+    scope: Scope,
+    keys: &'static [(&'static str, &'static str)],
+}
+
+/// The full view's help, in display order.
+const FULL_HELP: &[Section] = &[
+    Section {
+        title: "GLOBAL KEYS",
+        scope: Scope::Global,
+        keys: &[
+            ("q / Ctrl+C", "Quit"),
+            (
+                "1-9, 0",
+                "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Proc/Diagnose/Egress)",
+            ),
+            ("↑↓ / j/k", "Move the cursor or scroll"),
+            ("PgUp/PgDn", "Scroll lists by a page"),
+            ("p", "Pause/resume data collection"),
+            ("r", "Force refresh all data"),
+            ("s / S", "Sort picker on tabs with a table · S reverses the order"),
+            ("V / v", "Cycle view: full → lite → dense (dense needs 130×44)"),
+            ("L (shift)", "Switch to the Lite view"),
+            ("R (shift)", "Arm/disarm flight recorder"),
+            ("F (shift)", "Freeze the current incident window"),
+            ("E (shift)", "Export the current incident bundle"),
+            ("?", "Toggle this help overlay"),
+            ("g", "Toggle GeoIP location display"),
+            (
+                "P (shift)",
+                "Promote observed egress baseline → egress-policy.toml (warn on drift)",
+            ),
+            (
+                "t",
+                "Cycle theme — except on Dashboard, Stats, Timeline and Diagnose, where t is the tab's own",
+            ),
+            (",", "Open settings menu (←→ / h/l to cycle theme)"),
+            ("M (shift)", "Memory overlay: sizes of the bounded collections"),
+        ],
+    },
+    Section {
+        title: "SORT PICKER (any table tab)",
+        scope: Scope::Reference,
+        keys: &[
+            ("↑↓ / j/k", "Move selection"),
+            ("Enter", "Apply selected sort column"),
+            ("S (shift)", "Toggle ascending/descending"),
+            ("/", "Filter columns by name"),
+            ("Esc / s / q", "Close picker"),
+        ],
+    },
+    Section {
+        title: "DASHBOARD (Tab 1)",
+        scope: Scope::Tab(Tab::Dashboard),
+        keys: &[
+            (
+                "↑↓ / j/k",
+                "Move the cursor in the connections panel (↑ off the top hides it)",
+            ),
+            ("space / Enter", "Fold/expand the process under the cursor"),
+            ("z", "Fold/expand every process"),
+            ("t", "Throughput graph: linear or log scale"),
+        ],
+    },
+    Section {
+        title: "CONNECTIONS (Tab 2)",
+        scope: Scope::Tab(Tab::Connections),
+        keys: &[
+            ("↑↓ / j/k", "Scroll connection list"),
+            ("/", "Filter connections (process, state, remote address)"),
+            ("f", "Cycle state: all / established / listen / time-wait"),
+            ("G (shift)", "Group by process / remote / none"),
+            (
+                "space",
+                "Fold/expand the group under the cursor (grouped modes)",
+            ),
+            ("z", "Fold/expand every group"),
+            (
+                "Enter",
+                "Jump to Packets tab with filter for selected connection; on a group row, fold it",
+            ),
+            ("e", "Export connections to JSON + CSV"),
+            ("W (shift)", "Whois lookup for selected connection's remote IP"),
+            ("T (shift)", "Traceroute to selected connection's remote IP"),
+            ("Esc", "Close the traceroute overlay, else clear the filter"),
+        ],
+    },
+    Section {
+        title: "INTERFACES (Tab 3)",
+        scope: Scope::Tab(Tab::Interfaces),
+        keys: &[
+            ("↑↓ / j/k", "Select interface"),
+            ("f", "Cycle the list: active / all / wifi / vpn / idle"),
+        ],
+    },
+    Section {
+        title: "PACKETS (Tab 4)",
+        scope: Scope::Tab(Tab::Packets),
+        keys: &[
+            ("↑↓ / j/k", "Scroll packet list"),
+            ("Enter", "Select packet at cursor"),
+            ("c", "Start/stop capture"),
+            ("i", "Cycle capture interface (restarts capture if running)"),
+            ("/", "Open display filter bar"),
+            ("Esc", "Clear display filter"),
+            ("s", "Open stream view for selected packet"),
+            ("d", "Expand/shrink the packet detail pane"),
+            ("y", "Copy the selected packet's details"),
+            ("w", "Export packets to .pcap file"),
+            ("f", "Toggle auto-follow"),
+            ("x", "Show only expert findings (warnings and errors)"),
+            ("n", "Jump to next expert finding"),
+            ("N (shift)", "Jump to previous expert finding"),
+            ("m", "Toggle bookmark on selected packet"),
+            ("] / [", "Jump to next/previous bookmark"),
+            ("X (shift)", "Clear all captured packets and bookmarks"),
+            ("W (shift)", "Whois lookup for selected packet IPs"),
+        ],
+    },
+    Section {
+        title: "STREAM VIEW (in Packets tab)",
+        scope: Scope::StreamView,
+        keys: &[
+            ("Esc", "Close stream view"),
+            ("↑↓ / j/k", "Scroll stream content"),
+            ("→←", "Filter direction (A→B / B→A)"),
+            ("a", "Show both directions"),
+            ("h", "Toggle hex/text mode"),
+        ],
+    },
+    Section {
+        title: "STATS (Tab 5)",
+        scope: Scope::Tab(Tab::Stats),
+        keys: &[
+            ("↑↓ / j/k", "Scroll protocol list"),
+            ("t", "Cycle range: 1m / 5m / 15m / 1h / 24h / session"),
+        ],
+    },
+    Section {
+        title: "TOPOLOGY (Tab 6)",
+        scope: Scope::Tab(Tab::Topology),
+        keys: &[
+            ("↑↓ / j/k", "Scroll topology view"),
+            ("Enter", "Jump to Connections tab"),
+            ("T (shift)", "Traceroute to selected remote host"),
+            ("Esc", "Close traceroute overlay"),
+        ],
+    },
+    Section {
+        title: "TIMELINE (Tab 7)",
+        scope: Scope::Tab(Tab::Timeline),
+        keys: &[
+            ("↑↓ / j/k", "Scroll connection list"),
+            ("t", "Cycle time window (1m/5m/15m/30m/1h)"),
+            ("f", "Cycle events: all / crit / warn / conn / dns / rtt / iface"),
+            ("Enter", "Jump to Connections tab"),
+        ],
+    },
+    Section {
+        title: "PROCESSES (Tab 8)",
+        scope: Scope::Tab(Tab::Processes),
+        keys: &[
+            ("↑↓ / j/k", "Scroll process list"),
+            ("e", "Export connections to JSON + CSV"),
+        ],
+    },
+    Section {
+        title: "DIAGNOSE (Tab 9)",
+        scope: Scope::Tab(Tab::Diagnose),
+        keys: &[
+            ("↑↓ / j/k", "Select issue"),
+            (
+                "↵",
+                "--demo: simulate the first remediation (asks first); live, run the command shown",
+            ),
+            ("a", "Acknowledge — stays open, leaves the verdict line"),
+            ("m", "Mute for one hour"),
+            ("t", "Run the test that best separates the remaining causes"),
+            ("d", "Mark the issue's next manual step done"),
+            ("c", "Toggle the coverage view"),
+            ("o", "Toggle the report preview"),
+            ("e", "Export report.md + report.json"),
+            ("y", "Copy the one-line summary"),
+            ("i", "Regenerate the AI narrative (when enabled)"),
+        ],
+    },
+    Section {
+        title: "DIAGNOSE COVERAGE (c in Tab 9)",
+        scope: Scope::DiagnoseCoverage,
+        keys: &[
+            ("↑↓ / j/k", "Select a check"),
+            ("t", "Run the selected check's test"),
+            ("] / [", "Select the next/previous configured target"),
+            ("d", "Enable/disable the selected target (on a target.* check)"),
+            ("r", "Reload targets and probes from config.toml"),
+            ("x", "Cancel running active and target probes"),
+        ],
+    },
+    Section {
+        title: "EGRESS (Tab 0)",
+        scope: Scope::Tab(Tab::Egress),
+        keys: &[
+            ("↑↓ / j/k", "Move cursor (click also selects)"),
+            ("space", "Fold / unfold a process (or click its ▼)"),
+            (
+                "s / S",
+                "Sort picker (volume / active / process / last seen / risk) · S reverses",
+            ),
+            ("/", "Filter by process or destination"),
+            ("d", "Toggle destination detail pane"),
+            ("H (shift)", "Include processes seen in earlier sessions"),
+            (
+                "Enter",
+                "Add selected process to policy (from its observed baseline)",
+            ),
+            ("P (shift)", "Add every observed process"),
+            (
+                "x / Del",
+                "Remove selected process from policy (confirm with y)",
+            ),
+            ("z", "Fold/expand every process"),
+            ("e", "Export baseline to NDJSON"),
+            ("", ""),
+            ("✓ sni / ✓ ip", "Matched a declared name or address"),
+            (
+                "~ asn",
+                "Admitted by autonomous system — broad, not one endpoint",
+            ),
+            ("? ech", "Name encrypted (ECH) — cannot judge"),
+            ("✗ drift", "Outside the allowlist"),
+            ("— no rule", "Process undeclared — nothing was checked"),
+            (
+                "✗ undeclared",
+                "No rule, under strict = true — the absence is the finding",
+            ),
+            ("", ""),
+            (
+                "strict = true",
+                "Set in egress-policy.toml to warn on any undeclared process",
+            ),
+        ],
+    },
+    Section {
+        title: "DISPLAY FILTER SYNTAX",
+        scope: Scope::Reference,
+        keys: &[
+            ("tcp, udp, dns, icmp, arp", "Filter by protocol"),
+            ("192.168.1.1", "Match source or destination IP"),
+            ("ip.src == X / ip.dst == X", "Match specific direction"),
+            ("port 443", "Match source or destination port"),
+            ("stream 7", "Match stream index"),
+            ("contains \"text\"", "Search in info/payload"),
+            ("and, or, not / !", "Combine filters"),
+            ("bare word", "Shorthand for contains"),
+        ],
+    },
+    Section {
+        title: "TCP HANDSHAKE TIMING",
+        scope: Scope::Reference,
+        keys: &[
+            ("⏱ in stream header", "Total 3-way handshake time (SYN→ACK)"),
+            ("SYN→SA", "Client→Server network RTT (SYN to SYN-ACK)"),
+            ("SA→ACK", "Server→Client network RTT (SYN-ACK to ACK)"),
+            ("Shown in:", "Stream view header, status bar, packet detail"),
+        ],
+    },
+    Section {
+        title: "EXPERT INFO INDICATORS",
+        scope: Scope::Reference,
+        keys: &[
+            ("● (red)", "Error: TCP RST, DNS NXDOMAIN/SERVFAIL"),
+            (
+                "▲ (yellow)",
+                "Warning: Zero window, ICMP unreachable, HTTP 4xx/5xx",
+            ),
+            ("· (cyan)", "Note: TCP FIN, DNS response, TLS Server Hello"),
+            ("(space)", "Chat: SYN, DNS query, ARP, normal traffic"),
+        ],
+    },
+];
+
 fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-
-    // GLOBAL KEYS
-    lines.push(section_header(theme, "GLOBAL KEYS"));
-    lines.push(key_line(theme, "q", "Quit"));
-    lines.push(key_line(theme, "Ctrl+C", "Quit"));
-    lines.push(key_line(
-        theme,
-        "1-9, 0",
-        "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Proc/Diagnose/Egress)",
-    ));
-    lines.push(key_line(theme, "p", "Pause/resume data collection"));
-    lines.push(key_line(theme, "r", "Force refresh all data"));
-    lines.push(key_line(
-        theme,
-        "V (shift)",
-        "Cycle view: full → lite → dense (dense needs 130×44)",
-    ));
-    lines.push(key_line(theme, "L (shift)", "Switch to the Lite view"));
-    lines.push(key_line(theme, "R (shift)", "Arm/disarm flight recorder"));
-    lines.push(key_line(
-        theme,
-        "F (shift)",
-        "Freeze the current incident window",
-    ));
-    lines.push(key_line(
-        theme,
-        "E (shift)",
-        "Export the current incident bundle",
-    ));
-    lines.push(key_line(theme, "?", "Toggle this help overlay"));
-    lines.push(key_line(theme, "g", "Toggle GeoIP location display"));
-    lines.push(key_line(
-        theme,
-        "P (shift)",
-        "Promote observed egress baseline → egress-policy.toml (warn on drift)",
-    ));
-    lines.push(key_line(
-        theme,
-        "t",
-        "Cycle theme — except on Dashboard, Stats and Timeline, where t is that tab's scale or range toggle",
-    ));
-    lines.push(key_line(
-        theme,
-        ",",
-        "Open settings menu (←→ / h/l to cycle theme)",
-    ));
-    lines.push(key_line(theme, "PgUp/PgDn", "Scroll lists by a page"));
-    lines.push(Line::raw(""));
-
-    // DASHBOARD
-    lines.push(section_header(theme, "DASHBOARD (Tab 1)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Select interface"));
-    lines.push(key_line(theme, "s", "Open sort picker"));
-    lines.push(key_line(
-        theme,
-        "t",
-        "Throughput graph: linear or log scale",
-    ));
-    lines.push(Line::raw(""));
-
-    // SORT PICKER
-    lines.push(section_header(theme, "SORT PICKER (any table tab)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Move selection"));
-    lines.push(key_line(theme, "Enter", "Apply selected sort column"));
-    lines.push(key_line(theme, "S (shift)", "Toggle ascending/descending"));
-    lines.push(key_line(theme, "/", "Filter columns by name"));
-    lines.push(key_line(theme, "Esc / s / q", "Close picker"));
-    lines.push(Line::raw(""));
-
-    // DASHBOARD
-    lines.push(section_header(theme, "DASHBOARD (Tab 1)"));
-    lines.push(key_line(
-        theme,
-        "↑↓ / j/k",
-        "Move the cursor in the connections panel (↑ off the top hides it)",
-    ));
-    lines.push(key_line(
-        theme,
-        "space / Enter",
-        "Fold/expand the process under the cursor",
-    ));
-    lines.push(key_line(theme, "z", "Fold/expand every process"));
-    lines.push(key_line(
-        theme,
-        "t",
-        "Toggle the throughput plot's log scale",
-    ));
-    lines.push(Line::raw(""));
-
-    // CONNECTIONS
-    lines.push(section_header(theme, "CONNECTIONS (Tab 2)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Scroll connection list"));
-    lines.push(key_line(theme, "s", "Open sort picker"));
-    lines.push(key_line(
-        theme,
-        "/",
-        "Filter connections (process, state, remote address)",
-    ));
-    lines.push(key_line(theme, "Esc", "Clear active filter"));
-    lines.push(key_line(
-        theme,
-        "space",
-        "Fold/expand the group under the cursor (grouped modes)",
-    ));
-    lines.push(key_line(theme, "z", "Fold/expand every group"));
-    lines.push(key_line(
-        theme,
-        "Enter",
-        "Jump to Packets tab with filter for selected connection; on a group row, fold it",
-    ));
-    lines.push(key_line(
-        theme,
-        "W (shift)",
-        "Whois lookup for selected connection's remote IP",
-    ));
-    lines.push(key_line(
-        theme,
-        "T",
-        "Traceroute to selected connection's remote IP",
-    ));
-    lines.push(key_line(theme, "Esc", "Close traceroute overlay"));
-    lines.push(Line::raw(""));
-
-    // INTERFACES
-    lines.push(section_header(theme, "INTERFACES (Tab 3)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Select interface"));
-    lines.push(key_line(theme, "s", "Open sort picker"));
-    lines.push(Line::raw(""));
-
-    // PACKETS
-    lines.push(section_header(theme, "PACKETS (Tab 4)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Scroll packet list"));
-    lines.push(key_line(theme, "Enter", "Select packet at cursor"));
-    lines.push(key_line(theme, "c", "Start/stop capture"));
-    lines.push(key_line(
-        theme,
-        "R/F/E",
-        "Recorder arm, freeze, export incident bundle",
-    ));
-    lines.push(key_line(
-        theme,
-        "i",
-        "Cycle capture interface (restarts capture if running)",
-    ));
-    lines.push(key_line(theme, "/", "Open display filter bar"));
-    lines.push(key_line(theme, "Esc", "Clear display filter"));
-    lines.push(key_line(theme, "s", "Open stream view for selected packet"));
-    lines.push(key_line(theme, "w", "Export packets to .pcap file"));
-    lines.push(key_line(theme, "f", "Toggle auto-follow"));
-    lines.push(key_line(
-        theme,
-        "x",
-        "Show only expert findings (warnings and errors)",
-    ));
-    lines.push(key_line(theme, "n", "Jump to next expert finding"));
-    lines.push(key_line(
-        theme,
-        "N (shift)",
-        "Jump to previous expert finding",
-    ));
-    lines.push(key_line(theme, "m", "Toggle bookmark on selected packet"));
-    lines.push(key_line(theme, "] / [", "Jump to next/previous bookmark"));
-    lines.push(key_line(
-        theme,
-        "X (shift)",
-        "Clear all captured packets and bookmarks",
-    ));
-    lines.push(key_line(
-        theme,
-        "W (shift)",
-        "Whois lookup for selected packet IPs",
-    ));
-    lines.push(Line::raw(""));
-
-    // STREAM VIEW
-    lines.push(section_header(theme, "STREAM VIEW (in Packets tab)"));
-    lines.push(key_line(theme, "Esc", "Close stream view"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Scroll stream content"));
-    lines.push(key_line(theme, "→←", "Filter direction (A→B / B→A)"));
-    lines.push(key_line(theme, "a", "Show both directions"));
-    lines.push(key_line(theme, "h", "Toggle hex/text mode"));
-    lines.push(Line::raw(""));
-
-    // STATS
-    lines.push(section_header(theme, "STATS (Tab 5)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Scroll protocol list"));
-    lines.push(Line::raw(""));
-
-    // TOPOLOGY
-    lines.push(section_header(theme, "TOPOLOGY (Tab 6)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Scroll topology view"));
-    lines.push(key_line(theme, "Enter", "Jump to Connections tab"));
-    lines.push(key_line(theme, "T", "Traceroute to selected remote host"));
-    lines.push(key_line(theme, "Esc", "Close traceroute overlay"));
-    lines.push(Line::raw(""));
-
-    // TIMELINE
-    lines.push(section_header(theme, "TIMELINE (Tab 7)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Scroll connection list"));
-    lines.push(key_line(theme, "t", "Cycle time window (1m/5m/15m/30m/1h)"));
-    lines.push(key_line(theme, "Enter", "Jump to Connections tab"));
-    lines.push(Line::raw(""));
-
-    // PROCESSES
-    lines.push(section_header(theme, "PROCESSES (Tab 8)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Scroll process list"));
-    lines.push(key_line(theme, "s", "Open sort picker"));
-    lines.push(key_line(theme, "e", "Export connections to JSON + CSV"));
-    lines.push(Line::raw(""));
-
-    // DIAGNOSE
-    lines.push(section_header(theme, "DIAGNOSE (Tab 9)"));
-    lines.push(key_line(theme, "↑↓ / j/k", "Select issue"));
-    lines.push(key_line(
-        theme,
-        "↵",
-        "--demo: simulate the first remediation (asks first); live, run the command shown",
-    ));
-    lines.push(key_line(
-        theme,
-        "a",
-        "Acknowledge — stays open, leaves the verdict line",
-    ));
-    lines.push(key_line(theme, "m", "Mute for one hour"));
-    lines.push(key_line(theme, "o", "Toggle the report preview"));
-    lines.push(key_line(theme, "e", "Export report.md + report.json"));
-    lines.push(key_line(theme, "y", "Copy the one-line summary"));
-    lines.push(key_line(
-        theme,
-        "i",
-        "Regenerate the AI narrative (when enabled)",
-    ));
-    lines.push(Line::raw(""));
-
-    // EGRESS
-    lines.push(section_header(theme, "EGRESS (Tab 0)"));
-    lines.push(key_line(
-        theme,
-        "↑↓ / j/k",
-        "Move cursor (click also selects)",
-    ));
-    lines.push(key_line(
-        theme,
-        "space",
-        "Fold / unfold a process (or click its ▼)",
-    ));
-    lines.push(key_line(
-        theme,
-        "s / S",
-        "Sort picker (volume / active / process / last seen / risk) · S reverses",
-    ));
-    lines.push(key_line(theme, "/", "Filter by process or destination"));
-    lines.push(key_line(theme, "d", "Toggle destination detail pane"));
-    lines.push(key_line(
-        theme,
-        "Enter",
-        "Add selected process to policy (from its observed baseline)",
-    ));
-    lines.push(key_line(theme, "P (shift)", "Add every observed process"));
-    lines.push(key_line(
-        theme,
-        "x / Del",
-        "Remove selected process from policy (confirm with y)",
-    ));
-    lines.push(key_line(theme, "z", "Fold/expand every process"));
-    lines.push(key_line(theme, "e", "Export baseline to NDJSON"));
-    lines.push(Line::raw(""));
-    lines.push(key_line(
-        theme,
-        "✓ sni / ✓ ip",
-        "Matched a declared name or address",
-    ));
-    lines.push(key_line(
-        theme,
-        "~ asn",
-        "Admitted by autonomous system — broad, not one endpoint",
-    ));
-    lines.push(key_line(
-        theme,
-        "? ech",
-        "Name encrypted (ECH) — cannot judge",
-    ));
-    lines.push(key_line(theme, "✗ drift", "Outside the allowlist"));
-    lines.push(key_line(
-        theme,
-        "— no rule",
-        "Process undeclared — nothing was checked",
-    ));
-    lines.push(key_line(
-        theme,
-        "✗ undeclared",
-        "No rule, under strict = true — the absence is the finding",
-    ));
-    lines.push(Line::raw(""));
-    lines.push(key_line(
-        theme,
-        "strict = true",
-        "Set in egress-policy.toml to warn on any undeclared process",
-    ));
-    lines.push(Line::raw(""));
-
-    // DISPLAY FILTER SYNTAX
-    lines.push(section_header(theme, "DISPLAY FILTER SYNTAX"));
-    lines.push(key_line(
-        theme,
-        "tcp, udp, dns, icmp, arp",
-        "Filter by protocol",
-    ));
-    lines.push(key_line(
-        theme,
-        "192.168.1.1",
-        "Match source or destination IP",
-    ));
-    lines.push(key_line(
-        theme,
-        "ip.src == X / ip.dst == X",
-        "Match specific direction",
-    ));
-    lines.push(key_line(
-        theme,
-        "port 443",
-        "Match source or destination port",
-    ));
-    lines.push(key_line(theme, "stream 7", "Match stream index"));
-    lines.push(key_line(
-        theme,
-        "contains \"text\"",
-        "Search in info/payload",
-    ));
-    lines.push(key_line(theme, "and, or, not / !", "Combine filters"));
-    lines.push(key_line(theme, "bare word", "Shorthand for contains"));
-    lines.push(Line::raw(""));
-
-    // TCP HANDSHAKE TIMING
-    lines.push(section_header(theme, "TCP HANDSHAKE TIMING"));
-    lines.push(key_line(
-        theme,
-        "⏱ in stream header",
-        "Total 3-way handshake time (SYN→ACK)",
-    ));
-    lines.push(key_line(
-        theme,
-        "SYN→SA",
-        "Client→Server network RTT (SYN to SYN-ACK)",
-    ));
-    lines.push(key_line(
-        theme,
-        "SA→ACK",
-        "Server→Client network RTT (SYN-ACK to ACK)",
-    ));
-    lines.push(key_line(
-        theme,
-        "Shown in:",
-        "Stream view header, status bar, packet detail",
-    ));
-    lines.push(Line::raw(""));
-
-    // EXPERT INFO INDICATORS
-    lines.push(section_header(theme, "EXPERT INFO INDICATORS"));
-    lines.push(key_line(
-        theme,
-        "● (red)",
-        "Error: TCP RST, DNS NXDOMAIN/SERVFAIL",
-    ));
-    lines.push(key_line(
-        theme,
-        "▲ (yellow)",
-        "Warning: Zero window, ICMP unreachable, HTTP 4xx/5xx",
-    ));
-    lines.push(key_line(
-        theme,
-        "· (cyan)",
-        "Note: TCP FIN, DNS response, TLS Server Hello",
-    ));
-    lines.push(key_line(
-        theme,
-        "(space)",
-        "Chat: SYN, DNS query, ARP, normal traffic",
-    ));
-
+    for (n, section) in FULL_HELP.iter().enumerate() {
+        if n > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(section_header(theme, section.title));
+        for (key, desc) in section.keys {
+            if key.is_empty() {
+                lines.push(Line::raw(""));
+            } else {
+                lines.push(key_line(theme, key, desc));
+            }
+        }
+    }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// The keys a help label names: "q / Ctrl+C" is q and Ctrl+C, "R/F/E"
+    /// is three keys, "1-9, 0" is ten.
+    fn label_keys(label: &str) -> BTreeSet<String> {
+        if label == "/" || label == "," {
+            return BTreeSet::from([label.to_string()]);
+        }
+        let mut keys = BTreeSet::new();
+        let label = label.replace("(shift)", "").replace('↵', "Enter");
+        for word in label.split([' ', ',']).filter(|w| !w.is_empty()) {
+            let parts: Vec<&str> = if word.len() > 1 && word.contains('/') {
+                word.split('/').collect()
+            } else {
+                vec![word]
+            };
+            for part in parts.into_iter().filter(|p| !p.is_empty() && *p != "/") {
+                if let Some((a, b)) = part.split_once('-').filter(|_| part.len() == 3) {
+                    let (a, b) = (a.as_bytes()[0], b.as_bytes()[0]);
+                    keys.extend((a..=b).map(|c| (c as char).to_string()));
+                } else if ["↑↓", "→←"].contains(&part) {
+                    keys.extend(part.chars().map(String::from));
+                } else {
+                    keys.insert(part.to_string());
+                }
+            }
+        }
+        keys
+    }
+
+    /// The name help uses for a `KeyCode::…` pattern.
+    fn key_name(code: &str) -> String {
+        if let Some(c) = code
+            .strip_prefix("Char('")
+            .and_then(|c| c.strip_suffix("')"))
+        {
+            return if c == " " { "space".into() } else { c.into() };
+        }
+        match code {
+            "Up" => "↑",
+            "Down" => "↓",
+            "Left" => "←",
+            "Right" => "→",
+            "PageUp" => "PgUp",
+            "PageDown" => "PgDn",
+            "Delete" => "Del",
+            other => other,
+        }
+        .into()
+    }
+
+    /// Every (scope, key) `handle_main_key` acts on, read from its source.
+    /// An arm whose guard compares the tab with `==` belongs to those tabs;
+    /// one guarded on the stream view or the coverage view belongs to that
+    /// view; anything else is global. The y/n remediation prompt is skipped:
+    /// it prints its own keys.
+    fn handled_keys() -> Vec<(Scope, String, String)> {
+        const SRC: &str = include_str!("../app.rs");
+        let start = SRC.find("\nfn handle_main_key(").expect("handle_main_key");
+        let body = &SRC[start + 1..];
+        let body = &body[..body[1..].find("\nfn ").map_or(body.len(), |n| n + 1)];
+
+        let mut handled = Vec::new();
+        let mut lines = body.lines().peekable();
+        while let Some(line) = lines.next() {
+            if !line.starts_with("        KeyCode::") {
+                continue;
+            }
+            let mut arm = line.trim().to_string();
+            while !arm.contains("=>") {
+                let Some(next) = lines.next() else { break };
+                arm.push(' ');
+                arm.push_str(next.trim());
+            }
+            let head = &arm[..arm.find("=>").unwrap()];
+            let (patterns, guard) = head.split_once(" if ").unwrap_or((head, ""));
+            if guard.contains("pending_apply.is_some()") {
+                continue;
+            }
+            let scopes: Vec<Scope> = if guard.contains("&& app.ui.stream_view_open") {
+                vec![Scope::StreamView]
+            } else if guard.contains("&& app.diagnose.show_coverage") {
+                vec![Scope::DiagnoseCoverage]
+            } else if guard.contains("!= Tab::") || !guard.contains("Tab::") {
+                vec![Scope::Global]
+            } else {
+                Tab::ALL
+                    .iter()
+                    .filter(|t| guard.contains(&format!("== Tab::{t:?}")))
+                    .map(|t| Scope::Tab(*t))
+                    .collect()
+            };
+            assert!(!scopes.is_empty(), "no scope read from: {arm}");
+            for pattern in patterns.split('|').map(str::trim) {
+                let code = pattern.strip_prefix("KeyCode::").expect(pattern);
+                let mut name = key_name(code);
+                if guard.contains("KeyModifiers::CONTROL") {
+                    name = format!("Ctrl+{}", name.to_uppercase());
+                }
+                for scope in &scopes {
+                    handled.push((*scope, name.clone(), arm.clone()));
+                }
+            }
+        }
+        assert!(handled.len() > 50, "read only {} keys", handled.len());
+        handled
+    }
+
+    #[test]
+    fn every_handled_key_has_a_help_line() {
+        let documented = |scope: Scope, key: &str| {
+            FULL_HELP
+                .iter()
+                .filter(|s| s.scope == scope)
+                .flat_map(|s| s.keys.iter())
+                .any(|(label, _)| label_keys(label).contains(key))
+        };
+        let missing: Vec<String> = handled_keys()
+            .into_iter()
+            .filter(|(scope, key, _)| !documented(*scope, key))
+            .map(|(scope, key, arm)| format!("{scope:?} `{key}`: {arm}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "keys with no help line:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn help_sections_are_unique() {
+        let mut seen = BTreeSet::new();
+        for section in FULL_HELP {
+            assert!(
+                seen.insert(section.title),
+                "{} appears twice",
+                section.title
+            );
+        }
+        for tab in Tab::ALL {
+            let count = FULL_HELP
+                .iter()
+                .filter(|s| s.scope == Scope::Tab(*tab))
+                .count();
+            assert_eq!(count, 1, "{tab:?} has {count} help sections");
+        }
+    }
+
+    #[test]
+    fn label_keys_reads_the_notations_help_uses() {
+        let keys = |l: &str| label_keys(l).into_iter().collect::<Vec<_>>();
+        assert_eq!(keys("q / Ctrl+C"), ["Ctrl+C", "q"]);
+        assert_eq!(keys("R/F/E"), ["E", "F", "R"]);
+        assert_eq!(keys("] / ["), ["[", "]"]);
+        assert_eq!(keys("/"), ["/"]);
+        assert_eq!(keys(","), [","]);
+        assert_eq!(keys("↑↓ / j/k"), ["j", "k", "↑", "↓"]);
+        assert_eq!(keys("1-9, 0").len(), 10);
+        assert_eq!(keys("N (shift)"), ["N"]);
+    }
 }

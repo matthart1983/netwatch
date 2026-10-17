@@ -361,6 +361,22 @@ pub enum Tab {
     Egress,
 }
 
+impl Tab {
+    /// Every tab, in tab-bar order.
+    pub const ALL: &'static [Tab] = &[
+        Tab::Dashboard,
+        Tab::Connections,
+        Tab::Interfaces,
+        Tab::Packets,
+        Tab::Stats,
+        Tab::Topology,
+        Tab::Timeline,
+        Tab::Processes,
+        Tab::Diagnose,
+        Tab::Egress,
+    ];
+}
+
 use crate::sort::{SortColumn, TabSortState};
 
 /// Where exports land: the user's home directory, falling back to the working
