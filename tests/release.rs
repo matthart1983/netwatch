@@ -184,7 +184,11 @@ mod script {
                  %changelog\n* Sun Sep 20 2026 Someone <someone@example.com> - 0.32.3-1\n- Earlier\n",
             )
             .unwrap();
-            for script in ["scripts/release.sh", "scripts/release-guard.sh"] {
+            for script in [
+                "scripts/release.sh",
+                "scripts/release-guard.sh",
+                "scripts/tags-on-main.sh",
+            ] {
                 fs::copy(
                     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(script),
                     repo.join(script),
@@ -320,6 +324,24 @@ mod script {
             self.git(&["commit", "-q", "--allow-empty", "-m", "on the remote"]);
             self.git(&["push", "-q", "-u", "origin", "main"]);
             self.git(&["reset", "-q", "--hard", "HEAD~1"]);
+        }
+
+        /// Runs tags-on-main.sh in the repository: whether it passed, and its
+        /// output.
+        fn tags_on_main(&self) -> (bool, String) {
+            let out = self
+                .command("bash")
+                .arg("scripts/tags-on-main.sh")
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
         }
 
         fn read(&self, path: &str) -> String {
@@ -794,5 +816,53 @@ mod script {
             run.log
         );
         assert!(run.gh.is_empty(), "{:?}", run.gh);
+    }
+
+    #[test]
+    fn tags_on_main_passes_when_every_tag_is_in_history() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.git(&["tag", "v0.32.3"]);
+        fixture.git(&["commit", "-q", "--allow-empty", "-m", "later work"]);
+        let (passed, log) = fixture.tags_on_main();
+        assert!(passed, "{log}");
+        assert!(log.contains("all 1 release tags"), "{log}");
+    }
+
+    /// The v0.35.3 layout: a hotfix tagged on a release branch that main has
+    /// not merged. It fails until the branch is merged back.
+    #[test]
+    fn tags_on_main_refuses_a_hotfix_tag_left_off_main() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.git(&["tag", "v0.32.3"]);
+        fixture.git(&["checkout", "-q", "-b", "release/0.32.4"]);
+        fixture.git(&["commit", "-q", "--allow-empty", "-m", "the hotfix"]);
+        fixture.git(&["tag", "v0.32.4"]);
+        fixture.git(&["checkout", "-q", "main"]);
+        fixture.git(&["commit", "-q", "--allow-empty", "-m", "unreleased work"]);
+
+        let (passed, log) = fixture.tags_on_main();
+        assert!(!passed, "{log}");
+        assert!(log.contains("::error::v0.32.4 is not on main"), "{log}");
+        assert!(!log.contains("v0.32.3 is not on main"), "{log}");
+
+        fixture.git(&["merge", "-q", "--no-edit", "release/0.32.4"]);
+        let (passed, log) = fixture.tags_on_main();
+        assert!(passed, "{log}");
+    }
+
+    /// Without tags, or in a shallow clone, the check would pass for want of
+    /// anything to look at.
+    #[test]
+    fn tags_on_main_refuses_a_clone_without_tags() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let (passed, log) = fixture.tags_on_main();
+        assert!(!passed, "{log}");
+        assert!(log.contains("no v* tags in this clone"), "{log}");
     }
 }

@@ -55,6 +55,22 @@ jobs:
       - name: Test
         run: cargo test
 
+  # Every release tag has to be on main, so a hotfix released from a
+  # release/X.Y.Z branch cannot be left behind by the next release from main
+  # (see scripts/tags-on-main.sh). Not on a manual run: `gh workflow run
+  # ci.yml --ref vX.Y.Z` tests a hotfix tag, whose branch can predate a later
+  # tag on main.
+  tags-on-main:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check every release tag is on main
+        run: scripts/tags-on-main.sh
+
   # No hosted FreeBSD runner exists, and cross-rs doesn't support FreeBSD, so
   # this boots a real FreeBSD VM via QEMU on the ubuntu-latest host — the
   # standard way Rust projects get genuine FreeBSD CI. Slower than the native

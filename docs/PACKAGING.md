@@ -59,6 +59,9 @@ Most of it is automatic. By hand:
    `%changelog` entry. It turns `[Unreleased]` into the version's section,
    runs `cargo test`, then commits and tags `vX.Y.Z`. It pushes nothing.
 3. Run the push commands it prints.
+4. For a hotfix, merge `release/X.Y.Z` back into `main`. Until it is, CI on
+   `main` fails its `tags-on-main` job, and the release guard refuses the
+   next tag cut from `main`.
 
 The release workflow's first job runs `scripts/release-guard.sh`, which
 refuses a tag that is not Cargo.toml's version or has no CHANGELOG section.
