@@ -27,7 +27,7 @@ jobs:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
 
@@ -64,7 +64,7 @@ jobs:
             tar czf netwatch-freebsd-x86_64.tar.gz netwatch-freebsd-x86_64
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: netwatch-freebsd-x86_64.tar.gz
 

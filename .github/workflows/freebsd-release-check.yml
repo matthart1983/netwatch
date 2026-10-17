@@ -14,7 +14,7 @@ jobs:
   build-freebsd:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build inside a FreeBSD 13 VM
         uses: vmactions/freebsd-vm@v1
