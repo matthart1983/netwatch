@@ -2,6 +2,10 @@
 name = "netwatch-tui"
 version = "0.35.4"
 edition = "2021"
+# Minimum supported Rust version, checked by CI's msrv job. Raised only in a
+# minor release, and named in the changelog when it is. Today's floor comes
+# from dependencies (time 0.3.47 needs 1.88).
+rust-version = "1.88"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
 license = "MIT"

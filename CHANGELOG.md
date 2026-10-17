@@ -78,6 +78,9 @@ All notable changes to NetWatch will be documented in this file.
   SHA, with its version in a comment, so a moved or compromised tag cannot
   change what builds a release. Workflow tokens are read-only by default;
   only the release, container and apt jobs, which publish, get write scopes.
+- **Minimum supported Rust version: 1.88**, declared in `Cargo.toml` and
+  checked by CI. It will be raised only in a minor release, with a changelog
+  entry.
 
 ## [0.35.4] - 2026-10-17
 

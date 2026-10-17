@@ -86,6 +86,24 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+  # The declared rust-version still builds. Without this, `rust-version` in
+  # Cargo.toml is a guess: the test matrix uses the latest stable, which
+  # accepts code that an older compiler a distro ships would reject.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - name: cargo check on the minimum supported Rust
+        run: cargo check --all-targets --locked
 
   # No hosted FreeBSD runner exists, and cross-rs doesn't support FreeBSD, so
   # this boots a real FreeBSD VM via QEMU on the ubuntu-latest host — the
