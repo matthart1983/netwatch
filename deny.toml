@@ -1,0 +1,46 @@
+# cargo-deny: what CI refuses in the dependency tree. Run `cargo deny check`.
+#
+# Advisories fail the build: a dependency with a published vulnerability,
+# unsoundness or abandonment has to be upgraded, replaced, or ignored below
+# with a reason and the release that removes the ignore.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    # paste is unmaintained, with no replacement release. Only ratatui 0.27
+    # pulls it in, as a proc macro at build time; it never runs in netwatch.
+    # The ratatui upgrade planned for 0.38 drops it, and this entry with it.
+    { id = "RUSTSEC-2024-0436", reason = "build-time only via ratatui 0.27; removed by the 0.38 ratatui upgrade" },
+]
+
+[licenses]
+# Everything the tree uses today, all compatible with shipping an MIT
+# binary. A new license fails CI until someone has read it.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are reported, not refused: most come from the windows-sys
+# and toml families moving at their own pace.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

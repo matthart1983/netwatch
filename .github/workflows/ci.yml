@@ -70,6 +70,16 @@ jobs:
 
       - name: Check every release tag is on main
         run: scripts/tags-on-main.sh
+  # Advisories, licenses and sources for every dependency, per deny.toml. A
+  # new RustSec advisory turns this red with no code change, which is the
+  # point: the fix is an upgrade, or an ignore with a reason in deny.toml.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   # No hosted FreeBSD runner exists, and cross-rs doesn't support FreeBSD, so
   # this boots a real FreeBSD VM via QEMU on the ubuntu-latest host — the

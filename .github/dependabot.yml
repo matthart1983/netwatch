@@ -1,0 +1,21 @@
+# Weekly update PRs. Security updates arrive as soon as an advisory is
+# published, independently of this schedule, once enabled in the repository
+# settings.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Patch and minor updates in one PR a week, rather than one per crate.
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

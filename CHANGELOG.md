@@ -2,6 +2,18 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Security
+- **rustls 0.23.40 → 0.23.46**, for RUSTSEC-2026-0285, -0346, -0348 and
+  -0349 (handshake messages accepted across encryption levels, secrets in
+  `Debug` output, a 1 GiB Brotli certificate allocation before
+  authentication, and a ServerHello key-exchange downgrade). netwatch uses
+  rustls for its own outbound HTTPS lookups. **anyhow 1.0.102 → 1.0.104**
+  for RUSTSEC-2026-0190.
+- CI now runs `cargo deny check` (advisories, licenses, sources) on every
+  change, and Dependabot proposes weekly Cargo and GitHub Actions updates.
+
 ## [0.35.4] - 2026-10-17
 
 ### Fixed
