@@ -14,6 +14,7 @@ maintenance notes, see [WIKI.md](WIKI.md).
   - [Network intelligence](#network-intelligence)
   - [Flight Recorder](#flight-recorder)
   - [Landlock sandbox (Linux)](#landlock-sandbox-linux)
+- [Command line](#command-line)
 - [Keyboard controls](#keyboard-controls)
 - [Permissions](#permissions)
   - [Running without sudo (Linux)](#running-without-sudo-linux)
@@ -267,6 +268,40 @@ Linux denial tests exercise actual lookup/Insights/keylog workers and keylog res
 Privileged capture/restart and macOS/Windows runtime validation remain release checks.
 Some detached workers still lack bounded shutdown; see the
 [runtime inventory](runtime-lifecycle.md) and [capability matrix](CAPABILITIES.md).
+
+---
+
+## Command line
+
+`netwatch --help` prints the flags; `netwatch diagnose` with no subcommand prints its usage.
+The [man page](netwatch.1) carries the same list.
+
+| Command | What it does |
+|---------|--------------|
+| `netwatch` | The TUI. Flags below. |
+| `netwatch daemon` (also `--daemon`, `--headless`) | The collectors with no screen. With `--metrics` or `--metrics-addr`, serves [Prometheus metrics](observability-export.md). |
+| `netwatch doctor [--json] [--check-capture] [--interface NAME]` | Read-only setup report: what this host lets netwatch see. `--check-capture` tries a real capture. See [doctor.md](doctor.md). |
+| `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue. 1: at least one open issue. 2: no usable observation in the budget. 3: bad arguments or no session. |
+| `netwatch diagnose coverage [--json] [--seconds N] [--test ID]` | Which checks have their inputs on this host, and why the others do not. |
+| `netwatch diagnose episodes [DIR]` | List recorded incident episodes. |
+| `netwatch diagnose replay [--json] FILE\|DIR...` | Replay episodes through the engine and report any divergence. |
+| `netwatch diagnose features [--out FILE] [--schema FILE] FILE\|DIR...` | Write the feature table of recorded episodes. |
+| `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
+| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
+| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. |
+| `netwatch --version`, `--help` | |
+
+TUI flags:
+
+| Flag | Effect |
+|------|--------|
+| `--view full\|lite\|dense`, `--lite` | Start in that view. |
+| `--demo` | Replay a recorded Diagnose incident instead of watching this host. |
+| `--no-sandbox`, `--sandbox-strict` | Turn the Linux sandbox off, or refuse to start unless it is enforced. |
+| `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Experimental. |
+| `--insecure-remote` | Allow an `http://` remote URL. |
+| `--api-key KEY` | Discouraged: the key shows in the process list. Use `NETWATCH_API_KEY`. |
+| `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
 
 ---
 

@@ -45,6 +45,13 @@ All notable changes to NetWatch will be documented in this file.
   video, so what was marked stays visible. REFERENCE.md gains a section
   listing the environment variables netwatch reads.
 
+### Documentation
+- README gains "Without the TUI": `doctor`, `diagnose run` and its exit
+  statuses, `daemon --metrics`, `--demo`, and `--remote` marked experimental.
+- REFERENCE.md gains a Command line section listing every command and flag.
+- CAPABILITIES.md gains a FreeBSD column and a draft of the platform tiers 1.0
+  would promise. WIKI.md no longer describes a 9-tab TUI with one CLI helper.
+
 ## [0.35.4] - 2026-10-17
 
 ### Fixed

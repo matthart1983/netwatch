@@ -6,7 +6,7 @@
 
 ## Overview
 
-NetWatch is a Rust terminal UI for real-time local network diagnostics. The current shipped surface area is the 9-tab TUI plus a small CLI helper for writing a starter config file with `netwatch --generate-config`.
+NetWatch is a Rust terminal UI for real-time local network diagnostics. The shipped surface is the 10-tab TUI, with Full, Lite and Dense views, and a CLI: `netwatch daemon` (headless, optional Prometheus metrics), `netwatch doctor` (setup report), `netwatch diagnose` (bounded runs, coverage, episodes) and `netwatch resolver`. [REFERENCE.md](REFERENCE.md#command-line) lists every command and flag.
 
 > User-facing deep dives (DPI, TLS decryption, JA4, eBPF, sandbox) live in the
 > [GitHub wiki](https://github.com/matthart1983/netwatch/wiki). This file is the
@@ -58,7 +58,7 @@ NetWatch currently exposes these runtime tabs:
 
 ### Supported platforms
 
-Netwatch has Linux, macOS and Windows backends and release targets. Features differ: Windows capture requires Npcap, kernel TCP metrics are absent on Windows, and only Linux has a sandbox backend. See the [capability matrix](CAPABILITIES.md) for implementation limits; backend presence is not cross-platform runtime validation.
+Netwatch has Linux, macOS, Windows and FreeBSD backends and release targets. Features differ: Windows capture requires Npcap, kernel TCP metrics are absent on Windows and FreeBSD, and only Linux has a sandbox backend. See the [capability matrix](CAPABILITIES.md) for implementation limits; backend presence is not cross-platform runtime validation.
 
 ---
 

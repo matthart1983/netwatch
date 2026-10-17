@@ -5,28 +5,39 @@ JSON without starting collectors. Its optional bounded capture check reports onl
 the isolated check's results. Live Settings and startup use the same capability
 model with runtime observations; static configuration is never a health verdict.
 
-This matrix describes the local implementation updated on 12 September 2026,
-including the unreleased diagnostic/remediation corrections. It is not a claim
+This matrix describes the implementation as of 18 October 2026 (0.35.4); the
+FreeBSD column dates from 0.35. It is not a claim
 that every backend was exercised on every supported OS. Linux unit tests do not
 establish macOS or Windows runtime parity.
 
-| Capability | Linux | macOS | Windows |
-| --- | --- | --- | --- |
-| Interface/configuration collection | Linux system counters and network tools | macOS network tools | PowerShell/network tools, with fallbacks |
-| Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required |
-| Process attribution | Verified procfs socket ownership; eBPF hints require corroboration and are disabled in sandboxed runs | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified socket/process polling |
-| Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows |
-| Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules |
-| Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend |
-| Strict sandbox startup | Rejects preflight/required entry failures; raw capture reopening may fail | Rejected: no backend | Rejected: no backend |
-| Resolver changes | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable |
-| AI commentary | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
+| Capability | Linux | macOS | Windows | FreeBSD |
+| --- | --- | --- | --- | --- |
+| Interface/configuration collection | Linux system counters and network tools | macOS network tools | PowerShell/network tools, with fallbacks | `getifaddrs` up-state, `netstat`/`ifconfig` |
+| Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required | Base-system libpcap/BPF; `/dev/bpf` access required |
+| Process attribution | Verified procfs socket ownership; eBPF hints require corroboration and are disabled in sandboxed runs | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified socket/process polling | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
+| Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |
+| Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules | Shared detectors; absent TCP metrics limit socket rules |
+| Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend | No backend (no Capsicum) |
+| Strict sandbox startup | Rejects preflight/required entry failures; raw capture reopening may fail | Rejected: no backend | Rejected: no backend | Rejected: no backend |
+| Resolver changes | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable | Unavailable |
+| AI commentary | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
 
 See [attribution evidence and controlled results](attribution.md) for exact
 coverage denominators and pending platform acceptance. Attribution may be unknown or stale. Polling can miss short-lived connections;
 backend identity and visibility are constrained by permissions and the observed
 network scope. An `ebpf` build or granted capability alone does not prove that the
 kernel accepted a program or that every flow was attributed.
+
+## Platform tiers (draft for 1.0)
+
+What 1.0 is expected to promise per platform. Until 1.0 this is a draft, and
+every tier is best-effort.
+
+| Tier | Platforms | Meaning |
+| --- | --- | --- |
+| 1 | Linux x86_64 and aarch64 | Every feature; CI runs the test matrix and the Diagnose fault and health labs; a regression blocks a release. |
+| 2 | macOS x86_64 and aarch64, Windows x86_64 | Built and tested in CI on every change; features limited as the matrix above says; a regression blocks a release. |
+| 3 | FreeBSD x86_64 (13+), Linux armv5te | Built in CI (FreeBSD tested in a VM, armv5te checked only); fixed when reported. Today the release guard waits on these jobs too; the plan is for releases to stop waiting on them. |
 
 ## Diagnose and remediation
 

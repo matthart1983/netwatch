@@ -77,6 +77,18 @@ netwatch --view dense # four boxes, 130x44 or larger
 
 `1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key. To run without sudo on Linux, grant the capabilities once: `sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"` ([why and when to repeat it](docs/REFERENCE.md#running-without-sudo-linux)).
 
+### Without the TUI
+
+```bash
+netwatch doctor                          # what netwatch can see on this host, and why not
+netwatch diagnose run --budget 30s       # one bounded diagnosis; exit 0 clean, 1 issue, 2 no evidence
+netwatch diagnose run --format json      # the same, for scripts
+netwatch daemon --metrics                # headless; Prometheus /metrics on 127.0.0.1:9464
+netwatch --demo                          # replay a recorded Diagnose incident, no capture needed
+```
+
+`daemon` runs the same collectors with no screen; a [systemd unit](packaging/systemd/netwatch.service) and a [launchd agent](packaging/launchd/com.netwatch.agent.plist) ship with it, and [Prometheus export](docs/observability-export.md) lists the metrics. `--remote URL` with `NETWATCH_API_KEY` streams snapshots to a backend you run; it is experimental and its wire format may change. [Every command and flag](docs/REFERENCE.md#command-line).
+
 ## The tabs
 
 | # | Tab | Shows |
