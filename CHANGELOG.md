@@ -79,6 +79,7 @@ All notable changes to NetWatch will be documented in this file.
   change what builds a release. Workflow tokens are read-only by default;
   only the release, container and apt jobs, which publish, get write scopes.
 - **Minimum supported Rust version: 1.88**, declared in `Cargo.toml` and
+- **Minimum supported Rust version: 1.95**, declared in `Cargo.toml` and
   checked by CI. It will be raised only in a minor release, with a changelog
   entry.
 
