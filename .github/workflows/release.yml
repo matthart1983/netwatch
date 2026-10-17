@@ -358,15 +358,16 @@ jobs:
         with:
           release: "13.5"
           usesh: true
+          # FreeBSD 13's package repository is gone (13.x is end of life),
+          # so `pkg install rust` 404s. rustup still ships FreeBSD
+          # toolchains, and libpcap comes from the base system, so the
+          # binary still runs on FreeBSD 13 and later.
           prepare: |
-            n=0
-            until pkg install -y rust; do
-              n=$((n + 1))
-              [ "$n" -ge 3 ] && exit 1
-              sleep 30
-            done
+            fetch -o /tmp/rustup-init.sh https://sh.rustup.rs
+            sh /tmp/rustup-init.sh -y --profile minimal
           run: |
             set -ex
+            . "$HOME/.cargo/env"
             freebsd-version
             cargo build --release
             ./target/release/netwatch --version

@@ -1,8 +1,8 @@
 name: Attach FreeBSD build to a release
 
-# release.yml's build-freebsd job is continue-on-error: when the FreeBSD VM
-# flakes (v0.35.4: "Error updating repositories!" from pkg), the release
-# ships without netwatch-freebsd-x86_64.tar.gz. Re-running that job would
+# release.yml's build-freebsd job is continue-on-error: when it fails (v0.35.4:
+# FreeBSD 13's pkg repository had gone), the release ships without
+# netwatch-freebsd-x86_64.tar.gz. Re-running that job would
 # re-run everything that depends on it — release, crates.io publish, apt,
 # COPR, the container — so this builds the tarball alone at an existing
 # tag and adds it to that tag's release, with SHA256SUMS and provenance.
@@ -40,15 +40,16 @@ jobs:
         with:
           release: "13.5"
           usesh: true
+          # FreeBSD 13's package repository is gone (13.x is end of life),
+          # so `pkg install rust` 404s. rustup still ships FreeBSD
+          # toolchains, and libpcap comes from the base system, so the
+          # binary still runs on FreeBSD 13 and later.
           prepare: |
-            n=0
-            until pkg install -y rust; do
-              n=$((n + 1))
-              [ "$n" -ge 3 ] && exit 1
-              sleep 30
-            done
+            fetch -o /tmp/rustup-init.sh https://sh.rustup.rs
+            sh /tmp/rustup-init.sh -y --profile minimal
           run: |
             set -ex
+            . "$HOME/.cargo/env"
             freebsd-version
             cargo build --release
             ./target/release/netwatch --version
