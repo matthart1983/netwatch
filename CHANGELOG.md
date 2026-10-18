@@ -9,6 +9,13 @@ All notable changes to NetWatch will be documented in this file.
   0.25, and every semver-compatible update (`cargo update`). These are the
   Dependabot updates #86-#90 in one change.
 
+### CI
+- Tests run under cargo-nextest. Only the tests whose outcome depends on the
+  runner (procfs attribution, local ports, probe timeouts) are retried, and a
+  pass on retry is reported as flaky, with a warning on the run, not hidden.
+- The FreeBSD VM and armv5te jobs moved to their own workflow, so as Tier 3
+  platforms they no longer hold a release. Every Tier 1 and 2 job still does.
+
 ### Security
 - **rustls 0.23.40 → 0.23.46**, for RUSTSEC-2026-0285, -0346, -0348 and
   -0349 (handshake messages accepted across encryption levels, secrets in

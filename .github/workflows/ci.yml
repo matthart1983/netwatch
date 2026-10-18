@@ -58,8 +58,39 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest
+
+      # nextest, not `cargo test`: .config/nextest.toml retries only the tests
+      # whose outcome depends on the runner, and a pass on retry is reported
+      # as FLAKY instead of hiding. The crate has no doctests to lose.
       - name: Test
-        run: cargo test
+        run: cargo nextest run --profile ci
+
+      # A flaky pass is still a pass, so say so where it will be seen: one
+      # warning per test, on the run's summary page.
+      - name: Report flaky tests
+        if: always()
+        shell: bash
+        run: |
+          f=target/nextest/ci/junit.xml
+          [ -f "$f" ] || exit 0
+          python3 - "$f" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          for case in ET.parse(sys.argv[1]).iter("testcase"):
+              if case.find("flakyFailure") is not None:
+                  print(f"::warning title=Flaky test::{case.get('classname')} {case.get('name')} passed only on retry")
+          PY
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
 
   # Every release tag has to be on main, so a hotfix released from a
   # release/X.Y.Z branch cannot be left behind by the next release from main
@@ -104,68 +135,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
       - name: cargo check on the minimum supported Rust
         run: cargo check --all-targets --locked
-
-  # No hosted FreeBSD runner exists, and cross-rs doesn't support FreeBSD, so
-  # this boots a real FreeBSD VM via QEMU on the ubuntu-latest host — the
-  # standard way Rust projects get genuine FreeBSD CI. Slower than the native
-  # matrix jobs above (no package cache survives the VM boundary, so every
-  # run compiles every dependency from scratch) and intentionally
-  # lighter-weight: fmt/clippy are already enforced in `test`, so this job
-  # only proves the FreeBSD-specific code (src/platform/freebsd.rs, the
-  # sockstat connection parser, the sysctl-based procname lookup) actually
-  # builds and its tests pass on the real OS.
-  freebsd:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Build and test on FreeBSD
-        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
-        with:
-          usesh: true
-          prepare: |
-            pkg install -y rust libpcap pkgconf
-          run: |
-            cargo build
-            cargo test
-
-  # Only the release workflow actually builds for armv5te (Iomega ix2-dl /
-  # Marvell Kirkwood), and that only runs on a tag push. Without this, a
-  # change like re-introducing an AtomicU64 (armv5te has no native 64-bit
-  # atomics) would stay green here and only surface as a broken release
-  # build days or weeks later, on a tag. A `check` catches the same class
-  # of regression without paying for a full cross build on every push.
-  armv5te-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-          targets: armv5te-unknown-linux-gnueabi
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - name: Install armv5te cross-compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabi
-          echo "CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_GNUEABI_LINKER=arm-linux-gnueabi-gcc" >> $GITHUB_ENV
-          # mimalloc-sys and ring compile C/asm sources from scratch, so
-          # cc-rs needs to be told which cross compiler to use rather than
-          # guessing from the host toolchain.
-          echo "CC_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-gcc" >> $GITHUB_ENV
-          echo "AR_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-ar" >> $GITHUB_ENV
-          # `cargo check` never links, so the `pcap` crate's build.rs only
-          # needs a LIBPCAP_LIBDIR to point at -- given one, it tries to
-          # load a library there to read its version and falls back to
-          # assuming the latest on failure, which is exactly what happens
-          # here (there's nothing at this path, and it's an x86_64 host
-          # trying to load an ARM library either way). No real libpcap
-          # build needed for a check-only job.
-          echo "LIBPCAP_LIBDIR=/tmp" >> $GITHUB_ENV
-
-      - name: cargo check armv5te
-        run: cargo check --target armv5te-unknown-linux-gnueabi
 
   # The Diagnose fault lab builds a two-namespace veth network and asserts the
   # probe's verdicts against faults it creates on purpose: IPv6 blackholes, a

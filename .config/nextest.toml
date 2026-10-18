@@ -1,0 +1,26 @@
+# cargo-nextest profiles. CI runs `cargo nextest run --profile ci`.
+#
+# The default profile (local `cargo nextest run`) never retries: a flaky test
+# should fail where someone is looking at it. The ci profile retries only the
+# tests below, whose outcome depends on the machine as well as the code (a
+# /proc scan racing another test's fork, a freed port taken by a parallel
+# test, wall-clock probe timeouts), and reports a pass on retry as FLAKY in
+# the log and the JUnit file rather than as a plain pass. Anything else that
+# fails once fails the run.
+
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+# List the flaky passes again at the end, where they will be read.
+final-status-level = "flaky"
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[[profile.ci.overrides]]
+filter = """
+    test(/^collectors::connections::tests::/)
+    | test(/^diagnose::targets::tests::/)
+    | test(/^diagnose::active::tests::/)
+"""
+retries = 2

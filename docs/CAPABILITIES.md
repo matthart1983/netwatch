@@ -37,7 +37,7 @@ every tier is best-effort.
 | --- | --- | --- |
 | 1 | Linux x86_64 and aarch64 | Every feature; CI runs the test matrix and the Diagnose fault and health labs; a regression blocks a release. |
 | 2 | macOS x86_64 and aarch64, Windows x86_64 | Built and tested in CI on every change; features limited as the matrix above says; a regression blocks a release. |
-| 3 | FreeBSD x86_64 (13+), Linux armv5te | Built in CI (FreeBSD tested in a VM, armv5te checked only); fixed when reported. Today the release guard waits on these jobs too; the plan is for releases to stop waiting on them. |
+| 3 | FreeBSD x86_64 (13+), Linux armv5te | Built in CI (FreeBSD tested in a VM, armv5te checked only) by `tier3.yml`, which the release guard does not wait on; fixed when reported. |
 
 ## Diagnose and remediation
 

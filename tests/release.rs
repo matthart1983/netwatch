@@ -113,6 +113,45 @@ fn the_guard_can_read_ci_runs() {
     );
 }
 
+/// Tier 3 jobs (docs/CAPABILITIES.md) run in their own workflow, so a red one
+/// shows on the pull request without holding a release: the guard waits on
+/// every ci.yml run. Tier 1 and 2 jobs stay in ci.yml, where they gate.
+#[test]
+fn only_tier_1_and_2_jobs_gate_a_release() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |f: &str| std::fs::read_to_string(root.join(".github/workflows").join(f)).unwrap();
+    let (ci, tier3) = (read("ci.yml"), read("tier3.yml"));
+    let names = |w: &str| {
+        jobs(w)
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>()
+    };
+    let (ci, tier3) = (names(&ci), names(&tier3));
+    for job in ["freebsd", "armv5te-check"] {
+        assert!(
+            !ci.contains(&job.to_string()),
+            "{job} is Tier 3 but gates releases in ci.yml"
+        );
+        assert!(
+            tier3.contains(&job.to_string()),
+            "{job} is missing from tier3.yml"
+        );
+    }
+    for job in [
+        "test",
+        "tags-on-main",
+        "cargo-deny",
+        "msrv",
+        "diagnose-fault-lab",
+    ] {
+        assert!(
+            ci.contains(&job.to_string()),
+            "{job} must stay in ci.yml, where it gates releases"
+        );
+    }
+}
+
 /// The guard's second check, made here so a version bump without its
 /// CHANGELOG section fails before anything is tagged.
 #[test]
