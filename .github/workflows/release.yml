@@ -426,6 +426,29 @@ jobs:
             *.deb
             *.rpm
 
+      # The dependency list every binary was built from, as CycloneDX JSON
+      # from Cargo.lock, attached to the release and attested against each
+      # artifact. Verified with:
+      #   gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch \
+      #     --predicate-type https://cyclonedx.org/bom
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate the SBOM
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --all-features --override-filename netwatch.cdx
+          mv netwatch.cdx.json "netwatch-${RELEASE_TAG#v}.cdx.json"
+      - name: Attest the SBOM
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2.4.0
+        with:
+          subject-path: |
+            *.tar.gz
+            *.zip
+            *.deb
+            *.rpm
+          sbom-path: netwatch-*.cdx.json
+
       - name: Create Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
@@ -443,6 +466,7 @@ jobs:
             *.deb
             *.rpm
             SHA256SUMS
+            netwatch-*.cdx.json
 
   # Multi-arch image from the binaries the build job already produced, so the
   # image, the tarball and the .deb are the same bytes. Pre-release tags get
@@ -453,6 +477,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Provenance for the image, stored in the registry beside it.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -480,6 +507,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
+        id: push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: packaging/docker
@@ -488,6 +516,15 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
             ${{ contains(env.RELEASE_TAG, '-') && '' || format('ghcr.io/{0}:latest', github.repository) }}
+
+      # The image's provenance, pushed to GHCR next to it. Verified with:
+      #   gh attestation verify oci://ghcr.io/matthart1983/netwatch:vX.Y.Z -R matthart1983/netwatch
+      - name: Attest the image
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
   # Publish an apt repository on GitHub Pages, built from the .deb files the
   # build job produced. Self-hosted rather than a Launchpad PPA on purpose:

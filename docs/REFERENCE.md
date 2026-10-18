@@ -457,10 +457,18 @@ sha256sum --ignore-missing -c SHA256SUMS
 
 # Provenance (needs the GitHub CLI)
 gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch
+
+# The SBOM the artifact was built from (netwatch-X.Y.Z.cdx.json on the release)
+gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch \
+  --predicate-type https://cyclonedx.org/bom
+
+# The container image
+gh attestation verify oci://ghcr.io/matthart1983/netwatch:vX.Y.Z -R matthart1983/netwatch
 ```
 
 Checksums and attestations are produced from v0.32.1 onward; earlier releases
-have neither.
+have neither. The CycloneDX SBOM and the image attestation start with the
+release after 0.35.4.
 
 ## Shell completions and the man page
 

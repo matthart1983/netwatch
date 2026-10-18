@@ -16,6 +16,12 @@ All notable changes to NetWatch will be documented in this file.
 - The FreeBSD VM and armv5te jobs moved to their own workflow, so as Tier 3
   platforms they no longer hold a release. Every Tier 1 and 2 job still does.
 
+### Release
+- Each release attaches a CycloneDX SBOM (`netwatch-X.Y.Z.cdx.json`) built
+  from `Cargo.lock` and attests it against every artifact. The GHCR image
+  gets signed build provenance, stored in the registry. REFERENCE.md shows
+  how to verify both.
+
 ### Security
 - **rustls 0.23.40 → 0.23.46**, for RUSTSEC-2026-0285, -0346, -0348 and
   -0349 (handshake messages accepted across encryption levels, secrets in
