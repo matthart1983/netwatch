@@ -128,7 +128,7 @@ required-features = ["ebpf"]
 embed-manifest = "1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["net", "ioctl", "hostname", "uio", "poll"] }
+nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"] }
 
 # Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
 # pcap + eBPF are up, then restrict filesystem and network via Landlock.
