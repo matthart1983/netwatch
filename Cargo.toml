@@ -59,7 +59,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
-toml_edit = "0.22"
+toml_edit = "0.25"
 dirs = "5"
 # Display-width-aware truncation for the Lite view's fixed character grid.
 # Byte or char length would misalign columns on CJK process names. Already in
