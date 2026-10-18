@@ -185,9 +185,7 @@ jobs:
       - name: Install npcap SDK (Windows)
         if: runner.os == 'Windows'
         run: |
-          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile npcap-sdk.zip
-          Expand-Archive -Path npcap-sdk.zip -DestinationPath npcap-sdk
-          echo "LIB=${{ github.workspace }}\npcap-sdk\Lib\x64" >> $env:GITHUB_ENV
+          ./scripts/npcap-sdk.ps1
 
       # netwatch-sdk 0.1.2+ ships the pre-built BPF object on crates.io, so
       # we no longer need to clone the SDK and run scripts/build-ebpf.sh

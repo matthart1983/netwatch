@@ -15,6 +15,10 @@ All notable changes to NetWatch will be documented in this file.
   pass on retry is reported as flaky, with a warning on the run, not hidden.
 - The FreeBSD VM and armv5te jobs moved to their own workflow, so as Tier 3
   platforms they no longer hold a release. Every Tier 1 and 2 job still does.
+- The Windows jobs fetch the Npcap SDK through `scripts/npcap-sdk.ps1`,
+  which checks a pinned SHA-256 and, if TLS to npcap.com fails, retries
+  without certificate validation. npcap.com's certificate expired on
+  2026-10-18 and failed every Windows CI job and would have failed a release.
 
 ### Release
 - Each release attaches a CycloneDX SBOM (`netwatch-X.Y.Z.cdx.json`) built
