@@ -4,6 +4,11 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Dependencies
+- nix 0.29 → 0.31, brotli 8 → 9, maxminddb 0.27 → 0.32, toml_edit 0.22 →
+  0.25, and every semver-compatible update (`cargo update`). These are the
+  Dependabot updates #86-#90 in one change.
+
 ### Security
 - **rustls 0.23.40 → 0.23.46**, for RUSTSEC-2026-0285, -0346, -0348 and
   -0349 (handshake messages accepted across encryption levels, secrets in

@@ -63,13 +63,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
-toml_edit = "0.22"
+toml_edit = "0.25"
 dirs = "5"
 # Display-width-aware truncation for the Lite view's fixed character grid.
 # Byte or char length would misalign columns on CJK process names. Already in
 # the tree as a transitive dep of ratatui.
 unicode-width = "0.1"
-maxminddb = "0.27"
+maxminddb = "0.32"
 # Used for QUIC Initial decryption (RFC 9001): HKDF-Expand-Label, AES-128-GCM
 # AEAD, and AES-128-ECB header protection via `ring::aead::quic`. Already in
 # the tree as a transitive dep of rustls; pinning explicitly so the QUIC
@@ -105,7 +105,7 @@ tracing-appender = "0.2"
 # rather than decode the QPACK-compressed Content-Encoding header. zstd
 # deferred.
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 
 [features]
 # eBPF process attribution is on by default. The runtime gracefully
@@ -132,7 +132,7 @@ required-features = ["ebpf"]
 embed-manifest = "1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["net", "ioctl", "hostname", "uio", "poll"] }
+nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"] }
 
 # Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
 # pcap + eBPF are up, then restrict filesystem and network via Landlock.
