@@ -101,7 +101,7 @@ tracing-appender = "0.2"
 # rather than decode the QPACK-compressed Content-Encoding header. zstd
 # deferred.
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 
 [features]
 # eBPF process attribution is on by default. The runtime gracefully
