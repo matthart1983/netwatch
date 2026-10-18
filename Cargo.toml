@@ -65,7 +65,7 @@ dirs = "5"
 # Byte or char length would misalign columns on CJK process names. Already in
 # the tree as a transitive dep of ratatui.
 unicode-width = "0.1"
-maxminddb = "0.27"
+maxminddb = "0.32"
 # Used for QUIC Initial decryption (RFC 9001): HKDF-Expand-Label, AES-128-GCM
 # AEAD, and AES-128-ECB header protection via `ring::aead::quic`. Already in
 # the tree as a transitive dep of rustls; pinning explicitly so the QUIC
