@@ -1,6 +1,6 @@
 # Fetch and unpack the Npcap SDK for the Windows build, verified by SHA-256.
 #
-#   pwsh scripts/npcap-sdk.ps1     # leaves .\npcap-sdk and sets LIB for later steps
+#   pwsh scripts/npcap-sdk.ps1     # leaves .\npcap-sdk; sets LIB and NPCAP_SDK for later steps
 #
 # The hash, not the TLS connection, is what makes the download trustworthy:
 # npcap.com's certificate lapsed on 2026-10-18 and took every Windows CI job
@@ -28,6 +28,12 @@ if ($got -ne $sha256) {
     throw "npcap-sdk-$version.zip has SHA-256 $got, expected $sha256"
 }
 Expand-Archive -Path $zip -DestinationPath npcap-sdk -Force
-$lib = Join-Path (Get-Location) 'npcap-sdk\Lib\x64'
-if ($env:GITHUB_ENV) { "LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+$sdk = Join-Path (Get-Location) 'npcap-sdk'
+$lib = Join-Path $sdk 'Lib\x64'
+# LIB for the linker; NPCAP_SDK so build.rs uses this copy instead of
+# downloading its own, unverified, from the same host.
+if ($env:GITHUB_ENV) {
+    "LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    "NPCAP_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+}
 Write-Output "Npcap SDK $version verified; LIB=$lib"
