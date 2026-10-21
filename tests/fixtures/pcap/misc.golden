@@ -1,0 +1,43 @@
+#1 ARP — -> — len=42 expert=Chat
+  info: Who has 192.0.2.1? Tell 192.0.2.10
+  | Frame: 42 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → ff:ff:ff:ff:ff:ff, Type: ARP (0x0806)
+  | ARP: Request — Who has 192.0.2.1? Tell 192.0.2.10 (02:00:00:00:00:01)
+#2 ICMP 192.0.2.10 -> 192.0.2.1 len=50 expert=Chat
+  info: 192.0.2.10 → 192.0.2.1 Echo Request, Id=66, Seq=1
+  | Frame: 50 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 192.0.2.1, TTL: 64, Proto: ICMP (1), Len: 36
+  | ICMP: Echo Request, Id=66, Seq=1
+#3 NTP 192.0.2.10:50123 -> 198.51.100.20:123 len=90 expert=Chat
+  info: 192.0.2.10:50123 → 198.51.100.20:123 v4 Client
+  stream: 0
+  app: Ntp { version: 4, mode: 3 }
+  | Frame: 90 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: UDP (17), Len: 76
+  | UDP: 50123 (—) → 123 (NTP), Len: 56
+  | NTP: v4 Client
+#4 DHCP 0.0.0.0:68 -> 255.255.255.255:67 len=286 expert=Chat
+  info: 0.0.0.0:68 → 255.255.255.255:67 Discover/Request
+  stream: 1
+  app: Dhcp { op: 1 }
+  | Frame: 286 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → ff:ff:ff:ff:ff:ff, Type: IPv4 (0x0800)
+  | IPv4: 0.0.0.0 → 255.255.255.255, TTL: 64, Proto: UDP (17), Len: 272
+  | UDP: 68 (DHCP-C) → 67 (DHCP-S), Len: 252
+  | DHCP: Discover/Request
+#5 HTTPS 192.0.2.10:50443 -> 198.51.100.20:443 len=120 expert=Chat
+  info: 192.0.2.10:50443 → 198.51.100.20:443 [PSH,ACK] Seq=1001 Win=64240 Ack=5001 Payload=66
+  stream: 2
+  | Frame: 120 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 257
+  | TCP: 50443 (—) → 443 (HTTPS), Seq: 1001, Flags: [PSH,ACK], Win: 64240, Ack: 5001
+#6 TCP 192.0.2.10 -> 198.51.100.20 len=34 expert=Chat
+  info: 192.0.2.10 → 198.51.100.20 TCP
+  | Frame: 34 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 65535
+  | TCP: 192.0.2.10 → 198.51.100.20
+#7 (not decoded)

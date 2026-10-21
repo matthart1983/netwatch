@@ -1,0 +1,30 @@
+#1 HTTPS 192.0.2.10:50443 -> 198.51.100.20:443 len=54 expert=Chat
+  info: 192.0.2.10:50443 → 198.51.100.20:443 [SYN] Seq=1000 Win=64240 Payload=0
+  stream: 0
+  | Frame: 54 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 40
+  | TCP: 50443 (—) → 443 (HTTPS), Seq: 1000, Flags: [SYN], Win: 64240
+#2 HTTPS 198.51.100.20:443 -> 192.0.2.10:50443 len=54 expert=Chat
+  info: 198.51.100.20:443 → 192.0.2.10:50443 [SYN,ACK] Seq=5000 Win=64240 Ack=1001 Payload=0
+  stream: 0
+  | Frame: 54 bytes on wire
+  | Ethernet: 02:00:00:00:00:02 → 02:00:00:00:00:01, Type: IPv4 (0x0800)
+  | IPv4: 198.51.100.20 → 192.0.2.10, TTL: 64, Proto: TCP (6), Len: 40
+  | TCP: 443 (HTTPS) → 50443 (—), Seq: 5000, Flags: [SYN,ACK], Win: 64240, Ack: 1001
+#3 HTTPS 192.0.2.10:50443 -> 198.51.100.20:443 len=54 expert=Chat
+  info: 192.0.2.10:50443 → 198.51.100.20:443 [ACK] Seq=1001 Win=64240 Ack=5001 Payload=0
+  stream: 0
+  | Frame: 54 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 40
+  | TCP: 50443 (—) → 443 (HTTPS), Seq: 1001, Flags: [ACK], Win: 64240, Ack: 5001
+#4 TLS 192.0.2.10:50443 -> 198.51.100.20:443 len=271 expert=Chat
+  info: 192.0.2.10:50443 → 198.51.100.20:443 www.example.com alpn=h2 [PSH,ACK]
+  stream: 0
+  app: Tls { sni: Some("www.example.com"), alpn: Some("h2"), ech: false, ja4: Some("t13d0507h2_c96ac5133cd7_c3bfa068707b") }
+  | Frame: 271 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 257
+  | TCP: 50443 (—) → 443 (HTTPS), Seq: 1001, Flags: [PSH,ACK], Win: 64240, Ack: 5001
+  | TLS: www.example.com alpn=h2

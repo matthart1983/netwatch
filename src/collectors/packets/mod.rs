@@ -1664,71 +1664,9 @@ impl PacketCollector {
                             continue;
                         }
                         let survived = run_capture_step(&capturing, &error, || {
-                            if let Some(mut parsed) = parse_packet(packet.data, &counter, &dns) {
-                                if let (Some(sp), Some(dp)) = (parsed.src_port, parsed.dst_port) {
-                                    let proto = if parsed.tcp_flags.is_some() {
-                                        StreamProtocol::Tcp
-                                    } else {
-                                        StreamProtocol::Udp
-                                    };
-                                    let payload = extract_app_payload(packet.data, proto);
-                                    let (idx, app_proto, decrypted) = {
-                                        let mut t = crate::app::safe_lock(
-                                            &tracker,
-                                            "packets::capture_loop",
-                                        );
-                                        let i = t.track_packet(
-                                            &parsed.src_ip,
-                                            sp,
-                                            &parsed.dst_ip,
-                                            dp,
-                                            proto,
-                                            &payload,
-                                            parsed.id,
-                                            &parsed.timestamp,
-                                            parsed.tcp_flags,
-                                            parsed.tcp_seq,
-                                            parsed.timestamp_ns,
-                                        );
-                                        let ap =
-                                            t.get_stream(i).and_then(|s| s.app_protocol.clone());
-                                        // TLS-decrypt the application-data record carried by
-                                        // *this* TCP segment, if we have keys for the flow.
-                                        // Determines direction from initiator info on the stream.
-                                        let client_to_server = t
-                                            .get_stream(i)
-                                            .and_then(|s| s.initiator.as_ref())
-                                            .map(|(ip, port)| {
-                                                ip.as_str() == parsed.src_ip.as_str() && *port == sp
-                                            })
-                                            .unwrap_or(true);
-                                        let dec = t
-                                            .try_decrypt_tls_record(i, &payload, client_to_server)
-                                            .or_else(|| {
-                                                // QUIC 1-RTT short-header packets ride UDP; the
-                                                // TLS path above no-ops on them.
-                                                if proto == StreamProtocol::Udp {
-                                                    t.try_decrypt_quic_1rtt(
-                                                        i,
-                                                        &payload,
-                                                        client_to_server,
-                                                    )
-                                                } else {
-                                                    None
-                                                }
-                                            });
-                                        // Mirror the decrypted plaintext onto this
-                                        // packet's stream segment so the stream view
-                                        // can follow the decrypted conversation.
-                                        if let Some(ref pt) = dec {
-                                            t.attach_segment_decrypted(i, parsed.id, pt.clone());
-                                        }
-                                        (i, ap, dec)
-                                    };
-                                    parsed.stream_index = Some(idx);
-                                    parsed.app_protocol = app_proto;
-                                    parsed.decrypted_plaintext = decrypted;
-                                }
+                            if let Some(parsed) =
+                                decode_and_track(packet.data, &counter, &dns, &tracker)
+                            {
                                 batch.push(parsed);
                                 if batch.len() >= CAPTURE_BATCH_SIZE {
                                     let mut pkts =
@@ -2139,6 +2077,31 @@ impl Drop for PacketCollector {
 
 // ── Packet parsing ──────────────────────────────────────────
 
+/// Decodes a saved capture frame by frame through the capture thread's own
+/// path, stream tracking and flow classification included, for the pcap
+/// golden tests in `tests/`. No reverse DNS, as for `fuzz_parse_frame`.
+#[doc(hidden)]
+pub struct Replay {
+    counter: Arc<Mutex<u64>>,
+    dns: DnsCache,
+    tracker: Mutex<StreamTracker>,
+}
+
+impl Replay {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            counter: Arc::new(Mutex::new(0)),
+            dns: DnsCache::new(),
+            tracker: Mutex::new(StreamTracker::new()),
+        }
+    }
+
+    pub fn frame(&self, data: &[u8]) -> Option<CapturedPacket> {
+        decode_and_track(data, &self.counter, &self.dns, &self.tracker)
+    }
+}
+
 /// Decode one Ethernet frame exactly as the capture thread does, for the
 /// fuzz targets in `fuzz/`. No reverse DNS: the cache has no peers and is
 /// never started.
@@ -2146,6 +2109,73 @@ impl Drop for PacketCollector {
 pub fn fuzz_parse_frame(data: &[u8]) {
     let counter = Arc::new(Mutex::new(0));
     let _ = parse_packet(data, &counter, &DnsCache::new());
+}
+
+/// Decode one frame and fold it into the stream tracker: the per-packet
+/// work of the capture thread, apart from batching. Also the entry point
+/// for replaying a saved capture (`replay_frame`).
+fn decode_and_track(
+    data: &[u8],
+    counter: &Arc<Mutex<u64>>,
+    dns: &DnsCache,
+    tracker: &Mutex<StreamTracker>,
+) -> Option<CapturedPacket> {
+    let mut parsed = parse_packet(data, counter, dns)?;
+    if let (Some(sp), Some(dp)) = (parsed.src_port, parsed.dst_port) {
+        let proto = if parsed.tcp_flags.is_some() {
+            StreamProtocol::Tcp
+        } else {
+            StreamProtocol::Udp
+        };
+        let payload = extract_app_payload(data, proto);
+        let (idx, app_proto, decrypted) = {
+            let mut t = crate::app::safe_lock(tracker, "packets::capture_loop");
+            let i = t.track_packet(
+                &parsed.src_ip,
+                sp,
+                &parsed.dst_ip,
+                dp,
+                proto,
+                &payload,
+                parsed.id,
+                &parsed.timestamp,
+                parsed.tcp_flags,
+                parsed.tcp_seq,
+                parsed.timestamp_ns,
+            );
+            let ap = t.get_stream(i).and_then(|s| s.app_protocol.clone());
+            // TLS-decrypt the application-data record carried by
+            // *this* TCP segment, if we have keys for the flow.
+            // Determines direction from initiator info on the stream.
+            let client_to_server = t
+                .get_stream(i)
+                .and_then(|s| s.initiator.as_ref())
+                .map(|(ip, port)| ip.as_str() == parsed.src_ip.as_str() && *port == sp)
+                .unwrap_or(true);
+            let dec = t
+                .try_decrypt_tls_record(i, &payload, client_to_server)
+                .or_else(|| {
+                    // QUIC 1-RTT short-header packets ride UDP; the
+                    // TLS path above no-ops on them.
+                    if proto == StreamProtocol::Udp {
+                        t.try_decrypt_quic_1rtt(i, &payload, client_to_server)
+                    } else {
+                        None
+                    }
+                });
+            // Mirror the decrypted plaintext onto this
+            // packet's stream segment so the stream view
+            // can follow the decrypted conversation.
+            if let Some(ref pt) = dec {
+                t.attach_segment_decrypted(i, parsed.id, pt.clone());
+            }
+            (i, ap, dec)
+        };
+        parsed.stream_index = Some(idx);
+        parsed.app_protocol = app_proto;
+        parsed.decrypted_plaintext = decrypted;
+    }
+    Some(parsed)
 }
 
 fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Option<CapturedPacket> {

@@ -1,0 +1,39 @@
+#1 HTTP 192.0.2.10:50080 -> 198.51.100.20:80 len=54 expert=Chat
+  info: 192.0.2.10:50080 → 198.51.100.20:80 [SYN] Seq=1000 Win=64240 Payload=0
+  stream: 0
+  | Frame: 54 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 40
+  | TCP: 50080 (—) → 80 (HTTP), Seq: 1000, Flags: [SYN], Win: 64240
+#2 HTTP 198.51.100.20:80 -> 192.0.2.10:50080 len=54 expert=Chat
+  info: 198.51.100.20:80 → 192.0.2.10:50080 [SYN,ACK] Seq=5000 Win=64240 Ack=1001 Payload=0
+  stream: 0
+  | Frame: 54 bytes on wire
+  | Ethernet: 02:00:00:00:00:02 → 02:00:00:00:00:01, Type: IPv4 (0x0800)
+  | IPv4: 198.51.100.20 → 192.0.2.10, TTL: 64, Proto: TCP (6), Len: 40
+  | TCP: 80 (HTTP) → 50080 (—), Seq: 5000, Flags: [SYN,ACK], Win: 64240, Ack: 1001
+#3 HTTP 192.0.2.10:50080 -> 198.51.100.20:80 len=54 expert=Chat
+  info: 192.0.2.10:50080 → 198.51.100.20:80 [ACK] Seq=1001 Win=64240 Ack=5001 Payload=0
+  stream: 0
+  | Frame: 54 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 40
+  | TCP: 50080 (—) → 80 (HTTP), Seq: 1001, Flags: [ACK], Win: 64240, Ack: 5001
+#4 HTTP 192.0.2.10:50080 -> 198.51.100.20:80 len=131 expert=Chat
+  info: 192.0.2.10:50080 → 198.51.100.20:80 GET example.com/index.html [PSH,ACK]
+  stream: 0
+  app: Http { method: "GET", host: Some("example.com"), path: Some("/index.html"), status: None }
+  | Frame: 131 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 117
+  | TCP: 50080 (—) → 80 (HTTP), Seq: 1001, Flags: [PSH,ACK], Win: 64240, Ack: 5001
+  | HTTP: GET example.com/index.html
+#5 HTTP 198.51.100.20:80 -> 192.0.2.10:50080 len=122 expert=Chat
+  info: 198.51.100.20:80 → 192.0.2.10:50080 200 [PSH,ACK]
+  stream: 0
+  app: Http { method: "GET", host: Some("example.com"), path: Some("/index.html"), status: None }
+  | Frame: 122 bytes on wire
+  | Ethernet: 02:00:00:00:00:02 → 02:00:00:00:00:01, Type: IPv4 (0x0800)
+  | IPv4: 198.51.100.20 → 192.0.2.10, TTL: 64, Proto: TCP (6), Len: 108
+  | TCP: 80 (HTTP) → 50080 (—), Seq: 5001, Flags: [PSH,ACK], Win: 64240, Ack: 1078
+  | HTTP: 200

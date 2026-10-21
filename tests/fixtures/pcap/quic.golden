@@ -1,0 +1,9 @@
+#1 QUIC 192.0.2.10:50443 -> 198.51.100.20:443 len=1242 expert=Chat
+  info: 192.0.2.10:50443 → 198.51.100.20:443 example.com
+  stream: 0
+  app: Quic { sni: Some("example.com"), ech: false, ja4: Some("q13d0211an_62ed6f6ca7ad_4d634acda6c0") }
+  | Frame: 1242 bytes on wire
+  | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
+  | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: UDP (17), Len: 1228
+  | UDP: 50443 (—) → 443 (HTTPS), Len: 1208
+  | QUIC: example.com

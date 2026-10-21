@@ -2,3 +2,7 @@
 # and compared against the catalogue by a test. Checked out with CRLF, a
 # Windows regeneration rewrites every line and the diff says nothing.
 docs/diagnostic-coverage.md text eol=lf
+
+# Replayed byte for byte by tests/pcap_golden.rs, and compared as text.
+tests/fixtures/pcap/*.pcap binary
+tests/fixtures/pcap/*.golden text eol=lf
