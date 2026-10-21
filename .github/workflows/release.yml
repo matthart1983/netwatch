@@ -468,9 +468,11 @@ jobs:
         with:
           tool: cargo-cyclonedx
       - name: Generate the SBOM
+        id: sbom
         run: |
           cargo cyclonedx --format json --spec-version 1.5 --all-features --override-filename netwatch.cdx
           mv netwatch.cdx.json "netwatch-${RELEASE_TAG#v}.cdx.json"
+          echo "path=netwatch-${RELEASE_TAG#v}.cdx.json" >> "$GITHUB_OUTPUT"
       - name: Attest the SBOM
         uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2.4.0
         with:
@@ -479,7 +481,8 @@ jobs:
             *.zip
             *.deb
             *.rpm
-          sbom-path: netwatch-*.cdx.json
+          # A literal path: attest-sbom reads it with open(), no globbing.
+          sbom-path: ${{ steps.sbom.outputs.path }}
 
       - name: Create Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
