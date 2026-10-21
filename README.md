@@ -32,7 +32,8 @@ One binary, no config. `sudo netwatch` and you have live capture with L7 decode,
 ```bash
 brew install netwatch                 # macOS / Linux
 scoop install netwatch                # Windows (needs Npcap)
-cargo install netwatch-tui           # prebuilt binary, anywhere with Rust
+cargo binstall netwatch-tui           # prebuilt binary (needs cargo-binstall)
+cargo install netwatch-tui            # build from source, anywhere with Rust
 paru -S netwatch-tui                  # Arch (AUR)
 nix-shell -p netwatch                 # NixOS / Nix
 conda install -c conda-forge netwatch # conda / mamba (Linux, macOS)
