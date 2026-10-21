@@ -50,11 +50,13 @@ jobs:
             fetch -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-freebsd/rustup-init
             chmod +x /tmp/rustup-init
             /tmp/rustup-init -y --profile minimal
+            . "$HOME/.cargo/env"
+            cargo install --locked cargo-auditable@0.7.7
           run: |
             set -ex
             . "$HOME/.cargo/env"
             freebsd-version
-            cargo build --release
+            cargo auditable build --release
             ./target/release/netwatch --version
             # Record what the binary needs from the host. Anything under
             # /usr/local would mean a ports dependency leaked in.

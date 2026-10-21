@@ -129,6 +129,14 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: matrix.target != 'armv5te-unknown-linux-gnueabi'
+      # `cargo auditable` embeds the resolved dependency list in the binary
+      # (a `.dep-v0` section), so `cargo audit bin`, Trivy and Syft can
+      # check an installed netwatch without the SBOM beside it.
+      - name: Install cargo-auditable
+        if: matrix.target != 'armv5te-unknown-linux-gnueabi'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-auditable@0.7.7
 
       - name: Install zig + cargo-zigbuild (Linux musl)
         if: contains(matrix.target, 'linux-musl')
@@ -204,6 +212,7 @@ jobs:
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --default-toolchain stable --profile minimal -t armv5te-unknown-linux-gnueabi
             . "$HOME/.cargo/env"
+            cargo install --locked cargo-auditable@0.7.7
 
             LIBPCAP_VERSION=1.10.5
             cd /tmp
@@ -241,7 +250,7 @@ jobs:
             # x86_64 host, so pin it like the musl builds do.
             export LIBPCAP_VER=${LIBPCAP_VERSION}
             cd /work
-            cargo build --release --target armv5te-unknown-linux-gnueabi
+            cargo auditable build --release --target armv5te-unknown-linux-gnueabi
           '
 
       - name: Build
@@ -249,9 +258,9 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.target }}" == *"linux-musl" ]]; then
-            cargo zigbuild --release --target ${{ matrix.target }}
+            cargo auditable zigbuild --release --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo auditable build --release --target ${{ matrix.target }}
           fi
 
       - name: Package (Unix)
@@ -366,11 +375,13 @@ jobs:
             fetch -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-freebsd/rustup-init
             chmod +x /tmp/rustup-init
             /tmp/rustup-init -y --profile minimal
+            . "$HOME/.cargo/env"
+            cargo install --locked cargo-auditable@0.7.7
           run: |
             set -ex
             . "$HOME/.cargo/env"
             freebsd-version
-            cargo build --release
+            cargo auditable build --release
             ./target/release/netwatch --version
             # Record what the binary needs from the host. Anything under
             # /usr/local would mean a ports dependency leaked in.
@@ -401,6 +412,29 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
+
+      # Every shipped binary must carry the dependency list `cargo auditable`
+      # embeds. A build step that lost the wrapper still links fine, so
+      # check the artifacts rather than trust the build.
+      - name: Install rust-audit-info
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: rust-audit-info@0.5.4
+      - name: Check every binary is auditable
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dir=$(mktemp -d)
+          n=0
+          for a in *.tar.gz; do tar xzf "$a" -C "$dir"; done
+          for a in *.zip; do unzip -q -o "$a" -d "$dir"; done
+          for bin in "$dir"/netwatch-*; do
+            pkgs=$(rust-audit-info "$bin" | jq '.packages | length')
+            echo "$(basename "$bin"): $pkgs packages"
+            [ "$pkgs" -gt 1 ]
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ]
 
       # One file, `sha256sum -c` format, so a downloader can verify without
       # trusting this page: `sha256sum --ignore-missing -c SHA256SUMS`.

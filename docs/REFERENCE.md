@@ -464,11 +464,16 @@ gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch \
 
 # The container image
 gh attestation verify oci://ghcr.io/matthart1983/netwatch:vX.Y.Z -R matthart1983/netwatch
+
+# Known advisories in an installed binary's dependencies (needs cargo-audit)
+cargo audit bin "$(command -v netwatch)"
 ```
 
 Checksums and attestations are produced from v0.32.1 onward; earlier releases
 have neither. The CycloneDX SBOM and the image attestation start with the
-release after 0.35.4.
+release after 0.35.4. Release binaries carry their dependency list (built
+with `cargo auditable`) from 0.37.0, so `cargo audit bin`, Trivy and Syft can
+check one without the SBOM. A `cargo install` build doesn't carry it.
 
 ## Shell completions and the man page
 
