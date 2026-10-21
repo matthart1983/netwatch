@@ -35,6 +35,10 @@ All notable changes to NetWatch will be documented in this file.
   check an installed binary. The release fails if any binary lacks it.
 
 ### Security
+- **rustls-webpki 0.103.15 → 0.103.16 and webpki-roots 1.0.9 → 1.0.10**,
+  for RUSTSEC-2026-0382 (certificate verification could accept distrusted
+  intermediates) and RUSTSEC-2026-0381 (bundled roots trusted the
+  distrusted emSign intermediates).
 - **rustls 0.23.40 → 0.23.46**, for RUSTSEC-2026-0285, -0346, -0348 and
   -0349 (handshake messages accepted across encryption levels, secrets in
   `Debug` output, a 1 GiB Brotli certificate allocation before
