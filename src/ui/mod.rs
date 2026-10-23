@@ -10,6 +10,7 @@ pub mod memory_stats;
 pub mod monochrome;
 pub mod packets;
 pub mod processes;
+pub mod quit_confirm;
 pub mod sanitize;
 pub mod settings;
 pub mod sort_picker;

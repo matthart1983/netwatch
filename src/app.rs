@@ -1569,6 +1569,9 @@ fn draw_frame(f: &mut Frame, app: &mut App) {
     if app.ui.show_memory_stats {
         ui::memory_stats::render(f, app, area);
     }
+    if app.ui.quit_pending {
+        ui::quit_confirm::render(f, app, area);
+    }
     if app.ui.sort_picker.is_open() {
         ui::sort_picker::render(
             f,
@@ -1964,7 +1967,14 @@ fn handle_lite_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
 
     let talkers = lite::filter_talkers(lite::collect_talkers(app), &app.ui.lite.filter_text);
     let count = talkers.len();
-    let visible = lite::Layout::new(app.ui.last_area).visible_talkers(app.ui.lite.detail_open);
+    // Below the grid, render shows "too small" instead of a layout, and
+    // `Layout::new` underflows, so there are no visible rows to page through.
+    let area = app.ui.last_area;
+    let visible = if area.width < lite::GRID_W || area.height < lite::GRID_H {
+        0
+    } else {
+        lite::Layout::new(area).visible_talkers(app.ui.lite.detail_open)
+    };
 
     match key.code {
         KeyCode::Char('q') => return true,
@@ -2500,7 +2510,38 @@ fn scroll_tab(app: &mut App, delta: isize) {
 // of four mode-specific handlers depending on which overlay is active.
 // Returns `true` if the application should exit.
 
+/// Routes the key, then decides whether a quit stands. With `confirm_quit`
+/// on, `q` raises a prompt and the next key answers it; Ctrl+C always quits
+/// at once, since a user reaching for it means it.
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    if app.ui.quit_pending {
+        app.ui.quit_pending = false;
+        return confirms_quit(key.code);
+    }
+    if !route_key(app, key) {
+        return false;
+    }
+    if is_ctrl_c(key) || !app.user_config.confirm_quit {
+        return true;
+    }
+    app.ui.quit_pending = true;
+    false
+}
+
+fn is_ctrl_c(key: crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Whether a key answers "yes" to the quit prompt. `q` counts, so quitting
+/// on purpose is `q q`; anything else cancels.
+fn confirms_quit(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') | KeyCode::Enter
+    )
+}
+
+fn route_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     // Overlays intercept first
     if app.ui.show_help {
         return handle_help_key(app, key);
@@ -2522,10 +2563,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         return handle_dense_key(app, key);
     }
     if app.ui.show_memory_stats {
-        // Tiny dedicated handler — Esc / M close, q / Ctrl-C still quit.
+        // Tiny dedicated handler — Esc / M / q close, Ctrl-C quits.
         match key.code {
-            KeyCode::Esc | KeyCode::Char('M') => app.ui.show_memory_stats = false,
-            KeyCode::Char('q') => return true,
+            KeyCode::Esc | KeyCode::Char('M') | KeyCode::Char('q') => {
+                app.ui.show_memory_stats = false
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             _ => {}
         }
@@ -2611,7 +2653,9 @@ fn confirms_removal(code: KeyCode) -> bool {
 
 fn handle_help_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     match key.code {
-        KeyCode::Char('?') | KeyCode::Esc => {
+        // `q` closes, like Esc: pressed on an overlay it means "close this"
+        // far more often than "quit netwatch" (#94).
+        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
             app.ui.show_help = false;
             app.ui.scroll.help_scroll = 0;
         }
@@ -2621,7 +2665,7 @@ fn handle_help_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Down | KeyCode::Char('j') => {
             app.ui.scroll.help_scroll += 1;
         }
-        KeyCode::Char('q') => return true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         _ => {}
     }
     false
@@ -2678,10 +2722,10 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
     } else {
         match key.code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 app.ui.show_settings = false;
             }
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Up | KeyCode::Char('k') => {
                 app.ui.settings_cursor = app.ui.settings_cursor.saturating_sub(1);
             }
@@ -2808,6 +2852,24 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.ui.settings_status = Some(format!(
                     "Groups start folded: {}",
                     if app.user_config.groups_start_collapsed {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ));
+                app.ui.settings_status_tick = 0;
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Char(' ')
+                if app.ui.settings_cursor == ui::settings::cursor::CONFIRM_QUIT =>
+            {
+                app.user_config.confirm_quit = !app.user_config.confirm_quit;
+                app.ui.settings_status = Some(format!(
+                    "Confirm quit: {}",
+                    if app.user_config.confirm_quit {
                         "on"
                     } else {
                         "off"
@@ -3876,6 +3938,119 @@ mod key_conflict_tests {
         for tab in [Tab::Connections, Tab::Packets, Tab::Topology, Tab::Egress] {
             assert!(t_cycles_theme(tab), "{tab:?} has no t of its own");
         }
+    }
+}
+
+#[cfg(test)]
+mod quit_key_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn app(confirm_quit: bool) -> App {
+        App::prepare_with_config(NetwatchConfig {
+            confirm_quit,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn q_quits_at_once_by_default() {
+        let mut app = app(false);
+        assert!(handle_key(&mut app, key(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn with_confirm_quit_q_asks_and_the_next_key_answers() {
+        for view in [ViewMode::Full, ViewMode::Dense, ViewMode::Lite] {
+            for yes in [KeyCode::Char('q'), KeyCode::Char('y'), KeyCode::Enter] {
+                let mut app = app(true);
+                app.ui.view_mode = view;
+                assert!(!handle_key(&mut app, key(KeyCode::Char('q'))), "{view:?}");
+                assert!(app.ui.quit_pending);
+                assert!(handle_key(&mut app, key(yes)), "{view:?} {yes:?}");
+            }
+            for no in [KeyCode::Esc, KeyCode::Char('n'), KeyCode::Char('?')] {
+                let mut app = app(true);
+                app.ui.view_mode = view;
+                handle_key(&mut app, key(KeyCode::Char('q')));
+                assert!(!handle_key(&mut app, key(no)), "{view:?} {no:?}");
+                assert!(!app.ui.quit_pending);
+                // The cancelling key is swallowed, not acted on.
+                assert!(!app.ui.show_help, "{view:?} {no:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_with_confirm_quit() {
+        let mut app = app(true);
+        let ctrl_c = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut app, ctrl_c));
+        app.ui.show_settings = true;
+        assert!(handle_key(&mut app, ctrl_c));
+    }
+
+    /// #94: `q` pressed to dismiss an overlay closed netwatch instead.
+    #[test]
+    fn q_closes_an_overlay_instead_of_quitting() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.show_help = true;
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert!(!app.ui.show_help);
+        app.ui.show_settings = true;
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert!(!app.ui.show_settings);
+        app.ui.show_memory_stats = true;
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert!(!app.ui.show_memory_stats);
+        assert!(handle_key(&mut app, key(KeyCode::Char('q'))));
+    }
+
+    /// Lite's key handler sized its layout from the last frame without the
+    /// minimum-size check render has, so any key in a terminal under ~40
+    /// columns overflowed.
+    #[test]
+    fn lite_keys_survive_a_terminal_below_the_grid() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Lite;
+        for area in [Rect::new(0, 0, 0, 0), Rect::new(0, 0, 20, 10)] {
+            app.ui.last_area = area;
+            assert!(!handle_key(&mut app, key(KeyCode::Down)));
+        }
+    }
+
+    #[test]
+    fn the_prompt_draws_over_every_view() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for view in [ViewMode::Full, ViewMode::Dense, ViewMode::Lite] {
+            let mut app = app(true);
+            app.ui.view_mode = view;
+            handle_key(&mut app, key(KeyCode::Char('q')));
+            let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+            terminal.draw(|f| draw_frame(f, &mut app)).unwrap();
+            let buf = terminal.backend().buffer();
+            let text: String = (0..buf.area.height)
+                .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+                .map(|(x, y)| buf.get(x, y).symbol().to_string())
+                .collect();
+            assert!(text.contains("Quit netwatch?"), "{view:?}");
+            assert!(text.contains("any other key"), "{view:?}");
+        }
+    }
+
+    #[test]
+    fn the_settings_row_toggles_confirm_quit() {
+        let mut app = app(false);
+        app.ui.show_settings = true;
+        app.ui.settings_cursor = ui::settings::cursor::CONFIRM_QUIT;
+        handle_key(&mut app, key(KeyCode::Right));
+        assert!(app.user_config.confirm_quit);
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(!app.user_config.confirm_quit);
     }
 }
 

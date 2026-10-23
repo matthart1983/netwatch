@@ -2,6 +2,24 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`confirm_quit`** (Settings → Confirm Quit, off by default): `q` asks
+  "Quit netwatch?" first, and `y`, `q` or `Enter` confirms. `Ctrl+C` still
+  quits at once (#94).
+
+### Changed
+- **`q` closes the help, settings and memory overlays** instead of quitting
+  netwatch, as `Esc` does. Pressed on an overlay, it nearly always meant
+  "close this" (#94). `Ctrl+C` still quits from anywhere.
+
+### Fixed
+- **Lite view: keys no longer overflow in a terminal smaller than its
+  grid.** The key handler sized its layout from the last frame without the
+  80×24 check the renderer makes, so in a terminal under about 40 columns
+  every key overflowed.
+
 ## [0.37.0] - 2026-10-22
 
 ### Dependencies

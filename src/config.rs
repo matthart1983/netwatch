@@ -126,6 +126,10 @@ pub struct NetwatchConfig {
     #[serde(default = "default_groups_collapsed")]
     pub groups_start_collapsed: bool,
 
+    /// Ask before `q` quits. Off by default. Ctrl+C always quits at once.
+    #[serde(default)]
+    pub confirm_quit: bool,
+
     /// Record Diagnose episodes: the ten minutes before an issue opens through
     /// ten minutes after it closes, plus one quiet 15-minute sample a day.
     /// Stored locally under `~/.local/state/netwatch/episodes`, kept 90 days
@@ -242,6 +246,7 @@ impl Default for NetwatchConfig {
             tls_keylog_path: String::new(),
             egress_violation_cooldown_secs: default_egress_cooldown(),
             groups_start_collapsed: default_groups_collapsed(),
+            confirm_quit: false,
         }
     }
 }
@@ -371,6 +376,7 @@ mod tests {
         assert_eq!(cfg.refresh_rate_ms, 1000);
         assert!(cfg.show_geo);
         assert!(cfg.packet_follow);
+        assert!(!cfg.confirm_quit);
         assert_eq!(cfg.timeline_window, "5m");
         assert_eq!(cfg.alerts.bandwidth_threshold, 100_000_000);
     }
@@ -387,6 +393,7 @@ show_geo = false
         // un-specified fields get defaults
         assert_eq!(cfg.refresh_rate_ms, 1000);
         assert!(cfg.packet_follow);
+        assert!(!cfg.confirm_quit);
         assert_eq!(cfg.alerts.port_scan_threshold, 20);
     }
 
@@ -419,6 +426,7 @@ show_geo = false
             tls_keylog_path: "/tmp/sslkeylog.txt".into(),
             egress_violation_cooldown_secs: 120,
             groups_start_collapsed: false,
+            confirm_quit: true,
             diagnose_record_episodes: false,
             diagnose_probes: Default::default(),
             diagnose_targets: vec![],
@@ -432,6 +440,7 @@ show_geo = false
         assert!(!deserialized.show_geo);
         assert_eq!(deserialized.timeline_window, "15m");
         assert!(!deserialized.packet_follow);
+        assert!(deserialized.confirm_quit);
         assert_eq!(deserialized.bpf_filter, "tcp port 443");
         assert_eq!(deserialized.alerts.bandwidth_threshold, 50_000_000);
         assert_eq!(deserialized.alerts.port_scan_threshold, 10);

@@ -328,7 +328,8 @@ TUI flags:
 | `L` | Switch to the Lite view |
 | `,` | Settings |
 | `?` | Help |
-| `q` | Quit |
+| `q` | Quit (asks first with `confirm_quit = true`). On an overlay, `q` closes it |
+| `Ctrl+C` | Quit at once |
 
 <details>
 <summary><strong>Full keybinding reference (per tab)</strong></summary>
@@ -415,7 +416,7 @@ TUI flags:
 | `Enter` | Edit selected setting |
 | `←` `→` | Cycle the selected setting (theme, view, graph style, sandbox…) |
 | `S` | Save config |
-| `Esc` | Close |
+| `Esc` / `q` | Close |
 
 </details>
 
@@ -609,6 +610,7 @@ to start.
 | `graph_style` | `"dots"` | `dots` `bars` | Chart rendering for every sparkline in the app. `dots` is the braille area plot: two samples per cell column and four times the vertical resolution, so a sparkline carries twice the history in the same width. `bars` is solid blocks, for terminals whose font has no braille coverage — there the area plot renders as empty boxes. |
 | `graph_fade` | `true` | `true` `false` | The magnitude gradient: every cell is coloured by how high it sits — dim at the baseline, the series colour in the middle, lightened at the peak. It is what makes a filled area read as depth rather than as a block. Under the `terminal` theme it steps from each series colour to its bright palette variant instead of blending, so no colour is invented. |
 | `groups_start_collapsed` | `true` | `true` `false` | Whether the grouped tables (Connections, Egress) open folded. Folded answers "what is on this machine" in one glance; `false` is closer to the old flat tables. |
+| `confirm_quit` | `false` | `true` `false` | Ask "Quit netwatch?" before `q` quits; `y`, `q` or `Enter` confirms, any other key stays. `Ctrl+C` always quits at once. |
 
 **The plain look**, if braille or colour interpolation is a problem in your terminal:
 

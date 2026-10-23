@@ -223,6 +223,8 @@ pub struct AppUiState {
     // ── Modal / overlay flags ──
     pub show_help: bool,
     pub show_memory_stats: bool,
+    /// `q` was pressed with `confirm_quit` on; the next key answers it.
+    pub quit_pending: bool,
     pub show_geo: bool,
     pub show_settings: bool,
     pub traceroute_view_open: bool,
@@ -298,6 +300,7 @@ impl AppUiState {
 
             show_help: false,
             show_memory_stats: false,
+            quit_pending: false,
             show_geo: cfg.show_geo,
             show_settings: false,
             traceroute_view_open: false,

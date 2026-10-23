@@ -48,6 +48,7 @@ pub mod cursor {
     pub const GRAPH_FADE: usize = 17;
     pub const SANDBOX: usize = 18;
     pub const GROUPS_COLLAPSED: usize = 19;
+    pub const CONFIRM_QUIT: usize = 20;
 }
 
 /// One row of the settings overlay.
@@ -345,6 +346,17 @@ const ROWS: &[Setting] = &[
         },
         cycles: true,
     },
+    Setting {
+        at: cursor::CONFIRM_QUIT,
+        label: "Confirm Quit",
+        raw: |c| on_off(c.confirm_quit),
+        show: None,
+        apply: |c, v| {
+            c.confirm_quit = parse_on_off(v).ok_or("Use on / off")?;
+            Ok(())
+        },
+        cycles: true,
+    },
 ];
 
 // The key handler names rows by `cursor::*` while the overlay draws them by
@@ -626,6 +638,7 @@ pub(crate) mod fixture {
             graph_fade: false,
             sandbox: "strict".into(),
             groups_start_collapsed: false,
+            confirm_quit: true,
             ..Default::default()
         }
     }
@@ -654,6 +667,7 @@ pub(crate) mod fixture {
         (cursor::GRAPH_FADE, "off"),
         (cursor::SANDBOX, "strict"),
         (cursor::GROUPS_COLLAPSED, "off"),
+        (cursor::CONFIRM_QUIT, "on"),
     ];
 }
 
@@ -703,6 +717,7 @@ mod tests {
             cursor::AI_INSIGHTS => c.insights_enabled = true,
             cursor::GRAPH_FADE => c.graph_fade = true,
             cursor::GROUPS_COLLAPSED => c.groups_start_collapsed = true,
+            cursor::CONFIRM_QUIT => c.confirm_quit = true,
             _ => panic!("no flag to turn on for {}", ROWS[at].label),
         };
         let flags: Vec<usize> = fixture::EDIT_VALUES
@@ -909,7 +924,7 @@ mod tests {
         assert_eq!(cfg.graph_style, "dots");
         assert!(apply_edit(&mut cfg, cursor::SANDBOX, "strict").is_ok());
         assert_eq!(cfg.sandbox, "strict");
-        assert_eq!(SETTINGS_COUNT, cursor::GROUPS_COLLAPSED + 1);
+        assert_eq!(SETTINGS_COUNT, cursor::CONFIRM_QUIT + 1);
     }
 
     #[test]
