@@ -222,7 +222,23 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.text_primary),
             )),
             Line::from(Span::styled(
-                format!(" up  {}", rtt_str),
+                // "up" was printed unconditionally, beside a connection box
+                // that could say the gateway was not answering.
+                format!(
+                    " {}  {}",
+                    if matches!(
+                        app.uptime.connection(),
+                        crate::uptime::Connection::Down {
+                            hop: crate::uptime::Hop::Gateway,
+                            ..
+                        }
+                    ) {
+                        "down"
+                    } else {
+                        "up"
+                    },
+                    rtt_str
+                ),
                 Style::default().fg(t.text_muted),
             )),
         ]),
@@ -276,6 +292,13 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
         isp_inner,
     );
     drop(traceroute);
+
+    render_connection_uptime(
+        f,
+        app,
+        Rect::new(router_x, isp_y + isp_h + 1, center_w, 4),
+        inner,
+    );
 
     // Spine connector: ROUTER → ISP. The locals-trunk (left column → ROUTER)
     // and publics-trunk (ISP → right column) are drawn below.
@@ -543,6 +566,77 @@ fn render_side_column(
 
 // ── Hop detail table ────────────────────────────────────────
 
+/// How long the connection has been up, under the router → ISP spine: the
+/// live state of the uptime monitor (`netwatch uptime` has the history).
+/// Falls back to one line when the graph has no room for the box.
+fn render_connection_uptime(f: &mut Frame, app: &App, rect: Rect, inner: Rect) {
+    use crate::uptime::{duration, Connection};
+    let t = &app.theme;
+    let now = chrono::Local::now();
+    let ago = |since: u64| duration((now.timestamp().max(0) as u64).saturating_sub(since));
+    let clock = |at: u64| {
+        let at = chrono::DateTime::from_timestamp(at as i64, 0)
+            .unwrap_or_default()
+            .with_timezone(&chrono::Local);
+        // The box is 34 columns; a date with a time does not fit beside
+        // the outage.
+        if at.date_naive() == now.date_naive() {
+            at.format("%H:%M").to_string()
+        } else {
+            at.format("%b %-d").to_string()
+        }
+    };
+    let (dot, headline, detail) = match app.uptime.connection() {
+        Connection::Up { since, last_outage } => (
+            t.status_good,
+            format!("up {}", ago(since)),
+            match last_outage {
+                Some(o) => format!(
+                    "since {} ({}, {})",
+                    clock(o.end),
+                    o.hop.name(),
+                    duration(o.end.saturating_sub(o.start))
+                ),
+                None => "since netwatch started".to_string(),
+            },
+        ),
+        Connection::Down { since, hop } => (
+            t.status_error,
+            format!("down {}", ago(since)),
+            format!("{} not answering", hop.name()),
+        ),
+        Connection::Unknown => (
+            t.text_muted,
+            "checking".to_string(),
+            "waiting for the internet probe".to_string(),
+        ),
+    };
+    let headline = Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(dot)),
+        Span::styled(headline, Style::default().fg(t.text_primary).bold()),
+    ]);
+    let detail = Span::styled(format!(" {detail}"), Style::default().fg(t.text_muted));
+    let bottom = inner.y + inner.height;
+    if rect.y + rect.height <= bottom {
+        let block = widgets::panel_block(t)
+            .title(Line::from(Span::styled(
+                " connection ",
+                Style::default().fg(t.brand).bold(),
+            )))
+            .border_type(BorderType::Rounded);
+        let body = block.inner(rect);
+        f.render_widget(block, rect);
+        f.render_widget(Paragraph::new(vec![headline, Line::from(detail)]), body);
+    } else if rect.y < bottom {
+        let mut spans = headline.spans;
+        spans.push(detail);
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(rect.x, rect.y, rect.width, 1),
+        );
+    }
+}
+
 fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let result =
@@ -782,4 +876,88 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::App;
+    use crate::config::NetwatchConfig;
+    use crate::uptime::{Connection, Hop, LastOutage, Monitor};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen(conn: Connection, w: u16, h: u16) -> String {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.uptime = Monitor::showing(conn);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| super::render(f, &app, f.size())).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn secs_ago(s: u64) -> u64 {
+        chrono::Local::now().timestamp() as u64 - s
+    }
+
+    #[test]
+    fn topology_says_how_long_the_connection_has_been_up() {
+        let up = Connection::Up {
+            since: secs_ago(3 * 3600 + 12 * 60),
+            last_outage: None,
+        };
+        let s = screen(up, 140, 46);
+        if let Ok(dir) = std::env::var("NETWATCH_DUMP") {
+            std::fs::write(format!("{dir}/topology-up.txt"), &s).unwrap();
+        }
+        assert!(s.contains("connection"), "{s}");
+        assert!(s.contains("up 3h 12m"), "{s}");
+        assert!(s.contains("since netwatch started"), "{s}");
+
+        let after = Connection::Up {
+            since: secs_ago(600),
+            last_outage: Some(LastOutage {
+                start: secs_ago(780),
+                end: secs_ago(600),
+                hop: Hop::Internet,
+            }),
+        };
+        let s = screen(after, 140, 46);
+        assert!(s.contains("up 10m 00s"), "{s}");
+        assert!(s.contains("(internet, 3m 00s)"), "{s}");
+    }
+
+    #[test]
+    fn topology_says_which_hop_is_down() {
+        let down = Connection::Down {
+            since: secs_ago(45),
+            hop: Hop::Gateway,
+        };
+        let s = screen(down, 140, 46);
+        if let Ok(dir) = std::env::var("NETWATCH_DUMP") {
+            std::fs::write(format!("{dir}/topology-down.txt"), &s).unwrap();
+        }
+        assert!(s.contains("down 45s"), "{s}");
+        assert!(s.contains("gateway not answering"), "{s}");
+        assert!(s.contains("│ down  —"), "router box: {s}");
+    }
+
+    #[test]
+    fn a_short_terminal_gets_one_line() {
+        let up = Connection::Up {
+            since: secs_ago(60),
+            last_outage: None,
+        };
+        // At the graph's minimum height there is no room for the box.
+        let s = screen(up, 140, 26);
+        if let Ok(dir) = std::env::var("NETWATCH_DUMP") {
+            std::fs::write(format!("{dir}/topology-short.txt"), &s).unwrap();
+        }
+        assert!(s.contains("up 1m 00s"), "{s}");
+    }
 }

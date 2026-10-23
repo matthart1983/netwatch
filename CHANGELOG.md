@@ -14,6 +14,11 @@ All notable changes to NetWatch will be documented in this file.
   only). `record_uptime = false` turns it off. A hop is down after three
   probe cycles in a row with no reply, and time when netwatch was not
   running is "not monitored", never up (#76).
+- **Topology shows how long the connection has been up**: a connection
+  box under the router and ISP reads "up 3h 12m since netwatch started",
+  or "since 14:02 (internet, 3m 00s)" after an outage, and "down 45s,
+  gateway not answering" during one. The router box says "down" when the
+  gateway is the hop that failed, rather than "up" regardless.
 - **`confirm_quit`** (Settings → Confirm Quit, off by default): `q` asks
   "Quit netwatch?" first, and `y`, `q` or `Enter` confirms. `Ctrl+C` still
   quits at once (#94).

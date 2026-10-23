@@ -100,7 +100,7 @@ netwatch --demo                          # replay a recorded Diagnose incident, 
 | 3 | Interfaces | Addresses, MTU, rates, errors, drops |
 | 4 | Packets | Live decode, TLS 1.3 decryption, JA4, stream tracking, display filters, PCAP export |
 | 5 | Stats | Protocol breakdown and handshake-timing histogram |
-| 6 | Topology | Machine, gateway, DNS, top hosts, traceroute |
+| 6 | Topology | Machine, gateway, DNS, top hosts, traceroute, how long the connection has been up |
 | 7 | Timeline | Connections by TCP state, with alerts |
 | 8 | Processes | Bandwidth per process |
 | 9 | Diagnose | Issue, cause, fix, verified close. `report.md` from the same objects |

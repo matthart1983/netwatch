@@ -226,11 +226,92 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Watches the health prober from the app tick and writes the log. Owned by
-/// the app; the TUI and the daemon both tick it.
+/// The connection as of now, for the Topology view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Connection {
+    /// No verdict yet, or the internet probe cannot be sent.
+    Unknown,
+    /// Up since `since`; `last_outage` is the one before, if this session
+    /// saw one.
+    Up {
+        since: u64,
+        last_outage: Option<LastOutage>,
+    },
+    Down {
+        since: u64,
+        hop: Hop,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LastOutage {
+    pub start: u64,
+    pub end: u64,
+    pub hop: Hop,
+}
+
+/// Folds hop records into [`Connection`], with the same rules as
+/// [`report`]: down while any hop is down, blamed on the nearest, up while
+/// the internet hop answers.
+struct Live {
+    states: BTreeMap<Hop, HopState>,
+    conn: Connection,
+    last_outage: Option<LastOutage>,
+}
+
+impl Live {
+    fn new() -> Self {
+        Self {
+            states: BTreeMap::new(),
+            conn: Connection::Unknown,
+            last_outage: None,
+        }
+    }
+
+    fn apply(&mut self, record: &Record) {
+        let Record::Hop { t, hop, state } = *record else {
+            return;
+        };
+        self.states.insert(hop, state);
+        let (now, down_hop) = overall(&self.states);
+        if let Connection::Down { since, hop } = self.conn {
+            match now {
+                Overall::Down => {
+                    let hop = hop.min(down_hop.unwrap_or(hop));
+                    self.conn = Connection::Down { since, hop };
+                    return;
+                }
+                _ => {
+                    self.last_outage = Some(LastOutage {
+                        start: since,
+                        end: t,
+                        hop,
+                    })
+                }
+            }
+        }
+        self.conn = match (now, self.conn) {
+            (Overall::Down, _) => Connection::Down {
+                since: t,
+                hop: down_hop.unwrap_or(Hop::Internet),
+            },
+            (Overall::Up, up @ Connection::Up { .. }) => up,
+            (Overall::Up, _) => Connection::Up {
+                since: t,
+                last_outage: self.last_outage,
+            },
+            (Overall::Unknown, _) => Connection::Unknown,
+        };
+    }
+}
+
+/// Watches the health prober from the app tick, keeps the live
+/// [`Connection`], and writes the log when it has one. Owned by the app;
+/// the TUI and the daemon both tick it.
 pub struct Monitor {
     log: Option<Log>,
     tracker: Tracker,
+    live: Live,
     seen: [Option<std::time::Instant>; 3],
     last_beat: Option<u64>,
 }
@@ -241,6 +322,7 @@ impl Monitor {
         Self {
             log: dir.map(Log::new),
             tracker: Tracker::default(),
+            live: Live::new(),
             seen: [None; 3],
             last_beat: None,
         }
@@ -250,13 +332,26 @@ impl Monitor {
         self.log.is_some()
     }
 
+    pub fn connection(&self) -> Connection {
+        self.live.conn
+    }
+
+    /// A monitor showing `conn`, for rendering tests.
+    #[cfg(test)]
+    pub(crate) fn showing(conn: Connection) -> Self {
+        let mut m = Self::new(None);
+        m.live.conn = conn;
+        m
+    }
+
     /// Call every tick. `gateway` and `dns` are whether the probe cycle had a
-    /// default gateway and a resolver to probe.
+    /// default gateway and a resolver to probe. Tracks the connection even
+    /// with no log, so the Topology view works with `record_uptime` off.
     pub fn observe(&mut self, status: &HealthStatus, gateway: bool, dns: bool) {
-        if self.log.is_none() {
-            return;
-        }
-        let t = now_unix();
+        self.observe_at(status, gateway, dns, now_unix());
+    }
+
+    fn observe_at(&mut self, status: &HealthStatus, gateway: bool, dns: bool, t: u64) {
         let mut out = Vec::new();
         if self.last_beat.is_none() {
             if let Some(log) = &self.log {
@@ -285,6 +380,7 @@ impl Monitor {
             };
             self.seen[hop as usize] = completed;
             if let Some(record) = sample.and_then(|s| self.tracker.sample(hop, s, t)) {
+                self.live.apply(&record);
                 out.push(record);
             }
         }
@@ -975,6 +1071,80 @@ mod tests {
         assert!(!dir.join("2026-07-25.jsonl").exists());
         assert!(dir.join("2026-07-26.jsonl").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn live(records: &[Record]) -> Connection {
+        let mut l = Live::new();
+        for r in records {
+            l.apply(r);
+        }
+        l.conn
+    }
+
+    #[test]
+    fn the_live_connection_follows_the_report_rules() {
+        assert_eq!(live(&[]), Connection::Unknown);
+        let up = hop(10, Hop::Internet, HopState::Up);
+        assert_eq!(
+            live(std::slice::from_ref(&up)),
+            Connection::Up {
+                since: 10,
+                last_outage: None
+            }
+        );
+        // Gateway and internet both fail; the gateway takes the blame, and
+        // the outage keeps its start.
+        let down = [
+            up.clone(),
+            hop(50, Hop::Internet, HopState::Down),
+            hop(52, Hop::Gateway, HopState::Down),
+        ];
+        assert_eq!(
+            live(&down),
+            Connection::Down {
+                since: 50,
+                hop: Hop::Gateway
+            }
+        );
+        let mut back = down.to_vec();
+        back.push(hop(90, Hop::Gateway, HopState::Up));
+        assert!(matches!(live(&back), Connection::Down { since: 50, .. }));
+        back.push(hop(95, Hop::Internet, HopState::Up));
+        assert_eq!(
+            live(&back),
+            Connection::Up {
+                since: 95,
+                last_outage: Some(LastOutage {
+                    start: 50,
+                    end: 95,
+                    hop: Hop::Gateway
+                })
+            }
+        );
+        // A DNS state change while up does not restart the clock.
+        back.push(hop(200, Hop::Dns, HopState::Up));
+        assert!(matches!(live(&back), Connection::Up { since: 95, .. }));
+    }
+
+    #[test]
+    fn the_monitor_tracks_the_connection_without_a_log() {
+        let mut m = Monitor::new(None);
+        let mut status = (*crate::collectors::health::HealthProber::new().status()).clone();
+        let t0 = std::time::Instant::now();
+        for (i, loss) in [0.0, 100.0, 100.0, 100.0, 0.0].into_iter().enumerate() {
+            let at = t0 + std::time::Duration::from_secs(i as u64 * 5);
+            status.completed.internet = Some(at);
+            status.completed.gateway = Some(at);
+            status.internet_loss = Loss::Measured(loss);
+            status.gateway_loss = Loss::Measured(0.0);
+            m.observe_at(&status, true, false, 1000 + i as u64 * 5);
+            if i == 3 {
+                // No resolver configured counts as DNS failing, so DNS has
+                // been down since the first cycle and takes the blame.
+                assert!(matches!(m.connection(), Connection::Down { .. }));
+            }
+        }
+        assert!(!m.is_recording());
     }
 
     #[test]

@@ -306,6 +306,11 @@ TUI flags:
 
 ### Uptime report
 
+The Topology tab's *connection* box shows the live state: how long the connection has been up
+(since netwatch started, or since the last outage it saw, with the hop and how long it lasted),
+or how long it has been down and which hop is not answering. It follows the rules below and
+works with `record_uptime = false`.
+
 `netwatch uptime` answers "how often did my connection drop this week, and for how long?" from a
 log the TUI and `netwatch daemon` keep while they run. For an always-on record, run the daemon
 (the [systemd unit](../packaging/systemd/netwatch.service) does).
