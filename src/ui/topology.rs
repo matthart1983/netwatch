@@ -293,12 +293,7 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
     );
     drop(traceroute);
 
-    render_connection_uptime(
-        f,
-        app,
-        Rect::new(router_x, isp_y + isp_h + 1, center_w, 4),
-        inner,
-    );
+    render_connection_uptime(f, app, router_x, router_y, center_w, inner);
 
     // Spine connector: ROUTER → ISP. The locals-trunk (left column → ROUTER)
     // and publics-trunk (ISP → right column) are drawn below.
@@ -566,10 +561,17 @@ fn render_side_column(
 
 // ── Hop detail table ────────────────────────────────────────
 
-/// How long the connection has been up, under the router → ISP spine: the
+/// How long the connection has been up, above the router → ISP spine: the
 /// live state of the uptime monitor (`netwatch uptime` has the history).
 /// Falls back to one line when the graph has no room for the box.
-fn render_connection_uptime(f: &mut Frame, app: &App, rect: Rect, inner: Rect) {
+fn render_connection_uptime(
+    f: &mut Frame,
+    app: &App,
+    x: u16,
+    spine_top: u16,
+    width: u16,
+    inner: Rect,
+) {
     use crate::uptime::{duration, Connection};
     let t = &app.theme;
     let now = chrono::Local::now();
@@ -616,8 +618,10 @@ fn render_connection_uptime(f: &mut Frame, app: &App, rect: Rect, inner: Rect) {
         Span::styled(headline, Style::default().fg(t.text_primary).bold()),
     ]);
     let detail = Span::styled(format!(" {detail}"), Style::default().fg(t.text_muted));
-    let bottom = inner.y + inner.height;
-    if rect.y + rect.height <= bottom {
+    // A row of space between the box and the router and ISP boxes.
+    let box_h = 4;
+    if spine_top >= inner.y + box_h + 1 {
+        let rect = Rect::new(x, spine_top - box_h - 1, width, box_h);
         let block = widgets::panel_block(t)
             .title(Line::from(Span::styled(
                 " connection ",
@@ -627,12 +631,12 @@ fn render_connection_uptime(f: &mut Frame, app: &App, rect: Rect, inner: Rect) {
         let body = block.inner(rect);
         f.render_widget(block, rect);
         f.render_widget(Paragraph::new(vec![headline, Line::from(detail)]), body);
-    } else if rect.y < bottom {
+    } else if spine_top > inner.y {
         let mut spans = headline.spans;
         spans.push(detail);
         f.render_widget(
             Paragraph::new(Line::from(spans)),
-            Rect::new(rect.x, rect.y, rect.width, 1),
+            Rect::new(x, spine_top - 1, width, 1),
         );
     }
 }
