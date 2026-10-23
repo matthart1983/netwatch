@@ -620,7 +620,7 @@ fn render_connection_uptime(
     let detail = Span::styled(format!(" {detail}"), Style::default().fg(t.text_muted));
     // A row of space between the box and the router and ISP boxes.
     let box_h = 4;
-    if spine_top > inner.y + box_h {
+    if spine_top >= inner.y + box_h + 1 {
         let rect = Rect::new(x, spine_top - box_h - 1, width, box_h);
         let block = widgets::panel_block(t)
             .title(Line::from(Span::styled(
