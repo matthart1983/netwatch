@@ -12,7 +12,7 @@ _netwatch() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local subcommands="daemon doctor diagnose resolver"
+    local subcommands="daemon doctor diagnose uptime resolver"
     local options="--remote --api-key --insecure-remote --view --lite --demo \
         --no-sandbox --sandbox-strict --metrics --metrics-addr --daemon \
         --headless --generate-config --help -h --version -V"
@@ -46,6 +46,10 @@ _netwatch() {
             else
                 COMPREPLY=( $(compgen -W "--json --seconds --test --out --schema --since --dry-run --target --budget --format --only --include-beta" -- "${cur}") )
             fi
+            return 0
+            ;;
+        uptime)
+            COMPREPLY=( $(compgen -W "--since --json --csv" -- "${cur}") )
             return 0
             ;;
         resolver)

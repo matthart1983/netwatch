@@ -85,6 +85,7 @@ netwatch doctor                          # what netwatch can see on this host, a
 netwatch diagnose run --budget 30s       # one bounded diagnosis; exit 0 clean, 1 issue, 2 no evidence
 netwatch diagnose run --format json      # the same, for scripts
 netwatch daemon --metrics                # headless; Prometheus /metrics on 127.0.0.1:9464
+netwatch uptime --since 7d               # outages this week: when, how long, and which hop failed
 netwatch --demo                          # replay a recorded Diagnose incident, no capture needed
 ```
 

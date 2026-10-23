@@ -5,6 +5,15 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`netwatch uptime`**: outage history for an ISP ticket. One row per
+  outage with start, end, duration and the hop that failed (gateway,
+  internet or DNS), then the outage count, total downtime, uptime and the
+  time nothing was monitored. `--since 7d`, `--json` and `--csv`. The TUI
+  and `netwatch daemon` keep the log it reads under
+  `~/.local/state/netwatch/uptime/` (about 80 KB a day, kept 90 days, owner
+  only). `record_uptime = false` turns it off. A hop is down after three
+  probe cycles in a row with no reply, and time when netwatch was not
+  running is "not monitored", never up (#76).
 - **`confirm_quit`** (Settings → Confirm Quit, off by default): `q` asks
   "Quit netwatch?" first, and `y`, `q` or `Enter` confirms. `Ctrl+C` still
   quits at once (#94).

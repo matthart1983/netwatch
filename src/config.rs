@@ -137,6 +137,13 @@ pub struct NetwatchConfig {
     #[serde(default = "default_record_episodes")]
     pub diagnose_record_episodes: bool,
 
+    /// Keep the uptime log `netwatch uptime` reports from: a heartbeat a
+    /// minute and a line when the gateway, internet or DNS hop goes down or
+    /// comes back. Stored locally under `~/.local/state/netwatch/uptime`,
+    /// kept 90 days, about 80 KB a day. Nothing is uploaded. Default true.
+    #[serde(default = "default_record_uptime")]
+    pub record_uptime: bool,
+
     /// Hosts Diagnose probes stage by stage (DNS, TCP, TLS, HTTP), e.g.
     ///
     /// ```toml
@@ -176,6 +183,10 @@ fn is_default_thresholds(t: &crate::diagnose::detectors::Thresholds) -> bool {
 }
 
 fn default_record_episodes() -> bool {
+    true
+}
+
+fn default_record_uptime() -> bool {
     true
 }
 
@@ -239,6 +250,7 @@ impl Default for NetwatchConfig {
             graph_style: default_graph_style(),
             graph_fade: default_graph_fade(),
             diagnose_record_episodes: default_record_episodes(),
+            record_uptime: default_record_uptime(),
             diagnose_probes: Default::default(),
             diagnose_targets: Vec::new(),
             diagnose_thresholds: Default::default(),
@@ -377,6 +389,7 @@ mod tests {
         assert!(cfg.show_geo);
         assert!(cfg.packet_follow);
         assert!(!cfg.confirm_quit);
+        assert!(cfg.record_uptime);
         assert_eq!(cfg.timeline_window, "5m");
         assert_eq!(cfg.alerts.bandwidth_threshold, 100_000_000);
     }
@@ -428,6 +441,7 @@ show_geo = false
             groups_start_collapsed: false,
             confirm_quit: true,
             diagnose_record_episodes: false,
+            record_uptime: false,
             diagnose_probes: Default::default(),
             diagnose_targets: vec![],
             diagnose_thresholds: Default::default(),
@@ -441,6 +455,7 @@ show_geo = false
         assert_eq!(deserialized.timeline_window, "15m");
         assert!(!deserialized.packet_follow);
         assert!(deserialized.confirm_quit);
+        assert!(!deserialized.record_uptime);
         assert_eq!(deserialized.bpf_filter, "tcp port 443");
         assert_eq!(deserialized.alerts.bandwidth_threshold, 50_000_000);
         assert_eq!(deserialized.alerts.port_scan_threshold, 10);

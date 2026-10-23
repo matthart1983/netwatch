@@ -52,6 +52,7 @@ pub mod sort;
 pub mod state;
 pub mod theme;
 pub mod ui;
+pub mod uptime;
 
 /// A simple hello world function that returns a greeting message.
 pub fn hello_world() -> String {

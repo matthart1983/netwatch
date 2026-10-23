@@ -45,6 +45,7 @@ _netwatch() {
                 'daemon:Headless agent, no TUI'
                 'doctor:Read-only setup report'
                 'diagnose:Diagnose runs, coverage, episodes and exports'
+                'uptime:Outage history from the uptime log'
                 'resolver:Inspect or change the DNS resolver'
             )
             _describe 'command' subcommands
@@ -73,6 +74,13 @@ _netwatch() {
                         '--only=[One corpus entry]:id:' \
                         '--include-beta[Count beta rules in the exit status]' \
                         '*:file:_files'
+                    ;;
+                uptime)
+                    _arguments \
+                        '--since=[Period, e.g. 7d, 24h, 90m]:period:' \
+                        '(--csv)--json[JSON output]' \
+                        '(--json)--csv[CSV output]' \
+                        '1:log directory:_files -/'
                     ;;
                 resolver)
                     _arguments \

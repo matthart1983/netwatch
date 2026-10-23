@@ -287,6 +287,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose replay [--json] FILE\|DIR...` | Replay episodes through the engine and report any divergence. |
 | `netwatch diagnose features [--out FILE] [--schema FILE] FILE\|DIR...` | Write the feature table of recorded episodes. |
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
+| `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
 | `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. |
 | `netwatch --version`, `--help` | |
@@ -302,6 +303,42 @@ TUI flags:
 | `--insecure-remote` | Allow an `http://` remote URL. |
 | `--api-key KEY` | Discouraged: the key shows in the process list. Use `NETWATCH_API_KEY`. |
 | `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
+
+### Uptime report
+
+`netwatch uptime` answers "how often did my connection drop this week, and for how long?" from a
+log the TUI and `netwatch daemon` keep while they run. For an always-on record, run the daemon
+(the [systemd unit](../packaging/systemd/netwatch.service) does).
+
+```
+$ netwatch uptime --since 7d
+Uptime 2026-10-17 09:00 → 2026-10-24 09:00
+
+START                END                  DURATION  FAILED
+2026-10-18 14:02:11  2026-10-18 14:05:40    3m 29s  internet
+2026-10-21 02:10:05  2026-10-21 02:10:50       45s  gateway
+
+gateway: your router or LAN · internet: your ISP or beyond · dns: name resolution only
+
+2 outages, 4m 14s down, 99.96% up over 6d 22h monitored; 2h 01m not monitored
+```
+
+- **Down** means three probe cycles in a row (about 15 s at the default refresh) with no reply,
+  timed from the first of them, until the first reply. No default gateway counts as the gateway
+  failing. Latency spikes are not outages.
+- **The hop** is the nearest one that failed: the gateway (your router or LAN), the internet
+  probe (your ISP or beyond) or DNS alone.
+- **Not monitored** is time when no netwatch was running, or a gap of more than three minutes in
+  the log. It is never counted as up. Time when the internet probe could not be sent at all
+  (ICMP blocked and TCP/443 unanswered) is *unmeasured*, and is neither up nor down.
+- **Uptime %** is up time over the time known to be up or down.
+
+`--json` and `--csv` carry the same outages for an ISP ticket or a chart. Both are versioned
+(`"schema": 1` in JSON) and covered by the 1.0 compatibility promise. Each outage's `ended` is
+`recovered`, `monitoring_stopped` (netwatch stopped while it was still down) or `ongoing`.
+
+The log is `~/.local/state/netwatch/uptime/`, one small file per day (about 80 KB), kept 90
+days, readable only by you. Nothing is uploaded. `record_uptime = false` turns it off.
 
 ---
 
@@ -658,6 +695,7 @@ full resolution.
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `sandbox` | `"on"` | `on` `strict` `off` | Sandbox enforcement. `on` is best-effort, `strict` refuses to start if the platform backend can't apply it, `off` skips it. `--no-sandbox` and `--sandbox-strict` override for one run. Applies at next launch. See [the Landlock sandbox](#landlock-sandbox-linux). |
+| `record_uptime` | `true` | `true` `false` | Keep the local log [`netwatch uptime`](#uptime-report) reports from. Config-file only. |
 | `egress_violation_cooldown_secs` | `300` | seconds | How long before the same violating flow — one (process, destination, port) — warns again on egress policy drift. `0` warns on every refresh. Config-file only. |
 
 ### Alerts

@@ -483,6 +483,9 @@ pub struct App {
     pub connection_collector: ConnectionCollector,
     pub config_collector: ConfigCollector,
     pub health_prober: HealthProber,
+    /// Writes the uptime log; inert until `bootstrap::start` turns it on for
+    /// a live TUI or daemon session.
+    pub uptime: crate::uptime::Monitor,
     pub packet_collector: PacketCollector,
     pub session_started_at: std::time::Instant,
     pub capture_interface: String,
@@ -651,6 +654,7 @@ impl App {
             connection_collector,
             config_collector,
             health_prober: HealthProber::new(),
+            uptime: crate::uptime::Monitor::new(None),
             packet_collector,
             session_started_at: std::time::Instant::now(),
             capture_interface,
@@ -1331,6 +1335,13 @@ impl App {
 
         // Refresh health every `HEALTH_PROBE_TICKS` ticks — and piggyback the
         // CPU% sampler.
+        // Every tick, not every probe cycle: results land asynchronously, and
+        // the monitor dedupes by completion time.
+        let gateway = self.config_collector.config.gateway.is_some();
+        let dns = self.config_collector.config.primary_dns().is_some();
+        self.uptime
+            .observe(&self.health_prober.status(), gateway, dns);
+
         self.health_tick += 1;
         if self.health_tick >= HEALTH_PROBE_TICKS {
             self.health_tick = 0;
@@ -1683,6 +1694,7 @@ pub async fn run<B: Backend>(
                     app.egress_profiler.persist_now();
                     // Preserve unresolved legacy recovery and save live baselines.
                     app.shutdown_diagnose();
+                    app.uptime.stop();
                     return Ok(());
                 }
             }
@@ -1834,6 +1846,7 @@ pub async fn run_headless(
     app.packet_collector.stop_capture();
     app.egress_profiler.persist_now();
     app.shutdown_diagnose();
+    app.uptime.stop();
     if let Some(publisher) = remote {
         publisher.shutdown(std::time::Duration::from_secs(8));
     }

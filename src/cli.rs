@@ -12,6 +12,7 @@ pub enum Command {
     },
     Resolver(Vec<String>),
     Diagnose(Vec<String>),
+    Uptime(Vec<String>),
     CaptureChild {
         interface: String,
         mode: Mode,
@@ -45,7 +46,7 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 pub fn help() -> String {
-    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
+    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
     for (name, value, description) in OPTIONS {
         text.push_str(&format!(
             "  {name:<19} {}{description}\n",
@@ -70,6 +71,9 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
     }
     if args.first().map(String::as_str) == Some("diagnose") {
         return Ok(Command::Diagnose(args[1..].to_vec()));
+    }
+    if args.first().map(String::as_str) == Some("uptime") {
+        return Ok(Command::Uptime(args[1..].to_vec()));
     }
     if args.first().map(String::as_str) == Some("__capture-check") {
         if args.len() != 3 || !["off", "strict", "best-effort"].contains(&args[2].as_str()) {
@@ -283,7 +287,7 @@ mod tests {
         }
 
         // The subcommands the parser routes on, which are not in OPTIONS.
-        for sub in ["daemon", "doctor", "diagnose", "resolver"] {
+        for sub in ["daemon", "doctor", "diagnose", "uptime", "resolver"] {
             for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH), ("man", MAN)] {
                 assert!(text.contains(sub), "{what} is missing the {sub} subcommand");
             }

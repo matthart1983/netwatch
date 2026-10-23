@@ -18,6 +18,12 @@ netwatch \- real-time network diagnostics in your terminal
 .I SUBCOMMAND
 .RI [ OPTIONS ]
 .br
+.B netwatch uptime
+.RB [ \-\-since
+.IR PERIOD ]
+.RB [ \-\-json " | " \-\-csv ]
+.RI [ DIR ]
+.br
 .B netwatch resolver
 .I SUBCOMMAND
 .RI [ OPTIONS ]
@@ -152,6 +158,21 @@ For netwatch's developers: regenerate the pinned test corpus under
 or one entry with
 .BR \-\-only .
 .TP
+.B uptime
+Outage history from the uptime log the TUI and
+.B daemon
+keep: one row per outage with its start, end, duration and the hop that
+failed (gateway, internet or DNS), then the outage count, total downtime,
+uptime and the time nothing was monitored.
+.B \-\-since
+takes a period such as 7d (the default), 24h or 90m;
+.B \-\-json
+and
+.B \-\-csv
+give machine-readable output with a versioned schema. A hop is down after
+three probe cycles in a row with no reply. Time when netwatch was not running
+is reported as not monitored, never as up.
+.TP
 .B resolver status
 Report the current DNS resolver and whether netwatch could change it.
 .TP
@@ -202,6 +223,12 @@ to alert on everything outside the allowlist as well.
 .TP
 .I ~/.cache/netwatch/exports/
 Diagnose report and incident exports.
+.TP
+.I ~/.local/state/netwatch/uptime/
+The uptime log
+.B netwatch uptime
+reads, one file per day, kept 90 days. Turn it off with
+.BR "record_uptime = false" .
 .SH EXIT STATUS
 .B 0
 on success,
