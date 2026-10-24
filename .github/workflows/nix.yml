@@ -24,21 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
 
       # Every system the flake declares must still evaluate, macOS included,
       # though only Linux is built here.
       - name: Evaluate the flake on every system
         run: nix flake check --all-systems --no-build
 
+      # checkPhase runs the test suite; installCheckPhase (versionCheckHook)
+      # runs the built binary's `--version` against Cargo.toml.
       - name: Build and test the package
         run: nix build -L .#default
-
-      - name: Run the built binary
-        run: |
-          want=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          got=$(./result/bin/netwatch --version)
-          echo "$got"
-          test "$got" = "netwatch $want"
