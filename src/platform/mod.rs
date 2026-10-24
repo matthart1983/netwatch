@@ -1,5 +1,8 @@
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
+/// Decoding for the records Windows' IP Helper API returns. Platform-neutral
+/// so it is tested everywhere; only the calls that fill it are Windows-only.
+pub mod ip_helper;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]

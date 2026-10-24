@@ -12,7 +12,7 @@ establish macOS or Windows runtime parity.
 
 | Capability | Linux | macOS | Windows | FreeBSD |
 | --- | --- | --- | --- | --- |
-| Interface/configuration collection | Linux system counters and network tools | macOS network tools | PowerShell/network tools, with fallbacks | `getifaddrs` up-state, `netstat`/`ifconfig` |
+| Interface/configuration collection | Linux system counters and network tools | macOS network tools | IP Helper API (adapters, DNS servers, counters, routes), with `ipconfig`/PowerShell/`route print` fallbacks | `getifaddrs` up-state, `netstat`/`ifconfig` |
 | Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required | Base-system libpcap/BPF; `/dev/bpf` access required |
 | Process attribution | Verified procfs socket ownership; eBPF hints require corroboration and are disabled in sandboxed runs | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified socket/process polling | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |
