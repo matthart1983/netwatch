@@ -250,6 +250,18 @@ All notable changes to NetWatch will be documented in this file.
   the two it needs to read another user's sockets under root, so
   connections are attributed as before.
 
+### Security
+- **Selecting a packet or a connection no longer sends its addresses to
+  rdap.org. Only `W` does.** Since 0.8.0 the Packets detail pane, and since
+  0.16.1 the Connections detail strip, started a WHOIS lookup themselves the
+  first time they drew an address. Stepping through a capture sent the
+  source and destination of each packet you landed on to rdap.org over
+  HTTPS, and on to the regional registry it redirects to. Moving down the
+  Connections table, or leaving the cursor on a row while the live table
+  changed under it, did the same with each remote address. Addresses in the
+  private ranges WHOIS skips were not sent. The panes now show only what a
+  `W` press has already fetched.
+
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
   toml 0.8 parsed through its own copy of toml_edit 0.22, next to the

@@ -889,7 +889,8 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 }
             }
 
-            // Whois info lines (on-demand)
+            // Whois lines for addresses W has looked up. `lookup` only reads
+            // the cache, so drawing them sends nothing.
             let mut whois_lines: Vec<Line> = Vec::new();
             for (label, ip) in [("Src", &pkt.src_ip), ("Dst", &pkt.dst_ip)] {
                 if let Some(whois) = app.whois_cache.lookup(ip) {
@@ -2605,5 +2606,33 @@ mod tests {
             p.expert = sev;
             assert_eq!(is_expert(&p), expected, "{sev:?}");
         }
+    }
+
+    /// Selecting a packet sends neither of its addresses to rdap.org; only W
+    /// does. The detail pane used to queue a lookup for both on its first
+    /// draw, so stepping through a capture sent every peer it passed.
+    #[test]
+    fn drawing_a_selected_packet_queues_no_whois_lookup() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector
+            .packets
+            .write()
+            .unwrap()
+            .push(pkt_with_decrypted(None));
+        app.ui.scroll.packet_selected = Some(1);
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("TCP: 12345 -> 443"), "detail not drawn");
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
     }
 }
