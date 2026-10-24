@@ -22,13 +22,48 @@ All notable changes to NetWatch will be documented in this file.
 - **`confirm_quit`** (Settings → Confirm Quit, off by default): `q` asks
   "Quit netwatch?" first, and `y`, `q` or `Enter` confirms. `Ctrl+C` still
   quits at once (#94).
+- **PCAPNG export, with the owning process in each packet's comment.** `w`
+  in Packets and `Shift+E` for an incident now open a preview that freezes
+  the selection, counts what will be written and what will be left out, and
+  warns that packet bytes are not redacted. `w` takes the packets the list
+  shows, so with `x` on only the expert findings. `Enter` writes in the
+  background, `f` picks PCAPNG (the default) or classic PCAP, `a` turns
+  comments off, and `Esc` cancels. Each PCAPNG packet's comment is a JSON
+  object Wireshark shows under "Packet comments": the process, PID and
+  direction when two checks of the socket's owner, one finished before the
+  packet and one begun after it, agree on it (Linux), else `unknown_owner`,
+  plus the DPI classification, SNI and JA4. One file can hold packets from several
+  interfaces and link types. The format and every comment key are specified
+  in REFERENCE.md, "Capture export".
 
 ### Changed
 - **`q` closes the help, settings and memory overlays** instead of quitting
   netwatch, as `Esc` does. Pressed on an overlay, it nearly always meant
   "close this" (#94). `Ctrl+C` still quits from anywhere.
+- **Incident bundles hold `packets.pcapng`, and `manifest.json` is version
+  2.** `packets.pcap` is still written when every packet shares one link
+  type and is dated before 2106. The manifest lists the packet files
+  present, how many packets were written, left out and annotated, and the
+  capture's last drop count. The
+  bundle directory name ends in a short random suffix, so exporting the same
+  incident twice gives two bundles instead of overwriting one.
+- **Frames from interfaces that are not Ethernet appear in Packets as
+  `Raw`**, undecoded, instead of being fed to the Ethernet parser, which
+  dropped most of them and misread the rest. A VPN tunnel's raw IP and BSD
+  or Windows loopback are the usual cases.
+- **Exports never overwrite a file or leave a partial one.** Captures and
+  bundles are written under a temporary name and moved into place when
+  complete; a cancelled or failed export removes them. The exports directory
+  must be on a filesystem with hard links.
 
 ### Fixed
+- **Exported captures carry the real capture time and wire length.** PCAP
+  export rebuilt each timestamp from the time of day shown in the packet
+  list, so every packet was dated 1 January 1970 and a capture across
+  midnight went backwards, and it recorded the captured length as the
+  length on the wire. Times now come from libpcap, in UTC to the
+  microsecond. `--demo` packets, which were never captured, are left out
+  and counted instead of written with an invented time.
 - **Lite view: keys no longer overflow in a terminal smaller than its
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns

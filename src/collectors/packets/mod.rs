@@ -46,6 +46,11 @@ pub const TCP_FLAG_URG: u8 = 0x20;
 pub struct CapturedPacket {
     pub id: u64,
     pub timestamp: String,
+    /// Original capture metadata; absent for synthetic or legacy packets.
+    pub capture: Option<export::CaptureMetadata>,
+    /// Frozen historical socket observation, never an export-time PID lookup.
+    /// Boxed: most packets never get one, and the ring holds thousands.
+    pub annotation: Option<Box<export::PacketAnnotation>>,
     pub src_ip: String,
     pub dst_ip: String,
     pub src_host: Option<String>,
@@ -1505,6 +1510,10 @@ pub struct PacketCollector {
     pub dns_cache: DnsCache,
     pub stream_tracker: Arc<Mutex<StreamTracker>>,
     counter: Arc<Mutex<u64>>,
+    annotation_history: export::AnnotationHistory,
+    /// Identifies the latest capture start, as each packet's capture
+    /// metadata does; the incident recorder samples it with the drop count.
+    pub capture_session: Option<String>,
     handle: Option<thread::JoinHandle<()>>,
     /// Lives for the lifetime of the collector when a TLS keylog path
     /// is configured. Dropping it signals the background polling
@@ -1529,6 +1538,8 @@ impl PacketCollector {
             dns_cache: DnsCache::new(),
             stream_tracker: Arc::new(Mutex::new(StreamTracker::new())),
             counter: Arc::new(Mutex::new(0)),
+            annotation_history: export::AnnotationHistory::default(),
+            capture_session: None,
             handle: None,
             tls_keylog_watcher: None,
         }
@@ -1563,6 +1574,9 @@ impl PacketCollector {
         if self.capturing.load(Ordering::SeqCst) {
             return;
         }
+        self.annotation_history.clear();
+        let capture_session = uuid::Uuid::new_v4().to_string();
+        self.capture_session = Some(capture_session.clone());
         // Every generation owns its cancellation flag, including detached old workers.
         self.capturing = Arc::new(AtomicBool::new(true));
         self.ready = Arc::new(AtomicBool::new(false));
@@ -1580,6 +1594,8 @@ impl PacketCollector {
         stats.reset();
         let interface = interface.to_string();
         let bpf = bpf_filter.map(|s| s.to_string());
+        let session_ref: Arc<str> = capture_session.into();
+        let interface_ref: Arc<str> = interface.as_str().into();
 
         self.handle = Some(thread::spawn(move || {
             // Resource preparation stays off the UI thread (device resolution
@@ -1607,6 +1623,9 @@ impl PacketCollector {
                 capturing.store(false, Ordering::SeqCst);
                 return;
             }
+            let datalink = cap.get_datalink();
+            let ethernet = datalink.0 == DLT_EN10MB;
+            let file_link_type = export::file_link_type(datalink);
             ready.store(true, Ordering::SeqCst);
 
             let mut batch: Vec<CapturedPacket> = Vec::with_capacity(CAPTURE_BATCH_SIZE);
@@ -1664,8 +1683,20 @@ impl PacketCollector {
                             continue;
                         }
                         let survived = run_capture_step(&capturing, &error, || {
-                            if let Some(parsed) =
-                                decode_and_track(packet.data, &counter, &dns, &tracker)
+                            let capture = file_link_type.and_then(|link_type| {
+                                export::CaptureMetadata::from_pcap(
+                                    &session_ref,
+                                    &interface_ref,
+                                    link_type,
+                                    packet.header,
+                                )
+                            });
+                            let frame = Frame {
+                                data: packet.data,
+                                ethernet,
+                                capture,
+                            };
+                            if let Some(parsed) = decode_and_track(frame, &counter, &dns, &tracker)
                             {
                                 batch.push(parsed);
                                 if batch.len() >= CAPTURE_BATCH_SIZE {
@@ -1770,6 +1801,16 @@ impl PacketCollector {
             Ok(g) => g.len(),
             Err(_) => 0,
         }
+    }
+
+    /// Record one poll of the connection table for PCAPNG annotations. A
+    /// packet is annotated only when this poll and the previous one agree on
+    /// its socket's owner; see [`export::AnnotationHistory`].
+    pub fn observe_attribution(&mut self, connections: &[super::connections::Connection]) {
+        self.annotation_history.observe(
+            connections,
+            &mut crate::app::safe_write(&self.packets, "packets::annotate"),
+        );
     }
 
     pub fn get_packets(&self) -> std::sync::RwLockReadGuard<'_, Vec<CapturedPacket>> {
@@ -2011,6 +2052,8 @@ impl PacketCollector {
             let hex = hex_dump(&payload);
             let ascii = ascii_dump(&payload);
             out.push(CapturedPacket {
+                capture: None,
+                annotation: None,
                 id,
                 timestamp: stamp,
                 src_ip: src.into(),
@@ -2097,8 +2140,16 @@ impl Replay {
         }
     }
 
+    /// An Ethernet frame. A saved capture's header is not passed in, so the
+    /// packet has no capture metadata, and the golden output does not depend
+    /// on when the fixture was recorded.
     pub fn frame(&self, data: &[u8]) -> Option<CapturedPacket> {
-        decode_and_track(data, &self.counter, &self.dns, &self.tracker)
+        let frame = Frame {
+            data,
+            ethernet: true,
+            capture: None,
+        };
+        decode_and_track(frame, &self.counter, &self.dns, &self.tracker)
     }
 }
 
@@ -2111,16 +2162,40 @@ pub fn fuzz_parse_frame(data: &[u8]) {
     let _ = parse_packet(data, &counter, &DnsCache::new());
 }
 
+/// libpcap's data link number for Ethernet, the only framing the dissectors
+/// read. It is 1 on every platform.
+const DLT_EN10MB: i32 = 1;
+
+/// One frame as the capture thread received it.
+struct Frame<'a> {
+    data: &'a [u8],
+    /// Whether `data` is Ethernet-framed. Anything else (raw IP from a VPN
+    /// tunnel, BSD loopback, Linux cooked capture) is kept undecoded.
+    ethernet: bool,
+    /// libpcap's timestamp and wire length for the frame, for exports.
+    /// `None` when replaying, or when the header or link type cannot be
+    /// written to a file.
+    capture: Option<export::CaptureMetadata>,
+}
+
 /// Decode one frame and fold it into the stream tracker: the per-packet
 /// work of the capture thread, apart from batching. Also the entry point
-/// for replaying a saved capture (`replay_frame`).
+/// for replaying a saved capture ([`Replay`]).
 fn decode_and_track(
-    data: &[u8],
+    frame: Frame<'_>,
     counter: &Arc<Mutex<u64>>,
     dns: &DnsCache,
     tracker: &Mutex<StreamTracker>,
 ) -> Option<CapturedPacket> {
-    let mut parsed = parse_packet(data, counter, dns)?;
+    let data = frame.data;
+    let mut parsed = if frame.ethernet {
+        parse_packet(data, counter, dns)?
+    } else {
+        undecoded_frame(data, counter, dns)
+    };
+    if let Some(meta) = frame.capture {
+        apply_capture_metadata(&mut parsed, meta);
+    }
     if let (Some(sp), Some(dp)) = (parsed.src_port, parsed.dst_port) {
         let proto = if parsed.tcp_flags.is_some() {
             StreamProtocol::Tcp
@@ -2176,6 +2251,56 @@ fn decode_and_track(
         parsed.decrypted_plaintext = decrypted;
     }
     Some(parsed)
+}
+
+/// A frame in a framing the dissectors do not read. It is listed and kept
+/// for export with its bytes as captured, rather than fed to the Ethernet
+/// parser, which would invent addresses from whatever sits at its offsets.
+fn undecoded_frame(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> CapturedPacket {
+    build_packet(
+        counter,
+        "Raw",
+        data.len() as u32,
+        "—",
+        "—",
+        None,
+        None,
+        "Undecoded capture framing",
+        vec![
+            format!("Frame: {} bytes", data.len()),
+            "Link: not Ethernet; not decoded".into(),
+        ],
+        &[],
+        data,
+        dns,
+        None,
+        None,
+    )
+}
+
+/// Use libpcap's timestamp and wire length for the packet in place of the
+/// decode-time clock and captured length, so the list, the stream tracker
+/// and exports agree on when the frame arrived and how long it was.
+fn apply_capture_metadata(parsed: &mut CapturedPacket, meta: export::CaptureMetadata) {
+    parsed.length = meta.original_len;
+    if let Some(frame) = parsed.details.first_mut() {
+        *frame = format!(
+            "Frame: {} bytes captured, {} on the wire",
+            parsed.raw_bytes.len(),
+            meta.original_len
+        );
+    }
+    parsed.timestamp_ns = meta.timestamp_ns;
+    if let Some(at) = chrono::DateTime::from_timestamp(
+        (meta.timestamp_ns / 1_000_000_000) as i64,
+        (meta.timestamp_ns % 1_000_000_000) as u32,
+    ) {
+        parsed.timestamp = at
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S%.3f")
+            .to_string();
+    }
+    parsed.capture = Some(meta);
 }
 
 fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Option<CapturedPacket> {
@@ -2853,6 +2978,8 @@ fn build_packet(
     let expert = classify_expert(protocol, info, tcp_flags);
 
     CapturedPacket {
+        capture: None,
+        annotation: None,
         id,
         timestamp,
         src_ip: src_ip.to_string(),
@@ -2998,6 +3125,7 @@ use format::{
 // ── PCAP export (extracted to pcap_export.rs) ──
 mod pcap_export;
 pub use pcap_export::export_pcap;
+pub mod export;
 
 // ── Display filters (extracted to filter.rs) ──
 mod filter;
@@ -3070,6 +3198,8 @@ mod tests {
         info: &str,
     ) -> CapturedPacket {
         CapturedPacket {
+            capture: None,
+            annotation: None,
             id: 1,
             timestamp: "00:00:00.000".into(),
             src_ip: src.into(),
@@ -3094,6 +3224,83 @@ mod tests {
             app_protocol: None,
             decrypted_plaintext: None,
         }
+    }
+
+    // ── capture metadata ────────────────────────────────────
+
+    /// Ethernet + IPv4 + UDP 127.0.0.1:1234 -> 192.0.2.1:53, 42 bytes.
+    const UDP_FRAME: [u8; 42] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 0, 0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0, 127,
+        0, 0, 1, 192, 0, 2, 1, 4, 210, 0, 53, 0, 8, 0, 0,
+    ];
+
+    fn metadata(link_type: u16) -> export::CaptureMetadata {
+        export::CaptureMetadata {
+            session: "s".into(),
+            interface: "eth0".into(),
+            link_type,
+            timestamp_ns: 1_700_000_000_123_456_000,
+            original_len: 1500,
+        }
+    }
+
+    fn decode(frame: Frame<'_>) -> Option<CapturedPacket> {
+        decode_and_track(
+            frame,
+            &Arc::new(Mutex::new(0)),
+            &DnsCache::new(),
+            &Mutex::new(StreamTracker::new()),
+        )
+    }
+
+    #[test]
+    fn capture_metadata_sets_time_and_wire_length_before_tracking() {
+        let p = decode(Frame {
+            data: &UDP_FRAME,
+            ethernet: true,
+            capture: Some(metadata(1)),
+        })
+        .unwrap();
+        assert_eq!(p.capture, Some(metadata(1)));
+        assert_eq!(p.timestamp_ns, 1_700_000_000_123_456_000);
+        assert_eq!(p.length, 1500);
+        assert_eq!(p.details[0], "Frame: 42 bytes captured, 1500 on the wire");
+        assert!(p.timestamp.ends_with(".123"), "{}", p.timestamp);
+        assert_eq!(p.raw_bytes, UDP_FRAME);
+        // The stream tracker saw the frame under libpcap's time too.
+        assert!(p.stream_index.is_some());
+
+        // Replay passes no header: decode time and captured length, as before.
+        let replayed = Replay::new().frame(&UDP_FRAME).unwrap();
+        assert!(replayed.capture.is_none());
+        assert_eq!(replayed.length, 42);
+        assert_eq!(replayed.details[0], "Frame: 42 bytes on wire");
+    }
+
+    #[test]
+    fn a_frame_in_another_framing_is_kept_undecoded() {
+        // Raw IP from a tunnel: the Ethernet parser would read addresses
+        // out of the IP header's own fields.
+        let raw_ip = &UDP_FRAME[14..];
+        let p = decode(Frame {
+            data: raw_ip,
+            ethernet: false,
+            capture: Some(metadata(101)),
+        })
+        .unwrap();
+        assert_eq!(p.protocol, "Raw");
+        assert_eq!((p.src_ip.as_str(), p.dst_ip.as_str()), ("—", "—"));
+        assert_eq!((p.src_port, p.dst_port, p.stream_index), (None, None, None));
+        assert_eq!(p.raw_bytes, raw_ip);
+        assert_eq!(p.capture.unwrap().link_type, 101);
+        // Even an empty frame is listed; export omits it for having no bytes.
+        let empty = decode(Frame {
+            data: &[],
+            ethernet: false,
+            capture: None,
+        })
+        .unwrap();
+        assert!(empty.raw_bytes.is_empty());
     }
 
     // ── format_mac ──────────────────────────────────────────

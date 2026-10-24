@@ -1660,7 +1660,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 "follow"
             },
         ));
-        v.push(hint("w", "write pcap"));
+        v.push(hint("w", "export capture"));
         v.push(hint("m", "mark"));
         if !app.caches.bookmarks.is_empty() {
             v.push(hint("][", "marks"));
@@ -2182,6 +2182,8 @@ mod tests {
 
     fn pkt_with_decrypted(pt: Option<Vec<u8>>) -> CapturedPacket {
         CapturedPacket {
+            capture: None,
+            annotation: None,
             id: 1,
             timestamp: "00:00:00.000".into(),
             src_ip: "1.1.1.1".into(),
@@ -2458,6 +2460,8 @@ mod tests {
         ns: u64,
     ) -> CapturedPacket {
         CapturedPacket {
+            capture: None,
+            annotation: None,
             id,
             timestamp: format!("06:49:20.{id:03}"),
             src_ip: src.into(),

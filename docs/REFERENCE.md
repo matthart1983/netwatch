@@ -1,14 +1,15 @@
 # NetWatch — Feature Reference
 
 The complete reference for NetWatch: every keybinding, the display-filter language, the
-protocol decoders, TLS decryption, JA4 hunting, the sandbox, the Flight Recorder, themes,
-and configuration. For a quick start, see the [README](../README.md); for architecture and
+protocol decoders, TLS decryption, JA4 hunting, the capture export format, the sandbox, the
+Flight Recorder, themes, and configuration. For a quick start, see the [README](../README.md); for architecture and
 maintenance notes, see [WIKI.md](WIKI.md).
 
 - [Deep Packet Inspection](#deep-packet-inspection)
   - [Protocol decoders](#protocol-decoders)
   - [TLS 1.3 / 1.2 decryption](#tls-13--12-decryption)
   - [Threat hunting with JA4](#threat-hunting-with-ja4)
+  - [Capture export](#capture-export)
 - [Display filters](#display-filters)
 - [Security & Forensics](#security--forensics)
   - [Network intelligence](#network-intelligence)
@@ -47,7 +48,7 @@ a reassembly/decode utility, not a separate classifier; ICMP/ARP are handled at 
 Classifiers run over **per-flow stream tracking** (byte accumulation + TCP sequence-anomaly
 detection — not full out-of-order resequencing; cross-segment TLS records aren't reassembled),
 with handshake timing, a hex/text payload viewer, packet bookmarks, BPF capture filters, and
-PCAP export.
+[PCAPNG and PCAP export](#capture-export).
 
 ### TLS 1.3 / 1.2 decryption
 
@@ -90,6 +91,108 @@ ja4:t13d1516h2_8daaf6152771_b186095e22b6
 ```
 
 NetWatch ships the FoxIO BSD-3 lookup database and lets you overlay your own entries via JSON.
+
+### Capture export
+
+Press `w` in the Packets tab to export the packets the list shows, after any display filter
+and `x` (expert findings only).
+`Shift+E` does the same for a frozen [Flight Recorder](#flight-recorder) incident. Either one
+opens a preview first. The preview freezes the selection, counts what will be written and
+what will be left out, and says what the file will hold. `Enter` writes, `f` switches between
+PCAPNG and classic PCAP, `a` turns packet comments on or off, and `Esc` or `q` closes the
+preview or cancels a write in progress.
+
+Files go to the `exports` directory in netwatch's cache (`~/.cache/netwatch/exports` on Linux,
+`~/Library/Caches/netwatch/exports` on macOS, `%LOCALAPPDATA%\netwatch\exports` on Windows),
+named `netwatch_capture_YYYYMMDD_HHMMSS_<8 hex digits>.pcapng` or `.pcap`. The write runs in
+the background, so capture carries on. An export never overwrites a file: it is written to a
+temporary file beside the destination and hard-linked into place only once complete, so a
+failed or cancelled export leaves nothing behind (only a crash can leave a
+`.netwatch-export-*.tmp`). The exports directory must be on a filesystem with hard links.
+Files are readable only by you: 0600 on Unix; on Windows they take the folder's permissions.
+
+**Times and lengths.** Each packet carries the time libpcap stamped it with, in UTC, to the
+microsecond, and both the bytes captured and its length on the wire. Packets netwatch did not
+capture from an interface (`--demo` traffic) are left out and counted as omitted, and a
+selection of nothing else is refused rather than written with invented times. Frames from an
+interface that is not Ethernet (a VPN tunnel's raw IP, BSD loopback) show in Packets as
+`Raw`, undecoded, and are exported with their own link type.
+
+**Privacy.** Packet bytes are not redacted: they hold whatever crossed the wire, addresses and
+any unencrypted payload included. TLS session keys and plaintext decrypted with them are never
+written. Packet comments add process names, PIDs and server names; `a` turns them off. To
+share evidence with someone else, `netwatch diagnose export` writes a pseudonymised bundle.
+
+#### Export file format, version 1
+
+This layout is stable. Later versions may add options and comment keys; a change that removes
+or renames one, or changes its meaning, gets a new schema name.
+
+**Classic PCAP**: little-endian, magic `0xa1b2c3d4` (microsecond timestamps), version 2.4,
+snaplen 65535, and one link type for the whole file. A selection that mixes link types can
+only be saved as PCAPNG.
+
+**PCAPNG** ([draft-ietf-opsawg-pcapng](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/)):
+one little-endian section, with only these blocks:
+
+| Block | Contents |
+|-------|----------|
+| Section Header | Byte-order magic `0x1A2B3C4D`, version 1.0, section length -1 (unspecified). Option `shb_userappl`: `netwatch <version>` |
+| Interface Description | One per capture session, interface and link type, written before its first packet: LINKTYPE, snaplen 65535. Options `if_name` and `if_tsresol` = 6 (microseconds). A file with no packets has one, Ethernet with no `if_name`, since libpcap cannot open a section without one |
+| Enhanced Packet | Interface ID, timestamp in microseconds since the Unix epoch, captured length, original length, packet bytes padded to 32 bits. Option `opt_comment` when comments are on |
+
+A block with options ends them with `opt_endofopt`; a block without has no options list.
+
+**Packet comments.** Each comment is one JSON object in UTF-8, schema
+`netwatch.annotation.v1`. Wireshark shows it under *Packet comments*, and
+`tshark -r FILE -T fields -e frame.comment` prints one per line.
+
+| Key | Type | When present | Meaning |
+|-----|------|--------------|---------|
+| `schema` | string | always | `netwatch.annotation.v1` |
+| `packet_id` | integer | always | The packet's number in the Packets list during that run |
+| `capture_session` | string | always | A UUID for one capture start. Restarting capture or switching interface starts a new one |
+| `protocol` | string | always | netwatch's protocol label, as in the Packets list: `TCP`, `DNS`, `TLS`, `Raw`… |
+| `status` | string | always | `bracketed_socket_observation` when the owner keys below are present, else `unknown_owner` |
+| `pid` | integer | owner | Process ID |
+| `process_name` | string or null | owner | Process name |
+| `process_session` | string | owner | UUID of the netwatch run that observed the process |
+| `start_token` | string | owner | The process's start time from `/proc/<pid>/stat`, in clock ticks since boot. With `pid` it rules out PID reuse |
+| `executable_identity` | string or null | owner | `device:inode:size:ctime:ctime_nsec` of the process's executable |
+| `network_namespace` | string or null | owner | Its network namespace, e.g. `net:[4026531840]` |
+| `source` | string | owner | Which socket table named the owner: `procfs`, `ebpf`, `lsof`, `pktap` or `sockstat` |
+| `direction` | string | owner | `outbound` when the packet left from the socket's local end, else `inbound` |
+| `before_utc_ms`, `after_utc_ms` | integer | owner | Unix time in ms by which the earlier check of the owner had finished, and at which the later one began. The packet falls strictly between them |
+| `flow_generation` | integer | owner | netwatch's number for this socket and owner in this run; a socket that passes to another process gets a new one |
+| `capture_generation` | integer | owner | The stream index the packet belongs to, as the stream view numbers them |
+| `app` | string | flow classified | The DPI classifier that recognised the flow: `tls` `quic` `http` `dns` `ssh` `mqtt` `stun` `bittorrent` `netbios` `snmp` `ssdp` `ftp` `llmnr` `dhcp` `ntp` |
+| `sni` | string | TLS or QUIC with a server name | The ClientHello's server name. When `ech_outer` is true it is the outer, public name, not the real destination |
+| `ech_outer` | boolean | with `sni` | The ClientHello carried Encrypted Client Hello |
+| `alpn` | string | TLS with ALPN | The first ALPN protocol the ClientHello offered |
+| `ja4` | string | TLS or QUIC fingerprinted | JA4 for TLS, JA4Q for QUIC |
+
+`app` and the keys after it are the flow's classification when the packet was captured, so the
+first packets of a flow, captured before it was recognised, have none. Only the classifier's
+name is written: HTTP paths, SNMP communities, FTP commands and decrypted payloads are not.
+Text values come from other programs and from the network. They are cut to 160 characters, and
+any character that could hide or reorder text (control and format characters, which include
+bidi overrides, zero-width marks and tag characters, and the line and paragraph separators)
+becomes `·`. Readers should ignore keys they do not know.
+
+**How a packet gets an owner.** netwatch polls the connection table about once a second. A
+packet is given the owner keys only when two consecutive polls both name the same process
+(same PID, start token, executable and namespace), the same socket and the same capture
+stream, and the packet falls strictly between the two checks of that owner: the earlier
+check had finished before the packet's time and the later one began after it, at most 5 s
+apart in all. A check is not always the poll. Sandboxed on Linux, netwatch reads socket
+owners from a separate `/proc` scan that runs every 0.5–5 s (the refresh rate) on its own
+schedule, so polls that share one scan bracket nothing, and packets after the latest scan
+wait for the next. Anything else stays `unknown_owner`: a single check, a stale one, a socket
+that changed hands, both ends of a loopback connection, or a platform where netwatch cannot
+verify a process's identity (only Linux can today). The owner is recorded during capture and
+kept, so packets from a process that has since exited keep it, and nothing is looked up at
+export. It is a correlation of socket observations, not proof that the process sent the
+packet: a socket that opens and closes between two checks is never seen.
 
 ---
 
@@ -139,22 +242,44 @@ Catch transient failures that vanish before you can inspect them:
 ```text
 Shift+R   Arm a rolling 5-minute recorder
 Shift+F   Freeze the current incident window
-Shift+E   Export an incident bundle to ~/netwatch_incident_YYYYMMDD_HHMMSS/
+Shift+E   Preview and export the frozen incident bundle
 ```
 
 Each bundle is self-contained — packet evidence *plus* the operational context that explains it:
 
 ```text
-netwatch_incident_20260403_103501/
+netwatch_incident_20260403_103501_1a2b3c4d/
   summary.md       # human-readable incident summary
-  manifest.json
+  manifest.json    # what the bundle holds (version 2, below)
   connections.json # who was talking to whom
   health.json      # gateway/DNS RTT + loss samples
   bandwidth.json   # per-interface rates + top processes
   dns.json         # query analytics
   alerts.json      # network-intelligence alert history
-  packets.pcap     # present when packets were captured
+  packets.pcapng   # recorded packets, when any can be exported
+  packets.pcap     # as well, when classic PCAP can hold them all
 ```
+
+`Shift+E` opens the same preview as a packet export ([Capture export](#capture-export)); an
+armed recorder is frozen first, so the bundle holds the window the preview counted. The
+packet files follow the [export file format](#export-file-format-version-1). The bundle is
+written into a hidden `.netwatch_incident_<id>.tmp` directory beside it and renamed into
+place once every file is complete; the directory is 0700 and its files 0600 on Unix. The
+incident JSON names processes and endpoints whether or not packet comments are on.
+
+`manifest.json` is version **2**. Besides the counts of what was recorded, it has:
+
+| Key | Meaning |
+|-----|---------|
+| `packet_artifacts` | The packet files actually in the bundle: none, `["packets.pcapng"]`, or both |
+| `packet_export` | `packets` written, `omitted` (no capture metadata), and `annotated` (with a socket owner) |
+| `packet_annotations` | Whether packet comments were on |
+| `last_capture_status` | The capture's `session`, `sampled_at_utc_ms` and `drops` (packets libpcap dropped, null when it had not reported recently), last sampled while recording. Not a loss total for the incident window |
+| `capture_limitations` | What the packet files cannot show, in prose |
+
+Version 1 bundles, from netwatch 0.37 and earlier, have `packets.pcap` only, with times
+rebuilt from the time of day. Read `version` and `packet_artifacts` rather than assuming a
+file is present.
 
 ### Egress policy linter
 
@@ -358,11 +483,11 @@ days, readable only by you. Nothing is uploaded. `record_uptime = false` turns i
 | `r` | Force refresh |
 | `R` | Arm / reset flight recorder |
 | `F` | Freeze current incident window |
-| `E` | Export incident bundle |
+| `E` | Preview and export the incident bundle |
 | `/` | Filter (Packets) |
 | `c` | Start/stop capture (Packets) |
 | `s` | Sort / stream view |
-| `w` | Export to .pcap |
+| `w` | Preview and export the shown packets as PCAPNG or PCAP |
 | `T` | Traceroute |
 | `W` | Whois lookup |
 | `t` | Cycle theme |
@@ -392,12 +517,12 @@ days, readable only by you. Nothing is uploaded. `record_uptime = false` turns i
 | `c` | Start/stop capture |
 | `R` | Arm / disarm flight recorder |
 | `F` | Freeze incident window |
-| `E` | Export incident bundle |
+| `E` | Preview and export the incident bundle |
 | `i` | Cycle capture interface |
 | `b` | Set BPF capture filter |
 | `/` | Display filter |
 | `s` | Stream view |
-| `w` | Export .pcap |
+| `w` | Preview and export the shown packets as PCAPNG or PCAP |
 | `x` | Clear packets |
 | `m` | Bookmark packet |
 | `n`/`N` | Next/prev bookmark |

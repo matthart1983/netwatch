@@ -100,6 +100,14 @@ pub struct MatchEvidence {
     pub flow: Option<FlowIdentity>,
     #[serde(skip)]
     pub observed_at: Option<Instant>,
+    /// When `process` was confirmed to hold the socket, as UTC ms: the check
+    /// ran at some point from the first time to the second. Not the poll's
+    /// own time: on Linux a sandboxed poll takes its owners from the
+    /// unconfined broker's last `/proc` scan, which can be seconds older than
+    /// the poll and shared by consecutive polls. Packet annotations bracket
+    /// on this.
+    #[serde(skip)]
+    pub owner_checked_utc_ms: Option<(u64, u64)>,
 }
 impl Default for MatchEvidence {
     fn default() -> Self {
@@ -111,6 +119,7 @@ impl Default for MatchEvidence {
             unknown_reason: Some(UnknownReason::NoSocketOwner),
             flow: None,
             observed_at: None,
+            owner_checked_utc_ms: None,
         }
     }
 }

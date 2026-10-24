@@ -15,6 +15,7 @@ establish macOS or Windows runtime parity.
 | Interface/configuration collection | Linux system counters and network tools | macOS network tools | PowerShell/network tools, with fallbacks | `getifaddrs` up-state, `netstat`/`ifconfig` |
 | Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required | Base-system libpcap/BPF; `/dev/bpf` access required |
 | Process attribution | Verified procfs socket ownership; eBPF hints require corroboration and are disabled in sandboxed runs | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified socket/process polling | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
+| Process in PCAPNG packet comments | When two verified owner checks bracket the packet | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified |
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |
 | Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules | Shared detectors; absent TCP metrics limit socket rules |
 | Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend | No backend (no Capsicum) |

@@ -20,3 +20,5 @@ pub mod timeline;
 pub mod topology;
 pub mod tree;
 pub mod widgets;
+
+pub mod capture_export;

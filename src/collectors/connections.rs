@@ -1450,14 +1450,17 @@ fn owner_still_valid(owner: &SocketOwner, inode: u64) -> bool {
         && super::attribution::process_identity(owner.identity.pid).as_ref()
             == Some(&owner.identity)
 }
+/// `checked` is when the owner was seen holding the socket, as UTC ms: some
+/// time from the first to the second (see `MatchEvidence::owner_checked_utc_ms`).
 #[cfg(target_os = "linux")]
-fn apply_owner(conn: &mut Connection, owner: &SocketOwner) {
+fn apply_owner(conn: &mut Connection, owner: &SocketOwner, checked: (u64, u64)) {
     conn.attribution = AttributionSource::Procfs;
     conn.pid = Some(owner.identity.pid);
     conn.process_name = Some(owner.comm.clone());
     conn.evidence.process = Some(owner.identity.clone());
     conn.evidence.unknown_reason = None;
     conn.evidence.observe();
+    conn.evidence.owner_checked_utc_ms = Some(checked);
 }
 /// Revalidate every Linux polling match, including ss-provided PIDs. A PID name
 /// alone cannot establish that the socket still belongs to that process.
@@ -1466,9 +1469,13 @@ fn apply_owner(conn: &mut Connection, owner: &SocketOwner) {
 /// denies ptrace-mode access outside its domain), so when a [`ProcBroker`]
 /// snapshot no older than `MAX_MATCH_AGE` is supplied, owners come from it.
 /// The broker validated identity around each fd scan; here the socket inode
-/// must still be the one the broker saw for this exact 5-tuple.
+/// must still be the one the broker saw for this exact 5-tuple. Such an owner
+/// was seen during the broker's scan, not now, and its evidence says so.
 #[cfg(target_os = "linux")]
 fn overlay_proc_attribution(connections: &mut [Connection], brokered: Option<&ProcSnapshot>) {
+    // Before the socket tables are read, so a local scan's owner check below
+    // falls between this and the time taken once it has passed.
+    let checked_from = super::attribution::utc_ms();
     let index = proc_net_inode_index();
     let brokered =
         brokered.filter(|s| s.captured_at.elapsed() <= super::attribution::MAX_MATCH_AGE);
@@ -1492,7 +1499,7 @@ fn overlay_proc_attribution(connections: &mut [Connection], brokered: Option<&Pr
                 continue;
             };
             if inode == Some(*seen) {
-                apply_owner(conn, owner);
+                apply_owner(conn, owner, snap.scanned_utc_ms);
             } else if inode.is_some_and(|i| i != 0) {
                 conn.evidence.unknown_reason =
                     Some(super::attribution::UnknownReason::IdentityChanged);
@@ -1503,7 +1510,7 @@ fn overlay_proc_attribution(connections: &mut [Connection], brokered: Option<&Pr
             inode.and_then(|i| owners.get(&i).and_then(|o| o.as_ref()).map(|o| (i, o)))
         {
             if owner_still_valid(owner, inode) {
-                apply_owner(conn, owner);
+                apply_owner(conn, owner, (checked_from, super::attribution::utc_ms()));
             } else {
                 conn.evidence.unknown_reason =
                     Some(super::attribution::UnknownReason::IdentityChanged);
@@ -1558,11 +1565,17 @@ impl ProcBroker {
 pub struct ProcSnapshot {
     entries: HashMap<SocketKey, (u64, SocketOwner)>,
     captured_at: Instant,
+    /// When the scan ran, as UTC ms. Each owner in it was seen holding its
+    /// socket at some point between the two, however much later a poll
+    /// applies it.
+    scanned_utc_ms: (u64, u64),
 }
 #[cfg(target_os = "linux")]
 pub fn capture_proc_snapshot() -> ProcSnapshot {
+    let started = super::attribution::utc_ms();
     let index = proc_net_inode_index();
     let owners = socket_inode_owners();
+    let scanned_utc_ms = (started, super::attribution::utc_ms());
     let entries = index
         .by_pair
         .into_iter()
@@ -1576,10 +1589,13 @@ pub fn capture_proc_snapshot() -> ProcSnapshot {
     ProcSnapshot {
         entries,
         captured_at: Instant::now(),
+        scanned_utc_ms,
     }
 }
 #[cfg(target_os = "linux")]
 fn overlay_proc_snapshot(connections: &mut [Connection], snap: &ProcSnapshot) {
+    // The owner is rechecked live below, so it was seen during this poll.
+    let checked_from = super::attribution::utc_ms();
     let index = proc_net_inode_index();
     for conn in connections {
         if conn.pid.is_some() {
@@ -1594,7 +1610,7 @@ fn overlay_proc_snapshot(connections: &mut [Connection], snap: &ProcSnapshot) {
         if snap.captured_at.elapsed() > super::attribution::MAX_MATCH_AGE {
             conn.evidence.unknown_reason = Some(super::attribution::UnknownReason::StaleSnapshot);
         } else if index.by_pair.get(&key) == Some(inode) && owner_still_valid(owner, *inode) {
-            apply_owner(conn, owner);
+            apply_owner(conn, owner, (checked_from, super::attribution::utc_ms()));
         } else {
             conn.evidence.unknown_reason =
                 Some(super::attribution::UnknownReason::IdentityUnavailable);
@@ -2016,10 +2032,15 @@ mod tests {
         let conn = || make_conn("UDP", &local, "127.0.0.1:45679", "", 1);
         let mut snap = snapshot_owning(&conn());
 
+        // The owner was seen when the broker scanned, which may be well
+        // before this poll; the evidence carries the scan's time.
+        snap.scanned_utc_ms = (1_000, 1_250);
         let mut c = conn();
         overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
         assert_eq!(c.pid, Some(std::process::id()));
         assert_eq!(c.attribution, AttributionSource::Procfs);
+        assert_eq!(c.evidence.owner_checked_utc_ms, Some((1_000, 1_250)));
+        assert!(c.evidence.observed_at_utc_ms > Some(1_250));
 
         // A stale broker snapshot is ignored in favour of the local scan,
         // which reads live /proc state across every pid on the box. That can
@@ -2037,6 +2058,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(c.pid, Some(std::process::id()));
+        // The local scan checked the owner during this poll.
+        let (from, until) = c.evidence.owner_checked_utc_ms.unwrap();
+        assert!(from > 1_250 && from <= until);
 
         // An owner recorded for a different inode on the same 5-tuple is not applied.
         snap.captured_at = Instant::now();

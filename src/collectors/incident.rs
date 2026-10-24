@@ -1,7 +1,8 @@
 use super::connections::Connection;
 use super::health::HealthStatus;
 use super::network_intel::{Alert, DnsAnalytics};
-use super::packets::{export_pcap, CapturedPacket, ExpertSeverity};
+use super::packets::export::{self, ExportSummary, Format};
+use super::packets::{CapturedPacket, ExpertSeverity};
 use super::process_bandwidth::ProcessBandwidth;
 use super::traffic::InterfaceTraffic;
 use chrono::{DateTime, Duration, Local, Utc};
@@ -9,6 +10,7 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_WINDOW_SECS: i64 = 300;
 const MAX_RECORDED_PACKETS: usize = 20_000;
@@ -81,6 +83,11 @@ pub struct AlertEventSnapshot {
 #[derive(Debug, Clone, Serialize)]
 struct IncidentManifest {
     version: u32,
+    packet_export: ExportSummary,
+    packet_artifacts: Vec<String>,
+    packet_annotations: bool,
+    capture_limitations: String,
+    last_capture_status: Option<CaptureStatus>,
     state: String,
     window_seconds: i64,
     armed_at: Option<String>,
@@ -92,6 +99,14 @@ struct IncidentManifest {
     bandwidth_snapshots: usize,
     dns_snapshots: usize,
     alert_events: usize,
+}
+
+/// Latest capture-session sample, not the incident window's loss total.
+#[derive(Debug, Clone, Serialize)]
+pub struct CaptureStatus {
+    pub session: String,
+    pub sampled_at_utc_ms: u64,
+    pub drops: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +121,9 @@ struct TimedSnapshot<T> {
     value: T,
 }
 
+#[derive(Clone)]
 pub struct IncidentRecorder {
+    last_capture_status: Option<CaptureStatus>,
     state: RecorderState,
     window: Duration,
     armed_at: Option<DateTime<Utc>>,
@@ -136,6 +153,7 @@ impl Default for IncidentRecorder {
 impl IncidentRecorder {
     pub fn new() -> Self {
         Self {
+            last_capture_status: None,
             state: RecorderState::Off,
             window: Duration::seconds(DEFAULT_WINDOW_SECS),
             armed_at: None,
@@ -179,6 +197,18 @@ impl IncidentRecorder {
 
     pub fn freeze_reason(&self) -> Option<&str> {
         self.freeze_reason.as_deref()
+    }
+
+    /// Sample the capture's session and libpcap drop count while armed, for
+    /// the manifest. Frozen, the sample stays the one from the window.
+    pub fn record_capture_status(&mut self, session: Option<String>, drops: Option<u64>) {
+        if self.is_armed() {
+            self.last_capture_status = session.map(|session| CaptureStatus {
+                session,
+                sampled_at_utc_ms: super::attribution::utc_ms(),
+                drops,
+            });
+        }
     }
 
     pub fn arm(&mut self) {
@@ -238,7 +268,24 @@ impl IncidentRecorder {
         );
     }
 
+    /// What a bundle's packet files would hold, for the export preview.
+    pub fn packet_preview(&self) -> ExportSummary {
+        export::preview_iter(self.packets.iter().map(|p| &p.packet))
+    }
+
+    /// Write the bundle into `base_dir`, with packet comments on.
     pub fn export_bundle(&self, base_dir: &Path) -> Result<PathBuf, String> {
+        self.export_bundle_options(base_dir, true, &AtomicBool::new(false))
+    }
+
+    /// Write the bundle into `base_dir` and return its directory. Setting
+    /// `cancel` stops the write and removes everything written so far.
+    pub fn export_bundle_options(
+        &self,
+        base_dir: &Path,
+        annotations: bool,
+        cancel: &AtomicBool,
+    ) -> Result<PathBuf, String> {
         if self.is_off() {
             return Err("Flight recorder is off".to_string());
         }
@@ -247,12 +294,65 @@ impl IncidentRecorder {
         let stamp = DateTime::<Local>::from(export_time)
             .format("%Y%m%d_%H%M%S")
             .to_string();
-        let dir = base_dir.join(format!("netwatch_incident_{stamp}"));
-        crate::owner_only::create_dir_all(&dir)
+        // Build the bundle in a private directory of its own and rename it
+        // into place only once every file is written, so a failure or a
+        // cancel never leaves a half-written bundle that looks complete. The
+        // id keeps two exports of the same frozen window apart.
+        crate::owner_only::create_dir_all(base_dir).map_err(|e| {
+            format!(
+                "Failed to create export directory {}: {e}",
+                base_dir.display()
+            )
+        })?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let final_dir = base_dir.join(format!("netwatch_incident_{stamp}_{}", &id[..8]));
+        let dir = base_dir.join(format!(".netwatch_incident_{id}.tmp"));
+        crate::owner_only::dir_builder()
+            .create(&dir)
             .map_err(|e| format!("Failed to create incident directory {}: {e}", dir.display()))?;
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let packets: Vec<&CapturedPacket> = self.packets.iter().map(|p| &p.packet).collect();
+        let mut packet_export = export::preview(&packets);
+        let mut artifacts = Vec::new();
+        if packet_export.packets > 0 {
+            packet_export = export::export_capture(
+                &packets,
+                &dir.join("packets.pcapng"),
+                Format::PcapNg,
+                annotations,
+                cancel,
+            )?;
+            artifacts.push("packets.pcapng".into());
+            // Classic PCAP has one link type per file and 32-bit seconds; a
+            // capture it cannot hold is only in the PCAPNG, never refused.
+            if export::fits_pcap(&packets) {
+                export::export_capture(
+                    &packets,
+                    &dir.join("packets.pcap"),
+                    Format::Pcap,
+                    false,
+                    cancel,
+                )?;
+                artifacts.push("packets.pcap".into());
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Export cancelled".into());
+        }
 
         let manifest = IncidentManifest {
-            version: 1,
+            version: 2,
+            packet_export,
+            packet_artifacts: artifacts,
+            packet_annotations: annotations,
+            last_capture_status: self.last_capture_status.clone(),
+            capture_limitations: "Retained packets only; not a complete wire capture. last_capture_status is the latest session sample, not an incident-window or multi-session loss total. Unknown ownership is not resolved at export. Comments contain bracketed socket observations, not proof of packet ownership. Packet bytes and incident JSON are not redacted. Session keys and separately decrypted plaintext are excluded.".into(),
             state: match self.state {
                 RecorderState::Off => "off",
                 RecorderState::Armed => "armed",
@@ -289,19 +389,20 @@ impl IncidentRecorder {
             &dir.join("alerts.json"),
             &snapshot_values(&self.alert_events),
         )?;
-        crate::owner_only::create(&dir.join("summary.md"))
+        create_new(&dir.join("summary.md"))
             .and_then(|mut file| file.write_all(self.build_summary().as_bytes()))
             .map_err(|e| format!("Failed to write summary.md: {e}"))?;
 
-        if !self.packets.is_empty() {
-            let packets: Vec<CapturedPacket> =
-                self.packets.iter().map(|p| p.packet.clone()).collect();
-            let pcap_path = dir.join("packets.pcap");
-            export_pcap(&packets, &pcap_path.to_string_lossy())
-                .map_err(|e| format!("Failed to write packets.pcap: {e}"))?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Export cancelled".into());
         }
-
-        Ok(dir)
+        std::fs::rename(&dir, &final_dir).map_err(|e| {
+            format!(
+                "Failed to publish incident bundle {}: {e}",
+                final_dir.display()
+            )
+        })?;
+        Ok(final_dir)
     }
 
     fn record_at(
@@ -361,6 +462,27 @@ impl IncidentRecorder {
     }
 
     fn record_new_packets(&mut self, now: DateTime<Utc>, packets: &[CapturedPacket]) {
+        // A live packet gains its socket owner a poll after it was captured,
+        // by when the recorder already holds a copy, so the copy catches up
+        // here. Only while armed: a frozen incident never consults live owners.
+        let annotations: HashMap<_, _> = packets
+            .iter()
+            .filter_map(|p| p.annotation.as_ref().map(|a| (p.id, a)))
+            .collect();
+        if let Some(oldest) = annotations.keys().min().copied() {
+            for saved in self
+                .packets
+                .iter_mut()
+                .rev()
+                .take_while(|saved| saved.packet.id >= oldest)
+            {
+                if saved.packet.annotation.is_none() {
+                    if let Some(annotation) = annotations.get(&saved.packet.id) {
+                        saved.packet.annotation = Some((*annotation).clone());
+                    }
+                }
+            }
+        }
         let mut last_packet_id = self.last_packet_id;
         for packet in packets {
             if packet.id <= last_packet_id {
@@ -590,6 +712,7 @@ impl IncidentRecorder {
     }
 
     fn clear(&mut self) {
+        self.last_capture_status = None;
         self.freeze_reason = None;
         self.frozen_at = None;
         self.last_packet_id = 0;
@@ -667,10 +790,18 @@ fn alert_severity_label(alert: &Alert) -> String {
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let file = crate::owner_only::create(path)
-        .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
+    let file = create_new(path).map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
     serde_json::to_writer_pretty(file, value)
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// A new owner-only file in the bundle's private directory. `create_new`,
+/// because nothing should be there yet: an existing file means something
+/// else is writing the same bundle.
+fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
+    crate::owner_only::file_options()
+        .create_new(true)
+        .open(path)
 }
 
 #[cfg(test)]
@@ -681,6 +812,14 @@ mod tests {
 
     fn make_packet(id: u64, protocol: &str, expert: ExpertSeverity) -> CapturedPacket {
         CapturedPacket {
+            capture: Some(export::CaptureMetadata {
+                session: "test".into(),
+                interface: "test".into(),
+                link_type: 1,
+                timestamp_ns: 1_700_000_000_000_000_000,
+                original_len: 64,
+            }),
+            annotation: None,
             id,
             timestamp: "12:00:00.000".into(),
             src_ip: "127.0.0.1".into(),
@@ -856,6 +995,124 @@ mod tests {
         assert_eq!(recorder.packets.front().unwrap().packet.id, 2);
     }
 
+    fn record_packets(recorder: &mut IncidentRecorder, packets: &[CapturedPacket]) {
+        recorder.record_at(
+            Utc::now(),
+            packets,
+            &[],
+            &make_health(),
+            &[],
+            &[],
+            &DnsAnalytics::default(),
+            &[],
+        );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "netwatch_incident_{name}_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn manifest(bundle: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap()
+    }
+
+    /// A packet's socket owner is resolved a poll after capture, when the
+    /// recorder already holds its copy; the copy must pick it up.
+    #[test]
+    fn a_late_annotation_reaches_the_recorded_copy() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let packet = make_packet(1, "TCP", ExpertSeverity::Chat);
+        record_packets(&mut recorder, std::slice::from_ref(&packet));
+        assert_eq!(recorder.packet_preview().annotated, 0);
+        let mut later = packet;
+        later.annotation = Some(Box::new(export::PacketAnnotation {
+            process: super::super::attribution::ProcessIdentity {
+                session: "run".into(),
+                pid: 4242,
+                start_token: "1".into(),
+                executable: None,
+                network_namespace: None,
+            },
+            process_name: Some("curl".into()),
+            source: Default::default(),
+            before_utc_ms: 1,
+            after_utc_ms: 2,
+            flow_generation: 1,
+            capture_generation: 1,
+            direction: export::Direction::Outbound,
+        }));
+        let next = make_packet(2, "TCP", ExpertSeverity::Chat);
+        record_packets(&mut recorder, &[later, next]);
+        let preview = recorder.packet_preview();
+        assert_eq!((preview.packets, preview.annotated), (2, 1));
+    }
+
+    /// A capture classic PCAP cannot hold, with two link types or a time
+    /// past its 32-bit seconds, is bundled as PCAPNG only, not refused.
+    #[test]
+    fn a_capture_pcap_cannot_hold_bundles_pcapng_only() {
+        for mixed in [true, false] {
+            let mut recorder = IncidentRecorder::new();
+            recorder.arm();
+            let mut second = make_packet(2, "Raw", ExpertSeverity::Chat);
+            let meta = second.capture.as_mut().unwrap();
+            if mixed {
+                meta.link_type = 101;
+            } else {
+                meta.timestamp_ns = (u64::from(u32::MAX) + 1) * 1_000_000_000;
+            }
+            let mut demo = make_packet(3, "DNS", ExpertSeverity::Chat);
+            demo.capture = None;
+            record_packets(
+                &mut recorder,
+                &[make_packet(1, "TCP", ExpertSeverity::Chat), second, demo],
+            );
+            recorder.freeze("mixed").unwrap();
+            let root = scratch("mixed");
+            let bundle = recorder.export_bundle(&root).unwrap();
+            assert!(bundle.join("packets.pcapng").exists(), "{mixed}");
+            assert!(!bundle.join("packets.pcap").exists(), "{mixed}");
+            let manifest = manifest(&bundle);
+            assert_eq!(
+                manifest["packet_artifacts"],
+                serde_json::json!(["packets.pcapng"])
+            );
+            assert_eq!(manifest["packet_export"]["packets"], 2);
+            assert_eq!(manifest["packet_export"]["omitted"], 1);
+            assert_eq!(manifest["packet_annotations"], true);
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn capture_status_is_sampled_only_while_armed() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.record_capture_status(Some("before".into()), Some(9));
+        recorder.arm();
+        recorder.record_capture_status(Some("session-1".into()), Some(3));
+        recorder.freeze("drops").unwrap();
+        recorder.record_capture_status(Some("after".into()), Some(7));
+        let root = scratch("status");
+        let bundle = recorder
+            .export_bundle_options(&root, false, &AtomicBool::new(false))
+            .unwrap();
+        let manifest = manifest(&bundle);
+        assert_eq!(manifest["last_capture_status"]["session"], "session-1");
+        assert_eq!(manifest["last_capture_status"]["drops"], 3);
+        assert_eq!(manifest["packet_annotations"], false);
+        // No packets: no packet files, and the manifest says so.
+        assert_eq!(manifest["packet_artifacts"], serde_json::json!([]));
+        assert!(!bundle.join("packets.pcapng").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn export_bundle_writes_summary_manifest_and_pcap() {
         let mut recorder = IncidentRecorder::new();
@@ -887,6 +1144,19 @@ mod tests {
         assert!(bundle.join("summary.md").exists());
         assert!(bundle.join("manifest.json").exists());
         assert!(bundle.join("packets.pcap").exists());
+        assert!(bundle.join("packets.pcapng").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["version"], 2);
+        assert_eq!(manifest["packet_export"]["packets"], 1);
+        assert!(manifest["last_capture_status"].is_null());
+        let second = recorder.export_bundle(&root).unwrap();
+        assert_ne!(bundle, second);
+        let cancelled = AtomicBool::new(true);
+        assert!(recorder
+            .export_bundle_options(&root, true, &cancelled)
+            .is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
 
         let summary = fs::read_to_string(bundle.join("summary.md")).unwrap();
         assert!(summary.contains("NetWatch Incident Bundle"));
