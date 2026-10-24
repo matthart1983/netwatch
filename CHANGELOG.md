@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.38.0] - 2026-10-25
 
 ### Added
 - **`netwatch uptime`**: outage history for an ISP ticket. One row per
