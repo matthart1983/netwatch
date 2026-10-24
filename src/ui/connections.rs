@@ -2231,7 +2231,8 @@ mod tests {
 
     /// The detail strip shows WHOIS for the selected row only after W. It
     /// used to queue the lookup itself, so moving the cursor down the table
-    /// sent each remote address to rdap.org.
+    /// sent each remote address to rdap.org. So did a parked cursor: the
+    /// selection is a row index, and the live table changes under it.
     #[test]
     fn drawing_the_selected_connection_queues_no_whois_lookup() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -2254,6 +2255,13 @@ mod tests {
             screen.contains("127.0.0.1:1234  →  8.8.8.8:443"),
             "detail not drawn"
         );
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+
+        // A new connection takes row 0 with no key pressed.
+        app.connection_collector
+            .publish_for_test(vec![conn("curl", "ESTABLISHED", "9.9.9.9:443")]);
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        assert_eq!(app.ui.scroll.connection_scroll, 0);
         assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
     }
 }

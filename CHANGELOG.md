@@ -225,7 +225,8 @@ All notable changes to NetWatch will be documented in this file.
   first time they drew an address. Stepping through a capture sent the
   source and destination of each packet you landed on to rdap.org over
   HTTPS, and on to the regional registry it redirects to. Moving down the
-  Connections table did the same with each remote address. Addresses in the
+  Connections table, or leaving the cursor on a row while the live table
+  changed under it, did the same with each remote address. Addresses in the
   private ranges WHOIS skips were not sent. The panes now show only what a
   `W` press has already fetched.
 
