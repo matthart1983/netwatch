@@ -1030,7 +1030,7 @@ fn render_table(f: &mut Frame, app: &App, l: &Layout, paused: bool) {
         let selected = i == sel;
         if selected {
             for x in l.content_x..=end {
-                f.buffer_mut().get_mut(x, y).set_bg(t.selection_bg);
+                f.buffer_mut()[(x, y)].set_bg(t.selection_bg);
             }
         }
         // On the selected row, secondary text is promoted to primary: `dim`

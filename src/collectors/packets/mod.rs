@@ -1817,6 +1817,22 @@ impl PacketCollector {
         crate::app::safe_read(&self.packets, "packets::get_packets")
     }
 
+    /// Decode an Ethernet frame into this collector's packet list and stream
+    /// tracker through the capture thread's own path, for render tests.
+    /// Returns the packet's id.
+    #[cfg(test)]
+    pub(crate) fn ingest_frame_for_test(&self, data: &[u8]) -> Option<u64> {
+        let frame = Frame {
+            data,
+            ethernet: true,
+            capture: None,
+        };
+        let pkt = decode_and_track(frame, &self.counter, &self.dns_cache, &self.stream_tracker)?;
+        let id = pkt.id;
+        crate::app::safe_write(&self.packets, "packets::ingest_for_test").push(pkt);
+        Some(id)
+    }
+
     /// Bytes for a seeded packet: something that reads like the protocol in
     /// the hex and ascii panes rather than a block of zeroes.
     fn demo_payload(proto: &str, info: &str, len: usize) -> Vec<u8> {
@@ -3100,7 +3116,21 @@ fn extract_readable_payload(payload: &[u8]) -> String {
                 result.push(ch);
             }
         }
-        let trimmed = result.trim().to_string();
+        // Tabs become `·` like every other control byte, after the trim so
+        // tabs at either end still go. ratatui drops control characters from
+        // the text it lays out, so a raw tab would vanish from the Payload
+        // Content pane and `id\tname` would read as `idname`.
+        let trimmed: String = result
+            .trim()
+            .chars()
+            .map(|c| {
+                if c == '\t' {
+                    crate::ui::sanitize::REPLACEMENT
+                } else {
+                    c
+                }
+            })
+            .collect();
         if payload.len() > 2048 {
             format!("{}\n… ({} bytes total)", trimmed, payload.len())
         } else {
@@ -3530,6 +3560,15 @@ mod tests {
     #[test]
     fn test_readable_empty_payload() {
         assert_eq!(extract_readable_payload(&[]), String::new());
+    }
+    /// A tab inside the text is a visible `·` (ratatui would drop a raw one);
+    /// tabs at either end are trimmed with the rest of the whitespace.
+    #[test]
+    fn test_readable_payload_shows_tabs() {
+        assert_eq!(
+            extract_readable_payload(b"\tid\tname\n\t\tindented\t\n"),
+            "id·name\n··indented"
+        );
     }
 
     // ── parse_filter / matches_packet ───────────────────────

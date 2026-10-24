@@ -8,12 +8,7 @@
 all-features = true
 
 [advisories]
-ignore = [
-    # paste is unmaintained, with no replacement release. Only ratatui 0.27
-    # pulls it in, as a proc macro at build time; it never runs in netwatch.
-    # The ratatui upgrade planned for 0.38 drops it, and this entry with it.
-    { id = "RUSTSEC-2024-0436", reason = "build-time only via ratatui 0.27; removed by the 0.38 ratatui upgrade" },
-]
+ignore = []
 
 [licenses]
 # Everything the tree uses today, all compatible with shipping an MIT

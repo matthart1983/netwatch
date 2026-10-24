@@ -232,9 +232,27 @@ All notable changes to NetWatch will be documented in this file.
   going out, so an upload that loses its first seconds to addresses that
   never answer gives no verdict from idle samples. Only one webpki-roots
   remains in the build.
-- **windows-sys 0.61 is a direct dependency on Windows**, for the IP Helper
-  and Toolhelp32 calls. tokio, mio and socket2 already built it there, so
-  no new crate is compiled.
+- **windows-sys 0.61, on Windows only.** The IP Helper and ICMP calls that
+  replace `netstat`, `tasklist`, `ping`, `tracert`, `ipconfig`, `route print`
+  and the per-tick PowerShell query take their struct layouts from
+  Microsoft's metadata through windows-sys rather than hand-written
+  declarations. tokio, mio and socket2 already built it there, so no new
+  crate is compiled.
+- **ratatui 0.27 → 0.30, crossterm 0.27 → 0.29 and unicode-width 0.1 →
+  0.2.** Every tab of the full view, Lite and Dense draw as before at
+  80×24, 120×40 and 200×60, in every theme and with `NO_COLOR`, CJK and
+  emoji names included. Three things differ. A box too narrow for both its
+  title and the text at the right of its top border now shows the
+  right-hand text over the title rather than under it. Most tabs of the
+  full view have such boxes, and they start to overlap below about 53
+  columns, as in a tmux window split in half; by 38 columns some boxes
+  lose their name entirely. A halfwidth katakana sound mark (ﾞ or ﾟ) now
+  has a column of its own, as terminals draw it, so a name holding one no
+  longer pushes the rest of its row right; in Lite and Dense the name
+  instead loses a column at its end for each mark. On Windows the second
+  click of a double-click now counts, as it already did elsewhere, so
+  double-clicking a group header folds it and opens it again. paste, the
+  unmaintained crate ratatui 0.27 built with, is gone from the tree.
 
 ### CI
 - **CI fails when Windows code compares English command output.** A test

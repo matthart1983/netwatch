@@ -1564,7 +1564,7 @@ fn build_connection_filter(conn: &Connection) -> String {
 
 /// Draw one frame of the TUI: the current view, then any open overlays.
 fn draw_frame(f: &mut Frame, app: &mut App) {
-    let area = f.size();
+    let area = f.area();
     app.ui.last_area = area;
     // Paint the theme's panel background AND default foreground
     // first so themes that opt in (sky, paper) get a colored fill
@@ -1667,13 +1667,18 @@ fn install_tui_panic_hook() {
     });
 }
 
+// Backends name their own error type since ratatui 0.30; anyhow takes any of
+// them that can cross threads.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     remote: Option<&crate::remote::RemotePublisher>,
     sandbox_mode: crate::sandbox::Mode,
     view: Option<ViewMode>,
     demo: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     // `main` has handed the terminal to the TUI.
     install_tui_panic_hook();
     let mut app = App::prepare();
@@ -4145,7 +4150,7 @@ mod quit_key_tests {
             let buf = terminal.backend().buffer();
             let text: String = (0..buf.area.height)
                 .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-                .map(|(x, y)| buf.get(x, y).symbol().to_string())
+                .map(|(x, y)| buf[(x, y)].symbol().to_string())
                 .collect();
             assert!(text.contains("Quit netwatch?"), "{view:?}");
             assert!(text.contains("any other key"), "{view:?}");
@@ -5205,15 +5210,118 @@ mod render_safety_tests {
     }
 
     /// The review's case: a ClientHello with SNI `ESC ]52;c;AAAA BEL` wrote
-    /// the viewer's clipboard as soon as its connection row was drawn.
+    /// the viewer's clipboard as soon as its connection row was drawn. The SNI
+    /// here skipped ingest, so nothing turned the ESC and BEL into `·`, and
+    /// ratatui 0.30 leaves them out of the row.
     #[test]
     fn a_connection_row_with_an_osc52_sni_draws_no_control_character() {
         let mut app = app_with_hostile_connection();
         app.ui.current_tab = Tab::Connections;
         let buf = draw(&mut app);
         let text: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("·]52;c;AAAA·"), "row was not drawn");
+        assert!(text.contains(" ]52;c;AAAA "), "row was not drawn");
         assert_eq!(unsafe_cells(&buf), Vec::<String>::new());
+    }
+
+    /// Ethernet + IPv4 + TCP 192.0.2.10:50000 -> 198.51.100.7:5555, PSH|ACK,
+    /// carrying `payload`.
+    fn tcp_frame(payload: &[u8]) -> Vec<u8> {
+        let ip_len = u16::try_from(40 + payload.len()).unwrap().to_be_bytes();
+        let mut f = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x08, 0x00];
+        f.extend_from_slice(&[0x45, 0, ip_len[0], ip_len[1], 0, 0, 0x40, 0, 64, 6, 0, 0]);
+        f.extend_from_slice(&[192, 0, 2, 10, 198, 51, 100, 7]);
+        f.extend_from_slice(&50000u16.to_be_bytes());
+        f.extend_from_slice(&5555u16.to_be_bytes());
+        f.extend_from_slice(&[
+            0, 0, 0x03, 0xe8, 0, 0, 0, 0, 0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0,
+        ]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Tabs in a cleartext payload show as `·` in Payload Content and the
+    /// stream view. ratatui 0.30 leaves control characters out of laid-out
+    /// text, so a raw tab vanished and `id\tname\tstatus` read as
+    /// `idnamestatus`, with tab indentation gone. Under 0.27 each tab had a
+    /// cell of its own, which the scrub turned into `·`.
+    #[test]
+    fn tabs_in_a_cleartext_payload_stay_visible() {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let id = app
+            .packet_collector
+            .ingest_frame_for_test(&tcp_frame(b"id\tname\tstatus\n\t\tindented\n"))
+            .expect("the frame decodes");
+        app.ui.current_tab = Tab::Packets;
+        app.ui.scroll.packet_selected = Some(id);
+
+        let screen = rows(&draw(&mut app));
+        assert!(
+            screen.iter().any(|r| r.contains("Payload Content")),
+            "{screen:#?}"
+        );
+        for needle in ["id·name·status", "··indented"] {
+            assert!(
+                screen.iter().any(|r| r.contains(needle)),
+                "payload pane lost {needle:?}: {screen:#?}"
+            );
+        }
+
+        app.ui.stream_view_open = true;
+        app.ui.stream_view_index = app.packet_collector.get_packets()[0].stream_index;
+        assert!(
+            app.ui.stream_view_index.is_some(),
+            "the frame has no stream"
+        );
+        let screen = rows(&draw(&mut app));
+        for needle in ["id·name·status", "··indented"] {
+            assert!(
+                screen
+                    .iter()
+                    .any(|r| r.contains(&format!("→ {needle}"))
+                        || r.contains(&format!("← {needle}"))),
+                "stream view lost {needle:?}: {screen:#?}"
+            );
+        }
+    }
+
+    /// tmux lets a pane shrink to one column. The Timeline's activity strip
+    /// then has an inner area of width 0 at x=1, and tinted the cursor
+    /// column at `buf[(1, y)]`, outside the buffer. ratatui 0.27's `get_mut`
+    /// wrote into the next row in release builds; 0.30's indexing panics,
+    /// which left the shell in raw mode on the alternate screen.
+    #[test]
+    fn no_view_panics_in_a_one_column_terminal() {
+        let mut app = app_with_hostile_connection();
+        let tabs = [
+            Tab::Dashboard,
+            Tab::Connections,
+            Tab::Interfaces,
+            Tab::Packets,
+            Tab::Stats,
+            Tab::Topology,
+            Tab::Timeline,
+            Tab::Processes,
+            Tab::Diagnose,
+            Tab::Egress,
+        ];
+        let views = tabs
+            .into_iter()
+            .map(|tab| (ViewMode::Full, tab))
+            .chain([ViewMode::Lite, ViewMode::Dense].map(|v| (v, Tab::Dashboard)));
+        for (view, tab) in views {
+            app.ui.view_mode = view;
+            app.ui.current_tab = tab;
+            for height in 1..=50 {
+                let mut terminal = Terminal::new(TestBackend::new(1, height)).unwrap();
+                let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    terminal.draw(|f| draw_frame(f, &mut app)).map(|_| ())
+                }));
+                assert!(
+                    matches!(drawn, Ok(Ok(()))),
+                    "{view:?} {tab:?} at 1x{height}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5315,13 +5423,13 @@ mod diagnose_action_tests {
         let screen = |app: &App| -> String {
             let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
             terminal
-                .draw(|f| crate::ui::diagnose::render(f, app, f.size()))
+                .draw(|f| crate::ui::diagnose::render(f, app, f.area()))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             (0..buf.area.height)
                 .map(|y| {
                     (0..buf.area.width)
-                        .map(|x| buf.get(x, y).symbol())
+                        .map(|x| buf[(x, y)].symbol())
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>()
@@ -5444,7 +5552,7 @@ mod interface_list_tests {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
                     + "\n"
             })

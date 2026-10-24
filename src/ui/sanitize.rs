@@ -2,12 +2,13 @@
 //!
 //! An SNI, a DNS name, an HTTP Host, an SSH banner, a PTR record, a whois
 //! reply and another user's process name all reach the screen as text we did
-//! not choose. ratatui 0.27 does not filter it: a control character is one
-//! cell wide under unicode-width 0.1.14, so it gets a cell of its own, and
-//! crossterm writes cell symbols to the terminal verbatim. A ClientHello whose
-//! SNI is `\x1b]52;c;…\x07` therefore writes the viewer's clipboard (OSC 52),
-//! and the same trick reaches the window title, screen clears and cursor
-//! moves. Bidi overrides and zero-width characters execute nothing, but they
+//! not choose, and crossterm writes cell symbols to the terminal verbatim.
+//! ratatui 0.27 gave a control character a cell of its own, so a ClientHello
+//! whose SNI is `\x1b]52;c;…\x07` wrote the viewer's clipboard (OSC 52), and
+//! the same trick reaches the window title, screen clears and cursor moves.
+//! ratatui 0.30 leaves control characters out of the text it lays out, with no
+//! mark where they were, but a symbol set on a cell directly still goes out as
+//! it is. Bidi overrides and zero-width characters execute nothing, but they
 //! let one hostname read as another; `Line`, `Table` and `List` keep them
 //! appended to the neighbouring cell.
 //!
@@ -84,10 +85,10 @@ pub fn display_multiline(s: &str) -> Cow<'_, str> {
 
 /// Remove unsafe characters from every cell of a drawn frame.
 ///
-/// The backstop behind [`display`]. A control character arrives in a cell of
-/// its own and becomes [`REPLACEMENT`]; a zero-width one arrives appended to
-/// its neighbour's symbol and is dropped, which leaves the neighbour and the
-/// cell's width as they were.
+/// The backstop behind [`display`]. A control character set on a cell
+/// directly arrives in a cell of its own and becomes [`REPLACEMENT`]; a
+/// zero-width one arrives appended to its neighbour's symbol and is dropped,
+/// which leaves the neighbour and the cell's width as they were.
 pub fn scrub_buffer(buf: &mut Buffer) {
     for cell in &mut buf.content {
         if !cell.symbol().chars().any(is_unsafe) {
@@ -186,12 +187,15 @@ mod tests {
         assert!(matches!(display_multiline("a\nb"), Cow::Borrowed(_)));
     }
 
-    /// Why the backstop exists: ratatui puts the ESC and BEL in cells of their
-    /// own, and those symbols are what crossterm writes to the terminal.
+    /// Why the backstop exists. ratatui 0.30 leaves the ESC and BEL out of
+    /// text it lays out, but a symbol set on a cell keeps them, and cell
+    /// symbols are what crossterm writes to the terminal.
     #[test]
-    fn ratatui_keeps_control_characters_in_cells() {
+    fn ratatui_keeps_control_characters_set_on_a_cell() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
         Paragraph::new(format!("HTTPS {OSC52}")).render(buf.area, &mut buf);
+        assert!(!has_unsafe(&buf), "ratatui laid out a control character");
+        buf[(0, 0)].set_symbol(OSC52);
         assert!(has_unsafe(&buf));
     }
 
@@ -201,14 +205,18 @@ mod tests {
         terminal
             .draw(|f| {
                 // `Line` rather than `Paragraph`: Paragraph skips zero-width
-                // graphemes, Line appends them to the previous cell.
-                f.render_widget(Line::from(format!("{OSC52} x\u{202E}y")), f.size());
+                // graphemes, Line appends them to the previous cell. Both
+                // drop the ESC and BEL, so one is set on a cell directly, the
+                // only way a control character reaches a cell now.
+                f.render_widget(Line::from(format!("{OSC52} x\u{202E}y")), f.area());
+                f.buffer_mut()[(16, 0)].set_symbol("\x1b");
+                assert_eq!(f.buffer_mut()[(11, 0)].symbol(), "x\u{202E}");
                 scrub_buffer(f.buffer_mut());
             })
             .unwrap();
         let buf = terminal.backend().buffer();
         assert!(!has_unsafe(buf));
         let row: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert_eq!(row.trim_end(), "·]52;c;AAAA· xy");
+        assert_eq!(row.trim_end(), "]52;c;AAAA xy   ·");
     }
 }
