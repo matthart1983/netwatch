@@ -92,6 +92,13 @@ All notable changes to NetWatch will be documented in this file.
   must be on a filesystem with hard links.
 
 ### Fixed
+- **Exported captures carry the real capture time and wire length.** PCAP
+  export rebuilt each timestamp from the time of day shown in the packet
+  list, so every packet was dated 1 January 1970 and a capture across
+  midnight went backwards, and it recorded the captured length as the
+  length on the wire. Times now come from libpcap, in UTC to the
+  microsecond. `--demo` packets, which were never captured, are left out
+  and counted instead of written with an invented time.
 - **The terminal is restored on a TUI panic or shutdown signal.** SIGTERM,
   SIGINT and SIGHUP exit cleanly on Unix; Windows handles Ctrl+C and console
   close notifications. Raw mode, mouse capture and the alternate screen are
@@ -193,13 +200,6 @@ All notable changes to NetWatch will be documented in this file.
   suggests `t`, and both `t` and `diagnose coverage --test pmtu.blackhole`
   refuse it, before asking for a `pmtu_url`, as the IPv6 experiment does
   off Linux.
-- **Exported captures carry the real capture time and wire length.** PCAP
-  export rebuilt each timestamp from the time of day shown in the packet
-  list, so every packet was dated 1 January 1970 and a capture across
-  midnight went backwards, and it recorded the captured length as the
-  length on the wire. Times now come from libpcap, in UTC to the
-  microsecond. `--demo` packets, which were never captured, are left out
-  and counted instead of written with an invented time.
 - **IPv6 connections show their protocol, rates and packets.** Packet
   capture wrote IPv6 addresses with every group spelled out
   (`2001:db8:0:0:0:0:0:1`) while the connection table compresses them
