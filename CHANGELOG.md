@@ -92,6 +92,13 @@ All notable changes to NetWatch will be documented in this file.
   must be on a filesystem with hard links.
 
 ### Fixed
+- **Exported captures carry the real capture time and wire length.** PCAP
+  export rebuilt each timestamp from the time of day shown in the packet
+  list, so every packet was dated 1 January 1970 and a capture across
+  midnight went backwards, and it recorded the captured length as the
+  length on the wire. Times now come from libpcap, in UTC to the
+  microsecond. `--demo` packets, which were never captured, are left out
+  and counted instead of written with an invented time.
 - **Lite view: keys no longer overflow in a terminal smaller than its
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns
@@ -187,13 +194,6 @@ All notable changes to NetWatch will be documented in this file.
   suggests `t`, and both `t` and `diagnose coverage --test pmtu.blackhole`
   refuse it, before asking for a `pmtu_url`, as the IPv6 experiment does
   off Linux.
-- **Exported captures carry the real capture time and wire length.** PCAP
-  export rebuilt each timestamp from the time of day shown in the packet
-  list, so every packet was dated 1 January 1970 and a capture across
-  midnight went backwards, and it recorded the captured length as the
-  length on the wire. Times now come from libpcap, in UTC to the
-  microsecond. `--demo` packets, which were never captured, are left out
-  and counted instead of written with an invented time.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
@@ -232,12 +232,9 @@ All notable changes to NetWatch will be documented in this file.
   going out, so an upload that loses its first seconds to addresses that
   never answer gives no verdict from idle samples. Only one webpki-roots
   remains in the build.
-- **windows-sys 0.61, on Windows only.** The IP Helper and ICMP calls that
-  replace `netstat`, `tasklist`, `ping`, `tracert`, `ipconfig`, `route print`
-  and the per-tick PowerShell query take their struct layouts from
-  Microsoft's metadata through windows-sys rather than hand-written
-  declarations. tokio, mio and socket2 already built it there, so no new
-  crate is compiled.
+- **windows-sys 0.61 is a direct dependency on Windows**, for the IP Helper
+  and Toolhelp32 calls. tokio, mio and socket2 already built it there, so
+  no new crate is compiled.
 
 ### CI
 - **CI fails when Windows code compares English command output.** A test
