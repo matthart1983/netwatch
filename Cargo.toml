@@ -52,7 +52,7 @@ httparse = "1.10"
 # certificate error class, which ureq hides. Both are already in the tree
 # through ureq with these features, so this adds no new crates.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 # QUIC Initial decryption (Phase 9 hard mode) uses ring's `aead::quic`
 # header-protection primitive + `aead::AES_128_GCM` + the `hkdf` module.
 # ring is already a direct dep above for TLS work.
