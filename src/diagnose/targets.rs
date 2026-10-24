@@ -995,6 +995,9 @@ fn link_domains() -> Vec<LinkDns> {
     }
 }
 
+/// Per-link DNS servers and domains from `resolvectl status`, which only
+/// Linux runs.
+#[cfg(any(target_os = "linux", test))]
 pub fn parse_resolvectl(text: &str) -> Vec<LinkDns> {
     let mut out: Vec<LinkDns> = Vec::new();
     let mut key = String::new();

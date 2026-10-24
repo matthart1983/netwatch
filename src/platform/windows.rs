@@ -113,6 +113,7 @@ pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
     }
 }
 
+// locale: fallback-only. GetAdaptersAddresses is tried first.
 fn collect_interface_info_ipconfig() -> Result<Vec<InterfaceInfo>> {
     let output = Command::new("ipconfig").args(["/all"]).output()?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -209,6 +210,7 @@ fn extract_value(line: &str) -> Option<String> {
 
 /// Collect MTU values from `netsh interface ipv4 show subinterfaces`, for the
 /// ipconfig fallback only: the API path takes the MTU from the adapter record.
+// locale: fallback-only. GetAdaptersAddresses is tried first.
 fn collect_mtu_map() -> HashMap<String, u32> {
     let mut map = HashMap::new();
 

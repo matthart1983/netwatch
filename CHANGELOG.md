@@ -240,6 +240,15 @@ All notable changes to NetWatch will be documented in this file.
   crate is compiled.
 
 ### CI
+- **CI fails when Windows code compares English command output.** A test
+  reads the source as a Windows build compiles it and fails on any
+  comparison with English that ping, tracert, ipconfig, netstat, netsh or
+  another Windows tool prints, such as `Average =` or `LISTENING`, because
+  a translated install prints something else and the match finds nothing.
+  The only code allowed to read English is a fallback that runs after its
+  IP Helper call has failed: ipconfig and netsh for the interface list,
+  ipconfig for DNS servers, and netstat's connection states. Each is listed
+  in the test and marked in the source.
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,
   `netwatch --version` must print the Cargo.toml version, and
   `netwatch doctor --json` must report `npcap_missing` with the download

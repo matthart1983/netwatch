@@ -210,6 +210,7 @@ fn collect_dns() -> Vec<String> {
 /// address rather than by lacking a colon. A link-local server keeps its
 /// zone index ("%12") and any other loses it, and Windows' fec0
 /// placeholders go, as on the API path (`ip_helper::dns_server_text`).
+// locale: fallback-only. GetAdaptersAddresses is tried first.
 #[cfg(any(target_os = "windows", test))]
 fn parse_ipconfig_dns(text: &str) -> Vec<String> {
     let mut servers = Vec::new();
