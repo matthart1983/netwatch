@@ -142,3 +142,51 @@ fn explicit_capture_check_reports_failure_and_creates_no_state() {
         1
     );
 }
+/// Doctor names the connection table a live session will read: `ss` when it
+/// is on PATH, `/proc/net` when it is not. PATH is set on the child only.
+#[test]
+fn doctor_reports_the_proc_net_fallback_when_ss_is_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let empty = fixture.0.join("empty-bin");
+    let with_ss = fixture.0.join("ss-bin");
+    fs::create_dir_all(&empty).unwrap();
+    fs::create_dir_all(&with_ss).unwrap();
+    fs::write(with_ss.join("ss"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(with_ss.join("ss"), fs::Permissions::from_mode(0o755)).unwrap();
+    let connections = |path: &std::path::Path| {
+        let output = fixture
+            .command()
+            .args(["doctor", "--json"])
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot: netwatch::runtime::capabilities::CapabilitySnapshot =
+            serde_json::from_slice(&output.stdout).unwrap();
+        snapshot.get("connections").clone()
+    };
+
+    let missing = connections(&empty);
+    assert_eq!(
+        missing.state,
+        netwatch::runtime::capabilities::State::Degraded
+    );
+    assert_eq!(missing.reason, "proc_net_fallback");
+    assert!(missing.detail.contains("/proc/net/"), "{}", missing.detail);
+
+    let found = connections(&with_ss);
+    assert_eq!(found.state, netwatch::runtime::capabilities::State::Ready);
+    assert_eq!(found.reason, "ss_found");
+    assert!(
+        found
+            .detail
+            .contains(&with_ss.join("ss").display().to_string()),
+        "{}",
+        found.detail
+    );
+}

@@ -677,11 +677,24 @@ struct ConnRow {
 
 impl ConnRow {
     /// A row nobody is talking on any more. Dims out rather than disappearing —
-    /// it is still a socket, it is just done.
+    /// it is still a socket, it is just done. Linux and Windows spell states
+    /// as `ss` does (`TIME-WAIT`), macOS as lsof does (`TIME_WAIT`).
     fn is_dead(&self) -> bool {
         matches!(
             self.state.as_str(),
-            "TIME_WAIT" | "CLOSE_WAIT" | "CLOSED" | "FIN_WAIT1" | "FIN_WAIT2" | "LAST_ACK"
+            "TIME_WAIT"
+                | "TIME-WAIT"
+                | "CLOSE_WAIT"
+                | "CLOSE-WAIT"
+                | "CLOSED"
+                | "FIN_WAIT1"
+                | "FIN_WAIT_1"
+                | "FIN-WAIT-1"
+                | "FIN_WAIT2"
+                | "FIN_WAIT_2"
+                | "FIN-WAIT-2"
+                | "LAST_ACK"
+                | "LAST-ACK"
         )
     }
 
@@ -1090,16 +1103,17 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// `ESTABLISHED` in an 8-wide column renders `ESTABLI…`, which is noise on
 /// every row. These are the spellings `ss` and `netstat` readers already know.
+/// Each takes lsof's spelling and `ss`'s, which Linux and Windows report.
 fn short_state(state: &str) -> &str {
     match state {
         "ESTABLISHED" => "ESTAB",
-        "TIME_WAIT" => "TIME_W",
-        "CLOSE_WAIT" => "CLOSE_W",
-        "FIN_WAIT1" => "FIN_W1",
-        "FIN_WAIT2" => "FIN_W2",
-        "SYN_SENT" => "SYN_S",
-        "SYN_RECV" | "SYN_RECEIVED" => "SYN_R",
-        "LAST_ACK" => "LAST_A",
+        "TIME_WAIT" | "TIME-WAIT" => "TIME_W",
+        "CLOSE_WAIT" | "CLOSE-WAIT" => "CLOSE_W",
+        "FIN_WAIT1" | "FIN_WAIT_1" | "FIN-WAIT-1" => "FIN_W1",
+        "FIN_WAIT2" | "FIN_WAIT_2" | "FIN-WAIT-2" => "FIN_W2",
+        "SYN_SENT" | "SYN-SENT" => "SYN_S",
+        "SYN_RECV" | "SYN_RECEIVED" | "SYN_RCVD" | "SYN-RECV" => "SYN_R",
+        "LAST_ACK" | "LAST-ACK" => "LAST_A",
         other => other,
     }
 }
@@ -3122,20 +3136,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn states_fit_their_column_without_eliding() {
-        let w = Layout::new(Rect::new(0, 0, 130, 44)).conn_cols[conn_col::STATE].w as usize;
-        for s in [
+    /// Every spelling a collector produces: lsof's, and the `ss` names that
+    /// Linux reports and Windows maps its numeric states to.
+    pub(super) fn every_state_name() -> Vec<&'static str> {
+        let mut names = vec![
             "ESTABLISHED",
             "TIME_WAIT",
             "CLOSE_WAIT",
             "FIN_WAIT1",
             "FIN_WAIT2",
+            "FIN_WAIT_1",
+            "FIN_WAIT_2",
             "SYN_SENT",
             "SYN_RECV",
+            "SYN_RECEIVED",
             "LAST_ACK",
             "LISTEN",
-        ] {
+        ];
+        names.extend((1..=12).map(crate::platform::socket_table::tcp_state_name));
+        names
+    }
+
+    #[test]
+    fn states_fit_their_column_without_eliding() {
+        let w = Layout::new(Rect::new(0, 0, 130, 44)).conn_cols[conn_col::STATE].w as usize;
+        for s in every_state_name() {
             let short = short_state(s);
             assert!(
                 short.width() <= w,
@@ -3370,5 +3395,18 @@ mod group_tests {
         assert_eq!(r.rtt_ms, Some(2.0), "best rtt, not first");
         assert_eq!(r.state, "ESTABLISHED", "dominant state");
         assert_eq!(r.history, vec![3, 3, 3], "sparklines summed");
+    }
+
+    /// A closing socket dims however its platform spells the state, and a
+    /// live one never does. `state_label` folds the spellings into one name.
+    #[test]
+    fn closing_states_are_dead_in_either_spelling() {
+        for s in super::tests::every_state_name() {
+            let closing = matches!(
+                crate::ui::widgets::state_label(s).as_str(),
+                "time-wait" | "close-wait" | "closed" | "fin-wait-1" | "fin-wait-2" | "last-ack"
+            );
+            assert_eq!(conn("p", 1, "h", 0.0, 0, s).is_dead(), closing, "{s}");
+        }
     }
 }

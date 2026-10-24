@@ -56,6 +56,15 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # The tests never start the binary this job just built. The runner has
+      # the Npcap SDK but not Npcap, like a new user's machine, so check what
+      # that user meets first. `--version` and `doctor` must run, and doctor
+      # must say Npcap is missing and where to get it.
+      - name: Smoke-test the release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1 target\release\netwatch.exe
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:

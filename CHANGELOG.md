@@ -22,17 +22,111 @@ All notable changes to NetWatch will be documented in this file.
 - **`confirm_quit`** (Settings → Confirm Quit, off by default): `q` asks
   "Quit netwatch?" first, and `y`, `q` or `Enter` confirms. `Ctrl+C` still
   quits at once (#94).
+- **`netwatch doctor` says where the Linux connection table will come
+  from.** A new `connections` entry reads `ready` (`ss_found`, with the path)
+  when `ss` is on `PATH`, and `degraded` (`proc_net_fallback`) when it is
+  not, naming the `/proc/net` tables a live session reads instead. When
+  `/proc/net/tcp` cannot be read either, it reads `unavailable`
+  (`no_connection_table`), because the table will be empty. The JSON gains
+  that one capability and nothing else changes.
 
 ### Changed
 - **`q` closes the help, settings and memory overlays** instead of quitting
   netwatch, as `Esc` does. Pressed on an overlay, it nearly always meant
   "close this" (#94). `Ctrl+C` still quits from anywhere.
+- **Windows reads connections through IP Helper, not netstat and
+  tasklist.** Each socket and its owning PID come from
+  `GetExtendedTcpTable` and `GetExtendedUdpTable`, and process names from
+  one process snapshot, where every refresh used to start two commands. The
+  names are the `chrome.exe` names tasklist gave. A listener's peer reads
+  `*:*` instead of `0.0.0.0:0`. An IPv6 link-local address no longer carries
+  its `%12` scope suffix, in the views and in the JSON and CSV exports. A
+  TIME_WAIT connection reads "unattributed" instead of "System Idle
+  Process", since no process owns it any more. The connection detail's
+  Match line says `IpHelper`. netstat and tasklist are used only if those
+  calls fail.
+- **Windows: interface counters, the default route and adapter GUIDs come
+  from the IP Helper API.** The Interfaces tab and traffic graphs read
+  `GetIfTable2` each tick, where netwatch used to start PowerShell for
+  Get-NetAdapterStatistics on every tick, at 300-800 ms a call. The default
+  capture interface and the gateway come from the routing table
+  (`GetIpForwardTable2`), ranked by route plus interface metric as Windows
+  ranks them, instead of from Get-NetRoute and `route print`. Capture finds
+  an adapter's Npcap device by the GUID `GetAdaptersAddresses` reports
+  rather than by asking Get-NetAdapter. Counters cover the adapters the
+  Interfaces tab lists and, as Get-NetAdapterStatistics did, NICs with IP
+  unbound, such as a capture-only NIC or the physical NIC under a Hyper-V
+  external switch. Packet counts now include broadcast and multicast, as
+  they do on Linux and macOS, from the API and its fallbacks alike.
+  PowerShell, `route print` and `netstat -e` remain only as fallbacks for
+  when an API call fails.
 
 ### Fixed
 - **Lite view: keys no longer overflow in a terminal smaller than its
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns
   every key overflowed.
+- **`netwatch doctor` on Windows says whether Npcap is installed, and where
+  to get it.** Without Npcap, the `capture_library` entry now says Npcap is
+  not installed, and its next step gives the https://npcap.com/#download
+  link that the capture error and the Dashboard banner already give. With
+  Npcap installed, doctor asks Windows whether the Npcap driver is running.
+  If it is not, the reason is `npcap_driver_stopped` and the next step is
+  `sc.exe start npcap` as administrator (`.exe`, because in Windows
+  PowerShell `sc` is Set-Content). A `wpcap.dll` with no Npcap driver
+  behind it, as WinPcap or a partial uninstall leaves, is
+  `npcap_driver_missing`. Both now report state `unavailable`; in 0.37 they
+  were `not_checked [npcap_present_unloaded]`. Before, doctor said "DLL and
+  driver not loaded" either way, and told a user who had Npcap to install
+  it.
+- **Linux: the connection table is no longer empty without `ss`.** When
+  `ss` is missing (minimal containers, some NAS distributions), cannot
+  start, or fails, netwatch reads the kernel's
+  `/proc/net/{tcp,tcp6,udp,udp6}` tables instead, so Connections, Processes
+  and Egress fill as they do with `ss`, and processes are attributed the
+  same way. The rows read the same with two exceptions: a socket bound to
+  a device loses the `%lo`-style suffix `ss` adds, and a dual-stack
+  wildcard reads `[::]:port` where `ss` prints `*:port`. While the fallback
+  is in use, Settings shows a `connections: degraded` row with the reason.
+  The log notes each switch once rather than every poll, and warns when a
+  poll can read no table at all, from the first poll on.
+- **Windows: connection states read the same in every display language.**
+  netstat translates its state column: German Windows showed `HERGESTELLT`
+  and `ABHÖREN`, which matched no state filter, colour or counter,
+  including the TIME_WAIT and CLOSE_WAIT counts behind the Prometheus
+  metrics, and English showed `LISTENING`, so the listen filter found
+  nothing. The state now arrives as a number and is named as on Linux
+  (`ESTABLISHED`, `LISTEN`, `TIME-WAIT`), in the views and in the JSON and
+  CSV exports.
+- **Processes view: SOCKET STATES counts CLOSE-WAIT, FIN-WAIT and SYN
+  sockets on Linux.** It knew only lsof's spelling (`CLOSE_WAIT`), so it
+  counted Linux's `CLOSE-WAIT` as other.
+- **Linux: the Dense view dims closing sockets, and the Connections view
+  flags CLOSE-WAIT.** Both knew only lsof's spellings (`TIME_WAIT`,
+  `CLOSE_WAIT`), not the `TIME-WAIT` and `CLOSE-WAIT` that Linux, and now
+  Windows, report. A closing row in the Dense view drew as live, with its
+  state cut to `TIME-WA…`, and a `CLOSE-WAIT` or `FIN-WAIT` row in the
+  Connections view was muted instead of drawn in the error colour.
+- **Windows: DNS servers are found on non-English Windows, and IPv6 ones
+  are read whole.** They came from `ipconfig /all` by its English label, so
+  on a French ("Serveurs DNS") or Russian ("DNS-серверы") install none were
+  found and the Health widget had no resolver to probe. An IPv6 server such
+  as `2001:db8::53%12` was cut at its last colon to `53%12`, further IPv6
+  servers were skipped, and another adapter's gateway could be listed as a
+  DNS server. They now come from `GetAdaptersAddresses` in any display
+  language: the default-route adapter's first, and without the
+  `fec0:0:0:ffff::1` placeholders Windows reports when no IPv6 resolver is
+  set. A link-local server keeps its zone index (`fe80::1%12`), as on Linux
+  and macOS, and the probes pass it over as they do there rather than send
+  to whichever link Windows picks. The ipconfig fallback reads IPv6 servers
+  correctly as well.
+- **Windows: the gateway is an address with a VPN up.** `route print` lists
+  default routes unsorted, and a VPN's on-link default shows "On-link" in the
+  gateway column, which the Health widget could then try to probe as the
+  gateway. The gateway is now the next hop of the lowest-metric default route
+  that has one. Where either old parse went wrong, the gateway or resolvers
+  in the network's Diagnose baseline key change with these two fixes, so
+  Diagnose relearns that network's baselines once after the upgrade.
 - **Windows: gateway and internet latency on any display language.** The
   probes ran `ping.exe` and read its English summary. On a German, Russian
   or other non-English install that summary never matched, so the probes
@@ -64,9 +158,52 @@ All notable changes to NetWatch will be documented in this file.
   off Linux.
 
 ### Dependencies
-- **windows-sys 0.61 (Windows only)**, for the ICMP API calls. Their
-  structures and constants come from Microsoft's metadata instead of
-  declarations written by hand.
+- **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
+  toml 0.8 parsed through its own copy of toml_edit 0.22, next to the
+  toml_edit 0.25 the egress policy writer uses; toml 1.x needs neither.
+  config.toml and the egress policy are written byte for byte as before,
+  `--generate-config` included. config.toml and egress-policy.toml can now
+  also use TOML 1.1: an inline table may span lines and end in a comma, and
+  strings take `\e` and `\xHH` escapes. netwatch 0.37 and earlier can't read
+  a file that does. They run on defaults in place of such a config.toml, and
+  they skip such an egress policy and enforce none of it, which shows only as
+  a log warning and in Diagnose coverage. Keep a file shared across machines,
+  such as a distributed egress policy, to TOML 1.0 until every host runs
+  0.38. Parse errors are worded a little differently.
+- **dirs 5 → 7.** Config, cache and state stay where they were on every
+  platform. The one location dirs 7 moved, `preference_dir` on Windows, is
+  not one netwatch uses.
+- **ureq 2 → 3.5 and webpki-roots 0.26 → 1.** The remote publisher, the geo
+  and whois lookups and AI insights behave as before. They keep their
+  timeouts, connect directly even when `HTTPS_PROXY` is set, which ureq 3
+  would otherwise honour, follow at most four redirects and send compact
+  JSON. A reply is still capped at 10 MiB once gzip is undone. The remote
+  URL is still sent as the url crate reads it, so a trailing newline from a
+  secret file, a space in the path or a non-ASCII host works as it did, and
+  a URL ureq 3 cannot send to is refused at start-up. Three things differ.
+  An ingest POST answered with a 307 or 308 is now retried, where ureq 2
+  counted it as delivered and dropped the batch. A response body now has
+  30 s to arrive, a redirect's included, since ureq 3 reads a redirect's
+  body before following it where ureq 2 dropped it unread. AI insights now
+  use the shared client, so the Ollama endpoint gets 5 s to accept the
+  connection and still 30 s to answer. The diagnose load test no longer
+  uploads through ureq, because ureq 3 takes a custom resolver only through
+  an API outside semver. It sends the same 25 MB over the cancellable
+  lookup and sockets the other probes use, and still never follows a
+  redirect. It times connections under load only once the upload's body is
+  going out, so an upload that loses its first seconds to addresses that
+  never answer gives no verdict from idle samples. Only one webpki-roots
+  remains in the build.
+- **windows-sys 0.61 is a direct dependency on Windows**, for the IP Helper
+  and Toolhelp32 calls. tokio, mio and socket2 already built it there, so
+  no new crate is compiled.
+
+### CI
+- **Windows CI runs the binary it builds.** On a runner with no Npcap,
+  `netwatch --version` must print the Cargo.toml version, and
+  `netwatch doctor --json` must report `npcap_missing` with the download
+  link. Nothing started the built binary on Windows before. The release
+  workflow runs the same check on the Windows binary before packaging it.
 
 ## [0.37.0] - 2026-10-22
 

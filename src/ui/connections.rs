@@ -1124,13 +1124,7 @@ fn render_conn_row(
     row_alpha: f32,
 ) {
     let t = &app.theme;
-    let state_color = match conn.state.as_str() {
-        "ESTABLISHED" => t.status_good,
-        "LISTEN" => t.status_info,
-        "TIME_WAIT" | "TIME-WAIT" => t.status_warn,
-        "CLOSE_WAIT" | "FIN_WAIT_1" | "FIN_WAIT_2" => t.status_error,
-        _ => t.text_muted,
-    };
+    let state_color = conn_state_color(&conn.state, t);
     let active = matches!(
         (conn.rx_rate, conn.tx_rate),
         (Some(r), _) if r > 0.0
@@ -1875,6 +1869,21 @@ fn rtt_sparkline(history: &std::collections::VecDeque<f64>) -> String {
         .collect()
 }
 
+/// A connection row's state colour. Linux and Windows spell states as `ss`
+/// does (`CLOSE-WAIT`), macOS as lsof does (`CLOSE_WAIT`), so each takes both:
+/// a CLOSE-WAIT socket an application never closed is what the error colour
+/// is there to flag.
+fn conn_state_color(state: &str, t: &crate::theme::Theme) -> Color {
+    match state {
+        "ESTABLISHED" => t.status_good,
+        "LISTEN" => t.status_info,
+        "TIME_WAIT" | "TIME-WAIT" => t.status_warn,
+        "CLOSE_WAIT" | "CLOSE-WAIT" | "FIN_WAIT1" | "FIN_WAIT_1" | "FIN-WAIT-1" | "FIN_WAIT2"
+        | "FIN_WAIT_2" | "FIN-WAIT-2" => t.status_error,
+        _ => t.text_muted,
+    }
+}
+
 #[allow(dead_code)]
 fn rtt_sparkline_color(
     history: &std::collections::VecDeque<f64>,
@@ -2173,6 +2182,23 @@ mod tests {
         let chars: Vec<char> = s.chars().collect();
         assert_eq!(chars[0], '█'); // max
         assert_eq!(chars[2], '▁'); // min
+    }
+
+    #[test]
+    fn closing_states_take_the_error_colour_in_either_spelling() {
+        let theme = crate::theme::dark();
+        for s in [
+            "CLOSE_WAIT",
+            "CLOSE-WAIT",
+            "FIN_WAIT_1",
+            "FIN-WAIT-1",
+            "FIN_WAIT_2",
+            "FIN-WAIT-2",
+        ] {
+            assert_eq!(conn_state_color(s, &theme), theme.status_error, "{s}");
+        }
+        assert_eq!(conn_state_color("TIME-WAIT", &theme), theme.status_warn);
+        assert_eq!(conn_state_color("SYN-SENT", &theme), theme.text_muted);
     }
 
     #[test]

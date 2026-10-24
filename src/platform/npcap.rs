@@ -61,6 +61,79 @@ pub fn installed() -> bool {
         .is_some_and(|p| p.join("Npcap/wpcap.dll").is_file() || p.join("wpcap.dll").is_file())
 }
 
+// The Service Control Manager calls doctor uses to ask whether Npcap's driver
+// is running, declared by hand for the same reason as the kernel32 ones above.
+// Wireshark checks the same way before warning "The NPF driver isn't running".
+const SC_MANAGER_CONNECT: u32 = 0x0001;
+const SERVICE_QUERY_STATUS: u32 = 0x0004;
+
+/// `SERVICE_STATUS`: seven DWORDs, unchanged since Windows NT.
+#[repr(C)]
+#[derive(Default)]
+struct ServiceStatus {
+    service_type: u32,
+    current_state: u32,
+    controls_accepted: u32,
+    win32_exit_code: u32,
+    service_specific_exit_code: u32,
+    check_point: u32,
+    wait_hint: u32,
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> *mut c_void;
+    fn OpenServiceW(manager: *mut c_void, name: *const u16, access: u32) -> *mut c_void;
+    fn QueryServiceStatus(service: *mut c_void, status: *mut ServiceStatus) -> i32;
+    fn CloseServiceHandle(handle: *mut c_void) -> i32;
+}
+
+/// The `npcap` driver service's `dwCurrentState`, or the Win32 error that kept
+/// us from reading it (1060 when no such service is registered).
+///
+/// This asks the Service Control Manager, which normally needs no elevation
+/// for a status query, so doctor can tell "Npcap's files are there but its
+/// driver is not running" from a working install without loading `wpcap.dll`
+/// or opening the driver. Static doctor promises to do neither.
+pub fn driver_service_state() -> Result<u32, u32> {
+    service_state("npcap")
+}
+
+fn service_state(name: &str) -> Result<u32, u32> {
+    // GetLastError, called straight after the call that failed:
+    // CloseServiceHandle can overwrite it.
+    let last_error = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+    // SAFETY: null machine and database names mean the local, active service
+    // database; the handle is checked for null before use.
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(last_error());
+    }
+    let name = wide(std::ffi::OsStr::new(name));
+    // SAFETY: `manager` is the live handle opened above, and `name` is a
+    // NUL-terminated UTF-16 string that outlives the call.
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS) };
+    let state = if service.is_null() {
+        Err(last_error())
+    } else {
+        let mut status = ServiceStatus::default();
+        // SAFETY: `service` was opened with SERVICE_QUERY_STATUS, and `status`
+        // is a writable SERVICE_STATUS the call fills in.
+        let ok = unsafe { QueryServiceStatus(service, &mut status) } != 0;
+        let state = if ok {
+            Ok(status.current_state)
+        } else {
+            Err(last_error())
+        };
+        // SAFETY: `service` is a handle this function opened and closes once.
+        unsafe { CloseServiceHandle(service) };
+        state
+    };
+    // SAFETY: as above, for the manager handle.
+    unsafe { CloseServiceHandle(manager) };
+    state
+}
+
 /// Add Npcap's install directory to the DLL search path, returning it when it
 /// was found and accepted.
 ///
@@ -128,5 +201,15 @@ mod tests {
         if let Some(dir) = add_npcap_dir_to_search_path() {
             assert!(dir.is_dir(), "returned a path that isn't there");
         }
+    }
+
+    /// The service query decodes a real answer, checked against services
+    /// whose state is known on every Windows rather than against Npcap, which
+    /// the CI runner does not have. RpcSs cannot be stopped, so it is always
+    /// SERVICE_RUNNING (4); 1060 is ERROR_SERVICE_DOES_NOT_EXIST.
+    #[test]
+    fn service_query_reads_known_services() {
+        assert_eq!(service_state("RpcSs"), Ok(4));
+        assert_eq!(service_state("netwatch-no-such-service"), Err(1060));
     }
 }
