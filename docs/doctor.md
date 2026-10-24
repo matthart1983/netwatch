@@ -47,7 +47,14 @@ selected `interface`, `capabilities`, `protections` and `network_restricted`.
 The additive `attribution_coverage` field is null in doctor reports; only runtime
 snapshots contain observed coverage. See [attribution evidence](attribution.md).
 Each capability has an `id`, `state`, machine-readable `reason`, explanatory
-`detail` and optional `next_check`. States are `ready`, `not_checked`,
+`detail` and optional `next_check`. On Linux, `connections` names where a live
+session reads the connection table. It is `ready` (`ss_found`) when `ss` is on
+`PATH`, and `degraded` (`proc_net_fallback`) when it is not and the kernel's
+`/proc/net` tables are read instead. When `/proc/net/tcp` cannot be read either,
+it is `unavailable` (`no_connection_table`) and the table will be empty. Static
+doctor does not run `ss`, so one that is present but fails shows only in a live
+session. There Settings shows a `connections: degraded` row with the reason, and
+the log records the fallback and why. States are `ready`, `not_checked`,
 `unavailable`, `disabled`, `degraded` and `stale`. Consumers should tolerate new
 capabilities and reason codes. A report is a point-in-time observation.
 

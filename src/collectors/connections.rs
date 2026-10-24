@@ -250,6 +250,10 @@ pub struct ConnectionCollector {
     /// Unconfined `/proc` scanner (see [`ProcBroker`]). `None` until attached.
     #[cfg(target_os = "linux")]
     proc_broker: Option<Arc<ProcBroker>>,
+    /// The `ss` the Linux poll runs: [`SS_PROGRAM`], except in tests that
+    /// need one that is missing or cannot run.
+    #[cfg(target_os = "linux")]
+    ss_program: &'static str,
 }
 
 impl ConnectionCollector {
@@ -270,6 +274,8 @@ impl ConnectionCollector {
             proc_snapshot: None,
             #[cfg(target_os = "linux")]
             proc_broker: None,
+            #[cfg(target_os = "linux")]
+            ss_program: SS_PROGRAM,
         }
     }
 
@@ -341,10 +347,23 @@ impl ConnectionCollector {
         self
     }
 
+    /// Run `program` in place of `ss`, to exercise the `/proc/net` fallback.
+    #[cfg(all(target_os = "linux", test))]
+    pub(crate) fn with_ss_program(mut self, program: &'static str) -> Self {
+        self.ss_program = program;
+        self
+    }
+
     /// Publish `rows` as if a poll had produced them, for render tests.
     #[cfg(test)]
     pub(crate) fn publish_for_test(&self, rows: Vec<Connection>) {
         *safe_write(&self.snapshot, "connections::publish") = Arc::new(rows);
+    }
+
+    /// Record `coverage` as if a poll had measured it, for render tests.
+    #[cfg(all(target_os = "linux", test))]
+    pub(crate) fn set_coverage_for_test(&self, coverage: super::attribution::Coverage) {
+        *safe_write(&self.coverage, "connections::coverage") = coverage;
     }
 
     pub fn with_capture_stats(mut self, stats: Arc<super::packets::CaptureStats>) -> Self {
@@ -378,19 +397,26 @@ impl ConnectionCollector {
         let proc_snapshot = self.proc_snapshot.clone();
         #[cfg(target_os = "linux")]
         let brokered = self.proc_broker.as_ref().and_then(|b| b.latest());
+        #[cfg(target_os = "linux")]
+        let ss_program = self.ss_program;
         crate::sandbox::worker::spawn("connections", move || {
             #[cfg(target_os = "macos")]
             let mut result = parse_lsof();
             #[cfg(target_os = "freebsd")]
             let mut result = parse_sockstat();
             #[cfg(target_os = "linux")]
-            let collected = parse_linux_connections_result(brokered.as_deref());
+            let collected = parse_linux_connections_result(ss_program, brokered.as_deref());
             #[cfg(target_os = "linux")]
             let collection_succeeded = collected.is_ok();
             #[cfg(target_os = "linux")]
-            let mut result = collected.unwrap_or_default();
+            let (mut result, table_source, table_note) = match collected {
+                Ok(table) => (table.rows, Some(table.source), table.note),
+                Err(error) => (Vec::new(), None, Some(error)),
+            };
             #[cfg(not(target_os = "linux"))]
             let collection_succeeded = false;
+            #[cfg(not(target_os = "linux"))]
+            let (table_source, table_note) = (None, None);
             #[cfg(target_os = "windows")]
             let mut result = parse_windows_connections();
             #[cfg(not(any(
@@ -509,6 +535,10 @@ impl ConnectionCollector {
             }
             let mut measured = measure_coverage(&result, &increments);
             measured.collection_succeeded = collection_succeeded;
+            measured.table_source = table_source;
+            measured.table_note = table_note;
+            #[cfg(target_os = "linux")]
+            log_table_source_change(&safe_read(&coverage, "connections::coverage"), &measured);
             *safe_write(&coverage, "connections::coverage") = measured;
             let count = result.len();
             *safe_write(&snapshot, "connections::publish") = Arc::new(result);
@@ -1151,18 +1181,134 @@ _dhcp    dhclient   567   5  udp4   *:68                  *:*                   
 
 #[cfg(all(target_os = "linux", test))]
 fn parse_linux_connections() -> Vec<Connection> {
-    parse_linux_connections_result(None).unwrap_or_default()
+    parse_linux_connections_result(SS_PROGRAM, None)
+        .map(|table| table.rows)
+        .unwrap_or_default()
 }
 
+/// The iproute2 tool the Linux connection table comes from when it can.
+#[cfg(target_os = "linux")]
+pub const SS_PROGRAM: &str = "ss";
+
+/// One Linux poll's connection table and where it came from.
+#[cfg(target_os = "linux")]
+struct LinuxTable {
+    rows: Vec<Connection>,
+    source: super::attribution::TableSource,
+    /// Why `ss` did not provide the rows, when it did not.
+    note: Option<String>,
+}
+
+/// Read the connection table from `ss`, or from `/proc/net` when `ss` is
+/// missing or fails.
+///
+/// Without the fallback, a host with no iproute2 (minimal containers, some NAS
+/// distributions), or a sandbox that cannot execute `ss`, showed an empty
+/// connection table and nothing said why. `ss` stays first because it is the
+/// long-tested path, and because it labels a socket bound to a device
+/// (`127.0.0.53%lo:53`), which `/proc/net` does not record. Process owners come
+/// from the same `/proc` overlay either way, so attribution does not change.
 #[cfg(target_os = "linux")]
 fn parse_linux_connections_result(
+    program: &str,
     brokered: Option<&ProcSnapshot>,
-) -> Result<Vec<Connection>, String> {
-    let output = Command::new("ss")
-        .args(["-tunap"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    parse_ss_command_output(output, brokered)
+) -> Result<LinuxTable, String> {
+    use super::attribution::TableSource;
+    let ss_error = match Command::new(program).args(["-tunap"]).output() {
+        Ok(output) => match parse_ss_command_output(output, brokered) {
+            Ok(rows) => {
+                return Ok(LinuxTable {
+                    rows,
+                    source: TableSource::Ss,
+                    note: None,
+                })
+            }
+            Err(error) => error,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "ss not found".to_string(),
+        Err(error) => format!("ss could not start: {error}"),
+    };
+    let mut rows = read_proc_net_connections().map_err(|error| format!("{ss_error}; {error}"))?;
+    overlay_proc_attribution(&mut rows, brokered);
+    Ok(LinuxTable {
+        rows,
+        source: TableSource::ProcNet,
+        note: Some(ss_error),
+    })
+}
+
+/// Log when the poll changes table, not on every poll: a host without `ss`
+/// would otherwise repeat the same warning every two seconds.
+#[cfg(target_os = "linux")]
+fn log_table_source_change(
+    previous: &super::attribution::Coverage,
+    current: &super::attribution::Coverage,
+) {
+    let previous = previous.completed_at.map(|_| previous.table_source);
+    let note = current.table_note.as_deref().unwrap_or_default();
+    match table_change(previous, current.table_source) {
+        Some(TableChange::ProcNet) => {
+            tracing::warn!(target: "netwatch::connections", note, "connection table read from /proc/net")
+        }
+        Some(TableChange::SsAgain) => {
+            tracing::info!(target: "netwatch::connections", "connection table read from ss again")
+        }
+        Some(TableChange::NoTable) => {
+            tracing::warn!(target: "netwatch::connections", note, "no connection table")
+        }
+        None => {}
+    }
+}
+
+/// What [`log_table_source_change`] reports.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum TableChange {
+    ProcNet,
+    SsAgain,
+    NoTable,
+}
+
+/// `previous` is the last poll's source, and `None` before the first poll.
+/// Comparing sources alone could not tell a first poll that read no table
+/// from a repeat of one, so a session that never had a table logged nothing.
+#[cfg(target_os = "linux")]
+fn table_change(
+    previous: Option<Option<super::attribution::TableSource>>,
+    current: Option<super::attribution::TableSource>,
+) -> Option<TableChange> {
+    use super::attribution::TableSource;
+    if previous == Some(current) {
+        return None;
+    }
+    match current {
+        Some(TableSource::ProcNet) => Some(TableChange::ProcNet),
+        Some(TableSource::Ss) => previous.is_some().then_some(TableChange::SsAgain),
+        None => Some(TableChange::NoTable),
+    }
+}
+
+/// Where `Command::new(program)` would find `program` on `path`, as `execvp`
+/// searches it: the first entry holding an executable regular file of that
+/// name. Doctor uses it to say whether a live session will read `ss` or fall
+/// back to `/proc/net`, without running anything.
+#[cfg(target_os = "linux")]
+pub fn find_on_path(program: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// [`find_on_path`] for [`SS_PROGRAM`] on this process's `PATH`. An unset
+/// `PATH` searches glibc's default, as `execvp` does.
+#[cfg(target_os = "linux")]
+pub fn ss_on_path() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
+    find_on_path(SS_PROGRAM, &path)
 }
 
 #[cfg(target_os = "linux")]
@@ -1172,7 +1318,7 @@ fn parse_ss_command_output(
 ) -> Result<Vec<Connection>, String> {
     let mut connections = Vec::new();
     if !output.status.success() {
-        return Err("ss did not complete successfully".into());
+        return Err(format!("ss failed ({})", output.status));
     }
     {
         let text = String::from_utf8_lossy(&output.stdout);
@@ -1275,6 +1421,146 @@ fn parse_proc_net_hex(s: &str) -> Option<(std::net::IpAddr, u16)> {
         _ => return None,
     };
     Some((ip, port))
+}
+
+/// The kernel's socket tables, in the order they are read. They hold exactly
+/// the sockets `ss -tunap` lists: TCP and UDP, both families.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PROC_NET_TABLES: [(&str, StreamProtocol); 4] = [
+    ("/proc/net/tcp", StreamProtocol::Tcp),
+    ("/proc/net/tcp6", StreamProtocol::Tcp),
+    ("/proc/net/udp", StreamProtocol::Udp),
+    ("/proc/net/udp6", StreamProtocol::Udp),
+];
+
+/// One socket from a `/proc/net/{tcp,udp}*` table, reduced to the columns
+/// netwatch reads.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcNetSocket {
+    local: (std::net::IpAddr, u16),
+    remote: (std::net::IpAddr, u16),
+    /// `st`: the kernel's TCP state number. UDP sockets use the same numbers.
+    state: u8,
+    /// Zero for sockets no file refers to (TIME_WAIT, embryonic SYN_RECV).
+    inode: u64,
+}
+
+/// Parse one `/proc/net/{tcp,udp}*` table: columns 1 and 2 are the hex
+/// endpoints, 3 the state and 9 the inode. The header and any malformed line
+/// are skipped; the kernel's own output never produces one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_net_table(text: &str) -> impl Iterator<Item = ProcNetSocket> + '_ {
+    text.lines().skip(1).filter_map(|line| {
+        let mut cols = line.split_whitespace();
+        let local = parse_proc_net_hex(cols.nth(1)?)?;
+        let remote = parse_proc_net_hex(cols.next()?)?;
+        let state = u8::from_str_radix(cols.next()?, 16).ok()?;
+        let inode = cols.nth(5)?.parse().ok()?;
+        Some(ProcNetSocket {
+            local,
+            remote,
+            state,
+            inode,
+        })
+    })
+}
+
+/// `ss`'s name for a kernel socket state (`include/net/tcp_states.h`), with
+/// `ESTAB` spelled out as [`parse_ss_command_output`] spells it, so the state
+/// filter and colours treat rows from either source alike. A UDP socket is
+/// ESTABLISHED once connected and CLOSE otherwise, which `ss` calls UNCONN.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn ss_state_name(state: u8) -> &'static str {
+    match state {
+        0x01 => "ESTABLISHED",
+        0x02 => "SYN-SENT",
+        // NEW_SYN_RECV is a request socket; ss shows those as SYN-RECV, and
+        // /proc/net already prints them with SYN_RECV's number.
+        0x03 | 0x0C => "SYN-RECV",
+        0x04 => "FIN-WAIT-1",
+        0x05 => "FIN-WAIT-2",
+        0x06 => "TIME-WAIT",
+        0x07 => "UNCONN",
+        0x08 => "CLOSE-WAIT",
+        0x09 => "LAST-ACK",
+        0x0A => "LISTEN",
+        0x0B => "CLOSING",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Render an endpoint as `ss -n` prints it: `a.b.c.d:port`, `[v6]:port`, a
+/// v4-mapped address as `[::ffff:a.b.c.d]:port`, and port 0 as `*`. Matching
+/// it exactly is what lets [`socket_key`], [`connection_stream_key`], the
+/// timeline and the flow registry treat a fallback row as the same connection
+/// an `ss` row was.
+///
+/// Two spellings cannot match, because `/proc/net` lacks what `ss` reads to
+/// choose them: the `%dev` suffix of a socket bound to a device, and `*` in
+/// place of `[::]` for a dual-stack wildcard. `ss` rows spelled either way
+/// fail to key at all, so the plain form joins where they did not; what the
+/// table loses is the device name.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn format_ss_endpoint((ip, port): (std::net::IpAddr, u16)) -> String {
+    let port = if port == 0 {
+        "*".to_string()
+    } else {
+        port.to_string()
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+    }
+}
+
+/// A connection row for one `/proc/net` socket, shaped as the `ss` parser
+/// shapes its rows. The owner is left for [`overlay_proc_attribution`], which
+/// replaces whatever `ss` reported too.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_net_connection(protocol: StreamProtocol, socket: &ProcNetSocket) -> Connection {
+    Connection {
+        protocol: match protocol {
+            StreamProtocol::Tcp => "TCP",
+            StreamProtocol::Udp => "UDP",
+        }
+        .into(),
+        local_addr: format_ss_endpoint(socket.local),
+        remote_addr: format_ss_endpoint(socket.remote),
+        state: ss_state_name(socket.state).into(),
+        pid: None,
+        process_name: None,
+        handshake_rtt_us: None,
+        rx_rate: None,
+        tx_rate: None,
+        attribution: AttributionSource::Lsof,
+        evidence: Default::default(),
+        app_protocol: None,
+        retransmits: 0,
+        out_of_order: 0,
+    }
+}
+
+/// Build connection rows straight from the kernel's socket tables, for when
+/// `ss` is missing or fails.
+///
+/// The IPv4 tables must be readable. The IPv6 ones do not exist when the
+/// kernel runs with IPv6 disabled, and that is not a failure. The sandbox
+/// already grants `/proc` for the attribution overlay, so this works inside
+/// the confined worker.
+#[cfg(target_os = "linux")]
+fn read_proc_net_connections() -> Result<Vec<Connection>, String> {
+    let mut rows = Vec::new();
+    for (path, protocol) in PROC_NET_TABLES {
+        match std::fs::read_to_string(path) {
+            Ok(text) => rows.extend(
+                parse_proc_net_table(&text).map(|socket| proc_net_connection(protocol, &socket)),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && path.ends_with('6') => {}
+            Err(error) => return Err(format!("{path}: {error}")),
+        }
+    }
+    Ok(rows)
 }
 
 /// Normalize an `ss`-rendered address (`"1.2.3.4:443"`, `"[::1]:443"`,
@@ -1383,34 +1669,20 @@ struct ProcNetIndex {
     by_pair: HashMap<SocketKey, u64>,
 }
 #[cfg(target_os = "linux")]
-fn proc_net_inode_index() -> ProcNetIndex {
-    let mut idx = ProcNetIndex::default();
-    for (path, protocol) in [
-        ("/proc/net/tcp", StreamProtocol::Tcp),
-        ("/proc/net/tcp6", StreamProtocol::Tcp),
-        ("/proc/net/udp", StreamProtocol::Udp),
-        ("/proc/net/udp6", StreamProtocol::Udp),
-    ] {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for line in text.lines().skip(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 10 {
-                continue;
-            }
-            let (Some(local), Some(remote), Ok(inode)) = (
-                parse_proc_net_hex(cols[1]),
-                parse_proc_net_hex(cols[2]),
-                cols[9].parse::<u64>(),
-            ) else {
-                continue;
-            };
+impl ProcNetIndex {
+    fn add(&mut self, protocol: StreamProtocol, text: &str) {
+        for socket in parse_proc_net_table(text) {
+            let ProcNetSocket {
+                local,
+                remote,
+                inode,
+                ..
+            } = socket;
             if inode == 0 {
                 continue;
             }
             // SO_REUSEPORT and shared endpoints must not select an arbitrary owner.
-            idx.by_pair
+            self.by_pair
                 .entry((protocol, local, remote))
                 .and_modify(|old| {
                     if *old != inode {
@@ -1419,6 +1691,16 @@ fn proc_net_inode_index() -> ProcNetIndex {
                 })
                 .or_insert(inode);
         }
+    }
+}
+#[cfg(target_os = "linux")]
+fn proc_net_inode_index() -> ProcNetIndex {
+    let mut idx = ProcNetIndex::default();
+    for (path, protocol) in PROC_NET_TABLES {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        idx.add(protocol, &text);
     }
     idx
 }
@@ -2278,6 +2560,385 @@ mod tests {
         }
     }
 
+    // ── /proc/net fallback (ss missing or failing) ──────────────────────
+
+    /// A name no host has on PATH, standing in for an absent `ss`.
+    #[cfg(target_os = "linux")]
+    const MISSING_SS: &str = "netwatch-test-no-such-ss";
+
+    /// Every fallback row with a socket inode must reach that inode through
+    /// `socket_key`, the join the attribution overlay depends on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_rows_join_the_inode_index() {
+        use super::proc_net_tests::{fixture_rows, TCP, TCP6, UDP, UDP6};
+        let mut index = ProcNetIndex::default();
+        index.add(StreamProtocol::Tcp, TCP);
+        index.add(StreamProtocol::Tcp, TCP6);
+        index.add(StreamProtocol::Udp, UDP);
+        index.add(StreamProtocol::Udp, UDP6);
+        let joined: Vec<_> = fixture_rows()
+            .iter()
+            .map(|c| socket_key(c).and_then(|key| index.by_pair.get(&key).copied()))
+            .collect();
+        assert_eq!(
+            joined,
+            [
+                Some(41001),
+                Some(41002),
+                None, // TIME-WAIT: no inode, nothing to attribute
+                Some(42001),
+                Some(42002),
+                Some(42003),
+                Some(43001),
+                Some(43002),
+                Some(44001),
+            ]
+        );
+    }
+
+    /// The same sockets as `proc_net_tests`' fixtures, as `ss -tunap` prints
+    /// them. Both sources must produce identical rows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ss_and_proc_net_fixtures_produce_identical_rows() {
+        use std::os::unix::process::ExitStatusExt;
+        let ss = "\
+Netid State     Recv-Q Send-Q          Local Address:Port      Peer Address:Port Process
+tcp   LISTEN    0      4096                127.0.0.1:8080           0.0.0.0:*
+tcp   ESTAB     0      0                  192.0.2.10:51234     198.51.100.7:443
+tcp   TIME-WAIT 0      0                   127.0.0.1:41394        127.0.0.1:8080
+tcp   LISTEN    0      128                      [::]:22              [::]:*
+tcp   ESTAB     0      0               [2001:db8::1]:443    [2001:db8::2]:50000
+tcp   ESTAB     0      0         [::ffff:127.0.0.1]:8080 [::ffff:192.0.2.10]:51234
+udp   UNCONN    0      0                     0.0.0.0:5353           0.0.0.0:*
+udp   ESTAB     0      0                  192.0.2.10:54321     203.0.113.53:53
+udp   UNCONN    0      0                       [::1]:323             [::]:*
+";
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: ss.as_bytes().to_vec(),
+            stderr: vec![],
+        };
+        let shape = |rows: Vec<Connection>| {
+            let mut rows: Vec<_> = rows
+                .into_iter()
+                .map(|c| (c.protocol, c.local_addr, c.remote_addr, c.state))
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            shape(parse_ss_command_output(output, None).unwrap()),
+            shape(super::proc_net_tests::fixture_rows())
+        );
+    }
+
+    /// `/proc/net` rows for sockets this test holds must be the rows the
+    /// installed `ss` prints for them, or the timeline, flow registry and
+    /// egress would see new connections whenever the source changed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_proc_net_rows_match_live_ss_rows() {
+        use std::net::{TcpListener, TcpStream, UdpSocket};
+        let mut held: Vec<Box<dyn std::any::Any>> = Vec::new();
+        let mut expected = Vec::new();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(listener) = TcpListener::bind(bind) else {
+                continue;
+            };
+            let server = listener.local_addr().unwrap();
+            let client = TcpStream::connect(server).unwrap();
+            let (accepted, _) = listener.accept().unwrap();
+            let client_addr = client.local_addr().unwrap();
+            expected.push(("TCP", server.to_string(), None));
+            expected.push(("TCP", client_addr.to_string(), Some(server.to_string())));
+            expected.push(("TCP", server.to_string(), Some(client_addr.to_string())));
+            held.extend([
+                Box::new(listener) as Box<dyn std::any::Any>,
+                Box::new(client),
+                Box::new(accepted),
+            ]);
+            let unconnected = UdpSocket::bind(bind).unwrap();
+            let connected = UdpSocket::bind(bind).unwrap();
+            connected
+                .connect(unconnected.local_addr().unwrap())
+                .unwrap();
+            expected.push(("UDP", unconnected.local_addr().unwrap().to_string(), None));
+            expected.push((
+                "UDP",
+                connected.local_addr().unwrap().to_string(),
+                Some(unconnected.local_addr().unwrap().to_string()),
+            ));
+            held.extend([
+                Box::new(unconnected) as Box<dyn std::any::Any>,
+                Box::new(connected),
+            ]);
+        }
+        // A v4-mapped flow: an IPv6 client socket reaching an IPv4 listener.
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mapped_server = format!("[::ffff:127.0.0.1]:{}", v4.local_addr().unwrap().port());
+        if let Ok(client) = TcpStream::connect(mapped_server.as_str()) {
+            expected.push((
+                "TCP",
+                client.local_addr().unwrap().to_string(),
+                Some(mapped_server.clone()),
+            ));
+            held.push(Box::new(client));
+        }
+        held.push(Box::new(v4));
+
+        let ss = match parse_linux_connections_result(SS_PROGRAM, None) {
+            Ok(table) if table.source == super::super::attribution::TableSource::Ss => table.rows,
+            other => {
+                eprintln!(
+                    "ss unavailable here ({:?}); skipping",
+                    other.map(|t| t.note)
+                );
+                return;
+            }
+        };
+        let proc = read_proc_net_connections().unwrap();
+        for (protocol, local, remote) in &expected {
+            // `None` is a wildcard peer: the listener, not a socket it accepted.
+            let find = |rows: &[Connection]| {
+                rows.iter()
+                    .find(|c| {
+                        c.protocol == *protocol
+                            && c.local_addr == *local
+                            && remote
+                                .as_ref()
+                                .map_or(c.remote_addr.ends_with(":*"), |r| c.remote_addr == *r)
+                    })
+                    .map(|c| (c.remote_addr.clone(), c.state.clone()))
+            };
+            let from_ss = find(&ss);
+            assert!(from_ss.is_some(), "ss has no row for {protocol} {local}");
+            assert_eq!(find(&proc), from_ss, "{protocol} {local} {remote:?}");
+        }
+        drop(held);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_ss_falls_back_to_proc_net_with_owners() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap().to_string();
+        // Another test's child holds this socket between fork and exec, and
+        // a shared socket rightly has no owner: poll, don't race.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let table = parse_linux_connections_result(MISSING_SS, None).unwrap();
+            assert_eq!(
+                table.source,
+                super::super::attribution::TableSource::ProcNet
+            );
+            assert_eq!(table.note.as_deref(), Some("ss not found"));
+            let row = table
+                .rows
+                .iter()
+                .find(|c| c.protocol == "TCP" && c.local_addr == local)
+                .expect("listener row from /proc/net");
+            assert_eq!(row.state, "LISTEN");
+            assert_eq!(row.remote_addr, "0.0.0.0:*");
+            if row.pid == Some(std::process::id()) || Instant::now() >= deadline {
+                assert_eq!(row.pid, Some(std::process::id()));
+                assert_eq!(row.attribution, AttributionSource::Procfs);
+                assert!(row.evidence.verified());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failing_ss_falls_back_to_proc_net() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap().to_string();
+        // `false` exists everywhere and exits 1, as a broken `ss` would.
+        let table = parse_linux_connections_result("false", None).unwrap();
+        assert_eq!(
+            table.source,
+            super::super::attribution::TableSource::ProcNet
+        );
+        assert_eq!(table.note.as_deref(), Some("ss failed (exit status: 1)"));
+        assert!(table
+            .rows
+            .iter()
+            .any(|c| c.protocol == "UDP" && c.local_addr == local && c.state == "UNCONN"));
+    }
+
+    /// The real worker, end to end: the coverage the capability report reads
+    /// says where the table came from and why.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collector_records_the_fallback_in_coverage() {
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap().to_string();
+        let collector = ConnectionCollector::new(Arc::new(Mutex::new(StreamTracker::new())))
+            .with_ss_program(MISSING_SS);
+        collector.update();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while collector.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let coverage = collector.coverage();
+        assert!(coverage.collection_succeeded, "{coverage:?}");
+        assert_eq!(
+            coverage.table_source,
+            Some(super::super::attribution::TableSource::ProcNet)
+        );
+        assert_eq!(coverage.table_note.as_deref(), Some("ss not found"));
+        assert!(collector
+            .connections()
+            .iter()
+            .any(|c| c.protocol == "TCP" && c.local_addr == local && c.state == "LISTEN"));
+    }
+
+    /// The log notes each change of table once, including a session whose
+    /// very first poll reads no table, which compared equal to "not polled".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn table_changes_are_logged_once_from_the_first_poll() {
+        use super::super::attribution::TableSource::{ProcNet, Ss};
+        let cases = [
+            (None, Some(Ss), None),
+            (None, Some(ProcNet), Some(TableChange::ProcNet)),
+            (None, None, Some(TableChange::NoTable)),
+            (Some(None), None, None),
+            (Some(None), Some(Ss), Some(TableChange::SsAgain)),
+            (Some(None), Some(ProcNet), Some(TableChange::ProcNet)),
+            (Some(Some(Ss)), Some(Ss), None),
+            (Some(Some(Ss)), Some(ProcNet), Some(TableChange::ProcNet)),
+            (Some(Some(ProcNet)), Some(ProcNet), None),
+            (Some(Some(ProcNet)), Some(Ss), Some(TableChange::SsAgain)),
+            (Some(Some(ProcNet)), None, Some(TableChange::NoTable)),
+        ];
+        for (previous, current, want) in cases {
+            assert_eq!(
+                table_change(previous, current),
+                want,
+                "{previous:?} -> {current:?}"
+            );
+        }
+    }
+
+    /// The fallback inside the confined worker. Landlock grants `/proc` but
+    /// not execution outside the system paths, so an `ss` elsewhere (as on a
+    /// host that installs it under another prefix) cannot start, and the poll
+    /// must read `/proc/net` rather than publish an empty table.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_net_fallback_works_inside_the_worker_sandbox() {
+        use std::time::Duration;
+        const CHILD: &str = "NETWATCH_PROC_NET_SANDBOX_TEST";
+        let Ok(root) = std::env::var(CHILD) else {
+            struct TestDir(std::path::PathBuf);
+            impl Drop for TestDir {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let temp = TestDir(
+                std::env::temp_dir().join(format!("netwatch-procnet-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir(&temp.0).unwrap();
+            // Runs and fails outside the sandbox; inside it, may not run at all.
+            let fake_ss = temp.0.join("ss");
+            std::fs::write(&fake_ss, "#!/bin/sh\nexit 1\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_ss, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "collectors::connections::tests::proc_net_fallback_works_inside_the_worker_sandbox",
+                    "--nocapture",
+                ])
+                .env(CHILD, &temp.0)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let paths = crate::sandbox::SandboxPaths {
+            cache_dir: Some(root.join("cache")),
+            config_dir: Some(root.join("config")),
+            state_dir: Some(root.join("state")),
+            cwd: Some(root.join("exports")),
+            ..Default::default()
+        };
+        paths.prepare().unwrap();
+        crate::sandbox::worker::install(crate::sandbox::Mode::Strict, paths).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap().to_string();
+        let fake_ss: &'static str = Box::leak(
+            root.join("ss")
+                .into_os_string()
+                .into_string()
+                .unwrap()
+                .into_boxed_str(),
+        );
+        let collector = ConnectionCollector::new(Arc::new(Mutex::new(StreamTracker::new())))
+            .with_ss_program(fake_ss);
+        collector.update();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while collector.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let worker = crate::sandbox::worker::snapshot().remove("connections");
+        assert!(
+            worker
+                .as_ref()
+                .is_some_and(|w| w.ready && w.error.is_none()),
+            "the connections worker did not enter the sandbox: {worker:?}"
+        );
+        let coverage = collector.coverage();
+        assert!(coverage.collection_succeeded, "{coverage:?}");
+        assert_eq!(
+            coverage.table_source,
+            Some(super::super::attribution::TableSource::ProcNet)
+        );
+        let note = coverage.table_note.unwrap_or_default();
+        assert!(
+            note.starts_with("ss could not start"),
+            "the sandbox let a binary outside its grants run: {note}"
+        );
+        assert!(collector
+            .connections()
+            .iter()
+            .any(|c| c.protocol == "TCP" && c.local_addr == local && c.state == "LISTEN"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn find_on_path_wants_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("netwatch-path-{}", uuid::Uuid::new_v4()));
+        let (dir, plain, exec) = (root.join("dir"), root.join("plain"), root.join("exec"));
+        for d in [&dir, &plain, &exec] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir(dir.join("ss")).unwrap();
+        std::fs::write(plain.join("ss"), "").unwrap();
+        std::fs::write(exec.join("ss"), "").unwrap();
+        std::fs::set_permissions(exec.join("ss"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = |dirs: &[&std::path::PathBuf]| std::env::join_paths(dirs).unwrap();
+        assert_eq!(find_on_path("ss", &path(&[&dir, &plain])), None);
+        assert_eq!(
+            find_on_path("ss", &path(&[&dir, &plain, &exec])),
+            Some(exec.join("ss"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn make_conn(proto: &str, local: &str, remote: &str, state: &str, pid: u32) -> Connection {
         Connection {
             protocol: proto.into(),
@@ -2372,11 +3033,18 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let _conn = TcpStream::connect((Ipv6Addr::LOCALHOST, port)).expect("connect to ::1");
 
-        let conns = parse_linux_connections();
-        if conns.is_empty() {
-            eprintln!("ss produced no rows (not installed?); skipping");
-            return;
-        }
+        // Only rows from ss: the /proc/net fallback would pass on any host
+        // and say nothing about the format ss prints.
+        let conns = match parse_linux_connections_result(SS_PROGRAM, None) {
+            Ok(table) if table.source == super::super::attribution::TableSource::Ss => table.rows,
+            other => {
+                eprintln!(
+                    "ss unavailable here ({:?}); skipping",
+                    other.map(|t| t.note)
+                );
+                return;
+            }
+        };
 
         // Our client row: TCP, established, remote port == the listener's.
         // Locating it *via parse_endpoint* is the point — if ss's v6
@@ -2812,5 +3480,205 @@ mod diagnose_poll_tests {
         assert!(parse_ss_command_output(output(256), None).is_err());
         assert!(parse_ss_command_output(output(0), None).unwrap().is_empty());
         assert!(!super::super::attribution::Coverage::default().collection_succeeded);
+    }
+}
+
+/// The `/proc/net` fallback's decoding, from fixtures, on every platform.
+///
+/// Addresses are from the documentation ranges, hex-encoded as a
+/// little-endian kernel prints them.
+#[cfg(test)]
+mod proc_net_tests {
+    use super::*;
+
+    pub(super) const TCP: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41001 1 0000000000000000 100 0 0 10 0
+   1: 0A0200C0:C822 076433C6:01BB 01 00000000:00000000 02:000A3B5C 00000000  1000        0 41002 2 0000000000000000 20 4 30 10 -1
+   2: 0100007F:A1B2 0100007F:1F90 06 00000000:00000000 03:00001770 00000000     0        0 0 3 0000000000000000
+";
+    pub(super) const TCP6: &str = "\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 42001 1 0000000000000000 100 0 0 10 0
+   1: B80D0120000000000000000001000000:01BB B80D0120000000000000000002000000:C350 01 00000000:00000000 02:00000A3B 00000000     0        0 42002 2 0000000000000000 20 4 30 10 -1
+   2: 0000000000000000FFFF00000100007F:1F90 0000000000000000FFFF00000A0200C0:C822 01 00000000:00000000 00:00000000 00000000  1000        0 42003 1 0000000000000000 20 4 30 10 -1
+";
+    pub(super) const UDP: &str = "\
+   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  236: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000    70        0 43001 2 0000000000000000 0
+12198: 0A0200C0:D431 357100CB:0035 01 00000000:00000000 00:00000000 00000000  1000        0 43002 2 0000000000000000 0
+";
+    pub(super) const UDP6: &str = "\
+   sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  323: 00000000000000000000000001000000:0143 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 44001 2 0000000000000000 0
+";
+
+    /// Every fixture row, as the fallback builds it.
+    pub(super) fn fixture_rows() -> Vec<Connection> {
+        [
+            (TCP, StreamProtocol::Tcp),
+            (TCP6, StreamProtocol::Tcp),
+            (UDP, StreamProtocol::Udp),
+            (UDP6, StreamProtocol::Udp),
+        ]
+        .into_iter()
+        .flat_map(|(text, protocol)| {
+            parse_proc_net_table(text)
+                .map(move |socket| proc_net_connection(protocol, &socket))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+    }
+
+    fn rows(text: &str, protocol: StreamProtocol) -> Vec<[String; 4]> {
+        parse_proc_net_table(text)
+            .map(|socket| proc_net_connection(protocol, &socket))
+            .map(|c| [c.protocol, c.local_addr, c.remote_addr, c.state])
+            .collect()
+    }
+
+    fn row(protocol: &str, local: &str, remote: &str, state: &str) -> [String; 4] {
+        [protocol, local, remote, state].map(String::from)
+    }
+
+    #[test]
+    fn ipv4_tcp_listen_established_and_time_wait() {
+        assert_eq!(
+            rows(TCP, StreamProtocol::Tcp),
+            [
+                row("TCP", "127.0.0.1:8080", "0.0.0.0:*", "LISTEN"),
+                row("TCP", "192.0.2.10:51234", "198.51.100.7:443", "ESTABLISHED"),
+                row("TCP", "127.0.0.1:41394", "127.0.0.1:8080", "TIME-WAIT"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_tcp_is_bracketed_and_v4_mapped_keeps_its_ss_spelling() {
+        assert_eq!(
+            rows(TCP6, StreamProtocol::Tcp),
+            [
+                row("TCP", "[::]:22", "[::]:*", "LISTEN"),
+                row(
+                    "TCP",
+                    "[2001:db8::1]:443",
+                    "[2001:db8::2]:50000",
+                    "ESTABLISHED"
+                ),
+                row(
+                    "TCP",
+                    "[::ffff:127.0.0.1]:8080",
+                    "[::ffff:192.0.2.10]:51234",
+                    "ESTABLISHED"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn udp_unconnected_is_unconn_and_connected_is_established() {
+        assert_eq!(
+            rows(UDP, StreamProtocol::Udp),
+            [
+                row("UDP", "0.0.0.0:5353", "0.0.0.0:*", "UNCONN"),
+                row("UDP", "192.0.2.10:54321", "203.0.113.53:53", "ESTABLISHED"),
+            ]
+        );
+        assert_eq!(
+            rows(UDP6, StreamProtocol::Udp),
+            [row("UDP", "[::1]:323", "[::]:*", "UNCONN")]
+        );
+    }
+
+    #[test]
+    fn inode_and_state_columns_are_read() {
+        let sockets: Vec<_> = parse_proc_net_table(TCP).collect();
+        assert_eq!(
+            sockets
+                .iter()
+                .map(|s| (s.state, s.inode))
+                .collect::<Vec<_>>(),
+            [(0x0A, 41001), (0x01, 41002), (0x06, 0)]
+        );
+    }
+
+    /// The capture side sees a v4-mapped socket's packets as plain IPv4, so
+    /// the row must key to the IPv4 stream, as an `ss` row for it does.
+    #[test]
+    fn v4_mapped_row_joins_the_ipv4_stream() {
+        let rows = fixture_rows();
+        let mapped = rows
+            .iter()
+            .find(|c| c.local_addr == "[::ffff:127.0.0.1]:8080")
+            .unwrap();
+        let (key, side) = connection_stream_key(mapped).unwrap();
+        assert_eq!(
+            key,
+            StreamKey::new(StreamProtocol::Tcp, "127.0.0.1", 8080, "192.0.2.10", 51234)
+        );
+        assert_eq!(
+            key.addr_a == ("127.0.0.1".to_string(), 8080),
+            side == LocalSide::A
+        );
+    }
+
+    #[test]
+    fn established_rows_key_to_their_streams_and_wildcard_peers_do_not() {
+        for c in fixture_rows() {
+            let keyed = connection_stream_key(&c).is_some();
+            assert_eq!(keyed, !c.remote_addr.ends_with(":*"), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn every_kernel_state_has_its_ss_name() {
+        let names: Vec<_> = (0x01..=0x0C).map(ss_state_name).collect();
+        assert_eq!(
+            names,
+            [
+                "ESTABLISHED",
+                "SYN-SENT",
+                "SYN-RECV",
+                "FIN-WAIT-1",
+                "FIN-WAIT-2",
+                "TIME-WAIT",
+                "UNCONN",
+                "CLOSE-WAIT",
+                "LAST-ACK",
+                "LISTEN",
+                "CLOSING",
+                "SYN-RECV",
+            ]
+        );
+        assert_eq!(ss_state_name(0), "UNKNOWN");
+        assert_eq!(ss_state_name(0xFF), "UNKNOWN");
+    }
+
+    #[test]
+    fn endpoints_render_as_ss_prints_them() {
+        let ep = |ip: &str, port| format_ss_endpoint((ip.parse().unwrap(), port));
+        assert_eq!(ep("10.0.2.15", 22), "10.0.2.15:22");
+        assert_eq!(ep("0.0.0.0", 0), "0.0.0.0:*");
+        assert_eq!(ep("::", 0), "[::]:*");
+        assert_eq!(ep("fe80::1", 546), "[fe80::1]:546");
+        assert_eq!(ep("::ffff:10.0.2.15", 443), "[::ffff:10.0.2.15]:443");
+    }
+
+    #[test]
+    fn header_short_and_malformed_lines_are_skipped() {
+        let header = TCP.lines().next().unwrap();
+        assert_eq!(parse_proc_net_table(header).count(), 0);
+        assert_eq!(parse_proc_net_table("").count(), 0);
+        let text = format!(
+            "{header}\n\
+             0: 0100007F:1F90 00000000:0000 0A 00000000:00000000\n\
+             1: nothex:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1\n\
+             2: 0100007F:1F90 00000000:0000 ZZ 00000000:00000000 00:00000000 00000000 0 0 1\n\
+             3: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 x\n\
+             4: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 7\n"
+        );
+        let parsed: Vec<_> = parse_proc_net_table(&text).collect();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].inode, 7);
     }
 }

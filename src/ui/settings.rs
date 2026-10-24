@@ -413,8 +413,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let popup_width = (area.width * 60 / 100)
         .max(50)
         .min(area.width.saturating_sub(4));
-    // +9 accounts for: 1 blank line, 1 sandbox-info row, 1 blank, 1 status
-    // message row, 1 footer hint row + borders/padding.
+    // +14 holds the rows below the settings, with one to spare: a blank, the
+    // sandbox row, up to three worker rows, the capability line, the
+    // connection-table row, the doctor hint, a blank, the status row, the
+    // footer and two borders.
     let popup_height = (SETTINGS_COUNT as u16 + 14).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
@@ -517,6 +519,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
 
     lines.push(Line::raw(format!("  {}", capabilities.compact())));
+    if let Some(table) = capabilities.connection_table_line() {
+        lines.push(Line::raw(format!("  {table}")));
+    }
     lines.push(Line::raw("  Setup details: netwatch doctor --json"));
 
     // Status message
@@ -932,5 +937,39 @@ mod tests {
         assert!(is_cycle_through(cursor::SANDBOX));
         assert!(is_cycle_through(cursor::THEME));
         assert!(!is_cycle_through(cursor::REFRESH_RATE));
+    }
+
+    /// The popup does not wrap, so a state at the end of the capability line
+    /// was cut off below about 140 columns. The connection-table state must
+    /// show in an 80-column terminal, where the popup is at its narrowest.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connection_fallback_shows_in_a_narrow_terminal() {
+        use crate::collectors::attribution::{Coverage, TableSource};
+        use ratatui::{backend::TestBackend, Terminal};
+        let app = App::prepare_with_config(NetwatchConfig::default());
+        app.connection_collector.set_coverage_for_test(Coverage {
+            completed_at: Some(std::time::Instant::now()),
+            collection_succeeded: true,
+            table_source: Some(TableSource::ProcNet),
+            table_note: Some("ss could not start: Permission denied (os error 13)".into()),
+            ..Default::default()
+        });
+        for width in [80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            terminal.draw(|f| render(f, &app, f.size())).unwrap();
+            let buf = terminal.backend().buffer();
+            let rows: Vec<String> = buf
+                .content
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect())
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("connections: degraded · ss could")),
+                "{width} columns:\n{}",
+                rows.join("\n")
+            );
+        }
     }
 }
