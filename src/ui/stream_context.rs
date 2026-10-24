@@ -427,6 +427,8 @@ mod tests {
 
     fn pkt(id: u64, ns: u64, src: &str, sport: u16, dst: &str, dport: u16) -> CapturedPacket {
         CapturedPacket {
+            capture: None,
+            annotation: None,
             id,
             timestamp: format!("00:00:{id:02}.000"),
             src_ip: src.into(),

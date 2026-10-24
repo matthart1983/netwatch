@@ -98,7 +98,7 @@ netwatch --demo                          # replay a recorded Diagnose incident, 
 | 1 | Dashboard | Latency tiles, mirrored throughput, the link carrying it, connections rolled up per process |
 | 2 | Connections | Every socket with process, PID, state, GeoIP, RTT, retransmits |
 | 3 | Interfaces | Addresses, MTU, rates, errors, drops |
-| 4 | Packets | Live decode, TLS 1.3 decryption, JA4, stream tracking, display filters, PCAP export |
+| 4 | Packets | Live decode, TLS 1.3 decryption, JA4, stream tracking, display filters, PCAPNG and PCAP export |
 | 5 | Stats | Protocol breakdown and handshake-timing histogram |
 | 6 | Topology | Machine, gateway, DNS, top hosts, traceroute, how long the connection has been up |
 | 7 | Timeline | Connections by TCP state, with alerts |

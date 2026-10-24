@@ -906,7 +906,52 @@ fn run_ping(target: &str) -> Option<(Option<f64>, f64)> {
         return Some(result);
     }
 
+    // Windows: IcmpSendEcho2 / Icmp6SendEcho2, which need no privilege and
+    // answer with a status code rather than ping.exe's localised text. The
+    // subprocess below runs only for a target that is not an address, or on
+    // a host where no ICMP handle can be opened.
+    #[cfg(windows)]
+    if let Some(echoes) = target
+        .parse()
+        .ok()
+        .and_then(|ip| crate::platform::windows::icmp::echoes(ip, PING_PROBES, PING_TIMEOUT_MS))
+    {
+        return ping_summary(&echoes);
+    }
+
     run_ping_subprocess(target)
+}
+
+/// Echoes per native Windows ping, and how long each waits: the three echoes
+/// and one second the Unix paths use.
+#[cfg(windows)]
+const PING_PROBES: usize = 3;
+#[cfg(windows)]
+const PING_TIMEOUT_MS: u32 = 1000;
+
+/// A native ping's echoes as the probe's `(rtt, loss)`, or `None` when not
+/// one could be sent.
+///
+/// Loss is over the echoes that left. One the stack refused to send is not a
+/// lost packet, which matches Unix, where a refused `sendto` means the
+/// native path returns `None` rather than a loss figure.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ping_summary(echoes: &[crate::platform::icmp::Echo]) -> Option<(Option<f64>, f64)> {
+    use crate::platform::icmp::Echo;
+    let sent = echoes.iter().filter(|e| e.was_sent()).count();
+    if sent == 0 {
+        return None;
+    }
+    let rtts: Vec<f64> = echoes
+        .iter()
+        .filter_map(|e| match e {
+            Echo::Reply { rtt_ms, .. } => Some(*rtt_ms),
+            _ => None,
+        })
+        .collect();
+    let avg = (!rtts.is_empty()).then(|| rtts.iter().sum::<f64>() / rtts.len() as f64);
+    let loss = (sent - rtts.len()) as f64 / sent as f64 * 100.0;
+    Some((avg, loss))
 }
 
 #[cfg(unix)]
@@ -1048,12 +1093,13 @@ fn icmp_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// Subprocess fallback for Windows + Unix systems where SOCK_DGRAM ICMP
-/// isn't available (no `net.ipv4.ping_group_range` entry, exotic
-/// kernels). Under the v0.17.x Linux sandbox this path is broken
-/// because Landlock sets NO_NEW_PRIVS and the setcap on `/usr/bin/ping`
-/// is ignored on exec — the native path above is what makes pings
-/// work under sandbox.
+/// Subprocess fallback for Unix systems where SOCK_DGRAM ICMP isn't
+/// available (no `net.ipv4.ping_group_range` entry, exotic kernels), and for
+/// Windows only when no ICMP handle can be opened: its parsing reads
+/// English `ping.exe` output and gets nothing from a German or Russian one.
+/// Under the v0.17.x Linux sandbox this path is broken because Landlock
+/// sets NO_NEW_PRIVS and the setcap on `/usr/bin/ping` is ignored on exec —
+/// the native path above is what makes pings work under sandbox.
 fn run_ping_subprocess(target: &str) -> Option<(Option<f64>, f64)> {
     // macOS and FreeBSD share the original BSD ping(8) lineage: `-t timeout`
     // is an overall deadline in seconds, predating Linux's iputils `-W`
@@ -1204,6 +1250,65 @@ mod tests {
         assert_eq!(Loss::Pending.note(), None);
         assert!(!Loss::Unmeasured("x").is_lossy());
         assert!(Loss::Measured(0.1).is_lossy());
+    }
+
+    // ── native Windows ping (decoded everywhere) ──────────────────────
+    #[test]
+    fn native_echoes_become_rtt_and_loss() {
+        use crate::platform::icmp::Echo;
+        let gw: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let reply = |rtt_ms| Echo::Reply { from: gw, rtt_ms };
+
+        let (rtt, loss) = ping_summary(&[reply(1.0), reply(2.0), reply(3.0)]).unwrap();
+        assert_eq!((rtt, loss), (Some(2.0), 0.0));
+
+        // A router's answer is not the target's: lost, like a timeout.
+        let hop = Echo::Unreachable {
+            from: Some("198.51.100.7".parse().unwrap()),
+            rtt_ms: 4.0,
+        };
+        let (rtt, loss) = ping_summary(&[reply(0.4), Echo::TimedOut, hop]).unwrap();
+        assert_eq!(rtt, Some(0.4));
+        assert!((loss - 200.0 / 3.0).abs() < 1e-9, "{loss}");
+
+        assert_eq!(
+            ping_summary(&[Echo::TimedOut; 3]),
+            Some((None, 100.0)),
+            "three unanswered echoes are a measurement"
+        );
+    }
+
+    #[test]
+    fn echoes_the_stack_refused_are_not_loss() {
+        use crate::platform::icmp::Echo;
+        // IP_GENERAL_FAILURE on every echo: nothing left this host, so the
+        // gateway probe goes on to TCP instead of reporting 100% loss.
+        assert_eq!(ping_summary(&[Echo::Failed(11050); 3]), None);
+        assert_eq!(ping_summary(&[]), None);
+        // One refusal among answers leaves the others to measure.
+        let gw = "192.0.2.1".parse().unwrap();
+        let got = ping_summary(&[
+            Echo::Failed(11050),
+            Echo::Reply {
+                from: gw,
+                rtt_ms: 2.0,
+            },
+            Echo::TimedOut,
+        ]);
+        assert_eq!(got, Some((Some(2.0), 50.0)));
+    }
+
+    /// The whole probe on Windows: native echoes, no `ping.exe` text. CI's
+    /// Windows runners reach loopback but not the internet.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ping_measures_loopback_natively() {
+        for target in ["127.0.0.1", "::1"] {
+            let (rtt, loss) = run_ping(target).expect("echoes were sent");
+            assert_eq!(loss, 0.0, "{target}");
+            let rtt = rtt.expect("an rtt");
+            assert!(rtt > 0.0 && rtt < 1000.0, "{target}: {rtt}");
+        }
     }
 
     #[test]

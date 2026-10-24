@@ -226,7 +226,7 @@ const FULL_HELP: &[Section] = &[
             ("L (shift)", "Switch to the Lite view"),
             ("R (shift)", "Arm/disarm flight recorder"),
             ("F (shift)", "Freeze the current incident window"),
-            ("E (shift)", "Export the current incident bundle"),
+            ("E (shift)", "Preview and export the frozen incident bundle"),
             ("?", "Toggle this help overlay"),
             ("g", "Toggle GeoIP location display"),
             (
@@ -309,7 +309,7 @@ const FULL_HELP: &[Section] = &[
             ("s", "Open stream view for selected packet"),
             ("d", "Expand/shrink the packet detail pane"),
             ("y", "Copy the selected packet's details"),
-            ("w", "Export packets to .pcap file"),
+            ("w", "Preview and export the shown packets (PCAPNG or PCAP)"),
             ("f", "Toggle auto-follow"),
             ("x", "Show only expert findings (warnings and errors)"),
             ("n", "Jump to next expert finding"),
@@ -318,6 +318,17 @@ const FULL_HELP: &[Section] = &[
             ("] / [", "Jump to next/previous bookmark"),
             ("X (shift)", "Clear all captured packets and bookmarks"),
             ("W (shift)", "Whois lookup for selected packet IPs"),
+        ],
+    },
+    Section {
+        title: "EXPORT PREVIEW (w in Packets, E anywhere)",
+        scope: Scope::Reference,
+        keys: &[
+            ("Enter", "Write the export in the background"),
+            ("f", "PCAPNG or classic PCAP (packet export only)"),
+            ("a", "Packet comments on/off (PCAPNG)"),
+            ("↑↓ / j/k", "Scroll the preview"),
+            ("Esc / q", "Close, or cancel a write in progress"),
         ],
     },
     Section {

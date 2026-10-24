@@ -100,6 +100,14 @@ pub struct MatchEvidence {
     pub flow: Option<FlowIdentity>,
     #[serde(skip)]
     pub observed_at: Option<Instant>,
+    /// When `process` was confirmed to hold the socket, as UTC ms: the check
+    /// ran at some point from the first time to the second. Not the poll's
+    /// own time: on Linux a sandboxed poll takes its owners from the
+    /// unconfined broker's last `/proc` scan, which can be seconds older than
+    /// the poll and shared by consecutive polls. Packet annotations bracket
+    /// on this.
+    #[serde(skip)]
+    pub owner_checked_utc_ms: Option<(u64, u64)>,
 }
 impl Default for MatchEvidence {
     fn default() -> Self {
@@ -111,6 +119,7 @@ impl Default for MatchEvidence {
             unknown_reason: Some(UnknownReason::NoSocketOwner),
             flow: None,
             observed_at: None,
+            owner_checked_utc_ms: None,
         }
     }
 }
@@ -175,6 +184,17 @@ impl FlowRegistry {
         self.previous = current;
     }
 }
+/// Where the Linux connection table came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableSource {
+    /// `ss -tunap`, from iproute2.
+    Ss,
+    /// The kernel's `/proc/net/{tcp,tcp6,udp,udp6}` tables, read directly
+    /// because `ss` was missing or failed.
+    ProcNet,
+}
+
 /// Coverage denominator: captured TCP/UDP streams with payload increments in the
 /// latest completed polling interval. It includes flows missing from socket polling.
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
@@ -182,6 +202,15 @@ pub struct Coverage {
     /// The connection-table command completed successfully, not a fallback empty list.
     #[serde(default)]
     pub collection_succeeded: bool,
+    /// Linux: the table the latest poll read. `None` before the first poll,
+    /// when no table could be read, and on the other platforms, which have
+    /// one source each.
+    #[serde(default)]
+    pub table_source: Option<TableSource>,
+    /// Linux: why the latest poll did not read `ss`, or why it read nothing.
+    /// `None` when `ss` answered.
+    #[serde(default)]
+    pub table_note: Option<String>,
     pub eligible_flows: u64,
     pub attributed_flows: u64,
     pub eligible_payload_bytes: u64,

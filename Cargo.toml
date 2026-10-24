@@ -49,22 +49,28 @@ pcap = "2"
 tls-parser = "0.12"
 httparse = "1.10"
 # Developer target probes time the TLS handshake themselves and need the
-# certificate error class, which ureq hides. Both are already in the tree
-# through ureq with these features, so this adds no new crates.
+# certificate error class, which ureq hides; the diagnostic load upload
+# shares their TLS set-up. Both are already in the tree through ureq with
+# these features, so this adds no new crates.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 # QUIC Initial decryption (Phase 9 hard mode) uses ring's `aead::quic`
 # header-protection primitive + `aead::AES_128_GCM` + the `hkdf` module.
 # ring is already a direct dep above for TLS work.
 socket2 = { version = "0.6", features = ["all"] }
 url = "2"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3.5", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-toml = "0.8"
+# toml is serde for config.toml and the egress policy; toml_edit rewrites the
+# policy in place so hand edits and comments survive a promote. toml 1.x no
+# longer parses through toml_edit, so this is the only copy of it in the tree.
+toml = "1"
 toml_edit = "0.25"
-dirs = "5"
+# Where config, cache and state live. A major that moves one strands users'
+# files, so sandbox::paths has a test that pins every location.
+dirs = "7"
 # Display-width-aware truncation for the Lite view's fixed character grid.
 # Byte or char length would misalign columns on CJK process names. Already in
 # the tree as a transitive dep of ratatui.
@@ -141,6 +147,18 @@ nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"]
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 caps = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 # ── Distro packages ───────────────────────────────────────────────────
 #

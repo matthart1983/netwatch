@@ -491,6 +491,7 @@ pub struct App {
     pub capture_interface: String,
     pub bpf_filter_active: Option<String>,
     pub incident_recorder: IncidentRecorder,
+    pub capture_export: Option<ui::capture_export::Dialog>,
     pub geo_cache: GeoCache,
     pub whois_cache: WhoisCache,
     pub traceroute_runner: TracerouteRunner,
@@ -660,6 +661,7 @@ impl App {
             capture_interface,
             bpf_filter_active,
             incident_recorder: IncidentRecorder::new(),
+            capture_export: None,
             geo_cache: GeoCache::with_mmdb_and_online(
                 &user_config.geoip_db,
                 &user_config.geoip_asn_db,
@@ -1160,28 +1162,45 @@ impl App {
         self.ui.export_status_tick = 0;
     }
 
-    /// Shared recorder action for native frontends.
-    pub fn export_incident_bundle(&mut self) {
+    /// Freeze an armed recorder, so an export has a fixed window. False,
+    /// with a status line saying why, when the recorder is off.
+    fn incident_ready_for_export(&mut self) -> bool {
         if self.incident_recorder.is_off() {
             self.ui.export_status = Some("Arm the flight recorder first with Shift+R".to_string());
             self.ui.export_status_tick = 0;
-            return;
+            return false;
         }
-
         if self.incident_recorder.is_armed() {
             self.freeze_incident_recorder("manual export");
         }
+        true
+    }
 
-        match self.incident_recorder.export_bundle(&export_dir()) {
-            Ok(path) => {
-                self.ui.export_status =
-                    Some(format!("Incident bundle saved to {}", path.display()));
-            }
-            Err(err) => {
-                self.ui.export_status = Some(format!("Incident export failed: {err}"));
-            }
+    /// Shared recorder action for native frontends: writes the bundle now,
+    /// on the calling thread, with packet comments on. The TUI uses
+    /// [`App::preview_incident_bundle`] instead.
+    pub fn export_incident_bundle(&mut self) {
+        if !self.incident_ready_for_export() {
+            return;
         }
+        self.ui.export_status = Some(match self.incident_recorder.export_bundle(&export_dir()) {
+            Ok(path) => format!("Incident bundle saved to {}", path.display()),
+            Err(err) => format!("Incident export failed: {err}"),
+        });
         self.ui.export_status_tick = 0;
+    }
+
+    /// Open the export preview on a copy of the frozen incident, so the
+    /// bundle holds what the preview counted even if the recorder is
+    /// re-armed while it is written.
+    pub fn preview_incident_bundle(&mut self) {
+        if !self.incident_ready_for_export() {
+            return;
+        }
+        self.capture_export = Some(ui::capture_export::Dialog::new(
+            ui::capture_export::Selection::Incident(Box::new(self.incident_recorder.clone())),
+            export_dir(),
+        ));
     }
 
     fn sync_incident_recorder(&mut self) {
@@ -1189,6 +1208,10 @@ impl App {
             return;
         }
 
+        self.incident_recorder.record_capture_status(
+            self.packet_collector.capture_session.clone(),
+            self.packet_collector.stats.observed_drops(),
+        );
         let connections = self.connection_collector.connections();
         let health = self.health_prober.status();
         let packets = self.packet_collector.get_packets();
@@ -1221,6 +1244,15 @@ impl App {
 
     /// Advance the shared collectors and diagnostic engine without rendering.
     pub fn tick(&mut self) {
+        if let Some(status) = self
+            .capture_export
+            .as_mut()
+            .and_then(|dialog| dialog.poll())
+        {
+            self.capture_export = None;
+            self.ui.export_status = Some(status);
+            self.ui.export_status_tick = 0;
+        }
         // Clear export status after 5 ticks
         if self.ui.export_status.is_some() {
             self.ui.export_status_tick += 1;
@@ -1279,6 +1311,7 @@ impl App {
                     .iter()
                     .flat_map(|c| [c.local_addr.as_str(), c.remote_addr.as_str()]),
             );
+            self.packet_collector.observe_attribution(&conns);
             self.connection_timeline.update(&conns);
             // Observe-mode egress profiling (Horizon 3): learn per-process
             // {SNI, ASN, port} baselines from the live connection table, and
@@ -1580,6 +1613,9 @@ fn draw_frame(f: &mut Frame, app: &mut App) {
     if app.ui.show_memory_stats {
         ui::memory_stats::render(f, app, area);
     }
+    if let Some(dialog) = &app.capture_export {
+        dialog.render(f, area, &app.theme);
+    }
     if app.ui.quit_pending {
         ui::quit_confirm::render(f, app, area);
     }
@@ -1699,7 +1735,9 @@ pub async fn run<B: Backend>(
                 }
             }
             AppEvent::Mouse(mouse) => {
-                handle_mouse(&mut app, mouse);
+                if app.capture_export.is_none() {
+                    handle_mouse(&mut app, mouse);
+                }
             }
             AppEvent::Tick => {
                 app.tick();
@@ -2555,6 +2593,20 @@ fn confirms_quit(code: KeyCode) -> bool {
 }
 
 fn route_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    // The export preview owns every key while it is open, in every view,
+    // except Ctrl+C, which quits from anywhere. Quitting drops the dialog,
+    // and that cancels a write in progress and removes its temporary file.
+    if let Some(dialog) = app.capture_export.as_mut() {
+        if is_ctrl_c(key) {
+            return true;
+        }
+        if let Some(status) = dialog.key(key) {
+            app.capture_export = None;
+            app.ui.export_status = Some(status);
+            app.ui.export_status_tick = 0;
+        }
+        return false;
+    }
     // Overlays intercept first
     if app.ui.show_help {
         return handle_help_key(app, key);
@@ -3090,7 +3142,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.freeze_incident_recorder("manual freeze");
         }
         KeyCode::Char('E') => {
-            app.export_incident_bundle();
+            app.preview_incident_bundle();
         }
         // The other half of the Lite toggle; `handle_lite_key` owns Lite→Full.
         KeyCode::Char('L') => app.ui.view_mode = ViewMode::Lite,
@@ -3490,36 +3542,18 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.timeline_filter = app.ui.timeline_filter.cycle();
         }
         KeyCode::Char('w') if app.ui.current_tab == Tab::Packets => {
-            use crate::collectors::packets::{export_pcap, matches_packet, parse_filter};
-            let packets = app.packet_collector.get_packets();
-            let filtered: Vec<_>;
-            let to_export: &[_] = if let Some(ref ft) = app.ui.packet_filter_active {
-                if let Some(expr) = parse_filter(ft) {
-                    filtered = packets
-                        .iter()
-                        .filter(|p| matches_packet(&expr, p))
-                        .cloned()
-                        .collect();
-                    &filtered
-                } else {
-                    &packets
-                }
-            } else {
-                &packets
+            // What the list shows: the display filter and `x` both apply.
+            let shown = {
+                let packets = app.packet_collector.get_packets();
+                ui::packets::visible_packets(app, &packets)
+                    .into_iter()
+                    .cloned()
+                    .collect()
             };
-            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-            let path = export_dir()
-                .join(format!("netwatch_capture_{ts}.pcap"))
-                .to_string_lossy()
-                .into_owned();
-            match export_pcap(to_export, &path) {
-                Ok(n) => {
-                    app.ui.export_status = Some(format!("Saved {n} packets to {path}"));
-                }
-                Err(e) => {
-                    app.ui.export_status = Some(format!("Export failed: {e}"));
-                }
-            }
+            app.capture_export = Some(ui::capture_export::Dialog::new(
+                ui::capture_export::Selection::Packets(shown),
+                export_dir(),
+            ));
             app.ui.export_status_tick = 0;
         }
         KeyCode::Char('W') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
@@ -4004,6 +4038,69 @@ mod quit_key_tests {
         assert!(handle_key(&mut app, ctrl_c));
         app.ui.show_settings = true;
         assert!(handle_key(&mut app, ctrl_c));
+    }
+
+    /// The export preview takes every key while open, `q` included, so it
+    /// closes the preview; Ctrl+C still quits from it.
+    #[test]
+    fn the_export_preview_owns_keys_except_ctrl_c() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        assert!(!handle_key(&mut app, key(KeyCode::Char('w'))));
+        assert!(app.capture_export.is_some());
+        assert!(!handle_key(&mut app, key(KeyCode::Char('?'))));
+        assert!(!app.ui.show_help, "the preview kept the key");
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert!(app.capture_export.is_none());
+        assert_eq!(app.ui.export_status.as_deref(), Some("Export cancelled"));
+
+        handle_key(&mut app, key(KeyCode::Char('w')));
+        let ctrl_c = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut app, ctrl_c));
+    }
+
+    /// `w` freezes the packets the list shows: with `x` on, only findings.
+    #[test]
+    fn w_exports_the_packets_the_list_shows() {
+        use crate::collectors::packets::ExpertSeverity;
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        app.packet_collector.seed_demo_capture();
+        let (total, findings) = {
+            let mut packets = app.packet_collector.packets.write().unwrap();
+            for (i, p) in packets.iter_mut().enumerate() {
+                p.expert = if i % 3 == 0 {
+                    ExpertSeverity::Warn
+                } else {
+                    ExpertSeverity::Chat
+                };
+            }
+            (packets.len(), packets.len().div_ceil(3))
+        };
+        assert!(findings < total);
+        for (expert_only, shown) in [(false, total), (true, findings)] {
+            app.ui.packet_expert_only = expert_only;
+            handle_key(&mut app, key(KeyCode::Char('w')));
+            // Demo packets were never captured, so each is counted as omitted.
+            let summary = app.capture_export.take().unwrap().summary();
+            assert_eq!(summary.packets + summary.omitted, shown, "{expert_only}");
+        }
+    }
+
+    #[test]
+    fn shift_e_previews_only_an_armed_or_frozen_recorder() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        handle_key(&mut app, key(KeyCode::Char('E')));
+        assert!(app.capture_export.is_none());
+        assert!(app.ui.export_status.as_deref().unwrap().contains("Arm"));
+        app.incident_recorder.arm();
+        handle_key(&mut app, key(KeyCode::Char('E')));
+        assert!(app.capture_export.is_some());
+        // Previewing freezes the window, so the bundle is what was counted.
+        assert!(!app.incident_recorder.is_armed());
     }
 
     /// #94: `q` pressed to dismiss an overlay closed netwatch instead.

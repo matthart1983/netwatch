@@ -506,11 +506,19 @@ fn call_ollama(
         }
     });
 
-    let resp = ureq::post(&url)
-        .timeout(OLLAMA_TIMEOUT)
-        .send_string(&body.to_string())?;
-
-    let body_str = resp.into_string()?;
+    // The shared agent, for its connect and write timeouts and its proxy and
+    // redirect settings. Its 10 s limit per read is lifted and the whole call
+    // bounded instead, because with `stream: false` the model sends nothing
+    // until it has finished, and a slow model takes longer than 10 s.
+    let response = crate::http::agent()
+        .post(&url)
+        .config()
+        .timeout_global(Some(OLLAMA_TIMEOUT))
+        .timeout_per_read(None)
+        .build()
+        .header("Content-Type", "application/json")
+        .send(body.to_string())?;
+    let body_str = crate::http::read_text(response.into_body())?;
     let json: serde_json::Value = serde_json::from_str(&body_str)?;
     let content = json["message"]["content"]
         .as_str()
@@ -578,6 +586,8 @@ mod tests {
         expert: ExpertSeverity,
     ) -> CapturedPacket {
         CapturedPacket {
+            capture: None,
+            annotation: None,
             id: 1,
             timestamp: "00:00:00.000".into(),
             src_ip: src.into(),
@@ -802,5 +812,78 @@ mod tests {
             clean_insight_text(reply),
             "Summary\n\nTraffic to evil·]52;c;AAAA·.example·."
         );
+    }
+
+    /// A stand-in Ollama that answers one request with `reply` and hands back
+    /// the request it received.
+    fn ollama_once(reply: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // The head, then as much body as Content-Length says.
+            let body_len = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "request ended early");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    break end + 4 + len;
+                }
+            };
+            while buf.len() < body_len {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "body ended early");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            stream.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn the_model_reply_is_read_from_a_json_post() {
+        let (endpoint, server) = ollama_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\
+             Connection: close\r\n\r\n{\"message\":{\"content\":\"all quiet here\"}}",
+        );
+        assert_eq!(
+            call_ollama("test-model", &endpoint, "how is it").unwrap(),
+            "all quiet here"
+        );
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("POST /api/chat HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: application/json\r\n"),
+            "{request}"
+        );
+        let body = &request[request.find("\r\n\r\n").unwrap() + 4..];
+        assert!(!body.contains('\n'), "a compact body: {body}");
+        let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(sent["model"], "test-model");
+        assert_eq!(sent["stream"], false);
+        assert_eq!(sent["messages"][1]["content"], "how is it");
+    }
+
+    #[test]
+    fn an_ollama_error_status_is_an_error() {
+        let (endpoint, server) =
+            ollama_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(call_ollama("missing-model", &endpoint, "hello").is_err());
+        server.join().unwrap();
     }
 }

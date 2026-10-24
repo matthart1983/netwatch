@@ -45,6 +45,11 @@ impl RuleCoverage {
             Availability::NotApplicable => "no action needed for this interface or target",
             Availability::PermissionDenied => "inspect the collector error and required capability",
             Availability::CollectorFailed => "inspect the collector error, then retry",
+            // Before the experiment rows: an experiment this platform cannot
+            // run must not offer t.
+            Availability::Unsupported => {
+                "nothing to run on this host or interface; the reason says what is missing"
+            }
             _ if matches!(self.rule.as_str(), "ipv6.broken" | "captive.portal" | "pmtu.blackhole") => { "configure [diagnose_probes]; t runs three rounds, x cancels; direct selected-endpoint traffic only" }
             _ if self.rule.starts_with("egress.") => {
                 "review the Egress tab; press t on the policy check to reload egress-policy.toml"
@@ -304,6 +309,11 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     };
     super::run::print_threshold_warnings(&config.diagnose_thresholds);
     if let Some(rule) = &test {
+        // The platform first, as Runner::start checks it: asking for a
+        // pmtu_url Windows could never use would only lead to this refusal.
+        if let Some(why) = super::active::unsupported(rule) {
+            anyhow::bail!("{rule} cannot run here: {why}");
+        }
         config
             .diagnose_probes
             .validate(rule)
@@ -470,6 +480,24 @@ mod tests {
                     .unwrap(),
                 status
             );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_experiment_does_not_offer_t() {
+        // pmtu.blackhole on Windows, ipv6.broken off Linux.
+        for rule in ["ipv6.broken", "pmtu.blackhole"] {
+            let row = RuleCoverage {
+                rule: rule.into(),
+                status: Availability::Unsupported,
+                reason: String::new(),
+            };
+            assert!(!row.next_action().contains("t runs"), "{rule}");
+            let awaiting = RuleCoverage {
+                status: Availability::AwaitingTest,
+                ..row
+            };
+            assert!(awaiting.next_action().contains("t runs"), "{rule}");
         }
     }
 
