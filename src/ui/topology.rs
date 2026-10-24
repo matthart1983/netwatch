@@ -992,12 +992,12 @@ mod tests {
         let mut app = App::prepare_with_config(NetwatchConfig::default());
         app.uptime = Monitor::showing(conn);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| super::render(f, &app, f.size())).unwrap();
+        terminal.draw(|f| super::render(f, &app, f.area())).unwrap();
         let buf = terminal.backend().buffer();
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()

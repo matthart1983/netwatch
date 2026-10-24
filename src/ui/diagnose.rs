@@ -441,7 +441,7 @@ fn draw_coverage(
     }
     let table = Table::new(body, widths)
         .header(header)
-        .highlight_style(Style::default().bg(t.selection_bg))
+        .row_highlight_style(Style::default().bg(t.selection_bg))
         .highlight_symbol("› ")
         .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
         .block(
@@ -1837,12 +1837,12 @@ mod tests {
         mutate(&mut view);
 
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
+        terminal.draw(|f| render_body(f, &view, f.area())).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
                     .trim_end()
                     .to_string()
@@ -1883,13 +1883,13 @@ mod tests {
         let details = vec![("Why", "inputs present".to_string())];
         let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
         terminal
-            .draw(|f| draw_coverage(f, &theme, &rules, selected, &details, f.size()))
+            .draw(|f| draw_coverage(f, &theme, &rules, selected, &details, f.area()))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
@@ -2154,17 +2154,15 @@ mod tests {
                 history: None,
             };
             let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-            terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
+            terminal.draw(|f| render_body(f, &view, f.area())).unwrap();
             let buf = terminal.backend().buffer().clone();
-            let row: String = (0..buf.area.width)
-                .map(|x| buf.get(x, 0).symbol())
-                .collect();
+            let row: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
             assert!(
                 row.contains("◌ no issues found · watching"),
                 "{name}: {row}"
             );
             for x in 0..buf.area.width {
-                let cell = buf.get(x, 0);
+                let cell = &buf[(x, 0)];
                 assert!(
                     cell.symbol() == " " || cell.fg != theme.status_good,
                     "{name}: green {:?} at column {x} of {row}",
@@ -2221,11 +2219,11 @@ mod tests {
                     history: None,
                 };
                 let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
-                terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
+                terminal.draw(|f| render_body(f, &view, f.area())).unwrap();
                 let buf = terminal.backend().buffer().clone();
                 let row = |y: u16| -> Vec<String> {
                     (0..buf.area.width)
-                        .map(|x| buf.get(x, y).symbol().to_string())
+                        .map(|x| buf[(x, y)].symbol().to_string())
                         .collect()
                 };
 
@@ -2250,7 +2248,7 @@ mod tests {
                     let text = cells[..end].concat();
                     assert!(text.contains('◌') && !text.contains('✓'), "{name}: {text}");
                     for x in 0..end {
-                        let cell = buf.get(x as u16, y);
+                        let cell = &buf[(x as u16, y)];
                         assert!(
                             cell.symbol() == " " || cell.fg != theme.status_good,
                             "{name}: green {:?} at column {x} of {text}",
@@ -2286,12 +2284,12 @@ mod tests {
             history: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
+        terminal.draw(|f| render_body(f, &view, f.area())).unwrap();
         let buf = terminal.backend().buffer().clone();
         let s: String = (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
@@ -2681,11 +2679,11 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|f| render_detail(f, &view, f.size()))
+            .draw(|f| render_detail(f, &view, f.area()))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let bottom: String = (0..buf.area.width)
-            .map(|x| buf.get(x, buf.area.height - 1).symbol())
+            .map(|x| buf[(x, buf.area.height - 1)].symbol())
             .collect();
         assert!(
             bottom.contains('╯'),

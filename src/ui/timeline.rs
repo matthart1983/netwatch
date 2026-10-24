@@ -448,7 +448,7 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
     let cursor_x = inner.x + inner.width.saturating_sub(1);
     let buf = f.buffer_mut();
     for y in inner.y..inner.y + inner.height {
-        let cell = buf.get_mut(cursor_x, y);
+        let cell = &mut buf[(cursor_x, y)];
         if cell.symbol() != " " {
             cell.set_style(Style::default().fg(t.brand));
         }

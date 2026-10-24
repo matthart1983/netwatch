@@ -2328,9 +2328,7 @@ mod tests {
 
         let mut cols = Vec::new();
         for y in 0..buf.area.height {
-            let row: String = (0..buf.area.width)
-                .map(|x| buf.get(x, y).symbol())
-                .collect();
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
             if let Some(c) = row.chars().position(|c| c == '→' || c == '←') {
                 cols.push((y, c, row.trim_end().to_string()));
             }

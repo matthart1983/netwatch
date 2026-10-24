@@ -113,7 +113,7 @@ pub fn spark(buf: &mut Buffer, x: u16, y: u16, w: u16, samples: &[u64], max: u64
 /// interface"; a flat line reads as "nothing happening", which is the truth.
 pub fn baseline(buf: &mut Buffer, x: u16, y: u16, w: u16, color: Color) {
     for i in 0..w {
-        let cell = buf.get_mut(x + i, y);
+        let cell = &mut buf[(x + i, y)];
         cell.set_char('⣀');
         cell.set_style(Style::default().fg(color));
     }
@@ -140,7 +140,7 @@ pub fn meter(buf: &mut Buffer, x: u16, y: u16, w: u16, frac: f32, ramp: &Ramp, e
     let span = (w.saturating_sub(1)).max(1) as f32;
     for i in 0..w {
         let on = i < filled;
-        let cell = buf.get_mut(x + i, y);
+        let cell = &mut buf[(x + i, y)];
         cell.set_char(if on { '■' } else { '·' });
         cell.set_style(Style::default().fg(if on { ramp.at(i as f32 / span) } else { empty }));
     }
@@ -286,7 +286,7 @@ fn set(buf: &mut Buffer, x: u16, y: u16, ch: char, style: Style) {
     if x >= buf.area.right() || y >= buf.area.bottom() {
         return;
     }
-    let cell = buf.get_mut(x, y);
+    let cell = &mut buf[(x, y)];
     cell.set_char(ch);
     cell.set_style(style);
 }
@@ -311,7 +311,7 @@ mod tests {
     }
 
     fn ch(b: &Buffer, x: u16, y: u16) -> char {
-        b.get(x, y).symbol().chars().next().unwrap_or(' ')
+        b[(x, y)].symbol().chars().next().unwrap_or(' ')
     }
 
     fn row(b: &Buffer, y: u16) -> String {
@@ -439,8 +439,8 @@ mod tests {
         let ramp = Ramp::new(vec![Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)]);
         let mut b = buf(1, 4);
         area_graph(&mut b, Rect::new(0, 0, 1, 4), &[16, 16], 16, &ramp, false);
-        let top = b.get(0, 0).fg;
-        let bottom = b.get(0, 3).fg;
+        let top = b[(0, 0)].fg;
+        let bottom = b[(0, 3)].fg;
         assert!(
             matches!((top, bottom), (Color::Rgb(a, _, _), Color::Rgb(c, _, _)) if a > c),
             "unflipped: top cell must be the bright end, got {top:?} over {bottom:?}"
@@ -448,8 +448,8 @@ mod tests {
 
         let mut b = buf(1, 4);
         area_graph(&mut b, Rect::new(0, 0, 1, 4), &[16, 16], 16, &ramp, true);
-        let top = b.get(0, 0).fg;
-        let bottom = b.get(0, 3).fg;
+        let top = b[(0, 0)].fg;
+        let bottom = b[(0, 3)].fg;
         assert!(
             matches!((top, bottom), (Color::Rgb(a, _, _), Color::Rgb(c, _, _)) if c > a),
             "flipped: bottom cell must be the bright end, got {top:?} under {bottom:?}"
@@ -485,7 +485,7 @@ mod tests {
         meter(&mut b, 0, 0, 10, 0.5, &ramp, Color::Gray);
         assert_eq!(row(&b, 0), "■■■■■·····");
         // Position-sampled: cell 4 is mid-ramp even though the value stops there.
-        assert_ne!(b.get(0, 0).fg, b.get(4, 0).fg);
+        assert_ne!(b[(0, 0)].fg, b[(4, 0)].fg);
     }
 
     #[test]

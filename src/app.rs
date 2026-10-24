@@ -1564,7 +1564,7 @@ fn build_connection_filter(conn: &Connection) -> String {
 
 /// Draw one frame of the TUI: the current view, then any open overlays.
 fn draw_frame(f: &mut Frame, app: &mut App) {
-    let area = f.size();
+    let area = f.area();
     app.ui.last_area = area;
     // Paint the theme's panel background AND default foreground
     // first so themes that opt in (sky, paper) get a colored fill
@@ -1667,13 +1667,18 @@ fn install_tui_panic_hook() {
     });
 }
 
+// Backends name their own error type since ratatui 0.30; anyhow takes any of
+// them that can cross threads.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     remote: Option<&crate::remote::RemotePublisher>,
     sandbox_mode: crate::sandbox::Mode,
     view: Option<ViewMode>,
     demo: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     // `main` has handed the terminal to the TUI.
     install_tui_panic_hook();
     let mut app = App::prepare();
@@ -4145,7 +4150,7 @@ mod quit_key_tests {
             let buf = terminal.backend().buffer();
             let text: String = (0..buf.area.height)
                 .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-                .map(|(x, y)| buf.get(x, y).symbol().to_string())
+                .map(|(x, y)| buf[(x, y)].symbol().to_string())
                 .collect();
             assert!(text.contains("Quit netwatch?"), "{view:?}");
             assert!(text.contains("any other key"), "{view:?}");
@@ -5205,14 +5210,16 @@ mod render_safety_tests {
     }
 
     /// The review's case: a ClientHello with SNI `ESC ]52;c;AAAA BEL` wrote
-    /// the viewer's clipboard as soon as its connection row was drawn.
+    /// the viewer's clipboard as soon as its connection row was drawn. The SNI
+    /// here skipped ingest, so nothing turned the ESC and BEL into `·`, and
+    /// ratatui 0.30 leaves them out of the row.
     #[test]
     fn a_connection_row_with_an_osc52_sni_draws_no_control_character() {
         let mut app = app_with_hostile_connection();
         app.ui.current_tab = Tab::Connections;
         let buf = draw(&mut app);
         let text: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("·]52;c;AAAA·"), "row was not drawn");
+        assert!(text.contains(" ]52;c;AAAA "), "row was not drawn");
         assert_eq!(unsafe_cells(&buf), Vec::<String>::new());
     }
 
@@ -5315,13 +5322,13 @@ mod diagnose_action_tests {
         let screen = |app: &App| -> String {
             let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
             terminal
-                .draw(|f| crate::ui::diagnose::render(f, app, f.size()))
+                .draw(|f| crate::ui::diagnose::render(f, app, f.area()))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             (0..buf.area.height)
                 .map(|y| {
                     (0..buf.area.width)
-                        .map(|x| buf.get(x, y).symbol())
+                        .map(|x| buf[(x, y)].symbol())
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>()
@@ -5444,7 +5451,7 @@ mod interface_list_tests {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
                     + "\n"
             })

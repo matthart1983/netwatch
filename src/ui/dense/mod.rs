@@ -1065,7 +1065,7 @@ fn header(f: &mut Frame, y: u16, cols: &[Col], sort: Option<usize>, t: &Theme) {
 }
 
 fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
-    let area = f.size();
+    let area = f.area();
     if x >= area.width || y >= area.height {
         return;
     }
@@ -1969,7 +1969,7 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
         // background, so it reads as "you are here" rather than as decoration.
         if is_sel {
             for x in l.conns.x + 1..l.conns.x + l.conns.width - 1 {
-                f.buffer_mut().get_mut(x, y).set_bg(t.selection_bg);
+                f.buffer_mut()[(x, y)].set_bg(t.selection_bg);
             }
         }
         // On the selected row the quiet tokens are promoted: `text_muted` on
@@ -2092,7 +2092,7 @@ fn render_group_row(
     let r = &group.rollup;
     if is_sel {
         for x in l.conns.x + 1..l.conns.x + l.conns.width - 1 {
-            f.buffer_mut().get_mut(x, y).set_bg(t.selection_bg);
+            f.buffer_mut()[(x, y)].set_bg(t.selection_bg);
         }
     }
     let quiet = if is_sel { t.text_primary } else { t.text_muted };
@@ -2563,7 +2563,7 @@ fn render_compact(f: &mut Frame, app: &App, area: Rect) {
         let is_sel = page_start + i == sel;
         if is_sel {
             for x in cl.conns.x + 1..cl.conns.x + cl.conns.width - 1 {
-                f.buffer_mut().get_mut(x, y).set_bg(t.selection_bg);
+                f.buffer_mut()[(x, y)].set_bg(t.selection_bg);
             }
         }
         let quiet = if is_sel { t.text_primary } else { t.text_muted };

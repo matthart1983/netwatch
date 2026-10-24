@@ -302,7 +302,7 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|f| dialog.render(f, f.size(), &crate::theme::by_name("default")))
+            .draw(|f| dialog.render(f, f.area(), &crate::theme::by_name("default")))
             .unwrap();
         terminal
             .backend()

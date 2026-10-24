@@ -957,7 +957,7 @@ mod tests {
         });
         for width in [80, 120] {
             let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
-            terminal.draw(|f| render(f, &app, f.size())).unwrap();
+            terminal.draw(|f| render(f, &app, f.area())).unwrap();
             let buf = terminal.backend().buffer();
             let rows: Vec<String> = buf
                 .content
