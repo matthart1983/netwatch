@@ -161,8 +161,7 @@ mod tests {
         }
 
         /// Run the test `name` of this binary as a child, with `child` set in
-        /// its environment and a fresh pty as its controlling terminal and
-        /// stdio, and collect what it writes until it exits.
+        /// its environment and a fresh pty as its stdio, and collect what it writes until it exits.
         pub fn run_child(name: &str, child: &str) -> Run {
             let size = Winsize {
                 ws_row: 24,
@@ -179,14 +178,14 @@ mod tests {
                 .stdin(stdio(&pty.slave))
                 .stdout(stdio(&pty.slave))
                 .stderr(stdio(&pty.slave));
-            // SAFETY: setsid and ioctl are async-signal-safe, which is all
-            // that may run between fork and exec, and touch only the child.
+            // Do not acquire the pty as a controlling terminal: macOS revokes
+            // its slave when the session leader exits, preventing the parent
+            // from checking restoration with tcgetattr after that exit.
+            // SAFETY: setsid is async-signal-safe, which is all
+            // that may run between fork and exec, and touches only the child.
             unsafe {
                 cmd.pre_exec(|| {
                     nix::unistd::setsid()?;
-                    if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
                     Ok(())
                 });
             }

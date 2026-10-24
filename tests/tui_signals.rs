@@ -43,7 +43,7 @@ impl Drop for Fixture {
     }
 }
 
-/// A process whose controlling terminal, stdin, stdout and stderr are one
+/// A process whose stdin, stdout and stderr are one
 /// fresh pty, and everything it has written there so far.
 struct Pty {
     child: Child,
@@ -68,14 +68,14 @@ impl Pty {
         cmd.stdin(stdio(&pty.slave))
             .stdout(stdio(&pty.slave))
             .stderr(stdio(&pty.slave));
-        // SAFETY: setsid and ioctl are async-signal-safe, which is all that
-        // may run between fork and exec, and touch only the child.
+        // Do not acquire the pty as a controlling terminal: macOS revokes
+        // its slave when the session leader exits, preventing the parent
+        // from checking restoration with tcgetattr after that exit.
+        // SAFETY: setsid is async-signal-safe, which is all that
+        // may run between fork and exec, and touches only the child.
         unsafe {
             cmd.pre_exec(|| {
                 nix::unistd::setsid()?;
-                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
                 Ok(())
             });
         }
