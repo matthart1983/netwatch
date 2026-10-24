@@ -2448,8 +2448,8 @@ fn parse_ipv6_packet(
     let payload_len = u16::from_be_bytes([data[4], data[5]]);
     let next_header = data[6];
     let hop_limit = data[7];
-    let src = format_ipv6(&data[8..24]);
-    let dst = format_ipv6(&data[24..40]);
+    let src = format_ipv6(data[8..24].try_into().ok()?);
+    let dst = format_ipv6(data[24..40].try_into().ok()?);
 
     details.push(format!(
         "IPv6: {} → {}, Hop Limit: {}, Next: {} ({}), Payload: {}",
@@ -2673,8 +2673,11 @@ fn parse_tcp(
         let (label, summary) = describe_app_protocol(&ap);
         details.push(format!("{label}: {summary}"));
         let info = format!(
-            "{}:{} → {}:{} {} [{}]",
-            src_ip, src_port, dst_ip, dst_port, summary, flag_str
+            "{} → {} {} [{}]",
+            format_endpoint(src_ip, src_port),
+            format_endpoint(dst_ip, dst_port),
+            summary,
+            flag_str
         );
         return (
             label.to_string(),
@@ -2689,11 +2692,9 @@ fn parse_tcp(
 
     let payload_len = payload.len();
     let info = format!(
-        "{}:{} → {}:{} [{}] Seq={} Win={}{} Payload={}",
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
+        "{} → {} [{}] Seq={} Win={}{} Payload={}",
+        format_endpoint(src_ip, src_port),
+        format_endpoint(dst_ip, dst_port),
         flag_str,
         seq,
         window,
@@ -2749,8 +2750,10 @@ fn parse_udp(
         let (label, summary) = describe_app_protocol(&ap);
         details.push(format!("{label}: {summary}"));
         let info = format!(
-            "{}:{} → {}:{} {}",
-            src_ip, src_port, dst_ip, dst_port, summary
+            "{} → {} {}",
+            format_endpoint(src_ip, src_port),
+            format_endpoint(dst_ip, dst_port),
+            summary
         );
         return (
             label.to_string(),
@@ -2765,11 +2768,9 @@ fn parse_udp(
 
     let svc = if dst_svc != "—" { dst_svc } else { src_svc };
     let info = format!(
-        "{}:{} → {}:{} Len={}{}",
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
+        "{} → {} Len={}{}",
+        format_endpoint(src_ip, src_port),
+        format_endpoint(dst_ip, dst_port),
         udp_len,
         if svc != "—" {
             format!(" ({})", svc)
@@ -3147,6 +3148,7 @@ fn extract_readable_payload(payload: &[u8]) -> String {
 // ── Helpers (formatting extracted to format.rs) ──
 mod format;
 pub use format::port_label;
+pub(crate) use format::{canonical_ip, format_endpoint};
 use format::{
     format_ipv6, format_mac, icmp_type_name, icmpv6_type_name, ip_protocol_name, parse_arp,
     tcp_flags,
@@ -3369,11 +3371,97 @@ mod tests {
     fn test_format_ipv6_loopback() {
         let mut bytes = [0u8; 16];
         bytes[15] = 1;
-        assert_eq!(format_ipv6(&bytes), "0:0:0:0:0:0:0:1");
+        assert_eq!(format_ipv6(&bytes), "::1");
     }
     #[test]
     fn test_format_ipv6_all_zeros() {
-        assert_eq!(format_ipv6(&[0u8; 16]), "0:0:0:0:0:0:0:0");
+        assert_eq!(format_ipv6(&[0u8; 16]), "::");
+    }
+    /// RFC 5952: lower case, no leading zeros, the longest run of zero groups
+    /// (the first of equals) as `::`, and never `::` for a single group.
+    #[test]
+    fn test_format_ipv6_is_rfc_5952() {
+        for (text, want) in [
+            ("2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::1"),
+            ("2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"),
+            ("2001:0:0:1:0:0:0:1", "2001:0:0:1::1"),
+            ("2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"),
+            (
+                "fe80:0:0:0:aede:48ff:fe00:1122",
+                "fe80::aede:48ff:fe00:1122",
+            ),
+            ("0:0:0:0:0:ffff:c000:201", "::ffff:192.0.2.1"),
+        ] {
+            let octets = text.parse::<std::net::Ipv6Addr>().unwrap().octets();
+            assert_eq!(format_ipv6(&octets), want, "{text}");
+        }
+    }
+
+    /// An endpoint reads back as the address and port it names. Compressed
+    /// IPv6 with `:port` appended does not: `2001:db8::20:53` is itself the
+    /// address 2001:db8::20:53, so the port goes outside brackets.
+    #[test]
+    fn an_endpoint_reads_back_as_its_address_and_port() {
+        for (ip, port, want) in [
+            ("2001:db8::20", 53, "[2001:db8::20]:53"),
+            ("::1", 8080, "[::1]:8080"),
+            ("::ffff:192.0.2.1", 443, "[::ffff:192.0.2.1]:443"),
+            ("192.0.2.1", 443, "192.0.2.1:443"),
+        ] {
+            let text = format_endpoint(ip, port);
+            assert_eq!(text, want);
+            let back: std::net::SocketAddr = text.parse().unwrap();
+            assert_eq!((back.ip(), back.port()), (ip.parse().unwrap(), port));
+        }
+        // A resolved name has no colon to confuse.
+        assert_eq!(format_endpoint("dns.google", 53), "dns.google:53");
+    }
+
+    // ── parse_ip / canonical_ip ─────────────────────────────
+    /// Every spelling a platform tool, a capture or a user produces for one
+    /// address comes out as the one packet decoding uses.
+    #[test]
+    fn canonical_ip_agrees_across_spellings() {
+        for (text, want) in [
+            ("2001:db8::1", "2001:db8::1"),
+            ("2001:DB8:0:0:0:0:0:1", "2001:db8::1"),
+            ("2001:0db8:0000::0001", "2001:db8::1"),
+            ("[2001:db8::1]", "2001:db8::1"),
+            // ss on a device-bound socket; ipconfig's zone index.
+            ("fe80::1%eth0", "fe80::1"),
+            ("[fe80::1%12]", "fe80::1"),
+            // macOS lsof: no opening bracket, scope embedded in group two.
+            ("fe80:16::145f:b7c7:8a9e:7fb7]", "fe80::145f:b7c7:8a9e:7fb7"),
+            // A dual-stack socket's IPv4 peer, whichever way it is spelled.
+            ("::ffff:192.0.2.10", "192.0.2.10"),
+            ("::FFFF:c000:20a", "192.0.2.10"),
+            ("192.0.2.10", "192.0.2.10"),
+            ("::1", "::1"),
+            ("::", "::"),
+        ] {
+            assert_eq!(canonical_ip(text).as_deref(), Some(want), "{text}");
+        }
+    }
+    #[test]
+    fn canonical_ip_leaves_non_addresses_alone() {
+        for text in [
+            "",
+            "*",
+            "192.168.",
+            "fe80:",
+            "example.com",
+            "1.2.3.4:443",
+            "::1::2",
+        ] {
+            assert_eq!(canonical_ip(text), None, "{text}");
+        }
+    }
+    /// Only a link-local address has bits a platform may borrow for scope;
+    /// the same groups elsewhere are part of the address.
+    #[test]
+    fn only_link_local_scope_is_cleared() {
+        assert_eq!(canonical_ip("2001:16::1").as_deref(), Some("2001:16::1"));
+        assert_eq!(canonical_ip("ff02:4::fb").as_deref(), Some("ff02:4::fb"));
     }
 
     // ── tcp_flags ───────────────────────────────────────────
@@ -4841,6 +4929,279 @@ mod tests {
             extract_sni_for_quic(&hello).as_deref(),
             Some("·]52;c;AAAA·.example")
         );
+    }
+
+    // ── connection rows join their streams ──────────────────
+
+    /// Ethernet, then IPv4 or IPv6 to match the addresses, then TCP carrying
+    /// `payload`: everything the decoder, the stream tracker and DPI read.
+    /// Checksums stay zero, as nothing here checks them.
+    pub(super) fn tcp_frame(
+        src: std::net::SocketAddr,
+        dst: std::net::SocketAddr,
+        flags: u8,
+        (seq, ack): (u32, u32),
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use std::net::IpAddr;
+        let mut tcp = Vec::with_capacity(20 + payload.len());
+        tcp.extend_from_slice(&src.port().to_be_bytes());
+        tcp.extend_from_slice(&dst.port().to_be_bytes());
+        tcp.extend_from_slice(&seq.to_be_bytes());
+        tcp.extend_from_slice(&ack.to_be_bytes());
+        tcp.extend_from_slice(&[5 << 4, flags]); // 20-byte header
+        tcp.extend_from_slice(&64240u16.to_be_bytes());
+        tcp.extend_from_slice(&[0; 4]); // checksum, urgent pointer
+        tcp.extend_from_slice(payload);
+        let mut frame = vec![0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0x01];
+        match (src.ip(), dst.ip()) {
+            (IpAddr::V4(s), IpAddr::V4(d)) => {
+                frame.extend_from_slice(&[0x08, 0x00, 0x45, 0]);
+                frame.extend_from_slice(&(20 + tcp.len() as u16).to_be_bytes());
+                frame.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0]);
+                frame.extend_from_slice(&s.octets());
+                frame.extend_from_slice(&d.octets());
+            }
+            (IpAddr::V6(s), IpAddr::V6(d)) => {
+                frame.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+                frame.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+                frame.extend_from_slice(&[6, 64]);
+                frame.extend_from_slice(&s.octets());
+                frame.extend_from_slice(&d.octets());
+            }
+            _ => panic!("one family per frame"),
+        }
+        frame.extend_from_slice(&tcp);
+        frame
+    }
+
+    /// An SSH session's handshake and server banner, replayed through the
+    /// capture path. The replay's tracker holds the stream and its DPI label.
+    fn replay_ssh(client: &str, server: &str) -> (Replay, Vec<CapturedPacket>) {
+        let (c, s) = (client.parse().unwrap(), server.parse().unwrap());
+        let replay = Replay::new();
+        let packets = [
+            tcp_frame(c, s, TCP_FLAG_SYN, (1000, 0), b""),
+            tcp_frame(s, c, TCP_FLAG_SYN | TCP_FLAG_ACK, (5000, 1001), b""),
+            tcp_frame(c, s, TCP_FLAG_ACK, (1001, 5001), b""),
+            tcp_frame(
+                s,
+                c,
+                TCP_FLAG_PSH | TCP_FLAG_ACK,
+                (5001, 1001),
+                b"SSH-2.0-OpenSSH_9.6\r\n",
+            ),
+        ]
+        .iter()
+        .map(|f| replay.frame(f).expect("decodes"))
+        .collect();
+        (replay, packets)
+    }
+
+    /// A connection table row, as the collectors build one.
+    fn row(local: &str, remote: &str) -> crate::collectors::connections::Connection {
+        crate::collectors::connections::Connection {
+            protocol: "TCP".into(),
+            local_addr: local.into(),
+            remote_addr: remote.into(),
+            state: "ESTABLISHED".into(),
+            pid: None,
+            process_name: None,
+            handshake_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
+        }
+    }
+
+    /// Every row in `rows` keys to the stream the replayed packets made, with
+    /// `local` on its own side, and so finds the stream's bytes and DPI label.
+    fn assert_rows_join(
+        replay: &Replay,
+        packets: &[CapturedPacket],
+        local: &str,
+        rows: &[(&str, &str)],
+    ) {
+        use crate::collectors::connections::{connection_stream_key, LocalSide};
+        let tracker = replay.tracker.lock().unwrap();
+        let (labels, bytes) = (tracker.snapshot_app_protocols(), tracker.snapshot_bytes());
+        let local: std::net::SocketAddr = local.parse().unwrap();
+        for &(l, r) in rows {
+            let (key, side) = connection_stream_key(&row(l, r)).expect("row keys");
+            for p in packets {
+                let (sp, dp) = (p.src_port.unwrap(), p.dst_port.unwrap());
+                let packet_key = StreamKey::new(StreamProtocol::Tcp, &p.src_ip, sp, &p.dst_ip, dp);
+                assert_eq!(packet_key, key, "{l} -> {r}");
+            }
+            let own = match side {
+                LocalSide::A => &key.addr_a,
+                LocalSide::B => &key.addr_b,
+            };
+            assert_eq!(own, &(local.ip().to_string(), local.port()), "{l}");
+            assert!(bytes.contains_key(&key), "{l}");
+            assert!(
+                matches!(labels.get(&key), Some(crate::dpi::AppProtocol::Ssh { .. })),
+                "{l}"
+            );
+        }
+    }
+
+    /// The regression: capture wrote every IPv6 group out while the
+    /// connection table compresses them, so an IPv6 row never found its
+    /// stream, packets, DPI label or JA4.
+    #[test]
+    fn an_ipv6_row_joins_its_packets_stream_and_label() {
+        let (replay, packets) = replay_ssh("[2001:db8::10]:50022", "[2001:db8::20]:22");
+        assert_eq!(
+            (packets[0].src_ip.as_str(), packets[0].dst_ip.as_str()),
+            ("2001:db8::10", "2001:db8::20")
+        );
+        assert_rows_join(
+            &replay,
+            &packets,
+            "[2001:db8::10]:50022",
+            &[
+                // ss, lsof, IP Helper and the /proc/net fallback.
+                ("[2001:db8::10]:50022", "[2001:db8::20]:22"),
+                // ss on a socket bound to a device.
+                ("[2001:db8::10%eth0]:50022", "[2001:db8::20]:22"),
+                // ss -n's occasional unbracketed form.
+                ("2001:db8::10:50022", "2001:db8::20:22"),
+                // No collector writes this, but it is the same address.
+                ("[2001:DB8:0:0:0:0:0:10]:50022", "[2001:0db8::0020]:22"),
+            ],
+        );
+    }
+
+    /// macOS `lsof` drops the opening bracket of a link-local endpoint and
+    /// embeds the interface in its second group; neither is on the wire.
+    /// Each end of an IPv6 packet's Info line names its peer and port. With
+    /// the port appended bare, `2001:db8::20:22` read as another host, and
+    /// pasting it into the filter matched nothing.
+    #[test]
+    fn ipv6_info_names_each_end_with_its_port() {
+        let (_, packets) = replay_ssh("[2001:db8::10]:50022", "[2001:db8::20]:22");
+        for p in &packets {
+            let (src, rest) = p.info.split_once(" → ").expect("two ends");
+            let dst = rest.split_whitespace().next().unwrap();
+            for (end, ip, port) in [(src, &p.src_ip, p.src_port), (dst, &p.dst_ip, p.dst_port)] {
+                let addr: std::net::SocketAddr = end
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{end}: {e} in {}", p.info));
+                assert_eq!(
+                    (addr.ip().to_string(), Some(addr.port())),
+                    (ip.clone(), port),
+                    "{}",
+                    p.info
+                );
+            }
+        }
+        assert!(packets[3]
+            .info
+            .starts_with("[2001:db8::20]:22 → [2001:db8::10]:50022 "));
+    }
+
+    #[test]
+    fn a_macos_link_local_row_joins_its_stream() {
+        let (replay, packets) = replay_ssh(
+            "[fe80::145f:b7c7:8a9e:7fb7]:50022",
+            "[fe80::aede:48ff:fe00:1122]:22",
+        );
+        assert_rows_join(
+            &replay,
+            &packets,
+            "[fe80::145f:b7c7:8a9e:7fb7]:50022",
+            &[
+                (
+                    "fe80:16::145f:b7c7:8a9e:7fb7]:50022",
+                    "fe80:16::aede:48ff:fe00:1122]:22",
+                ),
+                (
+                    "[fe80::145f:b7c7:8a9e:7fb7%en0]:50022",
+                    "[fe80::aede:48ff:fe00:1122%en0]:22",
+                ),
+            ],
+        );
+    }
+
+    /// A dual-stack socket talking to an IPv4 peer: `ss` prints both ends
+    /// v4-mapped, and the packets travel as IPv4.
+    #[test]
+    fn a_v4_mapped_row_joins_its_ipv4_stream() {
+        let (replay, packets) = replay_ssh("192.0.2.10:51234", "198.51.100.7:22");
+        assert_eq!(packets[0].src_ip, "192.0.2.10");
+        assert_rows_join(
+            &replay,
+            &packets,
+            "192.0.2.10:51234",
+            &[
+                ("[::ffff:192.0.2.10]:51234", "[::ffff:198.51.100.7]:22"),
+                ("192.0.2.10:51234", "198.51.100.7:22"),
+            ],
+        );
+    }
+
+    /// Typed any way, an address finds its packets, and only its own: as
+    /// text, `2001:db8::1` is inside `2001:db8::10`.
+    #[test]
+    fn address_filters_match_ipv6_however_it_is_typed() {
+        let (_, packets) = replay_ssh("[2001:db8::10]:50022", "[2001:db8::20]:22");
+        let syn = &packets[0];
+        let matches = |filter: &str| matches_packet(&parse_filter(filter).unwrap(), syn);
+        for filter in [
+            "ip.addr == 2001:db8::10",
+            "ip.addr == 2001:DB8:0:0:0:0:0:10",
+            "ip.addr == 2001:0db8:0000:0000:0000:0000:0000:0010",
+            "ip.addr==\"2001:db8::20\"",
+            "ip.src == [2001:db8::10]",
+            "ip.src == 2001:db8:0:0:0:0:0:10",
+            "ip.dst == 2001:db8::20",
+            "2001:db8:0:0:0:0:0:20",
+            "2001:db8::20 and port 22",
+            // A fragment still matches as text.
+            "ip.addr == 2001:db8:",
+        ] {
+            assert!(matches(filter), "{filter}");
+        }
+        for filter in [
+            "ip.addr == 2001:db8::1",
+            "ip.addr == 2001:db8:0:0:0:0:0:1",
+            "ip.addr == ::10",
+            "ip.src == 2001:db8::20",
+            "ip.dst == 2001:db8::10",
+            "2001:db8::2",
+        ] {
+            assert!(!matches(filter), "{filter}");
+        }
+    }
+
+    /// The v4-mapped spelling a dual-stack row shows finds the IPv4 packets,
+    /// and a whole IPv4 address no longer matches every address it prefixes.
+    #[test]
+    fn address_filters_match_ipv4_as_an_address() {
+        let (_, packets) = replay_ssh("192.0.2.10:51234", "198.51.100.7:22");
+        let syn = &packets[0];
+        let matches = |filter: &str| matches_packet(&parse_filter(filter).unwrap(), syn);
+        for filter in [
+            "ip.addr == ::ffff:192.0.2.10",
+            "::ffff:198.51.100.7",
+            "192.0.2.10",
+            "ip.src == 192.0.2.10",
+            "192.0.2.",
+        ] {
+            assert!(matches(filter), "{filter}");
+        }
+        for filter in [
+            "192.0.2.1",
+            "ip.addr == 198.51.100.70",
+            "ip.dst == 192.0.2.10",
+        ] {
+            assert!(!matches(filter), "{filter}");
+        }
     }
 }
 

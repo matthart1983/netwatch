@@ -1536,7 +1536,10 @@ pub(crate) fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
         return (None, None);
     }
     if let Some(bracket_end) = addr.rfind("]:") {
-        (part(&addr[1..bracket_end]), part(&addr[bracket_end + 2..]))
+        // macOS lsof prints a link-local endpoint with no opening bracket
+        // (`fe80:16::1]:1024`), so the first character is not always one.
+        let host = addr[..bracket_end].trim_start_matches('[');
+        (part(host), part(&addr[bracket_end + 2..]))
     } else if let Some(colon) = addr.rfind(':') {
         (part(&addr[..colon]), part(&addr[colon + 1..]))
     } else {
@@ -2503,7 +2506,9 @@ fn scroll_tab(app: &mut App, delta: isize) {
                 app.ui.scroll.traceroute_scroll =
                     clamp_scroll(app.ui.scroll.traceroute_scroll, delta, usize::MAX);
             } else {
-                let max = top_remote_ips(app).len().saturating_sub(1);
+                let max = crate::ui::topology::selectable_peers(app)
+                    .len()
+                    .saturating_sub(1);
                 app.ui.scroll.topology_scroll =
                     clamp_scroll(app.ui.scroll.topology_scroll, delta, max);
             }
@@ -3767,8 +3772,8 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Enter if app.ui.current_tab == Tab::Topology && !app.ui.traceroute_view_open => {
-            let remote_ips = top_remote_ips(app);
-            if let Some((ip, _)) = remote_ips.get(app.ui.scroll.topology_scroll) {
+            let peers = crate::ui::topology::selectable_peers(app);
+            if let Some(ip) = peers.get(app.ui.scroll.topology_scroll) {
                 app.ui.packet_filter_text = ip.clone();
                 app.ui.packet_filter_active = Some(ip.clone());
                 app.ui.packet_filter_input = false;
@@ -3778,8 +3783,8 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Char('T') if app.ui.current_tab == Tab::Topology => {
-            let remote_ips = top_remote_ips(app);
-            if let Some((ip, _)) = remote_ips.get(app.ui.scroll.topology_scroll) {
+            let peers = crate::ui::topology::selectable_peers(app);
+            if let Some(ip) = peers.get(app.ui.scroll.topology_scroll) {
                 app.traceroute_runner.run(ip);
                 app.ui.scroll.traceroute_scroll = 0;
             }
@@ -3870,51 +3875,6 @@ fn yank_selected_packet(app: &mut App) {
     app.ui.export_status_tick = 0;
 }
 
-/// Returns remote IPs ranked by connection count, used by Topology tab actions.
-fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
-    // Mirrors build_remote_nodes() in src/ui/topology.rs: partition local vs.
-    // public, then sort each by (has_established desc, conn_count desc,
-    // DNS-label asc). The third key MUST match the renderer's, otherwise the
-    // cursor index and the IP returned here can disagree whenever DNS
-    // resolves a tied row to a name that orders differently from its IP.
-    let mut acc: HashMap<String, (String, usize, bool)> = HashMap::new();
-    let conns = app.connection_collector.connections();
-    for conn in conns.iter() {
-        let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
-        if let Some(ip) = remote_ip {
-            let entry = acc.entry(ip.clone()).or_insert_with(|| {
-                let label = app
-                    .packet_collector
-                    .dns_cache
-                    .lookup(&ip)
-                    .unwrap_or_else(|| ip.clone());
-                (label, 0, false)
-            });
-            entry.1 += 1;
-            if conn.state == "ESTABLISHED" {
-                entry.2 = true;
-            }
-        }
-    }
-    let (mut local, mut public): (Vec<_>, Vec<_>) = acc
-        .into_iter()
-        .map(|(ip, (label, count, est))| (ip, label, count, est))
-        .partition(|(ip, _, _, _)| crate::collectors::geo::is_private_ip(ip));
-    let sort = |v: &mut Vec<(String, String, usize, bool)>| {
-        v.sort_by(|a, b| {
-            b.3.cmp(&a.3)
-                .then_with(|| b.2.cmp(&a.2))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-    };
-    sort(&mut local);
-    sort(&mut public);
-    local
-        .into_iter()
-        .chain(public)
-        .map(|(ip, _, count, _)| (ip, count))
-        .collect()
-}
 /// Refresh ticks between health probes.
 ///
 /// The gateway / dns / internet histories advance once per probe while the
@@ -4496,6 +4456,103 @@ mod tests {
         sort_connections(&mut conns, col(Tab::Connections, "Remote Address"));
         let addrs: Vec<_> = conns.iter().map(|c| c.remote_addr.as_str()).collect();
         assert_eq!(addrs, vec!["1.2.3.4:80", "10.0.0.1:80", "192.168.1.1:443"]);
+    }
+
+    /// Enter on a connection filters the Packets tab to its peer. The filter
+    /// has to name the peer as capture does, whichever way the platform
+    /// printed the row: v4-mapped, zoned, or macOS `lsof`'s link-local form
+    /// with no opening bracket, which used to lose its first character.
+    #[test]
+    fn a_connection_filter_names_the_peer_as_capture_does() {
+        use crate::collectors::packets::{parse_filter, FilterExpr};
+        for (remote, peer, port) in [
+            ("[2001:db8::20]:22", "2001:db8::20", 22),
+            ("[::ffff:192.0.2.10]:443", "192.0.2.10", 443),
+            ("[fe80::1%eth0]:22", "fe80::1", 22),
+            (
+                "fe80:16::aede:48ff:fe00:1122]:1024",
+                "fe80::aede:48ff:fe00:1122",
+                1024,
+            ),
+            ("192.0.2.10:443", "192.0.2.10", 443),
+        ] {
+            let c = conn_full(None, None, "0:0", remote, None, None);
+            let filter = parse_filter(&build_connection_filter(&c)).unwrap();
+            let FilterExpr::And(ip, p) = filter else {
+                panic!("{remote}: {filter:?}");
+            };
+            assert!(
+                matches!(*ip, FilterExpr::Ip(ref ip) if ip == peer),
+                "{remote}: {ip:?}"
+            );
+            assert!(
+                matches!(*p, FilterExpr::Port(n) if n == port),
+                "{remote}: {p:?}"
+            );
+        }
+    }
+
+    /// `Enter` on the Topology tab acts on the peer the graph highlights.
+    /// The key handlers once kept their own copy of the graph's partition and
+    /// sort, and the two read macOS `lsof`'s bracketless link-local row
+    /// differently: the graph drew `e80:16::…` among internet peers while the
+    /// key handlers put `fe80:16::…` among LAN peers, so with the cursor on
+    /// 203.0.113.5, `Enter` filtered to the link-local peer and `T` traced it.
+    #[test]
+    fn topology_enter_acts_on_the_highlighted_peer() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.ui.view_mode = ViewMode::Full;
+        let link_local = "fe80:16::aede:48ff:fe00:1122";
+        app.connection_collector.publish_for_test(vec![
+            conn_full(
+                None,
+                None,
+                "0:0",
+                &format!("{link_local}]:49152"),
+                None,
+                None,
+            ),
+            conn_full(None, None, "0:0", "203.0.113.5:443", None, None),
+            conn_full(None, None, "0:0", "192.168.1.1:53", None, None),
+        ]);
+        let mut highlighted = Vec::new();
+        for cursor in 0..3 {
+            app.ui.current_tab = Tab::Topology;
+            app.ui.scroll.topology_scroll = cursor;
+            let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+            terminal
+                .draw(|f| crate::ui::topology::render(f, &app, f.size()))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let screen: Vec<String> = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf.get(x, y).symbol())
+                        .collect()
+                })
+                .collect();
+            // The LAN column marks its cursor `▸ label`, the internet column
+            // `label ◂`.
+            let peer = screen
+                .iter()
+                .find_map(|line| {
+                    if let Some((_, after)) = line.split_once("▸ ") {
+                        after.split_whitespace().next()
+                    } else {
+                        let (before, _) = line.split_once(" ◂")?;
+                        before.split_whitespace().last()
+                    }
+                })
+                .unwrap_or_else(|| panic!("no cursor:\n{}", screen.join("\n")))
+                .to_string();
+            let key = crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            handle_key(&mut app, key);
+            assert_eq!(app.ui.packet_filter_text, peer, "cursor {cursor}");
+            highlighted.push(peer);
+        }
+        // The link-local peer is a LAN peer, drawn under its whole address.
+        assert_eq!(highlighted, ["192.168.1.1", link_local, "203.0.113.5"]);
     }
 
     #[test]

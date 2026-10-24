@@ -1577,6 +1577,42 @@ mod tests {
         assert_eq!(reply.annotation.unwrap().direction, Direction::Inbound);
     }
 
+    /// An IPv6 packet as capture decodes it takes its owner from the row `ss`
+    /// prints for its socket. The two spelled IPv6 differently, so no IPv6
+    /// packet was ever annotated.
+    #[test]
+    fn an_ipv6_packet_is_annotated_from_its_row() {
+        let (client, server) = (
+            "[2001:db8::10]:50022".parse().unwrap(),
+            "[2001:db8::20]:22".parse().unwrap(),
+        );
+        let frame = super::super::tests::tcp_frame(
+            client,
+            server,
+            super::super::TCP_FLAG_SYN,
+            (1000, 0),
+            b"",
+        );
+        let mut p = super::super::Replay::new().frame(&frame).unwrap();
+        p.capture = packet().capture;
+        p.capture.as_mut().unwrap().timestamp_ns = 1_500_000_000;
+        let row = |ms| {
+            let mut c = conn(ms);
+            c.protocol = "TCP".into();
+            c.local_addr = "[2001:db8::10]:50022".into();
+            c.remote_addr = "[2001:db8::20]:22".into();
+            c.evidence.flow.as_mut().unwrap().capture_generation = p.stream_index;
+            c
+        };
+        let mut history = AnnotationHistory::default();
+        let mut packets = vec![p.clone()];
+        history.observe(&[row(1000)], &mut packets);
+        history.observe(&[row(2000)], &mut packets);
+        let annotation = packets[0].annotation.as_ref().expect("annotated");
+        assert_eq!(annotation.process.pid, 42);
+        assert_eq!(annotation.direction, Direction::Outbound);
+    }
+
     #[test]
     fn comments_are_optional_bounded_and_exclude_plaintext() {
         let mut p = packet();

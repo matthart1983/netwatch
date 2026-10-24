@@ -205,7 +205,10 @@ fn build_events(app: &App) -> Vec<Event> {
             kind,
             category: Category::Dns,
             summary: format!("{}  {}", label, truncate(&pkt.info, 60)),
-            detail: format!("from {}:{}", pkt.src_ip, pkt.src_port.unwrap_or(0)),
+            detail: format!(
+                "from {}",
+                crate::collectors::packets::format_endpoint(&pkt.src_ip, pkt.src_port.unwrap_or(0))
+            ),
         });
     }
 

@@ -1,7 +1,7 @@
 use crate::app::{App, StreamDirectionFilter};
 use crate::collectors::packets::{
-    matches_packet, parse_filter, port_label, CapturedPacket, ExpertSeverity, FilterExpr,
-    StreamDirection,
+    format_endpoint, matches_packet, parse_filter, port_label, CapturedPacket, ExpertSeverity,
+    FilterExpr, StreamDirection,
 };
 use crate::ui::stream_context;
 use crate::ui::widgets;
@@ -248,11 +248,11 @@ pub fn format_packet_for_clipboard(
         pkt.id, pkt.timestamp, pkt.protocol
     );
     let src = match pkt.src_port {
-        Some(p) => format!("{}:{}", pkt.src_ip, p),
+        Some(p) => format_endpoint(&pkt.src_ip, p),
         None => pkt.src_ip.clone(),
     };
     let dst = match pkt.dst_port {
-        Some(p) => format!("{}:{}", pkt.dst_ip, p),
+        Some(p) => format_endpoint(&pkt.dst_ip, p),
         None => pkt.dst_ip.clone(),
     };
     let _ = writeln!(s, "{src} → {dst}  ({} bytes)", pkt.length);
@@ -489,6 +489,20 @@ pub fn is_expert(p: &CapturedPacket) -> bool {
     matches!(p.expert, ExpertSeverity::Warn | ExpertSeverity::Error)
 }
 
+/// A Source or Destination cell: the host (its resolved name, else its
+/// address), then the port, bracketing an IPv6 address so the port is not
+/// read as one more group of it, then the port's service when it has one.
+fn endpoint_cell(host: &str, port: Option<u16>) -> String {
+    let Some(port) = port else {
+        return host.to_string();
+    };
+    let endpoint = format_endpoint(host, port);
+    match port_label(port) {
+        "—" => endpoint,
+        svc => format!("{endpoint} ({svc})"),
+    }
+}
+
 fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
     let header = Row::new(
         [
@@ -592,28 +606,8 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             let src_label = src_resolved.as_deref().unwrap_or(&pkt.src_ip);
             let dst_label = dst_resolved.as_deref().unwrap_or(&pkt.dst_ip);
 
-            let src_display = match pkt.src_port {
-                Some(p) => {
-                    let svc = port_label(p);
-                    if svc != "—" {
-                        format!("{}:{} ({})", src_label, p, svc)
-                    } else {
-                        format!("{}:{}", src_label, p)
-                    }
-                }
-                None => src_label.to_string(),
-            };
-            let dst_display = match pkt.dst_port {
-                Some(p) => {
-                    let svc = port_label(p);
-                    if svc != "—" {
-                        format!("{}:{} ({})", dst_label, p, svc)
-                    } else {
-                        format!("{}:{}", dst_label, p)
-                    }
-                }
-                None => dst_label.to_string(),
-            };
+            let src_display = endpoint_cell(src_label, pkt.src_port);
+            let dst_display = endpoint_cell(dst_label, pkt.dst_port);
 
             let stream_label = pkt
                 .stream_index
@@ -1470,7 +1464,11 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
             format!(" {proto_str} Stream #{stream_index} "),
             Style::default().fg(app.theme.brand).bold(),
         ),
-        Span::raw(format!("── {a_ip}:{a_port} ↔ {b_ip}:{b_port}  ")),
+        Span::raw(format!(
+            "── {} ↔ {}  ",
+            format_endpoint(a_ip, a_port),
+            format_endpoint(b_ip, b_port)
+        )),
         Span::styled(dir_label, Style::default().fg(app.theme.key_hint)),
         Span::raw("  "),
         Span::styled(
@@ -2422,6 +2420,36 @@ mod tests {
         assert!(out.contains("GET /verify HTTP/1.1"));
         assert!(out.contains("Host: example.com"));
         assert_eq!(out.matches('Z').count(), 4000, "full payload, untruncated");
+    }
+
+    /// A copied IPv6 packet and its list cells bracket the address before
+    /// the port: `2001:db8::20:53` would paste as a different host.
+    #[test]
+    fn ipv6_endpoints_are_bracketed_where_a_port_follows() {
+        let mut pkt = pkt_with_decrypted(None);
+        pkt.src_ip = "2001:db8::10".into();
+        pkt.src_port = Some(53002);
+        pkt.dst_ip = "2001:db8::20".into();
+        pkt.dst_port = Some(53);
+        let out = format_packet_for_clipboard(&pkt, &[]);
+        assert!(
+            out.contains("[2001:db8::10]:53002 → [2001:db8::20]:53  (100 bytes)"),
+            "{out}"
+        );
+        assert_eq!(
+            endpoint_cell("2001:db8::20", Some(53)),
+            "[2001:db8::20]:53 (DNS)"
+        );
+        assert_eq!(
+            endpoint_cell("2001:db8::10", Some(53002)),
+            "[2001:db8::10]:53002"
+        );
+        assert_eq!(endpoint_cell("2001:db8::10", None), "2001:db8::10");
+        assert_eq!(
+            endpoint_cell("192.0.2.1", Some(443)),
+            "192.0.2.1:443 (HTTPS)"
+        );
+        assert_eq!(endpoint_cell("dns.google", Some(53)), "dns.google:53 (DNS)");
     }
 
     #[test]

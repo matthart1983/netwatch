@@ -1,5 +1,6 @@
 use crate::app::{safe_read, safe_write};
 use std::collections::VecDeque;
+#[cfg(not(windows))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -893,8 +894,9 @@ fn run_stun_probe(cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe
 }
 
 /// `None` means no echo request was sent by either path — the kernel refused
-/// the socket and `ping` could not run or could not open one. `Some` is a
-/// measurement, including `Some((None, 100.0))` for three unanswered echoes.
+/// the socket and `ping` could not run or could not open one, or on Windows
+/// no ICMP handle could be opened. `Some` is a measurement, including
+/// `Some((None, 100.0))` for three unanswered echoes.
 fn run_ping(target: &str) -> Option<(Option<f64>, f64)> {
     // Prefer native DGRAM ICMP on Unix — works under the sandbox
     // because Landlock sets NO_NEW_PRIVS, which makes the kernel
@@ -907,19 +909,23 @@ fn run_ping(target: &str) -> Option<(Option<f64>, f64)> {
     }
 
     // Windows: IcmpSendEcho2 / Icmp6SendEcho2, which need no privilege and
-    // answer with a status code rather than ping.exe's localised text. The
-    // subprocess below runs only for a target that is not an address, or on
-    // a host where no ICMP handle can be opened.
+    // answer with a status code rather than ping.exe's localised text. There
+    // is no ping.exe fallback. It opens the same ICMP handle, so it fails
+    // where this does, and only an English install could read its summary.
+    // Every caller passes an address: the gateway and the internet target.
     #[cfg(windows)]
-    if let Some(echoes) = target
-        .parse()
-        .ok()
-        .and_then(|ip| crate::platform::windows::icmp::echoes(ip, PING_PROBES, PING_TIMEOUT_MS))
     {
-        return ping_summary(&echoes);
+        target
+            .parse()
+            .ok()
+            .and_then(|ip| crate::platform::windows::icmp::echoes(ip, PING_PROBES, PING_TIMEOUT_MS))
+            .and_then(|echoes| ping_summary(&echoes))
     }
 
-    run_ping_subprocess(target)
+    #[cfg(not(windows))]
+    {
+        run_ping_subprocess(target)
+    }
 }
 
 /// Echoes per native Windows ping, and how long each waits: the three echoes
@@ -1094,12 +1100,11 @@ fn icmp_checksum(data: &[u8]) -> u16 {
 }
 
 /// Subprocess fallback for Unix systems where SOCK_DGRAM ICMP isn't
-/// available (no `net.ipv4.ping_group_range` entry, exotic kernels), and for
-/// Windows only when no ICMP handle can be opened: its parsing reads
-/// English `ping.exe` output and gets nothing from a German or Russian one.
+/// available (no `net.ipv4.ping_group_range` entry, exotic kernels).
 /// Under the v0.17.x Linux sandbox this path is broken because Landlock
 /// sets NO_NEW_PRIVS and the setcap on `/usr/bin/ping` is ignored on exec —
 /// the native path above is what makes pings work under sandbox.
+#[cfg(not(windows))]
 fn run_ping_subprocess(target: &str) -> Option<(Option<f64>, f64)> {
     // macOS and FreeBSD share the original BSD ping(8) lineage: `-t timeout`
     // is an overall deadline in seconds, predating Linux's iputils `-W`
@@ -1114,15 +1119,7 @@ fn run_ping_subprocess(target: &str) -> Option<(Option<f64>, f64)> {
     #[cfg(target_os = "linux")]
     let args = ["-c", "3", "-W", "1", target];
 
-    #[cfg(target_os = "windows")]
-    let args = ["-n", "3", "-w", "1000", target];
-
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "freebsd",
-        target_os = "windows"
-    )))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
     let args = ["-c", "3", "-W", "1", target];
 
     let output = Command::new("ping").args(args).output().ok()?;
@@ -1141,15 +1138,17 @@ fn run_ping_subprocess(target: &str) -> Option<(Option<f64>, f64)> {
 }
 
 /// Whether `ping`'s output carries a transmit summary at all: "3 packets
-/// transmitted" on Linux and macOS, "Packets: Sent = 3" on Windows.
+/// transmitted" on Linux and macOS.
+#[cfg(any(not(windows), test))]
 fn ping_ran(output: &str) -> bool {
-    output.contains("transmitted") || output.contains("Sent =")
+    output.contains("transmitted")
 }
 
+#[cfg(any(not(windows), test))]
 fn parse_loss(output: &str) -> f64 {
     // "3 packets transmitted, 3 packets received, 0.0% packet loss"
     for line in output.lines() {
-        if line.contains("packet loss") || line.contains("% loss") {
+        if line.contains("packet loss") {
             for part in line.split_whitespace() {
                 if part.ends_with('%') {
                     if let Ok(val) = part.trim_end_matches('%').parse::<f64>() {
@@ -1160,7 +1159,7 @@ fn parse_loss(output: &str) -> f64 {
             // Try comma-separated format
             for segment in line.split(',') {
                 let trimmed = segment.trim();
-                if trimmed.contains("% packet loss") || trimmed.contains("% loss") {
+                if trimmed.contains("% packet loss") {
                     if let Some(pct_str) = trimmed.split('%').next() {
                         let pct_str = pct_str.trim();
                         if let Ok(val) = pct_str.parse::<f64>() {
@@ -1181,6 +1180,7 @@ fn parse_loss(output: &str) -> f64 {
     100.0
 }
 
+#[cfg(any(not(windows), test))]
 fn parse_avg_rtt(output: &str) -> Option<f64> {
     // "round-trip min/avg/max/stddev = 1.234/2.345/3.456/0.567 ms"
     for line in output.lines() {
@@ -1191,15 +1191,6 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
                 if parts.len() >= 2 {
                     return parts[1].trim().parse().ok();
                 }
-            }
-        }
-    }
-    // Windows format: "Minimum = 1ms, Maximum = 3ms, Average = 2ms"
-    for line in output.lines() {
-        if line.contains("Average =") {
-            if let Some(avg_part) = line.split("Average =").nth(1) {
-                let avg_str = avg_part.trim().trim_end_matches("ms").trim();
-                return avg_str.parse().ok();
             }
         }
     }
@@ -1311,15 +1302,20 @@ mod tests {
         }
     }
 
+    /// Windows never starts ping.exe, whose summary only an English install
+    /// could read: a target the ICMP API cannot take is not measured.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ping_starts_no_ping_exe() {
+        assert_eq!(run_ping("localhost"), None);
+    }
+
     #[test]
     fn ping_that_could_not_open_a_socket_did_not_run() {
         assert!(!ping_ran(""));
         assert!(!ping_ran("ping: socket: Operation not permitted"));
         assert!(ping_ran(
             "3 packets transmitted, 0 received, 100% packet loss, time 2003ms"
-        ));
-        assert!(ping_ran(
-            "    Packets: Sent = 3, Received = 3, Lost = 0 (0% loss),"
         ));
     }
 
@@ -1354,16 +1350,6 @@ PING 192.168.1.1 (192.168.1.1): 56 data bytes
 --- 192.168.1.1 ping statistics ---
 3 packets transmitted, 3 packets received, 0.0% packet loss
 round-trip min/avg/max/stddev = 1.234/2.345/3.456/0.567 ms";
-        assert_eq!(parse_loss(output), 0.0);
-    }
-
-    #[test]
-    fn parse_loss_windows_format() {
-        let output = "\
-Ping statistics for 192.168.1.1:
-    Packets: Sent = 3, Received = 3, Lost = 0 (0% loss),
-Approximate round trip times in milli-seconds:
-    Minimum = 1ms, Maximum = 3ms, Average = 2ms";
         assert_eq!(parse_loss(output), 0.0);
     }
 
@@ -1409,22 +1395,6 @@ PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.
 3 packets transmitted, 3 received, 0% packet loss, time 2003ms
 rtt min/avg/max/mdev = 11.800/12.066/12.300/0.205 ms";
         assert_eq!(parse_avg_rtt(output), Some(12.066));
-    }
-
-    #[test]
-    fn parse_avg_rtt_windows() {
-        let output = "\
-Ping statistics for 192.168.1.1:
-    Packets: Sent = 3, Received = 3, Lost = 0 (0% loss),
-Approximate round trip times in milli-seconds:
-    Minimum = 1ms, Maximum = 3ms, Average = 2ms";
-        assert_eq!(parse_avg_rtt(output), Some(2.0));
-    }
-
-    #[test]
-    fn parse_avg_rtt_windows_large() {
-        let output = "    Minimum = 10ms, Maximum = 50ms, Average = 25ms";
-        assert_eq!(parse_avg_rtt(output), Some(25.0));
     }
 
     #[test]

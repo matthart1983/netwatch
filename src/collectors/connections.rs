@@ -134,15 +134,11 @@ fn parse_host_port(addr: &str) -> Option<(String, u16)> {
     Some((normalize_ip(host), port))
 }
 
-/// Strip `::ffff:` prefix from IPv4-mapped IPv6 so we match the plain IPv4
-/// addresses packet capture reports.
+/// The address as packet capture reports it, so the row keys to its stream:
+/// see [`canonical_ip`](crate::collectors::packets::canonical_ip) for what
+/// that undoes. A host that is not an address is kept as printed.
 fn normalize_ip(ip: &str) -> String {
-    if let Some(rest) = ip.strip_prefix("::ffff:") {
-        if rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return rest.to_string();
-        }
-    }
-    ip.to_string()
+    crate::collectors::packets::canonical_ip(ip).unwrap_or_else(|| ip.to_string())
 }
 
 /// Last-resort match for UDP Connections whose remote is wildcard
@@ -1505,8 +1501,10 @@ fn ss_state_name(state: u8) -> &'static str {
 /// Two spellings cannot match, because `/proc/net` lacks what `ss` reads to
 /// choose them: the `%dev` suffix of a socket bound to a device, and `*` in
 /// place of `[::]` for a dual-stack wildcard. `ss` rows spelled either way
-/// fail to key at all, so the plain form joins where they did not; what the
-/// table loses is the device name.
+/// fail [`socket_key`], so the plain form joins where they did not; what the
+/// table loses is the device name. Either spelling of a device-bound socket
+/// keys to its stream, because [`connection_stream_key`] drops the zone, which
+/// no packet carries.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn format_ss_endpoint((ip, port): (std::net::IpAddr, u16)) -> String {
     let port = if port == 0 {

@@ -98,6 +98,7 @@ pub fn tcp_state_name(state: u32) -> &'static str {
 /// English netstat's state column, in `MIB_TCP_STATE` order (1 to 12). Only
 /// the netstat fallback reads text; a translated name has no entry here and
 /// is kept as netstat printed it.
+// locale: fallback-only. GetExtendedTcpTable is tried first.
 const NETSTAT_STATES: [&str; 12] = [
     "CLOSED",
     "LISTENING",

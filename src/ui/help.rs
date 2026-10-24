@@ -460,6 +460,7 @@ const FULL_HELP: &[Section] = &[
         keys: &[
             ("tcp, udp, dns, icmp, arp", "Filter by protocol"),
             ("192.168.1.1", "Match source or destination IP"),
+            ("ip.addr == X", "The same; IPv6 in any spelling"),
             ("ip.src == X / ip.dst == X", "Match specific direction"),
             ("port 443", "Match source or destination port"),
             ("stream 7", "Match stream index"),

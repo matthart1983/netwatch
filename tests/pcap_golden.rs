@@ -79,15 +79,19 @@ fn pcapng_records(file: &[u8]) -> Vec<Record<'_>> {
 /// Everything the Packets tab shows for a frame except the wall-clock
 /// timestamp and the hex/ASCII dump, which repeats the frame bytes.
 fn describe(out: &mut String, n: usize, p: &CapturedPacket) {
-    let port = |p: Option<u16>| p.map(|p| format!(":{p}")).unwrap_or_default();
+    // As the Packets tab writes an endpoint: IPv6 in brackets, so the port
+    // is not read as one more group of a compressed address.
+    let end = |ip: &str, port: Option<u16>| match port {
+        Some(port) if ip.contains(':') => format!("[{ip}]:{port}"),
+        Some(port) => format!("{ip}:{port}"),
+        None => ip.to_string(),
+    };
     writeln!(
         out,
-        "#{n} {} {}{} -> {}{} len={} expert={:?}",
+        "#{n} {} {} -> {} len={} expert={:?}",
         p.protocol,
-        p.src_ip,
-        port(p.src_port),
-        p.dst_ip,
-        port(p.dst_port),
+        end(&p.src_ip, p.src_port),
+        end(&p.dst_ip, p.dst_port),
         p.length,
         p.expert,
     )

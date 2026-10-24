@@ -203,6 +203,7 @@ Wireshark-style filter syntax in the Packets tab (`/`):
 ```
 tcp                        # Protocol
 192.168.1.42               # IP address (src or dst)
+ip.addr == 2001:db8::1     # The same; IPv6 in any spelling
 ip.src == 10.0.0.1         # Directional
 port 443                   # Port
 stream 7                   # Stream index

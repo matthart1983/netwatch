@@ -15,16 +15,15 @@ pub use iphlpapi::{default_gateway, dns_servers};
 ///
 /// This runs every tick. It used to start PowerShell for
 /// Get-NetAdapterStatistics each time, 300-800 ms of process start-up per
-/// call, where the API answers in-process. PowerShell, and then `netstat -e`
-/// (one aggregate row), are kept only for when the API call fails.
+/// call, where the API answers in-process. PowerShell is kept only for when
+/// the API call fails. `netstat -e` no longer follows it. Its one
+/// machine-wide row matched no interface, and only an English install
+/// printed the labels its parser looked for.
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     if let Ok(stats) = iphlpapi::interface_stats() {
         return Ok(stats);
     }
-    if let Ok(stats) = collect_stats_powershell() {
-        return Ok(stats);
-    }
-    collect_stats_netstat()
+    collect_stats_powershell()
 }
 
 /// Run a PowerShell command and return its stdout as text.
@@ -97,69 +96,6 @@ fn parse_adapter_statistics(text: &str) -> Result<HashMap<String, InterfaceStats
     Ok(stats)
 }
 
-fn collect_stats_netstat() -> Result<HashMap<String, InterfaceStats>> {
-    let output = Command::new("netstat").args(["-e"]).output()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut stats = HashMap::new();
-
-    // netstat -e outputs aggregate stats in a table like:
-    //                         Received            Sent
-    // Bytes                 1234567             7654321
-    // Unicast packets          1234                4321
-    // Non-unicast packets       567                  89
-    // ...Errors                   0                   0
-    // ...Discards                 0                   0
-    let mut rx_bytes = 0u64;
-    let mut tx_bytes = 0u64;
-    let mut rx_packets = 0u64;
-    let mut tx_packets = 0u64;
-    let mut rx_errors = 0u64;
-    let mut tx_errors = 0u64;
-    let mut rx_drops = 0u64;
-    let mut tx_drops = 0u64;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let cols: Vec<&str> = trimmed.split_whitespace().collect();
-
-        if trimmed.starts_with("Bytes") && cols.len() >= 3 {
-            rx_bytes = cols[1].parse().unwrap_or(0);
-            tx_bytes = cols[2].parse().unwrap_or(0);
-        } else if (trimmed.starts_with("Unicast") || trimmed.starts_with("Non-unicast"))
-            && cols.len() >= 4
-        {
-            // Unicast plus non-unicast, as the other paths count packets.
-            rx_packets = rx_packets.saturating_add(cols[2].parse().unwrap_or(0));
-            tx_packets = tx_packets.saturating_add(cols[3].parse().unwrap_or(0));
-        } else if trimmed.starts_with("Errors") && cols.len() >= 3 {
-            rx_errors = cols[1].parse().unwrap_or(0);
-            tx_errors = cols[2].parse().unwrap_or(0);
-        } else if trimmed.starts_with("Discards") && cols.len() >= 3 {
-            rx_drops = cols[1].parse().unwrap_or(0);
-            tx_drops = cols[2].parse().unwrap_or(0);
-        }
-    }
-
-    stats.insert(
-        "aggregate".to_string(),
-        InterfaceStats {
-            name: "aggregate".to_string(),
-            rx_bytes,
-            tx_bytes,
-            rx_packets,
-            tx_packets,
-            rx_errors,
-            tx_errors,
-            rx_drops,
-            tx_drops,
-            signal_dbm: None,
-            tx_retries: None,
-        },
-    );
-
-    Ok(stats)
-}
-
 /// Interfaces from `GetAdaptersAddresses`, falling back to parsing ipconfig.
 ///
 /// ipconfig's output is translated: on a Russian install the header reads
@@ -177,6 +113,7 @@ pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
     }
 }
 
+// locale: fallback-only. GetAdaptersAddresses is tried first.
 fn collect_interface_info_ipconfig() -> Result<Vec<InterfaceInfo>> {
     let output = Command::new("ipconfig").args(["/all"]).output()?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -273,6 +210,8 @@ fn extract_value(line: &str) -> Option<String> {
 
 /// Collect MTU values from `netsh interface ipv4 show subinterfaces`, for the
 /// ipconfig fallback only: the API path takes the MTU from the adapter record.
+/// Only rows that start with a number are read, so the header and the dashes
+/// under it drop out whatever language netsh prints them in.
 fn collect_mtu_map() -> HashMap<String, u32> {
     let mut map = HashMap::new();
 
@@ -292,8 +231,7 @@ fn collect_mtu_map() -> HashMap<String, u32> {
     //   1500                1  123456789   98765432  Ethernet
     for line in text.lines() {
         let trimmed = line.trim();
-        // Skip header and separator lines
-        if trimmed.is_empty() || trimmed.starts_with("MTU") || trimmed.starts_with("---") {
+        if trimmed.is_empty() {
             continue;
         }
 

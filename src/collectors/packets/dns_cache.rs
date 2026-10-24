@@ -12,6 +12,8 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 
+use super::format::parse_ip;
+
 const DNS_CACHE_MAX: usize = 4096; // max entries kept in memory, pending ones included
 
 /// Lookups queued for the resolver thread at most. A request that finds the
@@ -211,14 +213,6 @@ impl DnsCache {
         }
         None
     }
-}
-
-/// An address as the capture and the connection table print it: IPv6
-/// possibly with a `%zone`, IPv4 possibly mapped into IPv6. Both reduce to
-/// the plain address, so the two sources agree.
-fn parse_ip(ip: &str) -> Option<IpAddr> {
-    let ip = ip.split('%').next()?;
-    ip.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
 }
 
 fn resolve_ip(ip: &str) -> Option<String> {

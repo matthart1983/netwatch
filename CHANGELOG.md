@@ -71,8 +71,10 @@ All notable changes to NetWatch will be documented in this file.
   unbound, such as a capture-only NIC or the physical NIC under a Hyper-V
   external switch. Packet counts now include broadcast and multicast, as
   they do on Linux and macOS, from the API and its fallbacks alike.
-  PowerShell, `route print` and `netstat -e` remain only as fallbacks for
-  when an API call fails.
+  PowerShell and `route print` remain only as fallbacks for when an API
+  call fails. `netstat -e`, the last fallback for counters, is no longer
+  run. It gave one machine-wide row that matched no interface, and only on
+  an English install.
 - **Incident bundles hold `packets.pcapng`, and `manifest.json` is version
   2.** `packets.pcap` is still written when every packet shares one link
   type and is dated before 2106. The manifest lists the packet files
@@ -163,7 +165,8 @@ All notable changes to NetWatch will be documented in this file.
   echoes itself through the Windows ICMP API (`IcmpSendEcho2`, IPv4 and
   IPv6), which needs no administrator rights and answers with a status code
   instead of text. A reply under a millisecond shows its measured fraction,
-  not 0. netwatch runs `ping.exe` only if it cannot open the ICMP API.
+  not 0. netwatch no longer starts `ping.exe` at all. It needs the same
+  ICMP API, so it could not help where netwatch's own call fails.
 - **Windows: traceroute works.** Since 0.32 the trace subprocess refused to
   start off Unix, so `T` ended in an error on Windows. Windows now traces
   natively through the ICMP API, IPv4 and IPv6, with three probes a hop up
@@ -191,6 +194,29 @@ All notable changes to NetWatch will be documented in this file.
   length on the wire. Times now come from libpcap, in UTC to the
   microsecond. `--demo` packets, which were never captured, are left out
   and counted instead of written with an invented time.
+- **IPv6 connections show their protocol, rates and packets.** Packet
+  capture wrote IPv6 addresses with every group spelled out
+  (`2001:db8:0:0:0:0:0:1`) while the connection table compresses them
+  (`2001:db8::1`), so no IPv6 connection ever found its capture stream. The
+  Connections and Dense views showed no protocol, SNI or JA4 for it, and no
+  live rate, retransmits or handshake time; its packets got no owner in a
+  PCAPNG export; and `Enter` on the row opened an empty Packets list, as it
+  also did for a dual-stack socket's `::ffff:192.0.2.1` peer. Capture now
+  writes IPv6 in the standard compressed form (RFC 5952) in the packet list
+  and details, copied packets, the timeline and alerts, and puts an IPv6
+  address followed by a port in brackets, `[2001:db8::1]:443`, as the
+  Connections tab does: unbracketed, `2001:db8::1:443` is a different
+  address. Rows also join when `ss` adds a `%dev` zone and when macOS
+  `lsof` writes the interface into a link-local address. Display filters
+  take an address in any of those spellings, and `ip.addr == X` as Wireshark
+  writes it; a whole address now matches only itself, so `10.0.0.1` no
+  longer also shows `10.0.0.10`. IPv6 loopback traffic no longer reaches the
+  beaconing detector as if it were external. The Egress tab and its NDJSON
+  export now see SNI and byte counts for IPv6 destinations too, so policy
+  verdicts, `netwatch_policy_violations_total` and Diagnose's egress check
+  can change after upgrading: an `allow_sni` list stops flagging allowed
+  IPv6 traffic that had no name before, and a `deny_sni` list now catches
+  IPv6 traffic it used to miss.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
@@ -252,6 +278,16 @@ All notable changes to NetWatch will be documented in this file.
   unmaintained crate ratatui 0.27 built with, is gone from the tree.
 
 ### CI
+- **CI fails when Windows code compares English command output.** A test
+  reads the source as a Windows build compiles it and fails on any
+  comparison with English that ping, tracert, ipconfig, netstat, netsh or
+  another Windows tool prints, such as `Average =` or `LISTENING`, because
+  a translated install prints something else and the match finds nothing.
+  The only code allowed to read English is a fallback that runs after its
+  IP Helper call has failed: ipconfig for the interface list and for DNS
+  servers, and netstat's connection states. Each is listed in the test and
+  marked in the source. The netsh MTU fallback no longer looks for the
+  English header row; it reads only rows that start with a number.
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,
   `netwatch --version` must print the Cargo.toml version, and
   `netwatch doctor --json` must report `npcap_missing` with the download
