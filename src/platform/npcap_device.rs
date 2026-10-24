@@ -12,8 +12,8 @@
 //! which fails with "The system cannot find the file specified" (issue #51).
 //!
 //! The GUID is the adapter's identity, so that is matched first. The IPv4
-//! address is the fallback for a host where PowerShell is unavailable, and an
-//! exact description match the last resort. There is no substring matching.
+//! address is the fallback for when the GUID lookup fails, and an exact
+//! description match the last resort. There is no substring matching.
 
 use std::collections::HashMap;
 use std::net::IpAddr;

@@ -589,7 +589,7 @@ pub enum Mode {
         let body = json!({ "host_id": host_id, "snapshots": [snapshot] });
 
         ureq::post(&endpoint)
-            .set("Authorization", &format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {api_key}"))
             .send_json(body)
             .ok();
 

@@ -3135,9 +3135,9 @@ pub use filter::{matches_packet, parse_filter, FilterExpr};
 ///
 /// On Windows pcap needs `\Device\NPF_{GUID}`, not the friendly name ipconfig
 /// reports ("Ethernet", "vEthernet (WSL)"). The matching lives in
-/// `platform::npcap_device` — by the adapter's GUID from `Get-NetAdapter`, then
-/// by its IPv4 address, never by description substring (issue #51). Elsewhere
-/// the name is already the device name.
+/// `platform::npcap_device` — by the adapter's GUID from `GetAdaptersAddresses`,
+/// then by its IPv4 address, never by description substring (issue #51).
+/// Elsewhere the name is already the device name.
 fn resolve_device_name(friendly: &str) -> Result<String, String> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -3167,8 +3167,8 @@ fn resolve_device_name(friendly: &str) -> Result<String, String> {
             return Ok(name);
         }
 
-        // No PowerShell, or the GUID matched no Npcap device: try the address
-        // ipconfig reports for this adapter.
+        // No GUID, or it matched no Npcap device: try the address the
+        // interface list reports for this adapter.
         let ipv4 = crate::platform::collect_interface_info()
             .ok()
             .and_then(|info| {

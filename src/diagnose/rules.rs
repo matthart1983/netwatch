@@ -273,7 +273,7 @@ pub const CATALOGUE: &[Rule] = &[
             "a firewalled tail that answers nothing, so propagation cannot be seen",
         ],
         recovery: "a later trace to the same target shows no hop losing packets",
-        platforms: "native trace on linux ipv4; elsewhere a traceroute subprocess, which cannot always tell whether the destination replied",
+        platforms: "native trace on linux ipv4 and on windows; elsewhere a traceroute subprocess, which cannot always tell whether the destination replied",
     },
     Rule {
         id: "path.rtt_spike",

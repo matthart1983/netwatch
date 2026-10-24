@@ -464,6 +464,81 @@ show_geo = false
         assert_eq!(deserialized.sandbox, "strict");
     }
 
+    /// config.toml is a file people edit by hand and keep in their dotfiles,
+    /// and `--generate-config` writes the one they start from. A toml release
+    /// that laid it out differently (tables inlined, strings quoted another
+    /// way, a float losing its `.0`) would show up as a rewrite of that file
+    /// on the next Settings save. This pins what toml decides about the
+    /// layout rather than the list of keys, so adding a key does not fail it.
+    #[test]
+    fn saved_config_layout_is_stable() {
+        let text = toml::to_string_pretty(&NetwatchConfig::default()).unwrap();
+        let first_table = text.find("\n[").expect("a table");
+        // Top-level keys first, one `key = value` line each.
+        for line in [
+            "default_tab = \"dashboard\"\n",
+            "refresh_rate_ms = 1000\n",
+            "capture_interface = \"\"\n",
+            "show_geo = true\n",
+            "diagnose_targets = []\n",
+        ] {
+            let at = text
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} in\n{text}"));
+            assert!(at < first_table, "{line:?} after a table in\n{text}");
+        }
+        // Then each nested struct as its own table and each list of them as
+        // an array of tables, never inline.
+        for block in [
+            "\n\n[alerts]\nbandwidth_threshold = 100000000\n",
+            "\n\n[diagnose_probes]\ntrace_target = \"1.1.1.1\"\n",
+            "\n\n[[diagnose_probes.ipv6_pairs]]\nv4 = \"1.1.1.1:443\"\nv6 = \"[2606:4700:4700::1111]:443\"\n",
+            "\n\n[[diagnose_probes.portal_endpoints]]\nurl = \"http://cp.cloudflare.com/generate_204\"\nexpect_status = 204\n",
+        ] {
+            assert!(text.contains(block), "{block:?} in\n{text}");
+        }
+        assert!(!text.contains('{'), "an inline table in\n{text}");
+
+        let text = toml::to_string_pretty(&NetwatchConfig {
+            bpf_filter: "host \"a\"".into(),
+            geoip_db: r"C:\GeoIP\City.mmdb".into(),
+            tls_keylog_path: "/tmp/a\nb".into(),
+            diagnose_targets: vec![toml::from_str("name = \"api\"\nhost = \"a.example\"").unwrap()],
+            diagnose_thresholds: crate::diagnose::detectors::Thresholds {
+                sigma_k: 3.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        for line in [
+            // A string a basic string would need escapes for is written as a
+            // literal string, and one with a newline as a multi-line string.
+            "\nbpf_filter = 'host \"a\"'\n",
+            "\ngeoip_db = 'C:\\GeoIP\\City.mmdb'\n",
+            "\ntls_keylog_path = \"\"\"\n/tmp/a\nb\"\"\"\n",
+            "\n\n[[diagnose_targets]]\nenabled = true\nname = \"api\"\nhost = \"a.example\"\nport = 443\n",
+            // Floats keep their decimal point, whole or not.
+            "\n\n[diagnose_thresholds]\nsigma_k = 3.5\nsigma_close_k = 2.0\n",
+        ] {
+            assert!(text.contains(line), "{line:?} in\n{text}");
+        }
+    }
+
+    /// toml 1.x reads TOML 1.1: an inline table may span lines and end in a
+    /// comma, and strings take `\e` and `\xHH` escapes. A file written that
+    /// way loads rather than falling back to the defaults.
+    #[test]
+    fn toml_1_1_syntax_loads() {
+        let cfg: NetwatchConfig = toml::from_str(
+            "bpf_filter = \"\\x74cp\"\nalerts = {\n    bandwidth_threshold = 5,\n    port_scan_threshold = 6,\n}\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.bpf_filter, "tcp");
+        assert_eq!(cfg.alerts.bandwidth_threshold, 5);
+        assert_eq!(cfg.alerts.port_scan_threshold, 6);
+    }
+
     #[test]
     fn sandbox_field_defaults_when_missing() {
         // Pre-v0.21.5 configs don't have a `sandbox` key — they must

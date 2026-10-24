@@ -309,8 +309,7 @@ fn lookup_geo_online(ip: &str) -> Option<GeoInfo> {
         "http://ip-api.com/json/{}?fields=status,country,countryCode,city,org,as",
         ip
     );
-    let resp = crate::http::agent().get(&url).call().ok()?;
-    let body = resp.into_string().ok()?;
+    let body = crate::http::get_text(&url).ok()?;
     parse_ip_api(&body)
 }
 
