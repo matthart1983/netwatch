@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 mod iphlpapi;
+pub mod tcp_table;
 
 pub use iphlpapi::{default_gateway, dns_servers};
 

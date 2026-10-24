@@ -19,6 +19,9 @@ pub mod pktap;
 /// Kernel-derived process identity — every platform, including the fallback
 /// that returns nothing so callers keep the name they already had.
 pub mod procname;
+/// Decoding of the Windows TCP and UDP socket tables. Platform-neutral so it
+/// is tested everywhere; only the calls that read the tables are gated.
+pub mod socket_table;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -27,6 +30,11 @@ pub mod windows;
 /// attribution (`sandbox/mod.rs`).
 pub const LINUX_CAPTURE_FIX: &str =
     r#"sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)""#;
+
+/// What [`capture_fix`] says on Windows. Named so doctor's Npcap wording can
+/// use it, and be tested, on every platform rather than only on Windows.
+pub const WINDOWS_CAPTURE_FIX: &str =
+    "install Npcap from https://npcap.com/#download, without \"restrict to administrators\"";
 
 /// What lets netwatch capture on this OS when opening a capture was refused.
 /// The one place it is written, so the error, the Dashboard banner and the
@@ -37,7 +45,7 @@ pub const fn capture_fix() -> &'static str {
     } else if cfg!(target_os = "macos") {
         "run with sudo, or give your user read access to /dev/bpf* (Wireshark's ChmodBPF does this)"
     } else if cfg!(target_os = "windows") {
-        "install Npcap from https://npcap.com/#download, without \"restrict to administrators\""
+        WINDOWS_CAPTURE_FIX
     } else {
         "run with sudo, or give your user read access to /dev/bpf* in devfs.rules"
     }

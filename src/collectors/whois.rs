@@ -156,8 +156,7 @@ fn is_private_ip(ip: &str) -> bool {
 fn lookup_whois(ip: &str) -> Option<WhoisInfo> {
     // Use rdap.org (free, no auth, JSON WHOIS)
     let url = format!("https://rdap.org/ip/{}", ip);
-    let resp = crate::http::agent().get(&url).call().ok()?;
-    let body = resp.into_string().ok()?;
+    let body = crate::http::get_text(&url).ok()?;
     parse_rdap(&body)
 }
 
