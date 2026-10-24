@@ -14,12 +14,18 @@
 //! of a Windows build (`#[cfg(unix)]`, `#[cfg(target_os = "linux")]`,
 //! `#[cfg(test)]` and the rest). There it looks only at string literals that
 //! are compared with text: the argument of a `str` search such as `contains`
-//! or `starts_with`, a side of `==` or `!=`, a `match` pattern, and the value
-//! of a `const` or `static` or an entry in its array. A literal fails the
-//! test when it holds a word or phrase from [`ENGLISH_OUTPUT`], the English
-//! the Windows tools print. Log messages, UI text and errors are not compared
-//! with anything, so the list can hold short words such as "Bytes" without
-//! catching a column heading.
+//! or `starts_with`, a side of `==` or `!=`, a pattern in a `match`,
+//! `matches!` or `let`, an entry of an array that `contains` searches, and
+//! the value of a `const` or `static`, an entry in its array, or the first
+//! field of a tuple or struct entry there, which a lookup table keys on. A
+//! literal inside a tuple, a slice, `Some(..)`, `&` or `format!` counts when
+//! the whole of it is compared, as in `[_, "LISTENING", ..] =>` or
+//! `contains(&format!("Reply from {ip}"))`. A literal fails the test when it
+//! holds a word or phrase from [`ENGLISH_OUTPUT`], the English the Windows
+//! tools print. Log messages and errors are not compared with anything, so
+//! the list can hold short words such as "Bytes" without catching a message.
+//! UI text in a `const` or `static` is read as a table, though, so a column
+//! heading kept there fails the test too.
 //!
 //! A fallback that has to read English stays allowed by name. It is listed in
 //! [`FALLBACKS`] with the call it stands in for, and carries a
@@ -31,8 +37,10 @@
 //! This reads tokens, not a syntax tree, which is enough for this crate's
 //! source and needs no parser dependency. A `#[cfg]` it cannot decide, such
 //! as a feature, counts as compiled, so anything it misjudges is read rather
-//! than skipped. A literal whose comparison it cannot see, such as an array
-//! searched through a closure, goes unchecked.
+//! than skipped. A literal whose comparison it cannot see goes unchecked:
+//! an array searched through a closure, a lookup table's key in a later
+//! field, or a single word compared with a line lowercased into a variable
+//! earlier.
 
 use std::path::{Path, PathBuf};
 
@@ -64,19 +72,19 @@ const FALLBACKS: &[Fallback] = &[
         item: "collect_interface_info_ipconfig",
         instead_of: "GetAdaptersAddresses, for the interface list",
     },
-    Fallback {
-        file: "src/platform/windows.rs",
-        item: "collect_mtu_map",
-        instead_of: "GetAdaptersAddresses, for MTUs in the ipconfig fallback",
-    },
 ];
 
 /// What the Windows networking tools print in English, by tool. A phrase
 /// that begins or ends with a letter matches only as whole words there, so
-/// "Errors" does not match "IfErrors". Case matters: these tools capitalise
-/// their labels, and Linux's `ip` and `ss` do not. Labels that netwatch's own
-/// views use as column names and sort by, such as netstat's "Local Address"
-/// and the old ipconfig's "IP Address", are left out.
+/// "Errors" does not match "IfErrors". A single word matches in the case
+/// written: these tools capitalise their labels, and Linux's `ip` and `ss`
+/// and netwatch's own field names do not. A phrase of several words, and any
+/// entry compared through `to_lowercase`, `eq_ignore_ascii_case` or the like,
+/// matches in any case, since a parser that folds the line first is just as
+/// English-only. Labels that netwatch's own views use as column names and
+/// sort by, such as netstat's "Local Address" and the old ipconfig's "IP
+/// Address", are left out, and so is netsh's "MTU", which no translation
+/// changes.
 const ENGLISH_OUTPUT: &[&str] = &[
     // ping.exe
     "Pinging",
@@ -139,7 +147,6 @@ const ENGLISH_OUTPUT: &[&str] = &[
     "Network Destination",
     "On-link",
     // netsh
-    "MTU",
     "MediaSenseState",
     "Bytes In",
     "Bytes Out",
@@ -162,7 +169,9 @@ const ENGLISH_OUTPUT: &[&str] = &[
 enum Tok {
     /// An identifier, keyword or number.
     Word(String),
-    /// A string literal's text as written, escapes and all.
+    /// A string literal's value: a raw string's text as written, and any
+    /// other's with its escapes read, so `"\tLISTENING"` holds a tab and then
+    /// the word.
     Str(String),
     Punct(&'static str),
     /// A `// locale: fallback-only` comment.
@@ -283,13 +292,51 @@ fn lex(src: &str) -> Vec<Token> {
     out
 }
 
-/// The text of a `"` string from `from`, and the index after its closing quote.
+/// The value of a `"` string from `from`, and the index after its closing
+/// quote.
 fn quoted(s: &[char], from: usize) -> (String, usize) {
+    let hex = |digits: &[char]| {
+        let digits: String = digits.iter().collect();
+        u32::from_str_radix(&digits, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .unwrap_or('\u{FFFD}')
+    };
+    let mut value = String::new();
     let mut k = from;
     while k < s.len() && s[k] != '"' {
-        k += if s[k] == '\\' { 2 } else { 1 };
+        if s[k] != '\\' {
+            value.push(s[k]);
+            k += 1;
+            continue;
+        }
+        let escape = s.get(k + 1).copied().unwrap_or('\\');
+        k += 2;
+        match escape {
+            'n' => value.push('\n'),
+            'r' => value.push('\r'),
+            't' => value.push('\t'),
+            '0' => value.push('\0'),
+            'x' => {
+                value.push(hex(&s[k..(k + 2).min(s.len())]));
+                k += 2;
+            }
+            'u' => {
+                let close = (k..s.len()).find(|&j| s[j] == '}').unwrap_or(s.len());
+                value.push(hex(&s[(k + 1).min(close)..close]));
+                k = close + 1;
+            }
+            // A `\` at the end of a line drops the line break and the
+            // indentation after it.
+            '\n' | '\r' => {
+                while k < s.len() && s[k].is_whitespace() {
+                    k += 1;
+                }
+            }
+            other => value.push(other),
+        }
     }
-    (s[from..k.min(s.len())].iter().collect(), k + 1)
+    (value, k + 1)
 }
 
 fn punct(t: &[Token], i: usize) -> Option<&'static str> {
@@ -598,25 +645,15 @@ fn scan(file: &str, src: &str) -> Scan {
             .iter()
             .filter(|it| it.start < i && i < it.end)
             .min_by_key(|it| it.end - it.start);
-        // A `const` or `static` that is the literal, or an array of them. A
-        // literal in a struct or tuple there, such as a rule's description,
-        // is not a table entry.
-        let tabled = item.and_then(|it| it.value).is_some_and(|v| {
-            v < i
-                && match enclosing[i] {
-                    Some(o) if o > v => punct(&t, o) == Some("["),
-                    _ => true,
-                }
-        });
-        let compared = matches!(punct(&t, i.wrapping_sub(1)), Some("==" | "!="))
-            || matches!(punct(&t, i + 1), Some("==" | "!=" | "=>" | "|"))
-            || word(&t, i + 1) == Some("if")
-            || searched(&t, i, &enclosing)
-            || tabled;
-        if !compared {
+        let in_table = item
+            .and_then(|it| it.value)
+            .is_some_and(|v| v < i && tabled(&t, i, v, &enclosing));
+        let Some(ignore_case) =
+            comparison(&t, i, &partner, &enclosing).or(in_table.then_some(false))
+        else {
             continue;
-        }
-        if let Some(phrase) = ENGLISH_OUTPUT.iter().find(|p| holds(text, p)) {
+        };
+        if let Some(phrase) = ENGLISH_OUTPUT.iter().find(|p| holds(text, p, ignore_case)) {
             findings.push(Finding {
                 file: file.to_string(),
                 line: t[i].line,
@@ -659,27 +696,287 @@ fn scan(file: &str, src: &str) -> Scan {
     }
 }
 
-/// The literal at `i` is an argument of a `str` search, directly or in an
-/// array of them.
-fn searched(t: &[Token], i: usize, enclosing: &[Option<usize>]) -> bool {
-    let mut open = enclosing[i];
-    if open.is_some_and(|o| punct(t, o) == Some("[")) {
-        open = enclosing[open.unwrap()];
+/// How the literal at `i` is compared with text, if it is: `Some(true)` when
+/// the comparison ignores case.
+///
+/// The literal is compared when it, or a tuple, slice, `&`, `Some(..)` or
+/// `format!` around it, is a side of `==` or `!=`, a pattern (before `=>`,
+/// `|` or a guard, after `let`, or in `matches!`), an argument of a `str`
+/// search, or an array that `contains` searches. A call of anything else,
+/// such as `push` or `warn!`, ends the search.
+fn comparison(
+    t: &[Token],
+    i: usize,
+    partner: &[Option<usize>],
+    enclosing: &[Option<usize>],
+) -> Option<bool> {
+    let (mut lo, mut hi) = (i, i);
+    loop {
+        let before = lo.checked_sub(1);
+        if before.is_some_and(|b| matches!(punct(t, b), Some("==" | "!="))) {
+            let end = lo.checked_sub(2)?;
+            return Some(folds(t, chain_start(t, end, partner)..=end));
+        }
+        if matches!(punct(t, hi + 1), Some("==" | "!=")) {
+            return Some(folds(t, hi + 2..=chain_end(t, hi + 2, partner)));
+        }
+        let let_pattern = before
+            .is_some_and(|b| word(t, b) == Some("let") || punct(t, b) == Some("|"))
+            && punct(t, hi + 1) == Some("=");
+        if let_pattern
+            || matches!(punct(t, hi + 1), Some("=>" | "|"))
+            || word(t, hi + 1) == Some("if")
+        {
+            return Some(scrutinee_folds(t, lo, hi, partner, enclosing));
+        }
+        // `["LISTENING", "ESTABLISHED"].contains(&state)`
+        if punct(t, hi) == Some("]")
+            && punct(t, hi + 1) == Some(".")
+            && word(t, hi + 2) == Some("contains")
+            && punct(t, hi + 3) == Some("(")
+        {
+            return Some(folds(t, hi + 3..=partner[hi + 3].unwrap()));
+        }
+
+        // Out to the next enclosing tuple, slice, constructor or `format!`.
+        if before.is_some_and(|b| punct(t, b) == Some("&")) {
+            lo -= 1;
+            continue;
+        }
+        let open = enclosing[lo]?;
+        let close = partner[open].unwrap();
+        // What the bracket applies to: a name it calls or indexes, a macro,
+        // or the value of another expression. A bracket that applies to
+        // nothing opens a tuple, an array or a slice pattern.
+        let prev = open.checked_sub(1);
+        let name = prev
+            .and_then(|p| word(t, p))
+            .filter(|w| !KEYWORDS.contains(w));
+        let macro_name = prev
+            .filter(|&p| punct(t, p) == Some("!"))
+            .and_then(|p| word(t, p.checked_sub(1)?));
+        let applied = name.is_some()
+            || macro_name.is_some()
+            || prev.is_some_and(|p| {
+                matches!(punct(t, p), Some(")" | "]" | "?")) || matches!(t[p].tok, Tok::Str(_))
+            });
+        match (punct(t, open), macro_name, name) {
+            (Some("("), Some("matches"), _) => {
+                let comma = (open + 1..close)
+                    .find(|&k| enclosing[k] == Some(open) && punct(t, k) == Some(","))
+                    .unwrap_or(close);
+                return Some(folds(t, open + 1..comma));
+            }
+            (Some("("), Some("format"), _) => (lo, hi) = (open - 2, close),
+            (Some("("), None, Some(callee)) => {
+                let at = open - 1;
+                if punct(t, at.wrapping_sub(1)) == Some(".") {
+                    if !SEARCHES.contains(&callee) {
+                        return None;
+                    }
+                    let receiver = at.checked_sub(2)?;
+                    return Some(folds(t, chain_start(t, receiver, partner)..=at));
+                }
+                // A tuple struct or variant such as `Some(..)` or
+                // `Kind::Listen(..)`, not a function call.
+                if !callee.starts_with(char::is_uppercase) {
+                    return None;
+                }
+                let mut start = at;
+                while start >= 2
+                    && punct(t, start - 1) == Some("::")
+                    && word(t, start - 2).is_some()
+                {
+                    start -= 2;
+                }
+                (lo, hi) = (start, close);
+            }
+            (Some("(" | "["), ..) if applied => return None,
+            (Some("(" | "["), ..) => (lo, hi) = (open, close),
+            _ => return None,
+        }
     }
-    open.is_some_and(|o| {
-        o >= 2
-            && punct(t, o) == Some("(")
-            && word(t, o - 1).is_some_and(|m| SEARCHES.contains(&m))
-            && punct(t, o - 2) == Some(".")
-    })
 }
 
-/// `phrase` appears in `text`, as whole words where it begins or ends with one.
-fn holds(text: &str, phrase: &str) -> bool {
+/// Keywords that can come right before an expression or a pattern, so that a
+/// bracket after one opens a tuple or an array, not a call or an index.
+const KEYWORDS: &[&str] = &[
+    "match", "if", "while", "let", "in", "return", "else", "break", "move", "mut", "ref", "for",
+    "loop", "as",
+];
+
+/// Methods that fold case, so that a comparison through one ignores it.
+const FOLDS: &[&str] = &[
+    "to_lowercase",
+    "to_ascii_lowercase",
+    "to_uppercase",
+    "to_ascii_uppercase",
+    "eq_ignore_ascii_case",
+];
+
+/// The tokens in `range` call a method that folds case.
+fn folds(t: &[Token], range: impl IntoIterator<Item = usize>) -> bool {
+    range
+        .into_iter()
+        .any(|k| word(t, k).is_some_and(|w| FOLDS.contains(&w)))
+}
+
+/// The value the pattern at `lo..=hi` is matched against folds case: the
+/// expression after a `let` pattern's `=`, a `match`'s scrutinee, or the
+/// first argument of `matches!`. A pattern inside a tuple or slice pattern
+/// is matched against what the whole of that is.
+fn scrutinee_folds(
+    t: &[Token],
+    mut lo: usize,
+    mut hi: usize,
+    partner: &[Option<usize>],
+    enclosing: &[Option<usize>],
+) -> bool {
+    loop {
+        // `let pattern = scrutinee`, past any `| other pattern`.
+        let mut k = hi + 1;
+        while k < t.len() {
+            match punct(t, k) {
+                Some("=") => return folds(t, k + 1..=chain_end(t, k + 1, partner)),
+                Some("=>" | ";" | "," | "{" | ")" | "]" | "}") => break,
+                Some("(" | "[") => k = partner[k].unwrap(),
+                _ => {}
+            }
+            k += 1;
+        }
+        let Some(open) = enclosing[lo] else {
+            return false;
+        };
+        let close = partner[open].unwrap();
+        match punct(t, open) {
+            Some("(")
+                if open >= 2
+                    && punct(t, open - 1) == Some("!")
+                    && word(t, open - 2) == Some("matches") =>
+            {
+                let comma = (open + 1..close)
+                    .find(|&k| enclosing[k] == Some(open) && punct(t, k) == Some(","))
+                    .unwrap_or(close);
+                return folds(t, open + 1..comma);
+            }
+            Some("(" | "[") => (lo, hi) = (open, close),
+            Some("{") if open > 0 => return folds(t, chain_start(t, open - 1, partner)..open),
+            _ => return false,
+        }
+    }
+}
+
+/// Where the method chain, call or path that ends at `end` begins, as `l`
+/// does for `l.trim().to_lowercase()`.
+fn chain_start(t: &[Token], end: usize, partner: &[Option<usize>]) -> usize {
+    let mut k = end;
+    loop {
+        // Back over calls, indexes, macros and `?` to what they apply to.
+        loop {
+            match punct(t, k) {
+                Some(")" | "]") => {
+                    let open = partner[k].unwrap();
+                    let applied = open.checked_sub(1).filter(|&c| match &t[c].tok {
+                        Tok::Word(w) => !KEYWORDS.contains(&w.as_str()),
+                        Tok::Punct(p) => matches!(*p, ")" | "]" | "?" | "!"),
+                        _ => false,
+                    });
+                    match applied {
+                        Some(c) => k = c,
+                        None => return open,
+                    }
+                }
+                Some("?" | "!") if k > 0 => k -= 1,
+                _ => break,
+            }
+        }
+        if k >= 2 && matches!(punct(t, k - 1), Some("." | "::")) {
+            k -= 2;
+        } else {
+            return k;
+        }
+    }
+}
+
+/// Where the method chain, call or path that starts at `start` ends, as `)`
+/// does for `l.trim().to_lowercase()`.
+fn chain_end(t: &[Token], start: usize, partner: &[Option<usize>]) -> usize {
+    let mut k = start;
+    while matches!(punct(t, k), Some("&" | "*" | "!" | "-")) {
+        k += 1;
+    }
+    loop {
+        if matches!(punct(t, k), Some("(" | "[")) {
+            k = partner[k].unwrap();
+        }
+        // On over calls, indexes, macros and `?`.
+        loop {
+            match punct(t, k + 1) {
+                Some("(" | "[") => k = partner[k + 1].unwrap(),
+                Some("?") => k += 1,
+                Some("!") if matches!(punct(t, k + 2), Some("(" | "[")) => {
+                    k = partner[k + 2].unwrap();
+                }
+                _ => break,
+            }
+        }
+        if matches!(punct(t, k + 1), Some("." | "::")) {
+            k += 2;
+        } else {
+            return k;
+        }
+    }
+}
+
+/// The literal at `i` is a key in the value of a `const` or `static` whose
+/// `=` is at `value`: the whole of it, an entry of an array, or the first
+/// field of a tuple or struct entry, which a lookup table keys on. A later
+/// field, such as a rule's description or its list of evidence, is not.
+fn tabled(t: &[Token], i: usize, value: usize, enclosing: &[Option<usize>]) -> bool {
+    // The first token of the entry or field the literal is in.
+    let mut start = i;
+    let mut open = enclosing[i];
+    while let Some(o) = open.filter(|&o| o > value) {
+        let key = match punct(t, o) {
+            Some("[") => true,
+            Some("(") => o + 1 == start,
+            Some("{") => {
+                word(t, o.wrapping_sub(1)).is_some()
+                    && word(t, o + 1).is_some()
+                    && punct(t, o + 2) == Some(":")
+                    && o + 3 == start
+            }
+            _ => false,
+        };
+        if !key {
+            return false;
+        }
+        // Back to the struct's name and any `&` before it.
+        start = o;
+        if word(t, start.wrapping_sub(1)).is_some() {
+            start -= 1;
+        }
+        if punct(t, start.wrapping_sub(1)) == Some("&") {
+            start -= 1;
+        }
+        open = enclosing[o];
+    }
+    true
+}
+
+/// `phrase` appears in `text`, as whole words where it begins or ends with
+/// one. A phrase of several words matches in any case, and so does any
+/// phrase when `ignore_case` is set.
+fn holds(text: &str, phrase: &str, ignore_case: bool) -> bool {
+    let (text, phrase) = if ignore_case || phrase.contains(' ') {
+        (text.to_ascii_lowercase(), phrase.to_ascii_lowercase())
+    } else {
+        (text.to_string(), phrase.to_string())
+    };
     let word_char = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
     let starts_word = word_char(phrase.chars().next());
     let ends_word = word_char(phrase.chars().next_back());
-    text.match_indices(phrase).any(|(at, _)| {
+    text.match_indices(&phrase).any(|(at, _)| {
         !(starts_word && word_char(text[..at].chars().next_back()))
             && !(ends_word && word_char(text[at + phrase.len()..].chars().next()))
     })
@@ -908,4 +1205,66 @@ const RULES: &[(&str, &str)] = &[("link.down", "ipconfig says Media disconnected
     assert_eq!(s.stray_markers, [29]);
     assert_eq!(s.modules, ["kept"]);
     assert!(!scan("y.rs", "#![cfg(unix)]\nfn a() {}").compiled);
+}
+
+/// Literals compared as part of something larger, through a case fold, or
+/// as a lookup table's key, and look-alikes that are none of these.
+#[test]
+fn nested_folded_and_tabled_literals_are_findings() {
+    let src = r##"
+fn slice(cols: &[&str]) -> u8 { match cols { [_, _, _, "LISTENING", ..] => 1, _ => 0 } }
+fn tuple(p: (&str, &str)) -> bool { match p { ("TCP", "DELETE_TCB") => true, _ => false } }
+fn some(l: &str) -> u8 { match l.split_whitespace().nth(3) { Some("LISTENING") => 1, _ => 0 } }
+fn eq_some(v: &[&str]) -> bool { v.get(3) == Some(&"LISTENING") || v.first() != Some(&"Errors") }
+fn via_matches(s: &str) -> bool { matches!(s, "Bytes") }
+fn needle(l: &str, ip: &str) -> bool { l.contains(&format!("Reply from {ip}")) }
+fn if_let(l: &str) { if let Some("Unicast") = l.split(':').next() {} }
+fn let_else(v: &[&str]) { let [.., "Discards"] = v else { return }; }
+fn listed(s: &str) -> bool { ["LISTENING", "DELETE_TCB"].contains(&s) }
+fn lowered(l: &str) -> bool { l.to_ascii_lowercase().contains("request timed out") }
+fn ignoring(l: &str) -> bool { l.eq_ignore_ascii_case("listening") }
+fn folded_match(l: &str) -> u8 { match l.trim().to_lowercase().as_str() { "errors" => 1, _ => 0 } }
+fn folded_eq(l: &str) -> bool { l.to_uppercase() == "BYTES" }
+fn phrase(lower: &str) -> bool { lower.starts_with("trace complete") }
+fn escaped(l: &str) -> bool { l.contains("\tLISTENING") || l.contains("\r\nEthernet adapter") }
+const LABELS: &[(&str, u8)] = &[("IPv4 Address", 4), ("Subnet Mask", 0)];
+const FIELDS: &[Label] = &[Label { text: "DHCP Server", v: 1 }];
+fn not_compared(v: &mut Vec<Option<&str>>) -> u8 { v.push(Some("Bytes")); let e = Some("Errors"); count("Unicast") }
+fn lowercase_word(l: &str) -> bool { l.contains("errors") || l.ends_with(".bytes") }
+const RULE: Rule = Rule { id: "link.down", evidence: &["a probe to the default gateway"] };
+fn index(m: &HashMap<&str, u8>) -> u8 { m["Bytes"] }
+fn logged() { tracing::warn!("{}", format!("Reply from {}", 1)); }
+"##;
+    let s = scan("x.rs", src);
+    let found: Vec<(usize, &str, Option<&str>)> = s
+        .findings
+        .iter()
+        .map(|f| (f.line, f.phrase, f.item.as_deref()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (2, "LISTENING", Some("slice")),
+            (3, "DELETE_TCB", Some("tuple")),
+            (4, "LISTENING", Some("some")),
+            (5, "LISTENING", Some("eq_some")),
+            (5, "Errors", Some("eq_some")),
+            (6, "Bytes", Some("via_matches")),
+            (7, "Reply from", Some("needle")),
+            (8, "Unicast", Some("if_let")),
+            (9, "Discards", Some("let_else")),
+            (10, "LISTENING", Some("listed")),
+            (10, "DELETE_TCB", Some("listed")),
+            (11, "Request timed out", Some("lowered")),
+            (12, "LISTENING", Some("ignoring")),
+            (13, "Errors", Some("folded_match")),
+            (14, "Bytes", Some("folded_eq")),
+            (15, "Trace complete", Some("phrase")),
+            (16, "LISTENING", Some("escaped")),
+            (16, "Ethernet adapter", Some("escaped")),
+            (17, "IPv4 Address", Some("LABELS")),
+            (17, "Subnet Mask", Some("LABELS")),
+            (18, "DHCP Server", Some("FIELDS")),
+        ]
+    );
 }

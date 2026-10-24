@@ -246,9 +246,10 @@ All notable changes to NetWatch will be documented in this file.
   another Windows tool prints, such as `Average =` or `LISTENING`, because
   a translated install prints something else and the match finds nothing.
   The only code allowed to read English is a fallback that runs after its
-  IP Helper call has failed: ipconfig and netsh for the interface list,
-  ipconfig for DNS servers, and netstat's connection states. Each is listed
-  in the test and marked in the source.
+  IP Helper call has failed: ipconfig for the interface list and for DNS
+  servers, and netstat's connection states. Each is listed in the test and
+  marked in the source. The netsh MTU fallback no longer looks for the
+  English header row; it reads only rows that start with a number.
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,
   `netwatch --version` must print the Cargo.toml version, and
   `netwatch doctor --json` must report `npcap_missing` with the download

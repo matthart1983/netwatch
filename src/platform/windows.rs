@@ -210,7 +210,8 @@ fn extract_value(line: &str) -> Option<String> {
 
 /// Collect MTU values from `netsh interface ipv4 show subinterfaces`, for the
 /// ipconfig fallback only: the API path takes the MTU from the adapter record.
-// locale: fallback-only. GetAdaptersAddresses is tried first.
+/// Only rows that start with a number are read, so the header and the dashes
+/// under it drop out whatever language netsh prints them in.
 fn collect_mtu_map() -> HashMap<String, u32> {
     let mut map = HashMap::new();
 
@@ -230,8 +231,7 @@ fn collect_mtu_map() -> HashMap<String, u32> {
     //   1500                1  123456789   98765432  Ethernet
     for line in text.lines() {
         let trimmed = line.trim();
-        // Skip header and separator lines
-        if trimmed.is_empty() || trimmed.starts_with("MTU") || trimmed.starts_with("---") {
+        if trimmed.is_empty() {
             continue;
         }
 
