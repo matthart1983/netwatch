@@ -4526,11 +4526,7 @@ mod tests {
                 .unwrap();
             let buf = terminal.backend().buffer();
             let screen: Vec<String> = (0..buf.area.height)
-                .map(|y| {
-                    (0..buf.area.width)
-                        .map(|x| buf[(x, y)].symbol())
-                        .collect()
-                })
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
                 .collect();
             // The LAN column marks its cursor `▸ label`, the internet column
             // `label ◂`.
