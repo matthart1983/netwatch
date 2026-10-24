@@ -58,7 +58,7 @@ webpki-roots = "0.26"
 # ring is already a direct dep above for TLS work.
 socket2 = { version = "0.6", features = ["all"] }
 url = "2"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
