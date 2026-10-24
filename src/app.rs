@@ -1209,7 +1209,7 @@ impl App {
         }
 
         self.incident_recorder.record_capture_status(
-            self.packet_collector.capture_session.clone(),
+            self.packet_collector.capture_session(),
             self.packet_collector.stats.observed_drops(),
         );
         let connections = self.connection_collector.connections();

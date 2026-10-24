@@ -460,6 +460,11 @@ pub struct StreamTracker {
     /// references resolve to None rather than aliasing a different flow.
     pub all_streams: HashMap<u32, Stream>,
     next_index: u32,
+    /// The capture session the indices count within, as packets' capture
+    /// metadata names it. 2^32 flows use the indices up; the tracker then
+    /// forgets every stream, starts again at 0 and takes a new session, so a
+    /// session and an index still name one flow. `None` outside live capture.
+    session: Option<Arc<str>>,
     /// Per-stream TLS 1.3 decryption state, keyed by stream index. Lives
     /// outside `Stream` because `aead::LessSafeKey` isn't `Clone`, and
     /// `Stream` needs to stay Clone for the public `get_stream` API.
@@ -525,6 +530,7 @@ impl StreamTracker {
             streams: HashMap::new(),
             all_streams: HashMap::new(),
             next_index: 0,
+            session: None,
             tls_keys: HashMap::new(),
             keylog: crate::dpi::tls_decrypt::KeylogStore::new(),
             quic_h3: HashMap::new(),
@@ -572,6 +578,22 @@ impl StreamTracker {
             }
             self.remove_stream(old);
         }
+    }
+
+    /// The next unused stream index. When none is left, every stream is
+    /// dropped and counting restarts at 0 under a new session. At the
+    /// measured decode rate that takes about seven hours of new flows.
+    fn allocate_index(&mut self) -> u32 {
+        if let Some(next) = self.next_index.checked_add(1) {
+            return std::mem::replace(&mut self.next_index, next);
+        }
+        self.clear();
+        self.next_index = 1;
+        if self.session.is_some() {
+            self.session = Some(uuid::Uuid::new_v4().to_string().into());
+        }
+        tracing::warn!(target: "netwatch::capture", "stream indices exhausted; streams cleared and a new capture session started");
+        0
     }
 
     /// Drop the LRU batch when over the high-water mark. Removes from both
@@ -629,8 +651,7 @@ impl StreamTracker {
         let stream_index = if let Some(&idx) = self.streams.get(&key) {
             idx
         } else {
-            let idx = self.next_index;
-            self.next_index += 1;
+            let idx = self.allocate_index();
             self.streams.insert(key.clone(), idx);
             self.all_streams
                 .insert(idx, Stream::new(idx, key.clone(), timestamp_ns));
@@ -1372,48 +1393,97 @@ impl StreamTracker {
 /// that appears to match nothing and a kernel buffer that overflowed look
 /// identical on screen. `dropped` is the kernel buffer plus the driver — both
 /// mean "packets existed that this screen never saw".
-// u32, not u64: every field here is sourced from libpcap's pcap_stats(),
-// whose C struct fields (ps_recv/ps_drop/ps_ifdrop) are `u_int` — 32 bits
-// on every platform pcap supports, not just this one. Widening the atomic
-// wouldn't add real range, and armv5te (old Kirkwood NAS boxes) has no
-// native 64-bit atomics.
+// libpcap's pcap_stats() counters (ps_recv/ps_drop/ps_ifdrop) are `u_int`,
+// 32 bits on every platform pcap supports, and wrap after 2^32 packets,
+// within the hour at 1.2M packets a second. Each poll adds the change since
+// the last one to u64 totals. Those sit behind a Mutex rather than in an
+// AtomicU64 because armv5te (old Kirkwood NAS boxes) has no native 64-bit
+// atomics.
 #[derive(Debug, Default)]
 pub struct CaptureStats {
-    received: AtomicU32,
-    dropped: AtomicU32,
+    totals: Mutex<CaptureTotals>,
     /// Packets per second over the last poll interval.
     rate_pps: AtomicU32,
     observed_at: Mutex<Option<std::time::Instant>>,
 }
 
+/// Counts since the capture started, as of the last poll.
+#[derive(Debug, Default, Clone, Copy)]
+struct CaptureTotals {
+    received: u64,
+    dropped: u64,
+    /// Packets that reached the list. Taken at the poll rather than live, so
+    /// it describes the same moment as the libpcap counts.
+    decoded: u64,
+}
+
 impl CaptureStats {
     pub fn received(&self) -> u64 {
-        self.received.load(Ordering::Relaxed) as u64
+        self.totals().received
     }
 
     /// Kernel-buffer drops plus interface/driver drops.
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed) as u64
+        self.totals().dropped
     }
 
     pub fn observed_drops(&self) -> Option<u64> {
-        self.observed_at
-            .lock()
-            .ok()?
-            .filter(|at| at.elapsed() <= crate::collectors::attribution::MAX_MATCH_AGE)
-            .map(|_| self.dropped())
+        let at = (*self.observed_at.lock().ok()?)?;
+        (at.elapsed() <= crate::collectors::attribution::MAX_MATCH_AGE).then(|| self.dropped())
     }
     pub fn rate_pps(&self) -> u64 {
         self.rate_pps.load(Ordering::Relaxed) as u64
     }
 
+    fn totals(&self) -> CaptureTotals {
+        *crate::app::safe_lock(&self.totals, "packets::stats")
+    }
+
+    /// Fold one `pcap_stats` reading into the totals. `last` is the previous
+    /// reading, all zeroes when the capture starts, and becomes this one.
+    /// `decoded` is how many packets the list has taken since the start.
+    fn record_poll(&self, last: &mut pcap::Stat, reading: pcap::Stat, decoded: u64, elapsed: f64) {
+        *crate::app::safe_lock(&self.observed_at, "packets::stats_poll") =
+            Some(std::time::Instant::now());
+        let received = counter_delta(last.received, reading.received);
+        let dropped = counter_delta(last.dropped, reading.dropped)
+            + counter_delta(last.if_dropped, reading.if_dropped);
+        *last = reading;
+        {
+            let mut totals = crate::app::safe_lock(&self.totals, "packets::stats_poll");
+            totals.received += received;
+            totals.dropped += dropped;
+            totals.decoded = decoded;
+        }
+        self.rate_pps.store(
+            if elapsed > 0.0 {
+                (received as f64 / elapsed).round() as u32
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+    }
+
     /// Zeroed when a capture starts, so the numbers describe this run rather
     /// than accumulating across interface switches.
     fn reset(&self) {
-        self.received.store(0, Ordering::Relaxed);
-        self.dropped.store(0, Ordering::Relaxed);
+        *crate::app::safe_lock(&self.totals, "packets::stats_reset") = CaptureTotals::default();
         self.rate_pps.store(0, Ordering::Relaxed);
         *crate::app::safe_lock(&self.observed_at, "packets::stats_reset") = None;
+    }
+}
+
+/// How far one of libpcap's u32 counters moved between two polls, counting
+/// across a wrap. pcap's counters are monotonic within a capture, but a
+/// re-arm can move one backwards; a reading less than half the range below
+/// the last is that, not 2^31 packets inside a poll, and counts nothing.
+fn counter_delta(last: u32, now: u32) -> u64 {
+    let delta = now.wrapping_sub(last);
+    if delta > u32::MAX / 2 {
+        0
+    } else {
+        u64::from(delta)
     }
 }
 
@@ -1511,9 +1581,6 @@ pub struct PacketCollector {
     pub stream_tracker: Arc<Mutex<StreamTracker>>,
     counter: Arc<Mutex<u64>>,
     annotation_history: export::AnnotationHistory,
-    /// Identifies the latest capture start, as each packet's capture
-    /// metadata does; the incident recorder samples it with the drop count.
-    pub capture_session: Option<String>,
     handle: Option<thread::JoinHandle<()>>,
     /// Lives for the lifetime of the collector when a TLS keylog path
     /// is configured. Dropping it signals the background polling
@@ -1539,7 +1606,6 @@ impl PacketCollector {
             stream_tracker: Arc::new(Mutex::new(StreamTracker::new())),
             counter: Arc::new(Mutex::new(0)),
             annotation_history: export::AnnotationHistory::default(),
-            capture_session: None,
             handle: None,
             tls_keylog_watcher: None,
         }
@@ -1575,8 +1641,9 @@ impl PacketCollector {
             return;
         }
         self.annotation_history.clear();
-        let capture_session = uuid::Uuid::new_v4().to_string();
-        self.capture_session = Some(capture_session.clone());
+        let mut session_ref: Arc<str> = uuid::Uuid::new_v4().to_string().into();
+        crate::app::safe_lock(&self.stream_tracker, "packets::start_session").session =
+            Some(Arc::clone(&session_ref));
         // Every generation owns its cancellation flag, including detached old workers.
         self.capturing = Arc::new(AtomicBool::new(true));
         self.ready = Arc::new(AtomicBool::new(false));
@@ -1594,7 +1661,6 @@ impl PacketCollector {
         stats.reset();
         let interface = interface.to_string();
         let bpf = bpf_filter.map(|s| s.to_string());
-        let session_ref: Arc<str> = capture_session.into();
         let interface_ref: Arc<str> = interface.as_str().into();
 
         self.handle = Some(thread::spawn(move || {
@@ -1634,32 +1700,20 @@ impl PacketCollector {
             // libpcap is the only thing that knows about the packets it had to
             // throw away, and those are exactly the ones the list cannot show.
             let mut last_poll = std::time::Instant::now();
-            let mut last_received: u64 = 0;
+            let mut last_reading = pcap::Stat {
+                received: 0,
+                dropped: 0,
+                if_dropped: 0,
+            };
+            let first_id = *crate::app::safe_lock(&counter, "packets::stats_poll");
 
             while capturing.load(Ordering::Relaxed) {
                 if last_poll.elapsed() >= STATS_POLL {
                     if let Ok(s) = cap.stats() {
-                        *crate::app::safe_lock(&stats.observed_at, "packets::stats_poll") =
-                            Some(std::time::Instant::now());
-                        let received = s.received as u64;
+                        let decoded = crate::app::safe_lock(&counter, "packets::stats_poll")
+                            .saturating_sub(first_id);
                         let elapsed = last_poll.elapsed().as_secs_f64();
-                        // pcap's counter is monotonic within a capture, but a
-                        // re-arm can move it backwards; saturating_sub keeps a
-                        // restart from reading as a negative rate.
-                        let delta = received.saturating_sub(last_received);
-                        stats.received.store(s.received, Ordering::Relaxed);
-                        stats
-                            .dropped
-                            .store(s.dropped.saturating_add(s.if_dropped), Ordering::Relaxed);
-                        stats.rate_pps.store(
-                            if elapsed > 0.0 {
-                                (delta as f64 / elapsed).round() as u32
-                            } else {
-                                0
-                            },
-                            Ordering::Relaxed,
-                        );
-                        last_received = received;
+                        stats.record_poll(&mut last_reading, s, decoded, elapsed);
                     }
                     last_poll = std::time::Instant::now();
                 }
@@ -1698,6 +1752,14 @@ impl PacketCollector {
                             };
                             if let Some(parsed) = decode_and_track(frame, &counter, &dns, &tracker)
                             {
+                                // A packet that used up the stream indices
+                                // comes back under the tracker's new session,
+                                // and every packet after it takes that one.
+                                if let Some(meta) = &parsed.capture {
+                                    if !Arc::ptr_eq(&meta.session, &session_ref) {
+                                        session_ref = Arc::clone(&meta.session);
+                                    }
+                                }
                                 batch.push(parsed);
                                 if batch.len() >= CAPTURE_BATCH_SIZE {
                                     let mut pkts =
@@ -1791,6 +1853,23 @@ impl PacketCollector {
 
     pub fn get_error(&self) -> Option<String> {
         crate::app::safe_lock(&self.error, "packets::get_error").clone()
+    }
+
+    /// Identifies the latest capture session, as each packet's capture
+    /// metadata does; the incident recorder samples it with the drop count.
+    pub fn capture_session(&self) -> Option<String> {
+        crate::app::safe_lock(&self.stream_tracker, "packets::capture_session")
+            .session
+            .as_deref()
+            .map(str::to_string)
+    }
+
+    /// Packets libpcap received and dropped since the capture started, and
+    /// how many of them reached the list, as of the last poll (once a
+    /// second). Monotonic within a capture; libpcap's own counters wrap.
+    pub fn capture_totals(&self) -> (u64, u64, u64) {
+        let totals = self.stats.totals();
+        (totals.received, totals.dropped, totals.decoded)
     }
 
     /// Cheap read of the packet ring's current length — for the `M`
@@ -2234,6 +2313,13 @@ fn decode_and_track(
                 parsed.tcp_seq,
                 parsed.timestamp_ns,
             );
+            // The index belongs to the tracker's session, which is not the
+            // one the frame was stamped with if this packet used them up.
+            if let (Some(meta), Some(session)) = (parsed.capture.as_mut(), &t.session) {
+                if !Arc::ptr_eq(&meta.session, session) {
+                    meta.session = Arc::clone(session);
+                }
+            }
             let ap = t.get_stream(i).and_then(|s| s.app_protocol.clone());
             // TLS-decrypt the application-data record carried by
             // *this* TCP segment, if we have keys for the flow.
@@ -4146,6 +4232,118 @@ mod tests {
         );
         assert_ne!(a, b);
         assert_eq!(tracker.snapshot_bytes().values().next(), Some(&(0, 5)));
+    }
+    #[test]
+    fn stream_index_exhaustion_resets_without_aliasing() {
+        let first: Arc<str> = "capture-a".into();
+        let tracker = Mutex::new(StreamTracker::new());
+        {
+            let mut t = tracker.lock().unwrap();
+            t.session = Some(Arc::clone(&first));
+            t.next_index = u32::MAX - 1;
+        }
+        let counter = Arc::new(Mutex::new(0));
+        let dns = DnsCache::new();
+        let udp_from = |port: u16| {
+            let mut frame = UDP_FRAME;
+            frame[34..36].copy_from_slice(&port.to_be_bytes());
+            let mut meta = metadata(1);
+            meta.session = Arc::clone(&first);
+            let frame = Frame {
+                data: &frame,
+                ethernet: true,
+                capture: Some(meta),
+            };
+            decode_and_track(frame, &counter, &dns, &tracker).unwrap()
+        };
+        let session = |p: &CapturedPacket| Arc::clone(&p.capture.as_ref().unwrap().session);
+
+        let last = udp_from(1000);
+        assert_eq!(last.stream_index, Some(u32::MAX - 1));
+        assert!(Arc::ptr_eq(&session(&last), &first));
+        // The next new flow finds no index left, since u32::MAX is never
+        // handed out, and numbering restarts under a new session.
+        let restart = udp_from(2000);
+        assert_eq!(restart.stream_index, Some(0));
+        let second = session(&restart);
+        assert_ne!(second, first);
+        // The flow from before is forgotten rather than found under its old
+        // index, and numbered afresh in the new session.
+        let again = udp_from(1000);
+        assert_eq!(again.stream_index, Some(1));
+        assert!(Arc::ptr_eq(&session(&again), &second));
+        let t = tracker.lock().unwrap();
+        assert!(t.get_stream(u32::MAX - 1).is_none());
+        assert_eq!(t.all_streams.len(), 2);
+        drop(t);
+
+        // The session the incident recorder samples moves on with it.
+        let collector = PacketCollector::new();
+        {
+            let mut t = collector.stream_tracker.lock().unwrap();
+            t.session = Some(Arc::clone(&first));
+            t.next_index = u32::MAX;
+        }
+        collector.ingest_frame_for_test(&UDP_FRAME).unwrap();
+        let now = collector.capture_session().unwrap();
+        assert_ne!(now, *first);
+        // Replay and --demo have no session and get none.
+        let mut tracker = StreamTracker::new();
+        tracker.next_index = u32::MAX;
+        let idx = tracker.track_packet(
+            "127.0.0.1",
+            1,
+            "127.0.0.1",
+            2,
+            StreamProtocol::Udp,
+            b"",
+            1,
+            "t",
+            None,
+            None,
+            1,
+        );
+        assert_eq!((idx, tracker.session.is_none()), (0, true));
+    }
+    #[test]
+    fn pcap_counter_wrap_keeps_totals_monotonic() {
+        let collector = PacketCollector::new();
+        let stats = &collector.stats;
+        let reading = |received, dropped, if_dropped| pcap::Stat {
+            received,
+            dropped,
+            if_dropped,
+        };
+        let mut last = reading(0, 0, 0);
+        // Climb near the top of the range in two polls. One poll that moved
+        // 2^31 or more would read as the counter going back.
+        stats.record_poll(&mut last, reading(u32::MAX / 2, u32::MAX / 2, 7), 1, 1.0);
+        stats.record_poll(&mut last, reading(u32::MAX - 999, u32::MAX - 9, 7), 5, 1.0);
+        let (received, dropped, decoded) = collector.capture_totals();
+        assert_eq!(received, u64::from(u32::MAX - 999));
+        assert_eq!(dropped, u64::from(u32::MAX - 9) + 7);
+        assert_eq!(decoded, 5);
+
+        // libpcap's u32 counters wrap between two polls.
+        stats.record_poll(&mut last, reading(1000, 10, 7), 9, 1.0);
+        assert_eq!(
+            collector.capture_totals(),
+            (received + 2000, dropped + 20, 9)
+        );
+        assert!(stats.received() > u64::from(u32::MAX));
+        assert_eq!(stats.rate_pps(), 2000, "the wrap reads as a rate, not 0");
+        assert_eq!(stats.observed_drops(), Some(dropped + 20));
+
+        // A counter moving back is a re-arm, not four billion packets.
+        stats.record_poll(&mut last, reading(400, 10, 7), 9, 1.0);
+        assert_eq!(stats.received(), received + 2000);
+        assert_eq!(stats.rate_pps(), 0);
+        stats.record_poll(&mut last, reading(700, 10, 7), 9, 1.0);
+        assert_eq!(stats.received(), received + 2300);
+
+        stats.reset();
+        assert_eq!(collector.capture_totals(), (0, 0, 0));
+        assert_eq!(stats.observed_drops(), None);
     }
 
     #[test]

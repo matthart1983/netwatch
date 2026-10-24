@@ -151,7 +151,7 @@ A block with options ends them with `opt_endofopt`; a block without has no optio
 |-----|------|--------------|---------|
 | `schema` | string | always | `netwatch.annotation.v1` |
 | `packet_id` | integer | always | The packet's number in the Packets list during that run |
-| `capture_session` | string | always | A UUID for one capture start. Restarting capture or switching interface starts a new one |
+| `capture_session` | string | always | A UUID for one capture start. Restarting capture or switching interface starts a new one, as does using up the stream indexes, which start again from 0 after 2^32 streams |
 | `protocol` | string | always | netwatch's protocol label, as in the Packets list: `TCP`, `DNS`, `TLS`, `Raw`… |
 | `status` | string | always | `bracketed_socket_observation` when the owner keys below are present, else `unknown_owner` |
 | `pid` | integer | owner | Process ID |
@@ -164,7 +164,7 @@ A block with options ends them with `opt_endofopt`; a block without has no optio
 | `direction` | string | owner | `outbound` when the packet left from the socket's local end, else `inbound` |
 | `before_utc_ms`, `after_utc_ms` | integer | owner | Unix time in ms by which the earlier check of the owner had finished, and at which the later one began. The packet falls strictly between them |
 | `flow_generation` | integer | owner | netwatch's number for this socket and owner in this run; a socket that passes to another process gets a new one |
-| `capture_generation` | integer | owner | The stream index the packet belongs to, as the stream view numbers them |
+| `capture_generation` | integer | owner | The stream index the packet belongs to, as the stream view numbers them. Unique within a `capture_session` |
 | `app` | string | flow classified | The DPI classifier that recognised the flow: `tls` `quic` `http` `dns` `ssh` `mqtt` `stun` `bittorrent` `netbios` `snmp` `ssdp` `ftp` `llmnr` `dhcp` `ntp` |
 | `sni` | string | TLS or QUIC with a server name | The ClientHello's server name. When `ech_outer` is true it is the outer, public name, not the real destination |
 | `ech_outer` | boolean | with `sni` | The ClientHello carried Encrypted Client Hello |
