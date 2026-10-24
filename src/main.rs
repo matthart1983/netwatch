@@ -1,11 +1,7 @@
 use anyhow::Result;
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use netwatch::app;
 use netwatch::config::NetwatchConfig;
+use netwatch::ui::tty;
 use ratatui::prelude::*;
 use std::io;
 
@@ -150,11 +146,11 @@ fn main() -> Result<()> {
         ));
     }
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // `_tty` is declared after `_worker_session` and `runtime`, so during an
+    // unwind it drops first and the shell is back before the workers' wait.
+    tty::install_panic_hook();
+    let _tty = tty::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let result = runtime.block_on(app::run(
         &mut terminal,
@@ -164,13 +160,18 @@ fn main() -> Result<()> {
         demo,
     ));
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    drop(terminal);
+    tty::restore();
 
-    result
+    // A background thread that dies can end the session with no more than
+    // "Event channel closed"; the panic is what the user needs to see.
+    match (result, tty::background_panic()) {
+        (Err(error), Some(panic)) => {
+            let log = netwatch::logging::log_dir()
+                .map(|dir| format!("; log in {}", dir.display()))
+                .unwrap_or_default();
+            Err(error.context(format!("{panic}{log}")))
+        }
+        (result, _) => result,
+    }
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEvent};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +44,7 @@ impl EventHandler {
                                 return;
                             }
                         }
-                        Ok(Event::Mouse(mouse)) => {
+                        Ok(Event::Mouse(mouse)) if wanted(&mouse) => {
                             if tx.send(AppEvent::Mouse(mouse)).is_err() {
                                 return;
                             }
@@ -73,5 +73,48 @@ impl EventHandler {
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("Event channel closed"))
+    }
+
+    /// The next event if one is already waiting. A closed channel reads as
+    /// empty here; [`next`](Self::next) reports it.
+    pub fn try_next(&mut self) -> Option<AppEvent> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Whether a mouse event goes to the app. Mouse capture turns on any-motion
+/// reporting, so every move of the pointer arrives, each one cost a full
+/// redraw, and nothing reads a move with no button held. A drag (a move with
+/// a button held) still goes through.
+fn wanted(mouse: &MouseEvent) -> bool {
+    mouse.kind != MouseEventKind::Moved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton};
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn moved_without_drag_is_dropped() {
+        assert!(!wanted(&mouse(MouseEventKind::Moved)));
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            assert!(wanted(&mouse(kind)), "{kind:?}");
+        }
     }
 }

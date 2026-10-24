@@ -147,6 +147,11 @@ embed-manifest = "1"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"] }
 
+# The terminal-restore tests run netwatch on a pty (`term`) and signal it
+# (`signal`). Same crate as above, so nothing new is compiled.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["term", "signal"] }
+
 # Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
 # pcap + eBPF are up, then restrict filesystem and network via Landlock.
 # Both crates are Linux-only — the sandbox module's macOS/Windows paths
