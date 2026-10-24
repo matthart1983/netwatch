@@ -73,7 +73,7 @@ impl Pty {
         unsafe {
             cmd.pre_exec(|| {
                 nix::unistd::setsid()?;
-                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) == -1 {
+                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
