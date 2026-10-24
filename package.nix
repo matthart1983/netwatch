@@ -1,15 +1,20 @@
 {
   lib,
+  stdenv,
   rustPlatform,
   pkg-config,
   libpcap,
+  iproute2,
+  # Short git revision, passed by the flake so builds between releases are distinguishable; null outside a git checkout.
+  rev ? null,
 }:
 
+let
+  cargoToml = lib.importTOML ./Cargo.toml;
+in
 rustPlatform.buildRustPackage {
-  pname = "netwatch-tui";
-  # Keep in sync with Cargo.toml's `version` on every release — the Nix
-  # derivation label otherwise drifts from the actual source contents.
-  version = "0.26.1";
+  pname = cargoToml.package.name;
+  version = cargoToml.package.version + lib.optionalString (rev != null) "+git.${rev}";
 
   src = lib.cleanSource ./.;
 
@@ -18,6 +23,9 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
 
   buildInputs = [ libpcap ];
+
+  # The Linux connection collector shells out to `ss`
+  nativeCheckInputs = lib.optionals stdenv.hostPlatform.isLinux [ iproute2 ];
 
   meta = {
     description = "Real-time network diagnostics in your terminal — like htop for your network";
