@@ -214,6 +214,7 @@ pub struct AppUiState {
     pub packet_detail_expanded: bool,
     pub stream_view_open: bool,
     pub stream_view_index: Option<u32>,
+    pub stream_view_session: Option<String>,
     pub stream_direction_filter: StreamDirectionFilter,
     pub stream_hex_mode: bool,
     /// Packet id whose stream segment the stream view should highlight and
@@ -294,6 +295,7 @@ impl AppUiState {
             packet_detail_expanded: false,
             stream_view_open: false,
             stream_view_index: None,
+            stream_view_session: None,
             stream_direction_filter: StreamDirectionFilter::Both,
             stream_hex_mode: false,
             stream_view_focus_packet: None,

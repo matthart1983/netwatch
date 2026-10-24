@@ -92,6 +92,9 @@ All notable changes to NetWatch will be documented in this file.
   must be on a filesystem with hard links.
 
 ### Fixed
+- **Old packets cannot resolve a stream from a later capture session.** Stream
+  details, HTTP/3 bodies, the conversation ladder and an already-open stream
+  view keep the capture session as well as the index when indices wrap.
 - **Exported captures carry the real capture time and wire length.** PCAP
   export rebuilt each timestamp from the time of day shown in the packet
   list, so every packet was dated 1 January 1970 and a capture across

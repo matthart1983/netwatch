@@ -2199,6 +2199,39 @@ impl PacketCollector {
             .cloned()
     }
 
+    /// Resolve a saved packet only within the session that allocated its index.
+    pub fn get_stream_for_packet(&self, packet: &CapturedPacket) -> Option<Stream> {
+        self.get_stream_in_session(
+            packet.stream_index?,
+            packet.capture.as_ref().map(|m| m.session.as_ref()),
+        )
+    }
+
+    /// An open stream view keeps its original session even after index exhaustion.
+    pub fn get_stream_in_session(&self, index: u32, session: Option<&str>) -> Option<Stream> {
+        let tracker = crate::app::safe_lock(&self.stream_tracker, "packets::get_stream_in_session");
+        if tracker.session.as_deref() != session {
+            return None;
+        }
+        tracker.get_stream(index).cloned()
+    }
+
+    /// A packet must not borrow decoded HTTP/3 content from a later session.
+    pub fn quic_h3_bodies_for_packet(
+        &self,
+        packet: &CapturedPacket,
+    ) -> Vec<crate::dpi::http3::DecodedBody> {
+        let Some(index) = packet.stream_index else {
+            return Vec::new();
+        };
+        let mut tracker =
+            crate::app::safe_lock(&self.stream_tracker, "packets::quic_h3_bodies_for_packet");
+        if tracker.session.as_deref() != packet.capture.as_ref().map(|m| m.session.as_ref()) {
+            return Vec::new();
+        }
+        tracker.quic_h3_bodies(index)
+    }
+
     /// Reassembled HTTP/3 bodies for a flow (Phase 3b). Decodes lazily (cached
     /// per stream) and clones only the decoded bodies, not the whole `Stream`,
     /// so the UI can call it per render frame.
@@ -4233,6 +4266,35 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(tracker.snapshot_bytes().values().next(), Some(&(0, 5)));
     }
+    #[test]
+    fn an_old_packet_does_not_resolve_a_reused_stream_index() {
+        let collector = PacketCollector::new();
+        let first: Arc<str> = "old-session".into();
+        collector.stream_tracker.lock().unwrap().session = Some(first.clone());
+        collector.ingest_frame_for_test(&UDP_FRAME).unwrap();
+        let mut old = collector.get_packets()[0].clone();
+        let mut meta = metadata(1);
+        meta.session = first;
+        old.capture = Some(meta);
+        assert_eq!(old.stream_index, Some(0));
+        {
+            let mut tracker = collector.stream_tracker.lock().unwrap();
+            tracker.clear();
+            tracker.next_index = u32::MAX;
+        }
+        collector.ingest_frame_for_test(&UDP_FRAME).unwrap();
+        assert_ne!(collector.capture_session().as_deref(), Some("old-session"));
+        assert!(
+            collector.get_stream_for_packet(&old).is_none(),
+            "the old packet must not resolve the new session's stream 0"
+        );
+        assert!(collector
+            .get_stream_in_session(0, Some("old-session"))
+            .is_none());
+        let current = collector.capture_session().unwrap();
+        assert!(collector.get_stream_in_session(0, Some(&current)).is_some());
+    }
+
     #[test]
     fn stream_index_exhaustion_resets_without_aliasing() {
         let first: Arc<str> = "capture-a".into();

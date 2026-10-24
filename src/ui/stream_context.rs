@@ -264,9 +264,21 @@ pub fn conversation(
         .initiator
         .as_ref()
         .is_none_or(|init| *init == stream.key.addr_a);
+    // An index can be reused after exhaustion, but never within one session.
+    let anchor = selected_id
+        .and_then(|id| packets.iter().find(|p| p.id == id))
+        .or_else(|| {
+            packets
+                .iter()
+                .find(|p| p.stream_index == Some(stream_index))
+        });
+    let session = anchor.and_then(|p| p.capture.as_ref().map(|m| m.session.as_ref()));
     let mut mine: Vec<&CapturedPacket> = packets
         .iter()
-        .filter(|p| p.stream_index == Some(stream_index))
+        .filter(|p| {
+            p.stream_index == Some(stream_index)
+                && p.capture.as_ref().map(|m| m.session.as_ref()) == session
+        })
         .collect();
     mine.sort_by_key(|p| p.timestamp_ns);
 
@@ -463,6 +475,25 @@ mod tests {
         );
         s.initiator = Some(("10.0.0.1".into(), 5000));
         s
+    }
+
+    #[test]
+    fn reused_indices_do_not_mix_capture_sessions_in_the_ladder() {
+        use crate::collectors::packets::export::CaptureMetadata;
+        let mut old = pkt(1, 1, "10.0.0.1", 5000, "10.0.0.2", 443);
+        let mut current = pkt(2, 2, "10.0.0.1", 5000, "10.0.0.2", 443);
+        for (packet, session) in [(&mut old, "old"), (&mut current, "current")] {
+            packet.capture = Some(CaptureMetadata {
+                session: session.into(),
+                interface: "eth0".into(),
+                link_type: 1,
+                timestamp_ns: packet.timestamp_ns,
+                original_len: packet.length,
+            });
+        }
+        let c = conversation(&stream(), &[old, current], 0, Some(2), 10);
+        assert_eq!(c.total, 1);
+        assert_eq!(c.position, Some(1));
     }
 
     /// A three-way handshake reads as one, in order, from the right end.
