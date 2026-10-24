@@ -186,12 +186,19 @@ fn read_table<T: OwnerPidTable>(
 
 /// Copy the rows out of a buffer a successful call filled. `filled` is the
 /// byte count the call left in its size argument, never trusted past the
-/// buffer's own length.
+/// buffer's own length. A buffer too short to hold the table header has no
+/// rows: `read_table` never passes one, but this is a safe fn and checks.
 fn rows<T: OwnerPidTable>(buf: &[u32], filled: usize) -> Vec<T::Row> {
+    // The tables' fields are all u32 and byte arrays, so u32 elements align
+    // the buffer for them. Checked here rather than taken on trust.
+    const { assert!(align_of::<T>() <= align_of::<u32>()) };
+    if size_of_val(buf) < size_of::<T>() {
+        return Vec::new();
+    }
     let bytes = filled.min(size_of_val(buf));
-    // SAFETY: `read_table` never allocates less than `size_of::<T>()` bytes,
-    // the u32 elements align the buffer for `T` (whose fields are all u32 and
-    // byte arrays), and a successful call wrote a table header at its start.
+    // SAFETY: the check above leaves at least `size_of::<T>()` bytes, the
+    // assert above makes the u32 elements aligned for `T`, and a successful
+    // call wrote a table header at the start.
     let claimed = unsafe { &*buf.as_ptr().cast::<T>() }.claimed();
     let n = socket_table::rows_that_fit(bytes, T::ROWS_AT, size_of::<T::Row>(), claimed as usize);
     // SAFETY: `ROWS_AT` is an offset inside `T`, and the buffer is never
@@ -320,6 +327,14 @@ mod tests {
             offered.windows(2).all(|w| w[1] > w[0]),
             "each retry offers more room: {offered:?}"
         );
+    }
+
+    /// `rows` is safe to call with any slice. One shorter than the table
+    /// struct would have the header read past its end.
+    #[test]
+    fn a_buffer_shorter_than_the_table_header_reads_no_rows() {
+        assert!(rows::<MIB_TCPTABLE_OWNER_PID>(&[], 0).is_empty());
+        assert!(rows::<MIB_TCP6TABLE_OWNER_PID>(&[1], 4).is_empty());
     }
 
     #[test]

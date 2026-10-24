@@ -90,6 +90,20 @@ All notable changes to NetWatch will be documented in this file.
   bundles are written under a temporary name and moved into place when
   complete; a cancelled or failed export removes them. The exports directory
   must be on a filesystem with hard links.
+- **Less `unsafe` code, and the raw-pointer reads that remain check what
+  they assume.** The nine places that read the effective user ID call nix's
+  safe wrapper instead of libc inside an `unsafe` block. On Windows, the
+  Npcap loader and doctor's query of the Npcap driver service call the
+  windows-sys declarations instead of hand-written ones, and on macOS the
+  process path lookup uses libc's declaration of `proc_pidpath`. Reading
+  the Windows socket tables now checks that the buffer holds a whole table
+  header before it reads the row count, which only the caller guaranteed
+  before, and the build fails if the alignment the socket table, adapter
+  and ICMP buffers rely on stops holding. macOS and FreeBSD share one walk
+  of the `getifaddrs` list for the link speed. It skips an entry with no
+  name instead of reading a null pointer, and reads only the speed field
+  rather than borrowing the whole `if_data` record. Nothing netwatch shows
+  changes, and no new crate is compiled.
 
 ### Fixed
 - **Lite view: keys no longer overflow in a terminal smaller than its

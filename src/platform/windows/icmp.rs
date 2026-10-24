@@ -176,6 +176,7 @@ pub fn echoes(dst: IpAddr, count: usize, timeout_ms: u32) -> Option<Vec<Echo>> {
 /// A zeroed reply buffer for one echo whose reply structure is `R`, in u64s so
 /// it is aligned for the structure's pointers.
 fn reply_buffer<R>() -> Vec<u64> {
+    const { assert!(align_of::<R>() <= align_of::<u64>()) };
     let bytes = icmp::reply_buffer_len(
         std::mem::size_of::<R>(),
         PAYLOAD.len(),
