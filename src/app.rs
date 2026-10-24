@@ -5223,6 +5223,107 @@ mod render_safety_tests {
         assert_eq!(unsafe_cells(&buf), Vec::<String>::new());
     }
 
+    /// Ethernet + IPv4 + TCP 192.0.2.10:50000 -> 198.51.100.7:5555, PSH|ACK,
+    /// carrying `payload`.
+    fn tcp_frame(payload: &[u8]) -> Vec<u8> {
+        let ip_len = u16::try_from(40 + payload.len()).unwrap().to_be_bytes();
+        let mut f = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x08, 0x00];
+        f.extend_from_slice(&[0x45, 0, ip_len[0], ip_len[1], 0, 0, 0x40, 0, 64, 6, 0, 0]);
+        f.extend_from_slice(&[192, 0, 2, 10, 198, 51, 100, 7]);
+        f.extend_from_slice(&50000u16.to_be_bytes());
+        f.extend_from_slice(&5555u16.to_be_bytes());
+        f.extend_from_slice(&[
+            0, 0, 0x03, 0xe8, 0, 0, 0, 0, 0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0,
+        ]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Tabs in a cleartext payload show as `·` in Payload Content and the
+    /// stream view. ratatui 0.30 leaves control characters out of laid-out
+    /// text, so a raw tab vanished and `id\tname\tstatus` read as
+    /// `idnamestatus`, with tab indentation gone. Under 0.27 each tab had a
+    /// cell of its own, which the scrub turned into `·`.
+    #[test]
+    fn tabs_in_a_cleartext_payload_stay_visible() {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let id = app
+            .packet_collector
+            .ingest_frame_for_test(&tcp_frame(b"id\tname\tstatus\n\t\tindented\n"))
+            .expect("the frame decodes");
+        app.ui.current_tab = Tab::Packets;
+        app.ui.scroll.packet_selected = Some(id);
+
+        let screen = rows(&draw(&mut app));
+        assert!(
+            screen.iter().any(|r| r.contains("Payload Content")),
+            "{screen:#?}"
+        );
+        for needle in ["id·name·status", "··indented"] {
+            assert!(
+                screen.iter().any(|r| r.contains(needle)),
+                "payload pane lost {needle:?}: {screen:#?}"
+            );
+        }
+
+        app.ui.stream_view_open = true;
+        app.ui.stream_view_index = app.packet_collector.get_packets()[0].stream_index;
+        assert!(
+            app.ui.stream_view_index.is_some(),
+            "the frame has no stream"
+        );
+        let screen = rows(&draw(&mut app));
+        for needle in ["id·name·status", "··indented"] {
+            assert!(
+                screen
+                    .iter()
+                    .any(|r| r.contains(&format!("→ {needle}"))
+                        || r.contains(&format!("← {needle}"))),
+                "stream view lost {needle:?}: {screen:#?}"
+            );
+        }
+    }
+
+    /// tmux lets a pane shrink to one column. The Timeline's activity strip
+    /// then has an inner area of width 0 at x=1, and tinted the cursor
+    /// column at `buf[(1, y)]`, outside the buffer. ratatui 0.27's `get_mut`
+    /// wrote into the next row in release builds; 0.30's indexing panics,
+    /// which left the shell in raw mode on the alternate screen.
+    #[test]
+    fn no_view_panics_in_a_one_column_terminal() {
+        let mut app = app_with_hostile_connection();
+        let tabs = [
+            Tab::Dashboard,
+            Tab::Connections,
+            Tab::Interfaces,
+            Tab::Packets,
+            Tab::Stats,
+            Tab::Topology,
+            Tab::Timeline,
+            Tab::Processes,
+            Tab::Diagnose,
+            Tab::Egress,
+        ];
+        let views = tabs
+            .into_iter()
+            .map(|tab| (ViewMode::Full, tab))
+            .chain([ViewMode::Lite, ViewMode::Dense].map(|v| (v, Tab::Dashboard)));
+        for (view, tab) in views {
+            app.ui.view_mode = view;
+            app.ui.current_tab = tab;
+            for height in 1..=50 {
+                let mut terminal = Terminal::new(TestBackend::new(1, height)).unwrap();
+                let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    terminal.draw(|f| draw_frame(f, &mut app)).map(|_| ())
+                }));
+                assert!(
+                    matches!(drawn, Ok(Ok(()))),
+                    "{view:?} {tab:?} at 1x{height}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn no_view_draws_a_control_character() {
         let mut app = app_with_hostile_connection();

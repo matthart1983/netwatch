@@ -239,15 +239,17 @@ All notable changes to NetWatch will be documented in this file.
   0.2.** Every tab of the full view, Lite and Dense draw as before at
   80×24, 120×40 and 200×60, in every theme and with `NO_COLOR`, CJK and
   emoji names included. Three things differ. A box too narrow for both its
-  title and the text at the right of its top border, as in a terminal about
-  40 columns wide, now shows the right-hand text over the title rather than
-  under it. A halfwidth katakana sound mark (ﾞ or ﾟ) now has a column of its
-  own, as terminals draw it, so a name holding one no longer pushes the
-  rest of its row right; in Lite and Dense the name instead loses a column
-  at its end for each mark. On Windows the second click of a double-click
-  now counts, as it already did elsewhere, so double-clicking a group
-  header folds it and opens it again. paste, the unmaintained crate
-  ratatui 0.27 built with, is gone from the tree.
+  title and the text at the right of its top border now shows the
+  right-hand text over the title rather than under it. Most tabs of the
+  full view have such boxes, and they start to overlap below about 53
+  columns, as in a tmux window split in half; by 38 columns some boxes
+  lose their name entirely. A halfwidth katakana sound mark (ﾞ or ﾟ) now
+  has a column of its own, as terminals draw it, so a name holding one no
+  longer pushes the rest of its row right; in Lite and Dense the name
+  instead loses a column at its end for each mark. On Windows the second
+  click of a double-click now counts, as it already did elsewhere, so
+  double-clicking a group header folds it and opens it again. paste, the
+  unmaintained crate ratatui 0.27 built with, is gone from the tree.
 
 ### CI
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,

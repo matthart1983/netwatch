@@ -1373,15 +1373,18 @@ pub fn build_stream_lines(
             } else {
                 Style::default()
             };
+            // Show a tab as `·`, like every other control byte. ratatui
+            // drops control characters from the text it lays out, so a raw
+            // tab would vanish and `id\tname` would read as `idname`.
             let text: String = bytes
                 .iter()
                 .map(|&b| {
-                    if b.is_ascii_graphic() || b == b' ' || b == b'\t' {
+                    if b.is_ascii_graphic() || b == b' ' {
                         b as char
                     } else if b == b'\n' || b == b'\r' {
                         '\n'
                     } else {
-                        '·'
+                        crate::ui::sanitize::REPLACEMENT
                     }
                 })
                 .collect();
