@@ -224,6 +224,12 @@ All notable changes to NetWatch will be documented in this file.
   shortens to 15 characters.
 
 ### Security
+- **The threat model states the limits of the Linux sandbox.** Earlier release
+  notes overstated protection by saying a compromised parser cannot read SSH
+  keys. Threads share memory and descriptors, the proc broker is outside
+  Landlock, and outbound networking remains unrestricted. Root operation has
+  limited containment. The preferred Linux setup restricts a capability-enabled
+  binary to a dedicated group; policy and endpoint tables are checked in tests.
 - **Run as root, the sandbox now takes the capabilities netwatch never
   uses from every confined thread.** It removes capabilities by a
   deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.

@@ -25,7 +25,7 @@
   <em><code>netwatch --view dense</code>. Four boxes, no chrome, every keybind on a border. Download grows up from the axis, upload grows down.</em>
 </p>
 
-One binary, no config. `sudo netwatch` and you have live capture with L7 decode, process attribution where available, and a diagnostic engine that opens an issue when a learned baseline breaks and closes it when the fix holds.
+One binary, no config. `netwatch` with capture permissions gives you live capture with L7 decode, process attribution where available, and a diagnostic engine that opens an issue when a learned baseline breaks and closes it when the fix holds.
 
 ## Install
 
@@ -71,12 +71,12 @@ newer (it cannot be static). On anything older, build from source with
 
 ```bash
 netwatch              # interfaces, connections, config. No privileges.
-sudo netwatch         # enables capture where elevated access is required
+sudo netwatch         # works; root containment is limited
 netwatch --lite       # one 80x24 screen
 netwatch --view dense # four boxes, 130x44 or larger
 ```
 
-`1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key. To run without sudo on Linux, grant the capabilities once: `sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"` ([why and when to repeat it](docs/REFERENCE.md#running-without-sudo-linux)).
+`1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key. On Linux, prefer `cap_net_raw,cap_bpf,cap_perfmon+eip` [restricted to a netwatch group](docs/REFERENCE.md#running-without-sudo-linux). Running as root works, but the sandbox is defence in depth and containment is limited. See the [threat model](docs/THREAT-MODEL.md).
 
 ### Without the TUI
 

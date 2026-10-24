@@ -280,7 +280,7 @@ fn record_retained(report: &mut Report) {
 /// System executable/library paths are broad; /etc uses an explicit list.
 /// Configured database/keylog parents and read/write grants can widen access
 /// to sensitive files. These rules apply only to confined threads.
-fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
+pub(super) fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
     for path in [
@@ -346,7 +346,7 @@ fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
 /// Paths we need to be able to write to. Read access is implied by
 /// `AccessFs::from_all` so these don't also need to appear in the
 /// read-only list.
-fn collect_read_write(paths: &SandboxPaths) -> Vec<PathBuf> {
+pub(super) fn collect_read_write(paths: &SandboxPaths) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
     // The config dir needs write access too — `NetwatchConfig::save()`

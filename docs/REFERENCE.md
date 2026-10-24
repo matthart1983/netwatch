@@ -357,6 +357,9 @@ Edit the file by hand freely; it reloads on startup.
 
 ### Landlock sandbox (Linux)
 
+See the [threat model](THREAT-MODEL.md) for boundaries, outbound traffic and
+remaining gaps. Root operation works, but containment is limited.
+
 Linux worker entry points apply a prepared Landlock filesystem policy before
 processing input. Capture opens/configures its device first and marks itself ready
 after policy entry. Main applies policy after resource startup. Rules pin opened
@@ -381,8 +384,8 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   executable/library and resolver paths remain readable. Missing or replaced
   keylog/database files require restarting Netwatch. Rotation does not expand the
   policy to a parent directory.
-- **SDK source:** eBPF attribution is disabled under enabled sandbox policy until
-  its SDK reader has an enforcement hook. Socket polling remains available.
+- **SDK source:** eBPF loads inside the filesystem policy. Its SDK reader
+  inherits that policy but retains load capabilities until it has its own entry hook.
 - **Strict mode:** preflight/required worker entry failures stop startup with a
   nonzero exit. After the main thread drops raw-socket authority, capture restart
   may fail; it never retries unsandboxed. macOS/Windows have no backend and reject
@@ -676,18 +679,30 @@ Degrades gracefully — features that need root show a clear message, never cras
 ### Running without sudo (Linux)
 
 Packet capture and eBPF process attribution need elevated capabilities, but you don't have to
-run the whole TUI as root. Grant them once to the binary:
+run the whole TUI as root. Prefer a root-owned binary executable only by an
+authorized group. Create the group if needed and add your account, then log in
+again for membership to take effect. Apply capabilities last, after ownership:
 
 ```bash
-sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"
-netwatch
+sudo groupadd -f netwatch
+sudo usermod -aG netwatch "$USER"
+# Use a root-owned installation path, not a user-writable cargo bin directory.
+if [ "$(command -v netwatch)" != /usr/local/bin/netwatch ]; then
+  sudo install -o root -g netwatch -m 0750 "$(command -v netwatch)" /usr/local/bin/netwatch
+fi
+sudo chown root:netwatch /usr/local/bin/netwatch
+sudo chmod 0750 /usr/local/bin/netwatch
+sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' /usr/local/bin/netwatch
+# After logging in again:
+/usr/local/bin/netwatch
 ```
 
 > **Re-run after every install.** `setcap` attaches to a specific binary on disk; `cargo
 > install netwatch-tui` and the Release tarballs overwrite that file, so the capabilities
 > don't carry over. If you see `pcap open failed: socket: Operation not permitted` or `BPF
 > load failed: PermissionDenied` in `~/.cache/netwatch/netwatch.log.*` after an upgrade, the
-> new binary just needs `setcap` re-applied.
+> new binary needs the root ownership, group execution restriction and `setcap`
+> re-applied. Never grant capture capabilities to a world-executable copy.
 
 | Capability | What it unlocks |
 |------------|-----------------|

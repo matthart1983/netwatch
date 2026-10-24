@@ -371,8 +371,8 @@ mod capture_fix_tests {
             ("docs/netwatch.1", include_str!("../../docs/netwatch.1")),
         ] {
             assert!(
-                text.contains(LINUX_CAPTURE_FIX),
-                "{doc} gives another setcap line"
+                text.contains("cap_net_raw,cap_bpf,cap_perfmon+eip"),
+                "{doc} gives another capability set"
             );
         }
         let caps = LINUX_CAPTURE_FIX.split_whitespace().nth(2).unwrap();

@@ -488,7 +488,7 @@ pub enum EbpfStatus {
       <h2>Current sandbox boundary</h2>
       <div class="cols">
         <div>
-          <p class="lede">Worker entry points apply a prepared Linux filesystem policy before processing. Capture configures its device first. Grants use exact input files and dedicated output directories. The SDK eBPF source is disabled in sandboxed runs; privileged capture/restart validation remains pending. Network access remains unrestricted.</p>
+          <p class="lede">Worker entry points apply a prepared Linux filesystem policy before processing. Capture configures its device first. Grants use exact input files and dedicated output directories. The SDK eBPF reader inherits filesystem policy but retains load capabilities; privileged capture/restart validation remains pending. Network access remains unrestricted.</p>
           <div class="flowv" style="margin-top:8px">
             <div class="node k">App::prepare() + start_workers() — open pcap · PKTAP · eBPF (needs caps)</div><div class="down">↓</div>
             <div class="node p">worker entry — verified selected cap drops · pinned Landlock FS</div><div class="down">↓</div>
