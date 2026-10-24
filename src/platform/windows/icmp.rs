@@ -32,7 +32,7 @@ pub struct IcmpHandle {
 
 impl IcmpHandle {
     /// `None` when the handle cannot be created, the one case in which
-    /// callers fall back to `ping.exe` or `tracert` for an address.
+    /// traceroute falls back to `tracert` for an address.
     pub fn open(dst: IpAddr) -> Option<Self> {
         // SAFETY: both functions take no arguments and return either a new
         // handle or INVALID_HANDLE_VALUE; nothing else is touched.

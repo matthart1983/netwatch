@@ -71,8 +71,10 @@ All notable changes to NetWatch will be documented in this file.
   unbound, such as a capture-only NIC or the physical NIC under a Hyper-V
   external switch. Packet counts now include broadcast and multicast, as
   they do on Linux and macOS, from the API and its fallbacks alike.
-  PowerShell, `route print` and `netstat -e` remain only as fallbacks for
-  when an API call fails.
+  PowerShell and `route print` remain only as fallbacks for when an API
+  call fails. `netstat -e`, the last fallback for counters, is no longer
+  run. It gave one machine-wide row that matched no interface, and only on
+  an English install.
 - **Incident bundles hold `packets.pcapng`, and `manifest.json` is version
   2.** `packets.pcap` is still written when every packet shares one link
   type and is dated before 2106. The manifest lists the packet files
@@ -163,7 +165,8 @@ All notable changes to NetWatch will be documented in this file.
   echoes itself through the Windows ICMP API (`IcmpSendEcho2`, IPv4 and
   IPv6), which needs no administrator rights and answers with a status code
   instead of text. A reply under a millisecond shows its measured fraction,
-  not 0. netwatch runs `ping.exe` only if it cannot open the ICMP API.
+  not 0. netwatch no longer starts `ping.exe` at all. It needs the same
+  ICMP API, so it could not help where netwatch's own call fails.
 - **Windows: traceroute works.** Since 0.32 the trace subprocess refused to
   start off Unix, so `T` ended in an error on Windows. Windows now traces
   natively through the ICMP API, IPv4 and IPv6, with three probes a hop up
