@@ -531,6 +531,70 @@ fn wrap(lines: &mut Vec<String>, value: &str) {
     lines.push(line);
 }
 
+/// What static doctor can learn about Npcap without loading it: whether
+/// `wpcap.dll` is where an install puts it and, if so, what the Service
+/// Control Manager says about the `npcap` driver service. Only Windows asks,
+/// but this and the wording below are built for tests too, so the wording is
+/// checked on every platform and not only on the Windows runner.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Npcap {
+    /// No `wpcap.dll` in `System32\Npcap` or `System32`.
+    Missing,
+    /// The DLL is there. The service's `dwCurrentState`, or the Win32 error
+    /// from asking for it.
+    Installed(Result<u32, u32>),
+}
+
+/// The `capture_library` entry for what was found: state, reason, detail and
+/// next step. A missing Npcap gets the fix the capture error and the
+/// Dashboard banner give, link included. Files without a running driver say
+/// that, where doctor used to say "not loaded" whether Npcap was there or not.
+#[cfg(any(target_os = "windows", test))]
+fn npcap_capture_library(npcap: Npcap) -> (State, &'static str, String, String) {
+    const SERVICE_RUNNING: u32 = 4;
+    const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+    let check = "netwatch doctor --check-capture --interface NAME";
+    let install = format!("{}; then run {check}", crate::platform::WINDOWS_CAPTURE_FIX);
+    match npcap {
+        Npcap::Missing => (
+            State::Unavailable,
+            "npcap_missing",
+            r"Npcap is not installed: no wpcap.dll in System32\Npcap or System32".into(),
+            install,
+        ),
+        Npcap::Installed(Ok(SERVICE_RUNNING)) => (
+            State::NotChecked,
+            "npcap_present_unloaded",
+            "Npcap installed and its driver service running; DLL not loaded, no capture opened"
+                .into(),
+            check.into(),
+        ),
+        // `sc.exe`, not `sc`: in Windows PowerShell `sc` is Set-Content, so
+        // `sc start npcap` writes a file named `start` and starts nothing.
+        Npcap::Installed(Ok(_)) => (
+            State::Unavailable,
+            "npcap_driver_stopped",
+            "Npcap is installed but its driver service (npcap) is not running".into(),
+            format!("As administrator, run sc.exe start npcap or reinstall Npcap; then run {check}"),
+        ),
+        // WinPcap's DLL, or files a partial uninstall left behind. Either way
+        // the driver Npcap registers is not there to start.
+        Npcap::Installed(Err(ERROR_SERVICE_DOES_NOT_EXIST)) => (
+            State::Unavailable,
+            "npcap_driver_missing",
+            "wpcap.dll found, but no npcap driver service is registered (WinPcap, or a partial Npcap uninstall)".into(),
+            install,
+        ),
+        Npcap::Installed(Err(code)) => (
+            State::NotChecked,
+            "npcap_present_unloaded",
+            format!("Npcap files found; driver service state unreadable (Win32 error {code}); DLL not loaded"),
+            check.into(),
+        ),
+    }
+}
+
 pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
     let (config, config_state, code, detail) =
         match NetwatchConfig::path().map(std::fs::read_to_string) {
@@ -620,22 +684,14 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
     );
     #[cfg(target_os = "windows")]
     {
-        let present = crate::platform::npcap::installed();
-        snapshot.put(
-            "capture_library",
-            if present {
-                State::NotChecked
-            } else {
-                State::Unavailable
-            },
-            if present {
-                "npcap_present_unloaded"
-            } else {
-                "npcap_missing"
-            },
-            "Npcap standard installation paths inspected; DLL and driver not loaded",
-            Some("Install Npcap; then run doctor --check-capture --interface NAME"),
-        );
+        use crate::platform::npcap;
+        let found = if npcap::installed() {
+            Npcap::Installed(npcap::driver_service_state())
+        } else {
+            Npcap::Missing
+        };
+        let (state, reason, detail, next) = npcap_capture_library(found);
+        snapshot.put("capture_library", state, reason, &detail, Some(&next));
     }
     snapshot.put(
         "remote",
@@ -934,5 +990,105 @@ mod tests {
         assert!(text
             .lines()
             .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 80));
+    }
+
+    /// A machine with no Npcap is told where to get it, with the same words
+    /// as the capture error, and is not told the driver merely isn't loaded.
+    #[test]
+    fn missing_npcap_names_the_download() {
+        let (state, reason, detail, next) = npcap_capture_library(Npcap::Missing);
+        assert_eq!(state, State::Unavailable);
+        assert_eq!(reason, "npcap_missing");
+        assert!(detail.contains("not installed"), "{detail}");
+        assert!(
+            next.starts_with(crate::platform::WINDOWS_CAPTURE_FIX),
+            "{next}"
+        );
+        assert!(next.contains("https://npcap.com/#download"), "{next}");
+        assert!(next.contains("--check-capture"), "{next}");
+    }
+
+    /// Installed with the driver running is as far as static doctor can see:
+    /// not ready, because nothing was loaded or opened, and no install advice.
+    #[test]
+    fn installed_npcap_with_running_driver_is_not_checked() {
+        let (state, reason, detail, next) = npcap_capture_library(Npcap::Installed(Ok(4)));
+        assert_eq!(state, State::NotChecked);
+        assert_eq!(reason, "npcap_present_unloaded");
+        assert!(detail.contains("running"), "{detail}");
+        assert!(!next.contains("install"), "{next}");
+        assert!(next.contains("--check-capture"), "{next}");
+    }
+
+    /// SERVICE_STOPPED (1) and the pending states all mean capture would fail
+    /// now, and the fix is starting the driver, not installing Npcap again.
+    /// The command has to work in cmd and in Windows PowerShell, where a bare
+    /// `sc` is the Set-Content alias.
+    #[test]
+    fn installed_npcap_with_stopped_driver_says_so() {
+        for state_code in [1, 2, 3, 7] {
+            let (state, reason, detail, next) =
+                npcap_capture_library(Npcap::Installed(Ok(state_code)));
+            assert_eq!(state, State::Unavailable);
+            assert_eq!(reason, "npcap_driver_stopped");
+            assert!(detail.contains("not running"), "{detail}");
+            assert!(next.contains("sc.exe start npcap"), "{next}");
+            assert!(!next.contains("sc start"), "{next}");
+        }
+    }
+
+    /// A wpcap.dll with no npcap service behind it is WinPcap or uninstall
+    /// debris; the fix is installing Npcap, so it gets the download link.
+    #[test]
+    fn dll_without_a_driver_service_gets_the_install_fix() {
+        let (state, reason, _, next) = npcap_capture_library(Npcap::Installed(Err(1060)));
+        assert_eq!(state, State::Unavailable);
+        assert_eq!(reason, "npcap_driver_missing");
+        assert!(next.contains("https://npcap.com/#download"), "{next}");
+    }
+
+    /// An unanswered service query (access denied is 5) is not evidence of
+    /// anything, so the entry stays as it was before the query existed.
+    #[test]
+    fn unreadable_driver_state_claims_nothing() {
+        let (state, reason, detail, next) = npcap_capture_library(Npcap::Installed(Err(5)));
+        assert_eq!(state, State::NotChecked);
+        assert_eq!(reason, "npcap_present_unloaded");
+        assert!(detail.contains("Win32 error 5"), "{detail}");
+        assert!(!next.contains("install"), "{next}");
+    }
+
+    /// doctor's text wraps at 80 columns by character, so a link that
+    /// straddled a wrap would print in two pieces that neither a terminal nor
+    /// a reader can follow. The install advice must keep it on one line.
+    #[test]
+    fn npcap_download_link_survives_text_wrapping() {
+        for npcap in [Npcap::Missing, Npcap::Installed(Err(1060))] {
+            let mut snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+            let (state, reason, detail, next) = npcap_capture_library(npcap);
+            snapshot.put("capture_library", state, reason, &detail, Some(&next));
+            let text = snapshot.text();
+            assert!(
+                text.lines()
+                    .any(|line| line.contains("https://npcap.com/#download")),
+                "{text}"
+            );
+        }
+    }
+
+    /// This machine's answer, end to end. The CI runner has the Npcap SDK but
+    /// not Npcap, which is the case `npcap_missing` exists for.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn static_doctor_reports_this_machines_npcap() {
+        let entry = inspect_static(None).get("capture_library").clone();
+        if !crate::platform::npcap::installed() {
+            assert_eq!(entry.reason, "npcap_missing");
+            assert!(entry
+                .next_check
+                .is_some_and(|next| next.contains("https://npcap.com/#download")));
+        } else {
+            assert_ne!(entry.reason, "npcap_missing");
+        }
     }
 }

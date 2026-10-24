@@ -13,8 +13,21 @@ Cargo's options and passes the remaining arguments to Netwatch.
 Static doctor reads configuration and local setup facts. It does not start
 collectors, open capture, send probes, contact configured endpoints, inspect or
 recover journals, create state directories, or save configuration. On Windows it
-checks standard Npcap DLL locations before any Npcap initialization. A dynamically
+checks standard Npcap DLL locations and asks the Service Control Manager whether
+the `npcap` driver service is running, without loading Npcap. A dynamically
 linked build still requires its loader dependencies to start the executable.
+
+On Windows the `capture_library` entry's reason says which of these it found:
+
+| Reason | State | Meaning |
+| --- | --- | --- |
+| `npcap_missing` | `unavailable` | No `wpcap.dll` in `System32\Npcap` or `System32`. `next_check` gives the download link. |
+| `npcap_driver_stopped` | `unavailable` | Npcap's files are there but its driver service is not running. `next_check` gives `sc.exe start npcap`. |
+| `npcap_driver_missing` | `unavailable` | A `wpcap.dll` with no `npcap` driver service, as WinPcap or a partial uninstall leaves. |
+| `npcap_present_unloaded` | `not_checked` | Installed, and the driver is running or its state could not be read. Npcap is not loaded. `--check-capture` tests a real open. |
+
+Before 0.38, every Windows host with a `wpcap.dll` reported `not_checked`
+with `npcap_present_unloaded`, including the two `unavailable` cases above.
 
 Missing or malformed configuration is reported explicitly; malformed content and
 configured endpoint credentials are not echoed. Configuration defaults are used
@@ -68,3 +81,6 @@ Linux automated coverage includes CLI validation, serialization, narrow-terminal
 text, subprocess timeout cleanup, unavailable interfaces, malformed config,
 configured endpoint traps and unchanged recovery/configuration files. These tests
 do not establish privileged capture success or macOS/Windows runtime parity.
+On Windows, CI runs the release binary's `--version`, `doctor` and
+`doctor --json` on a runner without Npcap and checks that it reports
+`npcap_missing` with the download link.

@@ -33,6 +33,26 @@ All notable changes to NetWatch will be documented in this file.
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns
   every key overflowed.
+- **`netwatch doctor` on Windows says whether Npcap is installed, and where
+  to get it.** Without Npcap, the `capture_library` entry now says Npcap is
+  not installed, and its next step gives the https://npcap.com/#download
+  link that the capture error and the Dashboard banner already give. With
+  Npcap installed, doctor asks Windows whether the Npcap driver is running.
+  If it is not, the reason is `npcap_driver_stopped` and the next step is
+  `sc.exe start npcap` as administrator (`.exe`, because in Windows
+  PowerShell `sc` is Set-Content). A `wpcap.dll` with no Npcap driver
+  behind it, as WinPcap or a partial uninstall leaves, is
+  `npcap_driver_missing`. Both now report state `unavailable`; in 0.37 they
+  were `not_checked [npcap_present_unloaded]`. Before, doctor said "DLL and
+  driver not loaded" either way, and told a user who had Npcap to install
+  it.
+
+### CI
+- **Windows CI runs the binary it builds.** On a runner with no Npcap,
+  `netwatch --version` must print the Cargo.toml version, and
+  `netwatch doctor --json` must report `npcap_missing` with the download
+  link. Nothing started the built binary on Windows before. The release
+  workflow runs the same check on the Windows binary before packaging it.
 
 ## [0.37.0] - 2026-10-22
 
