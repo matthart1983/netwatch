@@ -1,8 +1,10 @@
 {
   lib,
+  stdenv,
   rustPlatform,
   pkg-config,
   libpcap,
+  iproute2,
 }:
 
 rustPlatform.buildRustPackage {
@@ -18,6 +20,9 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
 
   buildInputs = [ libpcap ];
+
+  # The Linux connection collector shells out to `ss`
+  nativeCheckInputs = lib.optionals stdenv.hostPlatform.isLinux [ iproute2 ];
 
   meta = {
     description = "Real-time network diagnostics in your terminal — like htop for your network";
