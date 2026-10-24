@@ -218,6 +218,32 @@ All notable changes to NetWatch will be documented in this file.
   IPv6 traffic that had no name before, and a `deny_sni` list now catches
   IPv6 traffic it used to miss.
 
+### Security
+- **netwatch.log no longer records credentials from the `--remote` URL.**
+  When a POST to the remote backend failed, the warning carried the whole
+  ingest URL, so a user name and password in it, or a token in its query
+  string, went into a file that outlives the session and gets attached to
+  bug reports. The log now names the backend by scheme, host, port and path.
+- **`netwatch diagnose episodes` and `replay` print a shared episode as
+  plain text.** They printed ids, times, issue keys, causes and lab scenario
+  names as the file had them, so an episode someone sent you could carry
+  escape sequences that retitle the terminal or write the clipboard through
+  OSC 52. Those characters now print as `·`, as in the TUI, and so do the
+  same characters in file names and in load errors, which can quote the
+  file. `diagnose episodes` no longer panics on an id with a multi-byte
+  character across its eighth byte. Replay no longer panics when the first
+  frame's time does not parse, as happened to any recording that began in
+  the hour a clock goes back.
+- **An episode stops loading at 450 MiB.** `diagnose episodes`, `replay`,
+  `features` and `export` inflated a gzipped episode in full before parsing
+  it, so a 1 MiB file of compressed zeros took a gigabyte of memory, and a
+  larger one could take all of it. Loading now stops past 450 MiB
+  uncompressed, far more than any recording netwatch makes, with an error
+  that says so. `netwatch uptime` likewise skips a log line longer than
+  64 KiB and warns how many it skipped, where it used to read a line of any
+  length. A line that is not valid UTF-8 now costs that line only; it used
+  to end the rest of that day's file.
+
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
   toml 0.8 parsed through its own copy of toml_edit 0.22, next to the

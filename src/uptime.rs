@@ -24,7 +24,7 @@
 //! compatibility promise.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
@@ -42,6 +42,10 @@ pub const GAP_SECS: u64 = 3 * HEARTBEAT_SECS;
 pub const RETAIN_DAYS: i64 = 90;
 /// Version of the `--json` and `--csv` output.
 pub const SCHEMA: u32 = 1;
+/// Longest line [`load`] reads. A record is under a hundred bytes, so a
+/// longer line is not one netwatch wrote, and reading it whole would let a
+/// single file take all the memory there is.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -629,9 +633,10 @@ impl Accumulator {
 }
 
 /// Every record under `dir` from files that can hold times at or after
-/// `since`. A line that does not parse is skipped, so a torn last line from
-/// a crash costs that line only.
-pub fn load(dir: &Path, since: u64) -> Vec<Record> {
+/// `since`, and how many lines were skipped for running past
+/// [`MAX_LINE_BYTES`]. A line that does not parse is skipped too, so a torn
+/// last line from a crash costs that line only.
+pub fn load(dir: &Path, since: u64) -> (Vec<Record>, usize) {
     let first_day = Utc
         .timestamp_opt(since as i64, 0)
         .single()
@@ -648,17 +653,34 @@ pub fn load(dir: &Path, since: u64) -> Vec<Record> {
         .collect();
     files.sort();
     let mut out = Vec::new();
+    let mut overlong = 0;
+    let mut line = Vec::new();
+    // One byte over the limit tells a line that fits from one that runs on.
+    let limit = MAX_LINE_BYTES as u64 + 1;
     for path in files {
         let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            if let Ok(record) = serde_json::from_str::<Record>(&line) {
+        let mut reader = std::io::BufReader::new(file);
+        loop {
+            line.clear();
+            match reader.by_ref().take(limit).read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if line.len() > MAX_LINE_BYTES && line.last() != Some(&b'\n') {
+                overlong += 1;
+                if reader.skip_until(b'\n').is_err() {
+                    break;
+                }
+                continue;
+            }
+            if let Ok(record) = serde_json::from_slice::<Record>(&line) {
                 out.push(record);
             }
         }
     }
-    out
+    (out, overlong)
 }
 
 // ── Command ─────────────────────────────────────────────────────────────────
@@ -698,7 +720,14 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     };
     let until = now_unix();
     let since = until.saturating_sub(since_secs);
-    let report = report(load(&dir, since), since, until);
+    let (records, overlong) = load(&dir, since);
+    if overlong > 0 {
+        eprintln!(
+            "warning: skipped {overlong} uptime log lines longer than {} KiB",
+            MAX_LINE_BYTES / 1024
+        );
+    }
+    let report = report(records, since, until);
     let out = match format {
         Format::Text => text(&report, &dir),
         Format::Json => serde_json::to_string_pretty(&json(&report))? + "\n",
@@ -1049,13 +1078,59 @@ mod tests {
             .open(&path)
             .unwrap();
         f.write_all(b"{\"kind\":\"beat\",\"t\":").unwrap();
-        assert_eq!(load(&dir, now_unix() - 60), recs);
+        assert_eq!(load(&dir, now_unix() - 60), (recs, 0));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No record netwatch writes comes near the limit. A longer line is
+    /// skipped even when it parses, and the lines after it still count.
+    #[test]
+    fn uptime_load_skips_overlong_line() {
+        let dir = std::env::temp_dir().join(format!("nw-uptime-{}", uuid::Uuid::new_v4()));
+        let log = Log::new(dir.clone());
+        let first = start(now_unix());
+        log.append(&first).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(file_name(now_unix())))
+            .unwrap();
+        writeln!(
+            f,
+            "{{\"kind\":\"beat\",\"t\":{}{}}}",
+            now_unix(),
+            " ".repeat(MAX_LINE_BYTES)
+        )
+        .unwrap();
+        drop(f);
+        let last = hop(now_unix(), Hop::Dns, HopState::Down);
+        log.append(&last).unwrap();
+        assert_eq!(load(&dir, now_unix() - 60), (vec![first, last], 1));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `lines()` stopped at the first line that was not UTF-8, which cost the
+    /// rest of the file.
+    #[test]
+    fn a_line_that_is_not_utf8_costs_that_line_only() {
+        let dir = std::env::temp_dir().join(format!("nw-uptime-{}", uuid::Uuid::new_v4()));
+        let log = Log::new(dir.clone());
+        let first = start(now_unix());
+        log.append(&first).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(file_name(now_unix())))
+            .unwrap();
+        f.write_all(b"\xff\xfe\n").unwrap();
+        drop(f);
+        let last = hop(now_unix(), Hop::Dns, HopState::Down);
+        log.append(&last).unwrap();
+        assert_eq!(load(&dir, now_unix() - 60), (vec![first, last], 0));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
