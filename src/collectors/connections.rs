@@ -24,6 +24,12 @@ pub enum AttributionSource {
     /// kernel socket-table walk, but still a point-in-time poll like `Lsof`,
     /// not an independently corroborated event.
     Sockstat,
+    /// Windows: the owning PID the kernel's TCP and UDP tables keep for each
+    /// socket, read through IP Helper (`GetExtendedTcpTable`). Kernel data,
+    /// but a point-in-time poll like `Sockstat`, with no process-start
+    /// identity behind the PID. Rows from the `netstat -ano` fallback stay
+    /// `Lsof`, the label Linux's scraped `ss` rows carry too.
+    IpHelper,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1602,24 +1608,147 @@ fn overlay_proc_snapshot(connections: &mut [Connection], snap: &ProcSnapshot) {
     }
 }
 
+/// Windows: the kernel's TCP and UDP tables through IP Helper, each socket
+/// with the PID that owns it, named from one process snapshot.
+///
+/// This used to be `netstat -ano` and `tasklist /FO CSV` on every tick: two
+/// processes, and text in the display language, so German Windows reported
+/// `HERGESTELLT` where every filter and counter looks for `ESTABLISHED`, and
+/// English reported `LISTENING`, which nothing matched either. Both commands
+/// remain only as fallbacks, used when the API call they stand in for fails.
 #[cfg(target_os = "windows")]
-fn resolve_pids(pids: &[u32]) -> HashMap<u32, String> {
-    let mut map = HashMap::new();
-    if pids.is_empty() {
-        return map;
-    }
+fn parse_windows_connections() -> Vec<Connection> {
+    use crate::platform::windows::tcp_table;
 
-    let output = match Command::new("tasklist")
+    let (sockets, attribution) = match tcp_table::sockets() {
+        Ok(sockets) => (sockets, AttributionSource::IpHelper),
+        Err(code) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    target: "netwatch::connections",
+                    code,
+                    "GetExtendedTcpTable/GetExtendedUdpTable failed; reading netstat -ano instead"
+                );
+            });
+            let Ok(output) = Command::new("netstat").args(["-ano"]).output() else {
+                return Vec::new();
+            };
+            (
+                parse_netstat_output(&String::from_utf8_lossy(&output.stdout)),
+                AttributionSource::Lsof,
+            )
+        }
+    };
+
+    let pids: HashSet<u32> = sockets.iter().filter_map(|s| s.pid).collect();
+    let names = if pids.is_empty() {
+        HashMap::new()
+    } else {
+        // tasklist prints the same image names; it is only asked when the
+        // snapshot itself fails.
+        tcp_table::process_names(&pids).unwrap_or_else(|_| tasklist_names(&pids))
+    };
+    windows_connections(sockets, &names, attribution)
+}
+
+/// Rows of the Windows socket tables, named from `names`, as connections.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_connections(
+    sockets: Vec<crate::platform::socket_table::Socket>,
+    names: &HashMap<u32, String>,
+    attribution: AttributionSource,
+) -> Vec<Connection> {
+    sockets
+        .into_iter()
+        .map(|s| Connection {
+            protocol: s.protocol.to_string(),
+            local_addr: s.local_addr,
+            remote_addr: s.remote_addr,
+            state: s.state,
+            process_name: s.pid.and_then(|p| names.get(&p).cloned()),
+            pid: s.pid,
+            handshake_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+            attribution,
+            evidence: Default::default(),
+            app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
+        })
+        .collect()
+}
+
+/// `netstat -ano`, for when the socket tables cannot be read through the API.
+/// Brought into line with what the API path reports wherever netstat's text
+/// allows: English state names become netwatch's, a listener's `0.0.0.0:0`
+/// or `[::]:0` peer becomes `*:*`, a link-local address loses its `%12`
+/// scope, and PID 0 is no owner. A state in another display language is kept
+/// as netstat printed it; only the API path can name it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_netstat_output(text: &str) -> Vec<crate::platform::socket_table::Socket> {
+    use crate::platform::socket_table::{netstat_state_name, owner, Socket};
+
+    let mut sockets = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let (protocol, state, pid) = match cols.as_slice() {
+            // TCP lines: Proto LocalAddr ForeignAddr State PID
+            ["TCP", _, _, state, pid, ..] => (
+                "TCP",
+                netstat_state_name(state)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| state.to_string()),
+                pid,
+            ),
+            // UDP lines: Proto LocalAddr ForeignAddr PID (no state)
+            ["UDP", _, _, pid, ..] => ("UDP", String::new(), pid),
+            _ => continue,
+        };
+        let remote = match cols[2] {
+            "0.0.0.0:0" | "[::]:0" => "*:*".to_string(),
+            other => without_scope(other),
+        };
+        sockets.push(Socket {
+            protocol,
+            local_addr: without_scope(cols[1]),
+            remote_addr: remote,
+            state,
+            pid: pid.parse().ok().and_then(owner),
+        });
+    }
+    sockets
+}
+
+/// A netstat endpoint without the scope it prints on a link-local IPv6
+/// address (`[fe80::1%12]:1900`). The API rows carry none, so a socket read
+/// through either path has the same endpoint, and the same flow key.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn without_scope(endpoint: &str) -> String {
+    match (endpoint.find('%'), endpoint.find(']')) {
+        (Some(scope), Some(close)) if scope < close => {
+            format!("{}{}", &endpoint[..scope], &endpoint[close..])
+        }
+        _ => endpoint.to_string(),
+    }
+}
+
+/// PID -> image name from `tasklist`, for when a process snapshot fails.
+#[cfg(target_os = "windows")]
+fn tasklist_names(pids: &HashSet<u32>) -> HashMap<u32, String> {
+    match Command::new("tasklist")
         .args(["/FO", "CSV", "/NH"])
         .output()
     {
-        Ok(o) => o,
-        Err(_) => return map,
-    };
+        Ok(output) => parse_tasklist_output(&String::from_utf8_lossy(&output.stdout), pids),
+        Err(_) => HashMap::new(),
+    }
+}
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let pid_set: HashSet<u32> = pids.iter().copied().collect();
-
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_tasklist_output(text: &str, pids: &HashSet<u32>) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
     for line in text.lines() {
         // Format: "process.exe","1234","Console","1","12,345 K"
         let fields: Vec<&str> = line.split(',').collect();
@@ -1629,105 +1758,12 @@ fn resolve_pids(pids: &[u32]) -> HashMap<u32, String> {
         let name = fields[0].trim_matches('"');
         let pid_str = fields[1].trim_matches('"');
         if let Ok(pid) = pid_str.parse::<u32>() {
-            if pid_set.contains(&pid) {
+            if pids.contains(&pid) {
                 map.insert(pid, name.to_string());
             }
         }
     }
-
     map
-}
-
-#[cfg(target_os = "windows")]
-fn parse_windows_connections() -> Vec<Connection> {
-    let output = match Command::new("netstat").args(["-ano"]).output() {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    struct RawConn {
-        protocol: String,
-        local_addr: String,
-        remote_addr: String,
-        state: String,
-        pid: Option<u32>,
-    }
-
-    let mut raw_connections = Vec::new();
-    let mut all_pids = HashSet::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("TCP") && !trimmed.starts_with("UDP") {
-            continue;
-        }
-
-        let cols: Vec<&str> = trimmed.split_whitespace().collect();
-
-        let (protocol, local_addr, remote_addr, state, pid) = if cols[0] == "UDP" {
-            // UDP lines: Proto LocalAddr ForeignAddr PID (no state)
-            if cols.len() < 4 {
-                continue;
-            }
-            let pid: Option<u32> = cols[3].parse().ok();
-            (
-                cols[0].to_string(),
-                cols[1].to_string(),
-                cols[2].to_string(),
-                String::new(),
-                pid,
-            )
-        } else {
-            // TCP lines: Proto LocalAddr ForeignAddr State PID
-            if cols.len() < 5 {
-                continue;
-            }
-            let pid: Option<u32> = cols[4].parse().ok();
-            (
-                cols[0].to_string(),
-                cols[1].to_string(),
-                cols[2].to_string(),
-                cols[3].to_string(),
-                pid,
-            )
-        };
-
-        if let Some(p) = pid {
-            all_pids.insert(p);
-        }
-
-        raw_connections.push(RawConn {
-            protocol,
-            local_addr,
-            remote_addr,
-            state,
-            pid,
-        });
-    }
-
-    let pid_names = resolve_pids(&all_pids.into_iter().collect::<Vec<_>>());
-
-    raw_connections
-        .into_iter()
-        .map(|rc| Connection {
-            protocol: rc.protocol,
-            local_addr: rc.local_addr,
-            remote_addr: rc.remote_addr,
-            state: rc.state,
-            process_name: rc.pid.and_then(|p| pid_names.get(&p).cloned()),
-            pid: rc.pid,
-            handshake_rtt_us: None,
-            rx_rate: None,
-            tx_rate: None,
-            attribution: AttributionSource::Lsof,
-            evidence: Default::default(),
-            app_protocol: None,
-            retransmits: 0,
-            out_of_order: 0,
-        })
-        .collect()
 }
 
 /// Export connections to JSON file
@@ -2794,6 +2830,203 @@ mod tests {
             !collector.busy.load(Ordering::SeqCst),
             "the poll died on the poisoned tracker"
         );
+    }
+}
+
+#[cfg(test)]
+mod windows_table_tests {
+    use super::*;
+    use crate::platform::socket_table::Socket;
+
+    // `netstat -ano` from an English Windows 11, trimmed.
+    const NETSTAT_EN: &str = "
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1116
+  TCP    127.0.0.1:50443        127.0.0.1:50444        ESTABLISHED     8812
+  TCP    192.168.1.20:50611     140.82.112.25:443      TIME_WAIT       0
+  TCP    192.168.1.20:50612     140.82.112.25:443      CLOSE_WAIT      8812
+  TCP    [::]:445               [::]:0                 LISTENING       4
+  TCP    [::1]:50500            [::1]:8080             SYN_SENT        8812
+  UDP    0.0.0.0:5353           *:*                                    2260
+  UDP    [::]:5353              *:*                                    2260
+";
+
+    // The same listener and connection on a German install.
+    const NETSTAT_DE: &str = "
+Aktive Verbindungen
+
+  Proto  Lokale Adresse         Remoteadresse          Status           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              ABHÖREN          1116
+  TCP    127.0.0.1:50443        127.0.0.1:50444        HERGESTELLT      8812
+";
+
+    #[test]
+    fn english_netstat_rows_read_like_the_api_rows() {
+        let rows = parse_netstat_output(NETSTAT_EN);
+        assert_eq!(rows.len(), 8, "header and blank lines are skipped");
+        assert_eq!(
+            rows[0],
+            Socket {
+                protocol: "TCP",
+                local_addr: "0.0.0.0:135".into(),
+                remote_addr: "*:*".into(),
+                state: "LISTEN".into(),
+                pid: Some(1116),
+            }
+        );
+        let states: Vec<&str> = rows.iter().map(|r| r.state.as_str()).collect();
+        assert_eq!(
+            states,
+            [
+                "LISTEN",
+                "ESTABLISHED",
+                "TIME-WAIT",
+                "CLOSE-WAIT",
+                "LISTEN",
+                "SYN-SENT",
+                "",
+                ""
+            ]
+        );
+        assert_eq!(rows[2].pid, None, "TIME_WAIT's PID 0 owns nothing");
+        assert_eq!(rows[4].remote_addr, "*:*");
+        assert_eq!(rows[5].local_addr, "[::1]:50500");
+        assert_eq!(rows[6].protocol, "UDP");
+        assert_eq!(rows[6].remote_addr, "*:*");
+        assert_eq!(rows[6].pid, Some(2260));
+    }
+
+    /// The fallback cannot translate, and does not pretend to: the API is
+    /// what fixes a German install. The rest of the row still reads.
+    #[test]
+    fn a_translated_netstat_state_is_kept_verbatim() {
+        let rows = parse_netstat_output(NETSTAT_DE);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].state, "ABHÖREN");
+        assert_eq!(rows[0].remote_addr, "*:*");
+        assert_eq!(rows[1].state, "HERGESTELLT");
+        assert_eq!(rows[1].pid, Some(8812));
+    }
+
+    /// The API rows carry no IPv6 scope; the fallback drops netstat's, so
+    /// the same socket keeps one endpoint whichever path read it.
+    #[test]
+    fn netstat_link_local_endpoints_lose_their_scope() {
+        let rows = parse_netstat_output(
+            "  TCP    [fe80::a5d1:f1c0:5bd4:3f7b%12]:50700  [fe80::1%12]:445  ESTABLISHED  8812
+  UDP    [fe80::a5d1:f1c0:5bd4:3f7b%12]:1900  *:*  2260
+",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].local_addr, "[fe80::a5d1:f1c0:5bd4:3f7b]:50700");
+        assert_eq!(rows[0].remote_addr, "[fe80::1]:445");
+        assert_eq!(rows[1].local_addr, "[fe80::a5d1:f1c0:5bd4:3f7b]:1900");
+        assert_eq!(rows[1].remote_addr, "*:*");
+        assert_eq!(
+            normalize_addr(&rows[0].local_addr),
+            Some(("fe80::a5d1:f1c0:5bd4:3f7b".parse().unwrap(), 50700))
+        );
+    }
+
+    #[test]
+    fn short_netstat_rows_are_skipped() {
+        assert!(parse_netstat_output("  TCP    0.0.0.0:135\n  UDP 0.0.0.0:53\n").is_empty());
+        assert!(parse_netstat_output("").is_empty());
+    }
+
+    #[test]
+    fn tasklist_names_only_the_pids_asked_for() {
+        let text = "\"System Idle Process\",\"0\",\"Services\",\"0\",\"8 K\"\n\
+                    \"svchost.exe\",\"1116\",\"Services\",\"0\",\"12,345 K\"\n\
+                    \"chrome.exe\",\"8812\",\"Console\",\"1\",\"250,000 K\"\n";
+        let names = parse_tasklist_output(text, &HashSet::from([8812, 1116, 77]));
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[&8812], "chrome.exe");
+        assert_eq!(names[&1116], "svchost.exe");
+    }
+
+    #[test]
+    fn table_rows_become_named_connections_with_their_source() {
+        let sockets = vec![
+            Socket {
+                protocol: "TCP",
+                local_addr: "127.0.0.1:50443".into(),
+                remote_addr: "127.0.0.1:8080".into(),
+                state: "ESTABLISHED".into(),
+                pid: Some(8812),
+            },
+            Socket {
+                protocol: "TCP",
+                local_addr: "127.0.0.1:50444".into(),
+                remote_addr: "127.0.0.1:8080".into(),
+                state: "TIME-WAIT".into(),
+                pid: None,
+            },
+            Socket {
+                protocol: "UDP",
+                local_addr: "0.0.0.0:5353".into(),
+                remote_addr: "*:*".into(),
+                state: String::new(),
+                pid: Some(31337),
+            },
+        ];
+        let names = HashMap::from([(8812, "chrome.exe".to_string())]);
+        let conns = windows_connections(sockets, &names, AttributionSource::IpHelper);
+        assert_eq!(conns.len(), 3);
+        assert!(conns
+            .iter()
+            .all(|c| c.attribution == AttributionSource::IpHelper));
+        assert_eq!(conns[0].process_name.as_deref(), Some("chrome.exe"));
+        assert_eq!(conns[0].pid, Some(8812));
+        assert_eq!(
+            process_label(conns[1].process_name.as_deref(), conns[1].pid),
+            UNATTRIBUTED
+        );
+        // An exited process keeps its pid and reads as `pid:N`.
+        assert_eq!(
+            process_label(conns[2].process_name.as_deref(), conns[2].pid),
+            "pid:31337"
+        );
+        assert_eq!(
+            connection_stream_key(&conns[0]).map(|(k, _)| k),
+            Some(StreamKey::new(
+                StreamProtocol::Tcp,
+                "127.0.0.1",
+                50443,
+                "127.0.0.1",
+                8080
+            ))
+        );
+    }
+
+    #[test]
+    fn ip_helper_rows_serialise_as_iphelper() {
+        assert_eq!(
+            serde_json::to_value(AttributionSource::IpHelper).unwrap(),
+            serde_json::json!("iphelper")
+        );
+    }
+
+    /// The whole Windows path, API to named row: a listener this test opens
+    /// comes back under its own pid and image name, labelled as IP Helper.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn live_windows_collector_names_its_own_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let local = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let conns = parse_windows_connections();
+        let row = conns
+            .iter()
+            .find(|c| c.protocol == "TCP" && c.local_addr == local)
+            .unwrap_or_else(|| panic!("no row for {local}"));
+        assert_eq!(row.state, "LISTEN");
+        assert_eq!(row.remote_addr, "*:*");
+        assert_eq!(row.pid, Some(std::process::id()));
+        assert_eq!(row.attribution, AttributionSource::IpHelper);
+        let name = row.process_name.as_deref().unwrap_or_default();
+        assert!(name.starts_with("netwatch"), "named {name:?}");
     }
 }
 

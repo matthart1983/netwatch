@@ -27,12 +27,45 @@ All notable changes to NetWatch will be documented in this file.
 - **`q` closes the help, settings and memory overlays** instead of quitting
   netwatch, as `Esc` does. Pressed on an overlay, it nearly always meant
   "close this" (#94). `Ctrl+C` still quits from anywhere.
+- **Windows reads connections through IP Helper, not netstat and
+  tasklist.** Each socket and its owning PID come from
+  `GetExtendedTcpTable` and `GetExtendedUdpTable`, and process names from
+  one process snapshot, where every refresh used to start two commands. The
+  names are the `chrome.exe` names tasklist gave. A listener's peer reads
+  `*:*` instead of `0.0.0.0:0`. An IPv6 link-local address no longer carries
+  its `%12` scope suffix, in the views and in the JSON and CSV exports. A
+  TIME_WAIT connection reads "unattributed" instead of "System Idle
+  Process", since no process owns it any more. The connection detail's
+  Match line says `IpHelper`. netstat and tasklist are used only if those
+  calls fail.
 
 ### Fixed
 - **Lite view: keys no longer overflow in a terminal smaller than its
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns
   every key overflowed.
+- **Windows: connection states read the same in every display language.**
+  netstat translates its state column: German Windows showed `HERGESTELLT`
+  and `ABHÖREN`, which matched no state filter, colour or counter,
+  including the TIME_WAIT and CLOSE_WAIT counts behind the Prometheus
+  metrics, and English showed `LISTENING`, so the listen filter found
+  nothing. The state now arrives as a number and is named as on Linux
+  (`ESTABLISHED`, `LISTEN`, `TIME-WAIT`), in the views and in the JSON and
+  CSV exports.
+- **Processes view: SOCKET STATES counts CLOSE-WAIT, FIN-WAIT and SYN
+  sockets on Linux.** It knew only lsof's spelling (`CLOSE_WAIT`), so it
+  counted Linux's `CLOSE-WAIT` as other.
+- **Linux: the Dense view dims closing sockets, and the Connections view
+  flags CLOSE-WAIT.** Both knew only lsof's spellings (`TIME_WAIT`,
+  `CLOSE_WAIT`), not the `TIME-WAIT` and `CLOSE-WAIT` that Linux, and now
+  Windows, report. A closing row in the Dense view drew as live, with its
+  state cut to `TIME-WA…`, and a `CLOSE-WAIT` or `FIN-WAIT` row in the
+  Connections view was muted instead of drawn in the error colour.
+
+### Dependencies
+- **windows-sys 0.61 is a direct dependency on Windows**, for the IP Helper
+  and Toolhelp32 calls. tokio, mio and socket2 already built it there, so
+  no new crate is compiled.
 
 ## [0.37.0] - 2026-10-22
 

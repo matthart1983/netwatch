@@ -490,6 +490,23 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
     }
 }
 
+/// The SOCKET STATES row a connection counts towards. Linux and Windows
+/// spell states as `ss` does (`CLOSE-WAIT`), macOS as lsof does
+/// (`CLOSE_WAIT`), so each row takes both spellings.
+fn socket_state_row(state: &str) -> &'static str {
+    match state {
+        "ESTABLISHED" => "ESTABLISHED",
+        "LISTEN" => "LISTEN",
+        "TIME_WAIT" | "TIME-WAIT" => "TIME_WAIT",
+        "CLOSE_WAIT" | "CLOSE-WAIT" => "CLOSE_WAIT",
+        "FIN_WAIT_1" | "FIN_WAIT_2" | "FIN_WAIT1" | "FIN_WAIT2" | "FIN-WAIT-1" | "FIN-WAIT-2" => {
+            "FIN_WAIT"
+        }
+        "SYN_SENT" | "SYN_RECV" | "SYN_RECEIVED" | "SYN_RCVD" | "SYN-SENT" | "SYN-RECV" => "SYN",
+        _ => "OTHER",
+    }
+}
+
 fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth) {
     let t = &app.theme;
     f.render_widget(
@@ -511,16 +528,7 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
         if c.pid != proc.pid {
             continue;
         }
-        let label = match c.state.as_str() {
-            "ESTABLISHED" => "ESTABLISHED",
-            "LISTEN" => "LISTEN",
-            "TIME_WAIT" | "TIME-WAIT" => "TIME_WAIT",
-            "CLOSE_WAIT" => "CLOSE_WAIT",
-            "FIN_WAIT_1" | "FIN_WAIT_2" | "FIN_WAIT1" | "FIN_WAIT2" => "FIN_WAIT",
-            "SYN_SENT" | "SYN_RECV" | "SYN_RECEIVED" => "SYN",
-            _ => "OTHER",
-        };
-        *counts.entry(label).or_insert(0) += 1;
+        *counts.entry(socket_state_row(&c.state)).or_insert(0) += 1;
     }
     drop(conns);
 
@@ -660,4 +668,31 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::socket_state_row;
+
+    /// `ss` and the Windows socket tables use hyphens, lsof underscores. The
+    /// panel used to count a Linux CLOSE-WAIT, FIN-WAIT or SYN-SENT socket
+    /// as OTHER.
+    #[test]
+    fn both_spellings_of_each_state_count_in_the_same_row() {
+        for (ss, lsof, row) in [
+            ("TIME-WAIT", "TIME_WAIT", "TIME_WAIT"),
+            ("CLOSE-WAIT", "CLOSE_WAIT", "CLOSE_WAIT"),
+            ("FIN-WAIT-1", "FIN_WAIT_1", "FIN_WAIT"),
+            ("FIN-WAIT-2", "FIN_WAIT_2", "FIN_WAIT"),
+            ("SYN-SENT", "SYN_SENT", "SYN"),
+            ("SYN-RECV", "SYN_RCVD", "SYN"),
+        ] {
+            assert_eq!(socket_state_row(ss), row, "{ss}");
+            assert_eq!(socket_state_row(lsof), row, "{lsof}");
+        }
+        assert_eq!(socket_state_row("ESTABLISHED"), "ESTABLISHED");
+        assert_eq!(socket_state_row("LISTEN"), "LISTEN");
+        assert_eq!(socket_state_row("CLOSED"), "OTHER");
+        assert_eq!(socket_state_row(""), "OTHER");
+    }
 }

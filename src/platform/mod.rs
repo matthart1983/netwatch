@@ -16,6 +16,9 @@ pub mod pktap;
 /// Kernel-derived process identity — every platform, including the fallback
 /// that returns nothing so callers keep the name they already had.
 pub mod procname;
+/// Decoding of the Windows TCP and UDP socket tables. Platform-neutral so it
+/// is tested everywhere; only the calls that read the tables are gated.
+pub mod socket_table;
 #[cfg(target_os = "windows")]
 pub mod windows;
 

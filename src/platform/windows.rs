@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 mod iphlpapi;
+pub mod tcp_table;
 
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     // Try PowerShell Get-NetAdapterStatistics for per-interface stats
