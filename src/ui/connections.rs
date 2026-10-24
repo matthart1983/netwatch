@@ -2228,4 +2228,32 @@ mod tests {
         let s = rtt_sparkline(&h);
         assert_eq!(s.chars().count(), 20);
     }
+
+    /// The detail strip shows WHOIS for the selected row only after W. It
+    /// used to queue the lookup itself, so moving the cursor down the table
+    /// sent each remote address to rdap.org.
+    #[test]
+    fn drawing_the_selected_connection_queues_no_whois_lookup() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.connection_collector
+            .publish_for_test(vec![conn("curl", "ESTABLISHED", "8.8.8.8:443")]);
+        app.ui.connection_group = ConnectionGroup::None;
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("127.0.0.1:1234  →  8.8.8.8:443"),
+            "detail not drawn"
+        );
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+    }
 }
