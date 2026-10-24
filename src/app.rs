@@ -4522,13 +4522,13 @@ mod tests {
             app.ui.scroll.topology_scroll = cursor;
             let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
             terminal
-                .draw(|f| crate::ui::topology::render(f, &app, f.size()))
+                .draw(|f| crate::ui::topology::render(f, &app, f.area()))
                 .unwrap();
             let buf = terminal.backend().buffer();
             let screen: Vec<String> = (0..buf.area.height)
                 .map(|y| {
                     (0..buf.area.width)
-                        .map(|x| buf.get(x, y).symbol())
+                        .map(|x| buf[(x, y)].symbol())
                         .collect()
                 })
                 .collect();
