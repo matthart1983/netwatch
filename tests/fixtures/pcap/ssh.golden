@@ -1,39 +1,39 @@
-#1 SSH 2001:db8:0:0:0:0:0:10:50022 -> 2001:db8:0:0:0:0:0:20:22 len=74 expert=Chat
-  info: 2001:db8:0:0:0:0:0:10:50022 → 2001:db8:0:0:0:0:0:20:22 [SYN] Seq=1000 Win=64240 Payload=0
+#1 SSH [2001:db8::10]:50022 -> [2001:db8::20]:22 len=74 expert=Chat
+  info: [2001:db8::10]:50022 → [2001:db8::20]:22 [SYN] Seq=1000 Win=64240 Payload=0
   stream: 0
   | Frame: 74 bytes on wire
   | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv6 (0x86dd)
-  | IPv6: 2001:db8:0:0:0:0:0:10 → 2001:db8:0:0:0:0:0:20, Hop Limit: 64, Next: TCP (6), Payload: 20
+  | IPv6: 2001:db8::10 → 2001:db8::20, Hop Limit: 64, Next: TCP (6), Payload: 20
   | TCP: 50022 (—) → 22 (SSH), Seq: 1000, Flags: [SYN], Win: 64240
-#2 SSH 2001:db8:0:0:0:0:0:20:22 -> 2001:db8:0:0:0:0:0:10:50022 len=74 expert=Chat
-  info: 2001:db8:0:0:0:0:0:20:22 → 2001:db8:0:0:0:0:0:10:50022 [SYN,ACK] Seq=5000 Win=64240 Ack=1001 Payload=0
+#2 SSH [2001:db8::20]:22 -> [2001:db8::10]:50022 len=74 expert=Chat
+  info: [2001:db8::20]:22 → [2001:db8::10]:50022 [SYN,ACK] Seq=5000 Win=64240 Ack=1001 Payload=0
   stream: 0
   | Frame: 74 bytes on wire
   | Ethernet: 02:00:00:00:00:02 → 02:00:00:00:00:01, Type: IPv6 (0x86dd)
-  | IPv6: 2001:db8:0:0:0:0:0:20 → 2001:db8:0:0:0:0:0:10, Hop Limit: 64, Next: TCP (6), Payload: 20
+  | IPv6: 2001:db8::20 → 2001:db8::10, Hop Limit: 64, Next: TCP (6), Payload: 20
   | TCP: 22 (SSH) → 50022 (—), Seq: 5000, Flags: [SYN,ACK], Win: 64240, Ack: 1001
-#3 SSH 2001:db8:0:0:0:0:0:10:50022 -> 2001:db8:0:0:0:0:0:20:22 len=74 expert=Chat
-  info: 2001:db8:0:0:0:0:0:10:50022 → 2001:db8:0:0:0:0:0:20:22 [ACK] Seq=1001 Win=64240 Ack=5001 Payload=0
+#3 SSH [2001:db8::10]:50022 -> [2001:db8::20]:22 len=74 expert=Chat
+  info: [2001:db8::10]:50022 → [2001:db8::20]:22 [ACK] Seq=1001 Win=64240 Ack=5001 Payload=0
   stream: 0
   | Frame: 74 bytes on wire
   | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv6 (0x86dd)
-  | IPv6: 2001:db8:0:0:0:0:0:10 → 2001:db8:0:0:0:0:0:20, Hop Limit: 64, Next: TCP (6), Payload: 20
+  | IPv6: 2001:db8::10 → 2001:db8::20, Hop Limit: 64, Next: TCP (6), Payload: 20
   | TCP: 50022 (—) → 22 (SSH), Seq: 1001, Flags: [ACK], Win: 64240, Ack: 5001
-#4 SSH 2001:db8:0:0:0:0:0:20:22 -> 2001:db8:0:0:0:0:0:10:50022 len=95 expert=Chat
-  info: 2001:db8:0:0:0:0:0:20:22 → 2001:db8:0:0:0:0:0:10:50022 SSH-2.0-OpenSSH_9.6 [PSH,ACK]
+#4 SSH [2001:db8::20]:22 -> [2001:db8::10]:50022 len=95 expert=Chat
+  info: [2001:db8::20]:22 → [2001:db8::10]:50022 SSH-2.0-OpenSSH_9.6 [PSH,ACK]
   stream: 0
   app: Ssh { version: "SSH-2.0-OpenSSH_9.6" }
   | Frame: 95 bytes on wire
   | Ethernet: 02:00:00:00:00:02 → 02:00:00:00:00:01, Type: IPv6 (0x86dd)
-  | IPv6: 2001:db8:0:0:0:0:0:20 → 2001:db8:0:0:0:0:0:10, Hop Limit: 64, Next: TCP (6), Payload: 41
+  | IPv6: 2001:db8::20 → 2001:db8::10, Hop Limit: 64, Next: TCP (6), Payload: 41
   | TCP: 22 (SSH) → 50022 (—), Seq: 5001, Flags: [PSH,ACK], Win: 64240, Ack: 1001
   | SSH: SSH-2.0-OpenSSH_9.6
-#5 SSH 2001:db8:0:0:0:0:0:10:50022 -> 2001:db8:0:0:0:0:0:20:22 len=95 expert=Chat
-  info: 2001:db8:0:0:0:0:0:10:50022 → 2001:db8:0:0:0:0:0:20:22 SSH-2.0-OpenSSH_9.6 [PSH,ACK]
+#5 SSH [2001:db8::10]:50022 -> [2001:db8::20]:22 len=95 expert=Chat
+  info: [2001:db8::10]:50022 → [2001:db8::20]:22 SSH-2.0-OpenSSH_9.6 [PSH,ACK]
   stream: 0
   app: Ssh { version: "SSH-2.0-OpenSSH_9.6" }
   | Frame: 95 bytes on wire
   | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv6 (0x86dd)
-  | IPv6: 2001:db8:0:0:0:0:0:10 → 2001:db8:0:0:0:0:0:20, Hop Limit: 64, Next: TCP (6), Payload: 41
+  | IPv6: 2001:db8::10 → 2001:db8::20, Hop Limit: 64, Next: TCP (6), Payload: 41
   | TCP: 50022 (—) → 22 (SSH), Seq: 1001, Flags: [PSH,ACK], Win: 64240, Ack: 5022
   | SSH: SSH-2.0-OpenSSH_9.6

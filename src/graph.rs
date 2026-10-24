@@ -244,7 +244,7 @@ pub fn area_graph_with(
             let Some(ch) = char::from_u32(BRAILLE_BASE | bits as u32) else {
                 continue;
             };
-            let cell = buf.get_mut(area.x + cx as u16, area.y + cy as u16);
+            let cell = &mut buf[(area.x + cx as u16, area.y + cy as u16)];
             cell.set_char(ch);
             cell.set_style(Style::default().fg(ramp.at(f)));
         }
@@ -796,7 +796,7 @@ fn render_bars(buf: &mut Buffer, area: Rect, data: &[u64], max: u64, base: Color
                     Some(r) => r.at((cell_from_bottom as f32 + 0.5) / cell_h as f32),
                     None => base,
                 };
-                let cell = buf.get_mut(x, area.y + cy as u16);
+                let cell = &mut buf[(x, area.y + cy as u16)];
                 cell.set_char(glyph);
                 cell.set_style(Style::default().fg(color));
             }
@@ -855,7 +855,7 @@ fn render_bars_flipped(
                 Some(r) => r.at((cy as f32 + 0.5) / cell_h as f32),
                 None => base,
             };
-            let cell = buf.get_mut(x, area.y + cy as u16);
+            let cell = &mut buf[(x, area.y + cy as u16)];
             cell.set_char(glyph);
             cell.set_style(Style::default().fg(color));
         }
@@ -1248,7 +1248,7 @@ mod tests {
             Color::Green,
             GraphOpts::default(),
         );
-        let sym = buf.get(0, 0).symbol().to_string();
+        let sym = buf[(0, 0)].symbol().to_string();
         assert_ne!(sym, "⣿", "both halves cannot be full — the samples differ");
         assert_ne!(sym, "⣀", "the right half is a full-height sample");
 
@@ -1263,7 +1263,7 @@ mod tests {
             Color::Green,
             GraphOpts::default(),
         );
-        assert_eq!(buf.get(0, 0).symbol(), "⣿");
+        assert_eq!(buf[(0, 0)].symbol(), "⣿");
     }
 
     /// A quiet series still draws its baseline, so a gap reads as "no
@@ -1280,7 +1280,7 @@ mod tests {
             Color::Green,
             GraphOpts::default(),
         );
-        assert_eq!(buf.get(0, 0).symbol(), "⣀");
+        assert_eq!(buf[(0, 0)].symbol(), "⣀");
     }
 
     /// Every entry point honours the style, the mirrored one included. The
@@ -1301,8 +1301,8 @@ mod tests {
         render_bars_flipped_or_dots(&mut bars, area, &data, 10, GraphStyle::Bars);
 
         for x in 0..4u16 {
-            let d = dots.get(x, 0).symbol().chars().next().unwrap();
-            let b = bars.get(x, 0).symbol().chars().next().unwrap();
+            let d = dots[(x, 0)].symbol().chars().next().unwrap();
+            let b = bars[(x, 0)].symbol().chars().next().unwrap();
             assert!(braille(d), "dots drew {d:?}");
             assert!(blocks(b), "bars drew {b:?}");
         }
@@ -1353,7 +1353,7 @@ mod tests {
 
             let painted = |y: u16| {
                 (0..area.width)
-                    .filter(|&x| buf.get(x, y).symbol() != " ")
+                    .filter(|&x| buf[(x, y)].symbol() != " ")
                     .count()
             };
             assert_eq!(
@@ -1492,7 +1492,7 @@ mod tests {
     /// Rows with any painted cell in them, top first.
     fn painted_rows(buf: &Buffer, area: Rect) -> Vec<u16> {
         (0..area.height)
-            .filter(|&y| (0..area.width).any(|x| buf.get(x, y).symbol() != " "))
+            .filter(|&y| (0..area.width).any(|x| buf[(x, y)].symbol() != " "))
             .collect()
     }
 
@@ -1526,8 +1526,8 @@ mod tests {
         for y in 0..2u16 {
             for x in 0..4u16 {
                 assert_eq!(
-                    via_style.get(x, y).symbol(),
-                    direct.get(x, y).symbol(),
+                    via_style[(x, y)].symbol(),
+                    direct[(x, y)].symbol(),
                     "cell ({x},{y}) differs between the style and the primitive"
                 );
             }
@@ -1667,15 +1667,15 @@ mod tests {
             opts,
         );
 
-        let top = buf.get(0, 0).fg;
-        let bottom = buf.get(0, 3).fg;
+        let top = buf[(0, 0)].fg;
+        let bottom = buf[(0, 3)].fg;
         assert_ne!(top, bottom, "a column must be brighter at its tip");
 
         // And every column is coloured identically, because they carry the
         // same value.
         for x in 1..4u16 {
-            assert_eq!(buf.get(x, 0).fg, top, "column {x} differs at the top");
-            assert_eq!(buf.get(x, 3).fg, bottom, "column {x} differs at the base");
+            assert_eq!(buf[(x, 0)].fg, top, "column {x} differs at the top");
+            assert_eq!(buf[(x, 3)].fg, bottom, "column {x} differs at the base");
         }
     }
 
@@ -1730,11 +1730,7 @@ mod tests {
                 GraphStyle::Bars => render_bars(&mut buf, area, &[10, 10, 10, 10], 10, base, opts),
                 GraphStyle::Dots => render_dots(&mut buf, area, &[10, 10, 10, 10], 10, base, opts),
             }
-            assert_eq!(
-                buf.get(0, 0).fg,
-                base,
-                "{style:?} dimmed a one-row sparkline"
-            );
+            assert_eq!(buf[(0, 0)].fg, base, "{style:?} dimmed a one-row sparkline");
         }
     }
 
@@ -1767,8 +1763,8 @@ mod tests {
                 ),
             }
             // The floor sits on the bottom row, and the row above stays clear.
-            assert_ne!(buf.get(0, 1).symbol(), " ", "{style:?} drew no baseline");
-            assert_eq!(buf.get(0, 0).symbol(), " ", "{style:?} floor is not a fill");
+            assert_ne!(buf[(0, 1)].symbol(), " ", "{style:?} drew no baseline");
+            assert_eq!(buf[(0, 0)].symbol(), " ", "{style:?} floor is not a fill");
         }
     }
 
@@ -1908,7 +1904,7 @@ mod tests {
                 ),
             }
             // The leftmost column carries data, not an empty gap.
-            let left: String = (0..2u16).map(|y| buf.get(0, y).symbol()).collect();
+            let left: String = (0..2u16).map(|y| buf[(0, y)].symbol()).collect();
             assert_ne!(left.trim(), "", "{style:?} left the first column empty");
         }
     }
@@ -1926,9 +1922,9 @@ mod tests {
         let mut buf = Buffer::empty(area);
         area_graph_with(&mut buf, area, &doubled, 40, &ramp, false, false);
 
-        let col0: String = (0..2u16).map(|y| buf.get(0, y).symbol()).collect();
+        let col0: String = (0..2u16).map(|y| buf[(0, y)].symbol()).collect();
         assert_ne!(col0.trim(), "", "the first bucket must draw in column 0");
-        let col3: String = (0..2u16).map(|y| buf.get(3, y).symbol()).collect();
+        let col3: String = (0..2u16).map(|y| buf[(3, y)].symbol()).collect();
         assert_eq!(col3.trim(), "", "an empty bucket must stay empty");
     }
 
@@ -1950,7 +1946,7 @@ mod tests {
             for x in 0..4u16 {
                 for y in 0..2u16 {
                     assert_eq!(
-                        buf.get(x, y).symbol(),
+                        buf[(x, y)].symbol(),
                         " ",
                         "{style:?} painted an empty layer at ({x},{y})"
                     );
@@ -1962,7 +1958,7 @@ mod tests {
         // is no more entitled to invent data than the upward half.
         let mut buf = Buffer::empty(area);
         render_bars_flipped(&mut buf, area, &[0; 8], 10, Color::Red, opts);
-        assert_eq!(buf.get(0, 0).symbol(), " ");
+        assert_eq!(buf[(0, 0)].symbol(), " ");
     }
 
     /// Fade off means one flat colour, not a subtler gradient.
@@ -1980,8 +1976,8 @@ mod tests {
             base,
             GraphOpts::default(),
         );
-        assert_eq!(buf.get(0, 0).fg, base);
-        assert_eq!(buf.get(0, 3).fg, base);
+        assert_eq!(buf[(0, 0)].fg, base);
+        assert_eq!(buf[(0, 3)].fg, base);
     }
 
     /// The gradient is dim at the baseline and bright at the peak, and its

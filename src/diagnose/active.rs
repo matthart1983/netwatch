@@ -176,6 +176,9 @@ impl ResultObs {
             Outcome::NotApplicable => (Availability::NotApplicable,"no usable IPv6 default-route/address context"),
             Outcome::PermissionDenied => (Availability::PermissionDenied,"probe capability denied; inspect experiment detail"),
             Outcome::Failed => (Availability::CollectorFailed,"experiment could not complete; inspect detail and retry"),
+            Outcome::Unsupported if self.detail == PMTU_UNSUPPORTED => {
+                (Availability::Unsupported, PMTU_UNSUPPORTED)
+            }
             Outcome::Unsupported => (Availability::Unsupported, IPV6_UNSUPPORTED),
             Outcome::Inconclusive => (Availability::NotMeasured,"experiment inconclusive; endpoint, filtering, or multiple faults prevent attribution"),
         }
@@ -238,8 +241,8 @@ impl Runner {
         (s.obs.clone(), s.times.clone(), s.progress.clone())
     }
     pub fn start(&self, rule: &str, cfg: &Config) -> Result<(), String> {
-        if rule == "ipv6.broken" && !cfg!(target_os = "linux") {
-            return Err(IPV6_UNSUPPORTED.into());
+        if let Some(why) = unsupported(rule) {
+            return Err(why.into());
         }
         cfg.validate(rule)?;
         let mut s = self.state.lock().unwrap();
@@ -308,6 +311,30 @@ fn connected(addr: SocketAddr, cancel: &Cancel) -> bool {
 /// comes from `/proc`.
 pub const IPV6_UNSUPPORTED: &str = "IPv6 route context is read only on Linux";
 
+/// Whether `pmtu.blackhole` can run here. Its verdict rests on a transfer
+/// that fails at the normal segment size and then succeeds at MSS 536 on the
+/// same endpoint, and only Unix lets a program lower the MSS of one socket:
+/// socket2's `set_tcp_mss` exists only there, and Windows' `TCP_MAXSEG` only
+/// reports the MSS. DF pings through `IcmpSendEcho2` would run on Windows,
+/// but without that corroboration the experiment could only come out healthy
+/// or inconclusive, so a real black hole would read as "inconclusive" instead
+/// of as a check this platform cannot make.
+pub const PMTU_SUPPORTED: bool = cfg!(unix);
+/// Why `pmtu.blackhole` cannot run on Windows.
+pub const PMTU_UNSUPPORTED: &str =
+    "the PMTU check confirms a black hole with a reduced TCP MSS, which Windows cannot set per socket";
+
+/// Why `rule` cannot run on this platform, whatever the configuration says.
+/// Checked before the configuration, so no setting is asked for that would
+/// not make it runnable.
+pub fn unsupported(rule: &str) -> Option<&'static str> {
+    match rule {
+        "ipv6.broken" if !cfg!(target_os = "linux") => Some(IPV6_UNSUPPORTED),
+        "pmtu.blackhole" if !PMTU_SUPPORTED => Some(PMTU_UNSUPPORTED),
+        _ => None,
+    }
+}
+
 /// Whether this host has an IPv6 default route and a global address, so the
 /// experiment means something. Off Linux, Unsupported.
 fn ipv6_context() -> Result<bool, (Outcome, &'static str)> {
@@ -355,6 +382,9 @@ fn context_from(
 pub fn run(rule: &str, cfg: &Config, cancel: &Cancel) -> ResultObs {
     if rule == "ipv6.broken" && !cfg!(target_os = "linux") {
         return ResultObs::new(Outcome::Unsupported, IPV6_UNSUPPORTED);
+    }
+    if rule == "pmtu.blackhole" && !PMTU_SUPPORTED {
+        return ResultObs::new(Outcome::Unsupported, PMTU_UNSUPPORTED);
     }
     if let Err(e) = cfg.validate(rule) {
         return ResultObs::new(Outcome::Failed, &e);
@@ -518,6 +548,8 @@ enum Ping {
     Unavailable,
     PermissionDenied,
 }
+/// One DF ping of `size` bytes, with iputils flags. Never reached on Windows,
+/// where `pmtu.blackhole` is Unsupported before any probe runs.
 fn ping(ip: &str, size: usize, cancel: &Cancel) -> Ping {
     let size = size.to_string();
     match probe_io::command(
@@ -689,6 +721,46 @@ mod tests {
             obs.coverage(),
             (Availability::Unsupported, IPV6_UNSUPPORTED)
         );
+    }
+    #[test]
+    fn each_unsupported_experiment_keeps_its_own_reason() {
+        let pmtu = ResultObs::new(Outcome::Unsupported, PMTU_UNSUPPORTED);
+        assert_eq!(
+            pmtu.coverage(),
+            (Availability::Unsupported, PMTU_UNSUPPORTED)
+        );
+        assert_ne!(PMTU_UNSUPPORTED, IPV6_UNSUPPORTED);
+    }
+    #[test]
+    fn only_the_platform_makes_an_experiment_unsupported() {
+        assert_eq!(unsupported("pmtu.blackhole").is_some(), !PMTU_SUPPORTED);
+        assert_eq!(
+            unsupported("ipv6.broken").is_some(),
+            !cfg!(target_os = "linux")
+        );
+        assert_eq!(unsupported("captive.portal"), None);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn pmtu_experiment_refuses_to_start_on_windows() {
+        let cfg = Config {
+            pmtu_url: Some("http://192.0.2.10:8080/test-data".into()),
+            ..Default::default()
+        };
+        let runner = Runner::default();
+        assert_eq!(
+            runner.start("pmtu.blackhole", &cfg),
+            Err(PMTU_UNSUPPORTED.to_string())
+        );
+        // Unconfigured, it still says why, not "set pmtu_url".
+        assert_eq!(
+            runner.start("pmtu.blackhole", &Config::default()),
+            Err(PMTU_UNSUPPORTED.to_string())
+        );
+        // Not even a DNS lookup or a ping: the answer is the platform's.
+        let obs = run("pmtu.blackhole", &cfg, &Cancel::default());
+        assert_eq!(obs.outcome, Outcome::Unsupported);
+        assert_eq!(obs.coverage().1, PMTU_UNSUPPORTED);
     }
     #[test]
     fn missing_ipv6_proc_files_mean_not_applicable() {

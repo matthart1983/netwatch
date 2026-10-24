@@ -1,5 +1,11 @@
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
+/// ICMP echo outcomes as Windows' ICMP API reports them. Platform-neutral so
+/// the decoding is tested everywhere; only the calls are Windows-only.
+pub mod icmp;
+/// Decoding for the records Windows' IP Helper API returns. Platform-neutral
+/// so it is tested everywhere; only the calls that fill it are Windows-only.
+pub mod ip_helper;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -16,6 +22,9 @@ pub mod pktap;
 /// Kernel-derived process identity — every platform, including the fallback
 /// that returns nothing so callers keep the name they already had.
 pub mod procname;
+/// Decoding of the Windows TCP and UDP socket tables. Platform-neutral so it
+/// is tested everywhere; only the calls that read the tables are gated.
+pub mod socket_table;
 #[cfg(target_os = "windows")]
 pub mod windows;
 

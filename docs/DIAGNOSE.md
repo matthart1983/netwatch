@@ -377,6 +377,9 @@ proxy and bound response reads to 64 KiB. Probe URLs must be plain HTTP without
 credentials, query strings or fragments. The PMTU experiment changes TCP segment
 size on its own socket only; it does not change the host/interface MTU. Recovery
 requires a working transfer on the same tested path, not a fixed 1400-byte cutoff.
+Windows has no way to set one socket's segment size, so there the PMTU check is
+listed as unsupported, and **t** and `netwatch diagnose coverage --test
+pmtu.blackhole` refuse it.
 These selected-endpoint experiments do not suppress unrelated DNS/TCP findings.
 
 Default IPv6 pairs are Cloudflare and Google DNS addresses on TCP 443. Default

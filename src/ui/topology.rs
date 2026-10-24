@@ -30,6 +30,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 // ── Topology graph ──────────────────────────────────────────
 
 struct RemoteNode {
+    ip: String,
     label: String,
     process: Option<String>,
     conn_count: usize,
@@ -37,18 +38,32 @@ struct RemoteNode {
     has_established: bool,
 }
 
+/// The peers the Topology cursor steps through, in its order: the LAN
+/// column, then the internet column, each as the graph draws it. `Enter` and
+/// `T` act on the peer at the cursor's index here. It comes from the same
+/// build as the graph, so it cannot name a host other than the highlighted
+/// one, as a separate copy of the partition and sort once did.
+pub(crate) fn selectable_peers(app: &App) -> Vec<String> {
+    let (local, public) = build_remote_nodes(app);
+    local
+        .into_iter()
+        .chain(public)
+        .map(|node| node.ip)
+        .collect()
+}
+
 fn build_remote_nodes(app: &App) -> (Vec<RemoteNode>, Vec<RemoteNode>) {
     let mut remotes: HashMap<String, (RemoteNode, bool)> = HashMap::new();
     let conns = app.connection_collector.connections();
     for conn in conns.iter() {
-        let ip = extract_ip(&conn.remote_addr);
-        if ip.is_empty() || ip == "*" {
+        let Some(ip) = crate::app::parse_addr_parts(&conn.remote_addr).0 else {
             continue;
-        }
+        };
         let is_local = is_private_ip(&ip);
         let entry = remotes.entry(ip.clone()).or_insert_with(|| {
             (
                 RemoteNode {
+                    ip: ip.clone(),
                     label: app
                         .packet_collector
                         .dns_cache
@@ -871,24 +886,6 @@ fn health_dot(rtt: Option<f64>, loss: f64, t: &Theme) -> (&'static str, Color) {
     }
 }
 
-fn extract_ip(addr: &str) -> String {
-    if addr == "*:*" || addr.is_empty() {
-        return String::new();
-    }
-    if let Some(bracket_end) = addr.rfind("]:") {
-        addr[1..bracket_end].to_string()
-    } else if let Some(colon) = addr.rfind(':') {
-        let ip = &addr[..colon];
-        if ip == "*" {
-            String::new()
-        } else {
-            ip.to_string()
-        }
-    } else {
-        addr.to_string()
-    }
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -992,12 +989,12 @@ mod tests {
         let mut app = App::prepare_with_config(NetwatchConfig::default());
         app.uptime = Monitor::showing(conn);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| super::render(f, &app, f.size())).unwrap();
+        terminal.draw(|f| super::render(f, &app, f.area())).unwrap();
         let buf = terminal.backend().buffer();
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()

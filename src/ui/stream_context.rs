@@ -153,15 +153,15 @@ pub struct Conversation {
 
 /// Name the address pair, initiator first.
 fn endpoints(stream: &Stream) -> (Option<String>, Option<String>) {
-    let a = format!("{}:{}", stream.key.addr_a.0, stream.key.addr_a.1);
-    let b = format!("{}:{}", stream.key.addr_b.0, stream.key.addr_b.1);
+    use crate::collectors::packets::format_endpoint;
+    let (a, b) = (&stream.key.addr_a, &stream.key.addr_b);
+    let show = |(ip, port): &(String, u16)| Some(format_endpoint(ip, port));
     match &stream.initiator {
         Some(init) => {
-            let init_s = format!("{}:{}", init.0, init.1);
-            if init_s == a {
-                (Some(a), Some(b))
+            if init == a {
+                (show(a), show(b))
             } else {
-                (Some(b), Some(a))
+                (show(b), show(a))
             }
         }
         // Without a recorded initiator the key's canonical ordering is the
@@ -427,6 +427,8 @@ mod tests {
 
     fn pkt(id: u64, ns: u64, src: &str, sport: u16, dst: &str, dport: u16) -> CapturedPacket {
         CapturedPacket {
+            capture: None,
+            annotation: None,
             id,
             timestamp: format!("00:00:{id:02}.000"),
             src_ip: src.into(),
@@ -597,6 +599,40 @@ mod tests {
             (900, 100),
             "the counters must follow whoever opened the flow"
         );
+    }
+
+    /// The panel names IPv6 ends `[addr]:port`, initiator first, so the
+    /// port is not read as one more group of the address.
+    #[test]
+    fn ipv6_ends_are_bracketed_initiator_first() {
+        let mut s = Stream::new(
+            0,
+            StreamKey::new(
+                StreamProtocol::Tcp,
+                "2001:db8::10",
+                50022,
+                "2001:db8::20",
+                22,
+            ),
+            0,
+        );
+        for (init, want) in [
+            (
+                ("2001:db8::10", 50022),
+                ("[2001:db8::10]:50022", "[2001:db8::20]:22"),
+            ),
+            (
+                ("2001:db8::20", 22),
+                ("[2001:db8::20]:22", "[2001:db8::10]:50022"),
+            ),
+        ] {
+            s.initiator = Some((init.0.into(), init.1));
+            let c = conversation(&s, &[], 0, None, 4);
+            assert_eq!(
+                (c.initiator.as_deref(), c.peer.as_deref()),
+                (Some(want.0), Some(want.1))
+            );
+        }
     }
 
     /// The same sequence number in each direction is two different byte

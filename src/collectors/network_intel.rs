@@ -607,7 +607,11 @@ impl NetworkIntelCollector {
 
             if jitter < BEACON_JITTER_THRESHOLD {
                 state.last_alert = Some(now);
-                let msg = format!("Beaconing: {} → {}:{}", key.src, key.dst, key.dst_port);
+                let msg = format!(
+                    "Beaconing: {} → {}",
+                    key.src,
+                    super::packets::format_endpoint(&key.dst, key.dst_port)
+                );
                 let detail = format!(
                     "Regular interval {:.1}s (jitter {:.1}%), {} samples",
                     mean,
@@ -1025,6 +1029,26 @@ mod tests {
         assert!(
             matches!(intel.active_alerts[0].severity, AlertSeverity::Critical),
             "beacon must be Critical so the recorder auto-freezes"
+        );
+    }
+
+    /// The alert names an IPv6 peer `[addr]:port`. Bare, `2001:db8::5:443`
+    /// in an incident's alerts.json would read as the host 2001:db8::5:443.
+    #[test]
+    fn an_ipv6_beacon_alert_brackets_the_peer() {
+        let mut intel = NetworkIntelCollector::new();
+        let key = BeaconKey {
+            src: "2001:db8::10".into(),
+            dst: "2001:db8::5".into(),
+            dst_port: 443,
+        };
+        let base = Instant::now();
+        for i in 0..6 {
+            intel.detect_beacon(key.clone(), base + Duration::from_secs(60 * i));
+        }
+        assert_eq!(
+            intel.active_alerts[0].message,
+            "Beaconing: 2001:db8::10 → [2001:db8::5]:443"
         );
     }
 

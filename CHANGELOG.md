@@ -22,13 +22,83 @@ All notable changes to NetWatch will be documented in this file.
 - **`confirm_quit`** (Settings → Confirm Quit, off by default): `q` asks
   "Quit netwatch?" first, and `y`, `q` or `Enter` confirms. `Ctrl+C` still
   quits at once (#94).
+- **`netwatch doctor` says where the Linux connection table will come
+  from.** A new `connections` entry reads `ready` (`ss_found`, with the path)
+  when `ss` is on `PATH`, and `degraded` (`proc_net_fallback`) when it is
+  not, naming the `/proc/net` tables a live session reads instead. When
+  `/proc/net/tcp` cannot be read either, it reads `unavailable`
+  (`no_connection_table`), because the table will be empty. The JSON gains
+  that one capability and nothing else changes.
+- **PCAPNG export, with the owning process in each packet's comment.** `w`
+  in Packets and `Shift+E` for an incident now open a preview that freezes
+  the selection, counts what will be written and what will be left out, and
+  warns that packet bytes are not redacted. `w` takes the packets the list
+  shows, so with `x` on only the expert findings. `Enter` writes in the
+  background, `f` picks PCAPNG (the default) or classic PCAP, `a` turns
+  comments off, and `Esc` cancels. Each PCAPNG packet's comment is a JSON
+  object Wireshark shows under "Packet comments": the process, PID and
+  direction when two checks of the socket's owner, one finished before the
+  packet and one begun after it, agree on it (Linux), else `unknown_owner`,
+  plus the DPI classification, SNI and JA4. One file can hold packets from several
+  interfaces and link types. The format and every comment key are specified
+  in REFERENCE.md, "Capture export".
 
 ### Changed
 - **`q` closes the help, settings and memory overlays** instead of quitting
   netwatch, as `Esc` does. Pressed on an overlay, it nearly always meant
   "close this" (#94). `Ctrl+C` still quits from anywhere.
+- **Windows reads connections through IP Helper, not netstat and
+  tasklist.** Each socket and its owning PID come from
+  `GetExtendedTcpTable` and `GetExtendedUdpTable`, and process names from
+  one process snapshot, where every refresh used to start two commands. The
+  names are the `chrome.exe` names tasklist gave. A listener's peer reads
+  `*:*` instead of `0.0.0.0:0`. An IPv6 link-local address no longer carries
+  its `%12` scope suffix, in the views and in the JSON and CSV exports. A
+  TIME_WAIT connection reads "unattributed" instead of "System Idle
+  Process", since no process owns it any more. The connection detail's
+  Match line says `IpHelper`. netstat and tasklist are used only if those
+  calls fail.
+- **Windows: interface counters, the default route and adapter GUIDs come
+  from the IP Helper API.** The Interfaces tab and traffic graphs read
+  `GetIfTable2` each tick, where netwatch used to start PowerShell for
+  Get-NetAdapterStatistics on every tick, at 300-800 ms a call. The default
+  capture interface and the gateway come from the routing table
+  (`GetIpForwardTable2`), ranked by route plus interface metric as Windows
+  ranks them, instead of from Get-NetRoute and `route print`. Capture finds
+  an adapter's Npcap device by the GUID `GetAdaptersAddresses` reports
+  rather than by asking Get-NetAdapter. Counters cover the adapters the
+  Interfaces tab lists and, as Get-NetAdapterStatistics did, NICs with IP
+  unbound, such as a capture-only NIC or the physical NIC under a Hyper-V
+  external switch. Packet counts now include broadcast and multicast, as
+  they do on Linux and macOS, from the API and its fallbacks alike.
+  PowerShell and `route print` remain only as fallbacks for when an API
+  call fails. `netstat -e`, the last fallback for counters, is no longer
+  run. It gave one machine-wide row that matched no interface, and only on
+  an English install.
+- **Incident bundles hold `packets.pcapng`, and `manifest.json` is version
+  2.** `packets.pcap` is still written when every packet shares one link
+  type and is dated before 2106. The manifest lists the packet files
+  present, how many packets were written, left out and annotated, and the
+  capture's last drop count. The
+  bundle directory name ends in a short random suffix, so exporting the same
+  incident twice gives two bundles instead of overwriting one.
+- **Frames from interfaces that are not Ethernet appear in Packets as
+  `Raw`**, undecoded, instead of being fed to the Ethernet parser, which
+  dropped most of them and misread the rest. A VPN tunnel's raw IP and BSD
+  or Windows loopback are the usual cases.
+- **Exports never overwrite a file or leave a partial one.** Captures and
+  bundles are written under a temporary name and moved into place when
+  complete; a cancelled or failed export removes them. The exports directory
+  must be on a filesystem with hard links.
 
 ### Fixed
+- **Exported captures carry the real capture time and wire length.** PCAP
+  export rebuilt each timestamp from the time of day shown in the packet
+  list, so every packet was dated 1 January 1970 and a capture across
+  midnight went backwards, and it recorded the captured length as the
+  length on the wire. Times now come from libpcap, in UTC to the
+  microsecond. `--demo` packets, which were never captured, are left out
+  and counted instead of written with an invented time.
 - **Lite view: keys no longer overflow in a terminal smaller than its
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns
@@ -46,13 +116,107 @@ All notable changes to NetWatch will be documented in this file.
   were `not_checked [npcap_present_unloaded]`. Before, doctor said "DLL and
   driver not loaded" either way, and told a user who had Npcap to install
   it.
-
-### CI
-- **Windows CI runs the binary it builds.** On a runner with no Npcap,
-  `netwatch --version` must print the Cargo.toml version, and
-  `netwatch doctor --json` must report `npcap_missing` with the download
-  link. Nothing started the built binary on Windows before. The release
-  workflow runs the same check on the Windows binary before packaging it.
+- **Linux: the connection table is no longer empty without `ss`.** When
+  `ss` is missing (minimal containers, some NAS distributions), cannot
+  start, or fails, netwatch reads the kernel's
+  `/proc/net/{tcp,tcp6,udp,udp6}` tables instead, so Connections, Processes
+  and Egress fill as they do with `ss`, and processes are attributed the
+  same way. The rows read the same with two exceptions: a socket bound to
+  a device loses the `%lo`-style suffix `ss` adds, and a dual-stack
+  wildcard reads `[::]:port` where `ss` prints `*:port`. While the fallback
+  is in use, Settings shows a `connections: degraded` row with the reason.
+  The log notes each switch once rather than every poll, and warns when a
+  poll can read no table at all, from the first poll on.
+- **Windows: connection states read the same in every display language.**
+  netstat translates its state column: German Windows showed `HERGESTELLT`
+  and `ABHÖREN`, which matched no state filter, colour or counter,
+  including the TIME_WAIT and CLOSE_WAIT counts behind the Prometheus
+  metrics, and English showed `LISTENING`, so the listen filter found
+  nothing. The state now arrives as a number and is named as on Linux
+  (`ESTABLISHED`, `LISTEN`, `TIME-WAIT`), in the views and in the JSON and
+  CSV exports.
+- **Processes view: SOCKET STATES counts CLOSE-WAIT, FIN-WAIT and SYN
+  sockets on Linux.** It knew only lsof's spelling (`CLOSE_WAIT`), so it
+  counted Linux's `CLOSE-WAIT` as other.
+- **Linux: the Dense view dims closing sockets, and the Connections view
+  flags CLOSE-WAIT.** Both knew only lsof's spellings (`TIME_WAIT`,
+  `CLOSE_WAIT`), not the `TIME-WAIT` and `CLOSE-WAIT` that Linux, and now
+  Windows, report. A closing row in the Dense view drew as live, with its
+  state cut to `TIME-WA…`, and a `CLOSE-WAIT` or `FIN-WAIT` row in the
+  Connections view was muted instead of drawn in the error colour.
+- **Windows: DNS servers are found on non-English Windows, and IPv6 ones
+  are read whole.** They came from `ipconfig /all` by its English label, so
+  on a French ("Serveurs DNS") or Russian ("DNS-серверы") install none were
+  found and the Health widget had no resolver to probe. An IPv6 server such
+  as `2001:db8::53%12` was cut at its last colon to `53%12`, further IPv6
+  servers were skipped, and another adapter's gateway could be listed as a
+  DNS server. They now come from `GetAdaptersAddresses` in any display
+  language: the default-route adapter's first, and without the
+  `fec0:0:0:ffff::1` placeholders Windows reports when no IPv6 resolver is
+  set. A link-local server keeps its zone index (`fe80::1%12`), as on Linux
+  and macOS, and the probes pass it over as they do there rather than send
+  to whichever link Windows picks. The ipconfig fallback reads IPv6 servers
+  correctly as well.
+- **Windows: the gateway is an address with a VPN up.** `route print` lists
+  default routes unsorted, and a VPN's on-link default shows "On-link" in the
+  gateway column, which the Health widget could then try to probe as the
+  gateway. The gateway is now the next hop of the lowest-metric default route
+  that has one. Where either old parse went wrong, the gateway or resolvers
+  in the network's Diagnose baseline key change with these two fixes, so
+  Diagnose relearns that network's baselines once after the upgrade.
+- **Windows: gateway and internet latency on any display language.** The
+  probes ran `ping.exe` and read its English summary. On a German, Russian
+  or other non-English install that summary never matched, so the probes
+  got no ICMP figure and fell back to timing a TCP connect, or showed
+  "unmeasured" where nothing answered that either. netwatch now sends the
+  echoes itself through the Windows ICMP API (`IcmpSendEcho2`, IPv4 and
+  IPv6), which needs no administrator rights and answers with a status code
+  instead of text. A reply under a millisecond shows its measured fraction,
+  not 0. netwatch no longer starts `ping.exe` at all. It needs the same
+  ICMP API, so it could not help where netwatch's own call fails.
+- **Windows: traceroute works.** Since 0.32 the trace subprocess refused to
+  start off Unix, so `T` ended in an error on Windows. Windows now traces
+  natively through the ICMP API, IPv4 and IPv6, with three probes a hop up
+  to 30 hops, and records whether the destination itself answered, which
+  Diagnose's path rules read. A target that rejects pings with an
+  unreachable of its own (an iptables REJECT, a firewalld icmp-block) counts
+  as answered, as it does on Linux. `tracert` remains the fallback for a
+  target that is not an address, and netwatch now reads its output
+  correctly. `<1 ms` is under a millisecond rather than a hop named "<1",
+  `*` is a probe with no answer, a hop's address comes only from a token
+  that parses as one, so "Request timed out." no longer leaves "out." as
+  the address, and "Transmit error: code 1231." is no hop rather than a
+  1231 ms one. The tests cover English, German and Russian output.
+- **Diagnose: the PMTU experiment is "unsupported" on Windows.** It
+  confirms a black hole by repeating a transfer at a reduced TCP MSS, and
+  Windows cannot set the MSS of one socket, so the experiment could never
+  find a black hole there. The coverage row now says why and no longer
+  suggests `t`, and both `t` and `diagnose coverage --test pmtu.blackhole`
+  refuse it, before asking for a `pmtu_url`, as the IPv6 experiment does
+  off Linux.
+- **IPv6 connections show their protocol, rates and packets.** Packet
+  capture wrote IPv6 addresses with every group spelled out
+  (`2001:db8:0:0:0:0:0:1`) while the connection table compresses them
+  (`2001:db8::1`), so no IPv6 connection ever found its capture stream. The
+  Connections and Dense views showed no protocol, SNI or JA4 for it, and no
+  live rate, retransmits or handshake time; its packets got no owner in a
+  PCAPNG export; and `Enter` on the row opened an empty Packets list, as it
+  also did for a dual-stack socket's `::ffff:192.0.2.1` peer. Capture now
+  writes IPv6 in the standard compressed form (RFC 5952) in the packet list
+  and details, copied packets, the timeline and alerts, and puts an IPv6
+  address followed by a port in brackets, `[2001:db8::1]:443`, as the
+  Connections tab does: unbracketed, `2001:db8::1:443` is a different
+  address. Rows also join when `ss` adds a `%dev` zone and when macOS
+  `lsof` writes the interface into a link-local address. Display filters
+  take an address in any of those spellings, and `ip.addr == X` as Wireshark
+  writes it; a whole address now matches only itself, so `10.0.0.1` no
+  longer also shows `10.0.0.10`. IPv6 loopback traffic no longer reaches the
+  beaconing detector as if it were external. The Egress tab and its NDJSON
+  export now see SNI and byte counts for IPv6 destinations too, so policy
+  verdicts, `netwatch_policy_violations_total` and Diagnose's egress check
+  can change after upgrading: an `allow_sni` list stops flagging allowed
+  IPv6 traffic that had no name before, and a `deny_sni` list now catches
+  IPv6 traffic it used to miss.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
@@ -91,6 +255,44 @@ All notable changes to NetWatch will be documented in this file.
   going out, so an upload that loses its first seconds to addresses that
   never answer gives no verdict from idle samples. Only one webpki-roots
   remains in the build.
+- **windows-sys 0.61, on Windows only.** The IP Helper and ICMP calls that
+  replace `netstat`, `tasklist`, `ping`, `tracert`, `ipconfig`, `route print`
+  and the per-tick PowerShell query take their struct layouts from
+  Microsoft's metadata through windows-sys rather than hand-written
+  declarations. tokio, mio and socket2 already built it there, so no new
+  crate is compiled.
+- **ratatui 0.27 → 0.30, crossterm 0.27 → 0.29 and unicode-width 0.1 →
+  0.2.** Every tab of the full view, Lite and Dense draw as before at
+  80×24, 120×40 and 200×60, in every theme and with `NO_COLOR`, CJK and
+  emoji names included. Three things differ. A box too narrow for both its
+  title and the text at the right of its top border now shows the
+  right-hand text over the title rather than under it. Most tabs of the
+  full view have such boxes, and they start to overlap below about 53
+  columns, as in a tmux window split in half; by 38 columns some boxes
+  lose their name entirely. A halfwidth katakana sound mark (ﾞ or ﾟ) now
+  has a column of its own, as terminals draw it, so a name holding one no
+  longer pushes the rest of its row right; in Lite and Dense the name
+  instead loses a column at its end for each mark. On Windows the second
+  click of a double-click now counts, as it already did elsewhere, so
+  double-clicking a group header folds it and opens it again. paste, the
+  unmaintained crate ratatui 0.27 built with, is gone from the tree.
+
+### CI
+- **CI fails when Windows code compares English command output.** A test
+  reads the source as a Windows build compiles it and fails on any
+  comparison with English that ping, tracert, ipconfig, netstat, netsh or
+  another Windows tool prints, such as `Average =` or `LISTENING`, because
+  a translated install prints something else and the match finds nothing.
+  The only code allowed to read English is a fallback that runs after its
+  IP Helper call has failed: ipconfig for the interface list and for DNS
+  servers, and netstat's connection states. Each is listed in the test and
+  marked in the source. The netsh MTU fallback no longer looks for the
+  English header row; it reads only rows that start with a number.
+- **Windows CI runs the binary it builds.** On a runner with no Npcap,
+  `netwatch --version` must print the Cargo.toml version, and
+  `netwatch doctor --json` must report `npcap_missing` with the download
+  link. Nothing started the built binary on Windows before. The release
+  workflow runs the same check on the Windows binary before packaging it.
 
 ## [0.37.0] - 2026-10-22
 

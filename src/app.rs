@@ -491,6 +491,7 @@ pub struct App {
     pub capture_interface: String,
     pub bpf_filter_active: Option<String>,
     pub incident_recorder: IncidentRecorder,
+    pub capture_export: Option<ui::capture_export::Dialog>,
     pub geo_cache: GeoCache,
     pub whois_cache: WhoisCache,
     pub traceroute_runner: TracerouteRunner,
@@ -660,6 +661,7 @@ impl App {
             capture_interface,
             bpf_filter_active,
             incident_recorder: IncidentRecorder::new(),
+            capture_export: None,
             geo_cache: GeoCache::with_mmdb_and_online(
                 &user_config.geoip_db,
                 &user_config.geoip_asn_db,
@@ -1160,28 +1162,45 @@ impl App {
         self.ui.export_status_tick = 0;
     }
 
-    /// Shared recorder action for native frontends.
-    pub fn export_incident_bundle(&mut self) {
+    /// Freeze an armed recorder, so an export has a fixed window. False,
+    /// with a status line saying why, when the recorder is off.
+    fn incident_ready_for_export(&mut self) -> bool {
         if self.incident_recorder.is_off() {
             self.ui.export_status = Some("Arm the flight recorder first with Shift+R".to_string());
             self.ui.export_status_tick = 0;
-            return;
+            return false;
         }
-
         if self.incident_recorder.is_armed() {
             self.freeze_incident_recorder("manual export");
         }
+        true
+    }
 
-        match self.incident_recorder.export_bundle(&export_dir()) {
-            Ok(path) => {
-                self.ui.export_status =
-                    Some(format!("Incident bundle saved to {}", path.display()));
-            }
-            Err(err) => {
-                self.ui.export_status = Some(format!("Incident export failed: {err}"));
-            }
+    /// Shared recorder action for native frontends: writes the bundle now,
+    /// on the calling thread, with packet comments on. The TUI uses
+    /// [`App::preview_incident_bundle`] instead.
+    pub fn export_incident_bundle(&mut self) {
+        if !self.incident_ready_for_export() {
+            return;
         }
+        self.ui.export_status = Some(match self.incident_recorder.export_bundle(&export_dir()) {
+            Ok(path) => format!("Incident bundle saved to {}", path.display()),
+            Err(err) => format!("Incident export failed: {err}"),
+        });
         self.ui.export_status_tick = 0;
+    }
+
+    /// Open the export preview on a copy of the frozen incident, so the
+    /// bundle holds what the preview counted even if the recorder is
+    /// re-armed while it is written.
+    pub fn preview_incident_bundle(&mut self) {
+        if !self.incident_ready_for_export() {
+            return;
+        }
+        self.capture_export = Some(ui::capture_export::Dialog::new(
+            ui::capture_export::Selection::Incident(Box::new(self.incident_recorder.clone())),
+            export_dir(),
+        ));
     }
 
     fn sync_incident_recorder(&mut self) {
@@ -1189,6 +1208,10 @@ impl App {
             return;
         }
 
+        self.incident_recorder.record_capture_status(
+            self.packet_collector.capture_session.clone(),
+            self.packet_collector.stats.observed_drops(),
+        );
         let connections = self.connection_collector.connections();
         let health = self.health_prober.status();
         let packets = self.packet_collector.get_packets();
@@ -1221,6 +1244,15 @@ impl App {
 
     /// Advance the shared collectors and diagnostic engine without rendering.
     pub fn tick(&mut self) {
+        if let Some(status) = self
+            .capture_export
+            .as_mut()
+            .and_then(|dialog| dialog.poll())
+        {
+            self.capture_export = None;
+            self.ui.export_status = Some(status);
+            self.ui.export_status_tick = 0;
+        }
         // Clear export status after 5 ticks
         if self.ui.export_status.is_some() {
             self.ui.export_status_tick += 1;
@@ -1279,6 +1311,7 @@ impl App {
                     .iter()
                     .flat_map(|c| [c.local_addr.as_str(), c.remote_addr.as_str()]),
             );
+            self.packet_collector.observe_attribution(&conns);
             self.connection_timeline.update(&conns);
             // Observe-mode egress profiling (Horizon 3): learn per-process
             // {SNI, ASN, port} baselines from the live connection table, and
@@ -1503,7 +1536,10 @@ pub(crate) fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
         return (None, None);
     }
     if let Some(bracket_end) = addr.rfind("]:") {
-        (part(&addr[1..bracket_end]), part(&addr[bracket_end + 2..]))
+        // macOS lsof prints a link-local endpoint with no opening bracket
+        // (`fe80:16::1]:1024`), so the first character is not always one.
+        let host = addr[..bracket_end].trim_start_matches('[');
+        (part(host), part(&addr[bracket_end + 2..]))
     } else if let Some(colon) = addr.rfind(':') {
         (part(&addr[..colon]), part(&addr[colon + 1..]))
     } else {
@@ -1531,7 +1567,7 @@ fn build_connection_filter(conn: &Connection) -> String {
 
 /// Draw one frame of the TUI: the current view, then any open overlays.
 fn draw_frame(f: &mut Frame, app: &mut App) {
-    let area = f.size();
+    let area = f.area();
     app.ui.last_area = area;
     // Paint the theme's panel background AND default foreground
     // first so themes that opt in (sky, paper) get a colored fill
@@ -1579,6 +1615,9 @@ fn draw_frame(f: &mut Frame, app: &mut App) {
     }
     if app.ui.show_memory_stats {
         ui::memory_stats::render(f, app, area);
+    }
+    if let Some(dialog) = &app.capture_export {
+        dialog.render(f, area, &app.theme);
     }
     if app.ui.quit_pending {
         ui::quit_confirm::render(f, app, area);
@@ -1631,13 +1670,18 @@ fn install_tui_panic_hook() {
     });
 }
 
+// Backends name their own error type since ratatui 0.30; anyhow takes any of
+// them that can cross threads.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     remote: Option<&crate::remote::RemotePublisher>,
     sandbox_mode: crate::sandbox::Mode,
     view: Option<ViewMode>,
     demo: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     // `main` has handed the terminal to the TUI.
     install_tui_panic_hook();
     let mut app = App::prepare();
@@ -1699,7 +1743,9 @@ pub async fn run<B: Backend>(
                 }
             }
             AppEvent::Mouse(mouse) => {
-                handle_mouse(&mut app, mouse);
+                if app.capture_export.is_none() {
+                    handle_mouse(&mut app, mouse);
+                }
             }
             AppEvent::Tick => {
                 app.tick();
@@ -2460,7 +2506,9 @@ fn scroll_tab(app: &mut App, delta: isize) {
                 app.ui.scroll.traceroute_scroll =
                     clamp_scroll(app.ui.scroll.traceroute_scroll, delta, usize::MAX);
             } else {
-                let max = top_remote_ips(app).len().saturating_sub(1);
+                let max = crate::ui::topology::selectable_peers(app)
+                    .len()
+                    .saturating_sub(1);
                 app.ui.scroll.topology_scroll =
                     clamp_scroll(app.ui.scroll.topology_scroll, delta, max);
             }
@@ -2555,6 +2603,20 @@ fn confirms_quit(code: KeyCode) -> bool {
 }
 
 fn route_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    // The export preview owns every key while it is open, in every view,
+    // except Ctrl+C, which quits from anywhere. Quitting drops the dialog,
+    // and that cancels a write in progress and removes its temporary file.
+    if let Some(dialog) = app.capture_export.as_mut() {
+        if is_ctrl_c(key) {
+            return true;
+        }
+        if let Some(status) = dialog.key(key) {
+            app.capture_export = None;
+            app.ui.export_status = Some(status);
+            app.ui.export_status_tick = 0;
+        }
+        return false;
+    }
     // Overlays intercept first
     if app.ui.show_help {
         return handle_help_key(app, key);
@@ -3090,7 +3152,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.freeze_incident_recorder("manual freeze");
         }
         KeyCode::Char('E') => {
-            app.export_incident_bundle();
+            app.preview_incident_bundle();
         }
         // The other half of the Lite toggle; `handle_lite_key` owns Lite→Full.
         KeyCode::Char('L') => app.ui.view_mode = ViewMode::Lite,
@@ -3490,36 +3552,18 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.timeline_filter = app.ui.timeline_filter.cycle();
         }
         KeyCode::Char('w') if app.ui.current_tab == Tab::Packets => {
-            use crate::collectors::packets::{export_pcap, matches_packet, parse_filter};
-            let packets = app.packet_collector.get_packets();
-            let filtered: Vec<_>;
-            let to_export: &[_] = if let Some(ref ft) = app.ui.packet_filter_active {
-                if let Some(expr) = parse_filter(ft) {
-                    filtered = packets
-                        .iter()
-                        .filter(|p| matches_packet(&expr, p))
-                        .cloned()
-                        .collect();
-                    &filtered
-                } else {
-                    &packets
-                }
-            } else {
-                &packets
+            // What the list shows: the display filter and `x` both apply.
+            let shown = {
+                let packets = app.packet_collector.get_packets();
+                ui::packets::visible_packets(app, &packets)
+                    .into_iter()
+                    .cloned()
+                    .collect()
             };
-            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-            let path = export_dir()
-                .join(format!("netwatch_capture_{ts}.pcap"))
-                .to_string_lossy()
-                .into_owned();
-            match export_pcap(to_export, &path) {
-                Ok(n) => {
-                    app.ui.export_status = Some(format!("Saved {n} packets to {path}"));
-                }
-                Err(e) => {
-                    app.ui.export_status = Some(format!("Export failed: {e}"));
-                }
-            }
+            app.capture_export = Some(ui::capture_export::Dialog::new(
+                ui::capture_export::Selection::Packets(shown),
+                export_dir(),
+            ));
             app.ui.export_status_tick = 0;
         }
         KeyCode::Char('W') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
@@ -3728,8 +3772,8 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Enter if app.ui.current_tab == Tab::Topology && !app.ui.traceroute_view_open => {
-            let remote_ips = top_remote_ips(app);
-            if let Some((ip, _)) = remote_ips.get(app.ui.scroll.topology_scroll) {
+            let peers = crate::ui::topology::selectable_peers(app);
+            if let Some(ip) = peers.get(app.ui.scroll.topology_scroll) {
                 app.ui.packet_filter_text = ip.clone();
                 app.ui.packet_filter_active = Some(ip.clone());
                 app.ui.packet_filter_input = false;
@@ -3739,8 +3783,8 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Char('T') if app.ui.current_tab == Tab::Topology => {
-            let remote_ips = top_remote_ips(app);
-            if let Some((ip, _)) = remote_ips.get(app.ui.scroll.topology_scroll) {
+            let peers = crate::ui::topology::selectable_peers(app);
+            if let Some(ip) = peers.get(app.ui.scroll.topology_scroll) {
                 app.traceroute_runner.run(ip);
                 app.ui.scroll.traceroute_scroll = 0;
             }
@@ -3831,51 +3875,6 @@ fn yank_selected_packet(app: &mut App) {
     app.ui.export_status_tick = 0;
 }
 
-/// Returns remote IPs ranked by connection count, used by Topology tab actions.
-fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
-    // Mirrors build_remote_nodes() in src/ui/topology.rs: partition local vs.
-    // public, then sort each by (has_established desc, conn_count desc,
-    // DNS-label asc). The third key MUST match the renderer's, otherwise the
-    // cursor index and the IP returned here can disagree whenever DNS
-    // resolves a tied row to a name that orders differently from its IP.
-    let mut acc: HashMap<String, (String, usize, bool)> = HashMap::new();
-    let conns = app.connection_collector.connections();
-    for conn in conns.iter() {
-        let (remote_ip, _) = parse_addr_parts(&conn.remote_addr);
-        if let Some(ip) = remote_ip {
-            let entry = acc.entry(ip.clone()).or_insert_with(|| {
-                let label = app
-                    .packet_collector
-                    .dns_cache
-                    .lookup(&ip)
-                    .unwrap_or_else(|| ip.clone());
-                (label, 0, false)
-            });
-            entry.1 += 1;
-            if conn.state == "ESTABLISHED" {
-                entry.2 = true;
-            }
-        }
-    }
-    let (mut local, mut public): (Vec<_>, Vec<_>) = acc
-        .into_iter()
-        .map(|(ip, (label, count, est))| (ip, label, count, est))
-        .partition(|(ip, _, _, _)| crate::collectors::geo::is_private_ip(ip));
-    let sort = |v: &mut Vec<(String, String, usize, bool)>| {
-        v.sort_by(|a, b| {
-            b.3.cmp(&a.3)
-                .then_with(|| b.2.cmp(&a.2))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-    };
-    sort(&mut local);
-    sort(&mut public);
-    local
-        .into_iter()
-        .chain(public)
-        .map(|(ip, _, count, _)| (ip, count))
-        .collect()
-}
 /// Refresh ticks between health probes.
 ///
 /// The gateway / dns / internet histories advance once per probe while the
@@ -4006,6 +4005,69 @@ mod quit_key_tests {
         assert!(handle_key(&mut app, ctrl_c));
     }
 
+    /// The export preview takes every key while open, `q` included, so it
+    /// closes the preview; Ctrl+C still quits from it.
+    #[test]
+    fn the_export_preview_owns_keys_except_ctrl_c() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        assert!(!handle_key(&mut app, key(KeyCode::Char('w'))));
+        assert!(app.capture_export.is_some());
+        assert!(!handle_key(&mut app, key(KeyCode::Char('?'))));
+        assert!(!app.ui.show_help, "the preview kept the key");
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert!(app.capture_export.is_none());
+        assert_eq!(app.ui.export_status.as_deref(), Some("Export cancelled"));
+
+        handle_key(&mut app, key(KeyCode::Char('w')));
+        let ctrl_c = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut app, ctrl_c));
+    }
+
+    /// `w` freezes the packets the list shows: with `x` on, only findings.
+    #[test]
+    fn w_exports_the_packets_the_list_shows() {
+        use crate::collectors::packets::ExpertSeverity;
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        app.packet_collector.seed_demo_capture();
+        let (total, findings) = {
+            let mut packets = app.packet_collector.packets.write().unwrap();
+            for (i, p) in packets.iter_mut().enumerate() {
+                p.expert = if i % 3 == 0 {
+                    ExpertSeverity::Warn
+                } else {
+                    ExpertSeverity::Chat
+                };
+            }
+            (packets.len(), packets.len().div_ceil(3))
+        };
+        assert!(findings < total);
+        for (expert_only, shown) in [(false, total), (true, findings)] {
+            app.ui.packet_expert_only = expert_only;
+            handle_key(&mut app, key(KeyCode::Char('w')));
+            // Demo packets were never captured, so each is counted as omitted.
+            let summary = app.capture_export.take().unwrap().summary();
+            assert_eq!(summary.packets + summary.omitted, shown, "{expert_only}");
+        }
+    }
+
+    #[test]
+    fn shift_e_previews_only_an_armed_or_frozen_recorder() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        handle_key(&mut app, key(KeyCode::Char('E')));
+        assert!(app.capture_export.is_none());
+        assert!(app.ui.export_status.as_deref().unwrap().contains("Arm"));
+        app.incident_recorder.arm();
+        handle_key(&mut app, key(KeyCode::Char('E')));
+        assert!(app.capture_export.is_some());
+        // Previewing freezes the window, so the bundle is what was counted.
+        assert!(!app.incident_recorder.is_armed());
+    }
+
     /// #94: `q` pressed to dismiss an overlay closed netwatch instead.
     #[test]
     fn q_closes_an_overlay_instead_of_quitting() {
@@ -4048,7 +4110,7 @@ mod quit_key_tests {
             let buf = terminal.backend().buffer();
             let text: String = (0..buf.area.height)
                 .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-                .map(|(x, y)| buf.get(x, y).symbol().to_string())
+                .map(|(x, y)| buf[(x, y)].symbol().to_string())
                 .collect();
             assert!(text.contains("Quit netwatch?"), "{view:?}");
             assert!(text.contains("any other key"), "{view:?}");
@@ -4394,6 +4456,99 @@ mod tests {
         sort_connections(&mut conns, col(Tab::Connections, "Remote Address"));
         let addrs: Vec<_> = conns.iter().map(|c| c.remote_addr.as_str()).collect();
         assert_eq!(addrs, vec!["1.2.3.4:80", "10.0.0.1:80", "192.168.1.1:443"]);
+    }
+
+    /// Enter on a connection filters the Packets tab to its peer. The filter
+    /// has to name the peer as capture does, whichever way the platform
+    /// printed the row: v4-mapped, zoned, or macOS `lsof`'s link-local form
+    /// with no opening bracket, which used to lose its first character.
+    #[test]
+    fn a_connection_filter_names_the_peer_as_capture_does() {
+        use crate::collectors::packets::{parse_filter, FilterExpr};
+        for (remote, peer, port) in [
+            ("[2001:db8::20]:22", "2001:db8::20", 22),
+            ("[::ffff:192.0.2.10]:443", "192.0.2.10", 443),
+            ("[fe80::1%eth0]:22", "fe80::1", 22),
+            (
+                "fe80:16::aede:48ff:fe00:1122]:1024",
+                "fe80::aede:48ff:fe00:1122",
+                1024,
+            ),
+            ("192.0.2.10:443", "192.0.2.10", 443),
+        ] {
+            let c = conn_full(None, None, "0:0", remote, None, None);
+            let filter = parse_filter(&build_connection_filter(&c)).unwrap();
+            let FilterExpr::And(ip, p) = filter else {
+                panic!("{remote}: {filter:?}");
+            };
+            assert!(
+                matches!(*ip, FilterExpr::Ip(ref ip) if ip == peer),
+                "{remote}: {ip:?}"
+            );
+            assert!(
+                matches!(*p, FilterExpr::Port(n) if n == port),
+                "{remote}: {p:?}"
+            );
+        }
+    }
+
+    /// `Enter` on the Topology tab acts on the peer the graph highlights.
+    /// The key handlers once kept their own copy of the graph's partition and
+    /// sort, and the two read macOS `lsof`'s bracketless link-local row
+    /// differently: the graph drew `e80:16::…` among internet peers while the
+    /// key handlers put `fe80:16::…` among LAN peers, so with the cursor on
+    /// 203.0.113.5, `Enter` filtered to the link-local peer and `T` traced it.
+    #[test]
+    fn topology_enter_acts_on_the_highlighted_peer() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.ui.view_mode = ViewMode::Full;
+        let link_local = "fe80:16::aede:48ff:fe00:1122";
+        app.connection_collector.publish_for_test(vec![
+            conn_full(
+                None,
+                None,
+                "0:0",
+                &format!("{link_local}]:49152"),
+                None,
+                None,
+            ),
+            conn_full(None, None, "0:0", "203.0.113.5:443", None, None),
+            conn_full(None, None, "0:0", "192.168.1.1:53", None, None),
+        ]);
+        let mut highlighted = Vec::new();
+        for cursor in 0..3 {
+            app.ui.current_tab = Tab::Topology;
+            app.ui.scroll.topology_scroll = cursor;
+            let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+            terminal
+                .draw(|f| crate::ui::topology::render(f, &app, f.area()))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let screen: Vec<String> = (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            // The LAN column marks its cursor `▸ label`, the internet column
+            // `label ◂`.
+            let peer = screen
+                .iter()
+                .find_map(|line| {
+                    if let Some((_, after)) = line.split_once("▸ ") {
+                        after.split_whitespace().next()
+                    } else {
+                        let (before, _) = line.split_once(" ◂")?;
+                        before.split_whitespace().last()
+                    }
+                })
+                .unwrap_or_else(|| panic!("no cursor:\n{}", screen.join("\n")))
+                .to_string();
+            let key = crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            handle_key(&mut app, key);
+            assert_eq!(app.ui.packet_filter_text, peer, "cursor {cursor}");
+            highlighted.push(peer);
+        }
+        // The link-local peer is a LAN peer, drawn under its whole address.
+        assert_eq!(highlighted, ["192.168.1.1", link_local, "203.0.113.5"]);
     }
 
     #[test]
@@ -5108,15 +5263,118 @@ mod render_safety_tests {
     }
 
     /// The review's case: a ClientHello with SNI `ESC ]52;c;AAAA BEL` wrote
-    /// the viewer's clipboard as soon as its connection row was drawn.
+    /// the viewer's clipboard as soon as its connection row was drawn. The SNI
+    /// here skipped ingest, so nothing turned the ESC and BEL into `·`, and
+    /// ratatui 0.30 leaves them out of the row.
     #[test]
     fn a_connection_row_with_an_osc52_sni_draws_no_control_character() {
         let mut app = app_with_hostile_connection();
         app.ui.current_tab = Tab::Connections;
         let buf = draw(&mut app);
         let text: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("·]52;c;AAAA·"), "row was not drawn");
+        assert!(text.contains(" ]52;c;AAAA "), "row was not drawn");
         assert_eq!(unsafe_cells(&buf), Vec::<String>::new());
+    }
+
+    /// Ethernet + IPv4 + TCP 192.0.2.10:50000 -> 198.51.100.7:5555, PSH|ACK,
+    /// carrying `payload`.
+    fn tcp_frame(payload: &[u8]) -> Vec<u8> {
+        let ip_len = u16::try_from(40 + payload.len()).unwrap().to_be_bytes();
+        let mut f = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x08, 0x00];
+        f.extend_from_slice(&[0x45, 0, ip_len[0], ip_len[1], 0, 0, 0x40, 0, 64, 6, 0, 0]);
+        f.extend_from_slice(&[192, 0, 2, 10, 198, 51, 100, 7]);
+        f.extend_from_slice(&50000u16.to_be_bytes());
+        f.extend_from_slice(&5555u16.to_be_bytes());
+        f.extend_from_slice(&[
+            0, 0, 0x03, 0xe8, 0, 0, 0, 0, 0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0,
+        ]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Tabs in a cleartext payload show as `·` in Payload Content and the
+    /// stream view. ratatui 0.30 leaves control characters out of laid-out
+    /// text, so a raw tab vanished and `id\tname\tstatus` read as
+    /// `idnamestatus`, with tab indentation gone. Under 0.27 each tab had a
+    /// cell of its own, which the scrub turned into `·`.
+    #[test]
+    fn tabs_in_a_cleartext_payload_stay_visible() {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let id = app
+            .packet_collector
+            .ingest_frame_for_test(&tcp_frame(b"id\tname\tstatus\n\t\tindented\n"))
+            .expect("the frame decodes");
+        app.ui.current_tab = Tab::Packets;
+        app.ui.scroll.packet_selected = Some(id);
+
+        let screen = rows(&draw(&mut app));
+        assert!(
+            screen.iter().any(|r| r.contains("Payload Content")),
+            "{screen:#?}"
+        );
+        for needle in ["id·name·status", "··indented"] {
+            assert!(
+                screen.iter().any(|r| r.contains(needle)),
+                "payload pane lost {needle:?}: {screen:#?}"
+            );
+        }
+
+        app.ui.stream_view_open = true;
+        app.ui.stream_view_index = app.packet_collector.get_packets()[0].stream_index;
+        assert!(
+            app.ui.stream_view_index.is_some(),
+            "the frame has no stream"
+        );
+        let screen = rows(&draw(&mut app));
+        for needle in ["id·name·status", "··indented"] {
+            assert!(
+                screen
+                    .iter()
+                    .any(|r| r.contains(&format!("→ {needle}"))
+                        || r.contains(&format!("← {needle}"))),
+                "stream view lost {needle:?}: {screen:#?}"
+            );
+        }
+    }
+
+    /// tmux lets a pane shrink to one column. The Timeline's activity strip
+    /// then has an inner area of width 0 at x=1, and tinted the cursor
+    /// column at `buf[(1, y)]`, outside the buffer. ratatui 0.27's `get_mut`
+    /// wrote into the next row in release builds; 0.30's indexing panics,
+    /// which left the shell in raw mode on the alternate screen.
+    #[test]
+    fn no_view_panics_in_a_one_column_terminal() {
+        let mut app = app_with_hostile_connection();
+        let tabs = [
+            Tab::Dashboard,
+            Tab::Connections,
+            Tab::Interfaces,
+            Tab::Packets,
+            Tab::Stats,
+            Tab::Topology,
+            Tab::Timeline,
+            Tab::Processes,
+            Tab::Diagnose,
+            Tab::Egress,
+        ];
+        let views = tabs
+            .into_iter()
+            .map(|tab| (ViewMode::Full, tab))
+            .chain([ViewMode::Lite, ViewMode::Dense].map(|v| (v, Tab::Dashboard)));
+        for (view, tab) in views {
+            app.ui.view_mode = view;
+            app.ui.current_tab = tab;
+            for height in 1..=50 {
+                let mut terminal = Terminal::new(TestBackend::new(1, height)).unwrap();
+                let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    terminal.draw(|f| draw_frame(f, &mut app)).map(|_| ())
+                }));
+                assert!(
+                    matches!(drawn, Ok(Ok(()))),
+                    "{view:?} {tab:?} at 1x{height}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5218,13 +5476,13 @@ mod diagnose_action_tests {
         let screen = |app: &App| -> String {
             let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
             terminal
-                .draw(|f| crate::ui::diagnose::render(f, app, f.size()))
+                .draw(|f| crate::ui::diagnose::render(f, app, f.area()))
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             (0..buf.area.height)
                 .map(|y| {
                     (0..buf.area.width)
-                        .map(|x| buf.get(x, y).symbol())
+                        .map(|x| buf[(x, y)].symbol())
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>()
@@ -5347,7 +5605,7 @@ mod interface_list_tests {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
-                    .map(|x| buf.get(x, y).symbol())
+                    .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
                     + "\n"
             })

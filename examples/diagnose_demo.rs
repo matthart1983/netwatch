@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             history: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT))?;
-        terminal.draw(|f| render_body(f, &view, f.size()))?;
+        terminal.draw(|f| render_body(f, &view, f.area()))?;
         let buffer = terminal.backend().buffer().clone();
 
         std::fs::write(out.join(format!("{name}.txt")), buffer_to_text(&buffer))?;
@@ -119,7 +119,7 @@ fn buffer_to_text(buf: &Buffer) -> String {
     (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
-                .map(|x| buf.get(x, y).symbol())
+                .map(|x| buf[(x, y)].symbol())
                 .collect::<String>()
                 .trim_end()
                 .to_string()
@@ -155,7 +155,7 @@ fn buffer_to_ansi(buf: &Buffer) -> String {
     let mut out = String::new();
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
-            let cell = buf.get(x, y);
+            let cell = &buf[(x, y)];
             let mut codes = Vec::new();
             if let Some((r, g, b)) = rgb(cell.fg) {
                 codes.push(format!("38;2;{r};{g};{b}"));
@@ -224,7 +224,7 @@ fn buffer_to_html(buf: &Buffer) -> String {
         };
 
         for x in 0..buf.area.width {
-            let cell = buf.get(x, y);
+            let cell = &buf[(x, y)];
             let style = (cell.fg, cell.bg, cell.modifier.contains(Modifier::BOLD));
             if run_style != Some(style) {
                 flush(&mut out, &mut run, &run_style);

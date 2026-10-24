@@ -38,8 +38,14 @@ name = "netwatch"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.27"
-crossterm = "0.27"
+# Default features off: 0.30's add the calendar widget and the `line!` and
+# `span!` macros, which netwatch doesn't use. `layout-cache` was always on
+# before 0.30 and now has to be named; without it every frame solves every
+# layout from scratch.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
+# The version ratatui's crossterm backend is built on, so only one crossterm
+# is compiled.
+crossterm = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 anyhow = "1"
 chrono = "0.4"
@@ -73,8 +79,9 @@ toml_edit = "0.25"
 dirs = "7"
 # Display-width-aware truncation for the Lite view's fixed character grid.
 # Byte or char length would misalign columns on CJK process names. Already in
-# the tree as a transitive dep of ratatui.
-unicode-width = "0.1"
+# the tree as a transitive dep of ratatui, and kept on its major so there is
+# one copy and both measure with the same tables.
+unicode-width = "0.2"
 maxminddb = "0.32"
 # Used for QUIC Initial decryption (RFC 9001): HKDF-Expand-Label, AES-128-GCM
 # AEAD, and AES-128-ECB header protection via `ring::aead::quic`. Already in
@@ -147,6 +154,18 @@ nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"]
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 caps = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 # ── Distro packages ───────────────────────────────────────────────────
 #

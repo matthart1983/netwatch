@@ -1,5 +1,8 @@
 //! Display-formatting helpers: MAC / IPv6 rendering, TCP flag strings,
-//! IP-protocol and ICMP type names, port labels, and the ARP summary.
+//! IP-protocol and ICMP type names, port labels, and the ARP summary, plus
+//! the one canonical spelling addresses are compared in.
+
+use std::net::{IpAddr, Ipv6Addr};
 
 use super::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FLAG_URG};
 
@@ -11,12 +14,68 @@ pub(crate) fn format_mac(bytes: &[u8]) -> String {
         .join(":")
 }
 
-pub(crate) fn format_ipv6(bytes: &[u8]) -> String {
-    bytes
-        .chunks(2)
-        .map(|c| format!("{:x}", u16::from_be_bytes([c[0], c[1]])))
-        .collect::<Vec<_>>()
-        .join(":")
+/// An IPv6 address from a packet header, in RFC 5952's canonical form
+/// (`2001:db8::1`, as `Ipv6Addr` displays it). `ss`, `lsof`, IP Helper and
+/// the `/proc/net` fallback all print that form, and stream keys are built
+/// from these strings on both sides, so writing every group out
+/// (`2001:db8:0:0:0:0:0:1`) left IPv6 connections without their stream, DPI
+/// label or JA4.
+///
+/// A v4-mapped address stays IPv6 here (`::ffff:192.0.2.1`), because a packet
+/// carrying one on the wire is an IPv6 packet. Sockets describe their IPv4
+/// peers that way, but their packets travel as IPv4, which is why
+/// [`parse_ip`] maps it to IPv4 for the connection side.
+pub(crate) fn format_ipv6(bytes: &[u8; 16]) -> String {
+    Ipv6Addr::from(*bytes).to_string()
+}
+
+/// An address read from any of the places netwatch meets one: a connection
+/// table row, a packet, or a display filter the user typed. Everything that
+/// compares addresses from two of those goes through here, so they agree
+/// however each source spells it:
+///
+/// - brackets go, including the stray closing one macOS `lsof` prints
+///   (`fe80::1]`), and so does a `%zone`, which no packet carries;
+/// - a v4-mapped address (`::ffff:192.0.2.1`, how `ss` shows a dual-stack
+///   socket's IPv4 peer) becomes the IPv4 address its packets carry;
+/// - a link-local address loses the scope macOS embeds in its second group
+///   (`fe80:16::1`), which is never on the wire either: RFC 4291 requires
+///   those bits to be zero.
+///
+/// `None` for anything that is not an address: a host name, a wildcard, a
+/// fragment such as `192.168.`.
+pub(crate) fn parse_ip(text: &str) -> Option<IpAddr> {
+    let text = text.trim_start_matches('[').trim_end_matches(']');
+    let text = text.split_once('%').map_or(text, |(addr, _zone)| addr);
+    match text.parse::<IpAddr>().ok()?.to_canonical() {
+        IpAddr::V6(v6) if v6.is_unicast_link_local() => {
+            let mut groups = v6.segments();
+            groups[1..4].fill(0);
+            Some(IpAddr::V6(Ipv6Addr::from(groups)))
+        }
+        ip => Some(ip),
+    }
+}
+
+/// [`parse_ip`], spelled as packet decoding spells addresses: dotted IPv4 and
+/// RFC 5952 IPv6. Two spellings of one address give the same string, so the
+/// result can key a map or be compared with `==`.
+pub(crate) fn canonical_ip(text: &str) -> Option<String> {
+    parse_ip(text).map(|ip| ip.to_string())
+}
+
+/// One end of a conversation as people read and paste it: `host:port`, with
+/// an IPv6 address in brackets (`[2001:db8::20]:53`) as RFC 5952 section 6
+/// asks and the connection table prints. Compressed IPv6 has no fixed group
+/// count, so an unbracketed port reads as one more group, and
+/// `2001:db8::20:53` is itself the address of a different host. A host name
+/// or an IPv4 address is written as is.
+pub(crate) fn format_endpoint(host: &str, port: impl std::fmt::Display) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 pub(crate) fn tcp_flags(flags: u8) -> String {

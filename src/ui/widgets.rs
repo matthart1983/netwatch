@@ -1205,7 +1205,7 @@ mod tests {
                 .unwrap();
             let buf = terminal.backend().buffer().clone();
             (0..w)
-                .map(|x| buf.get(x, 0).symbol().to_string())
+                .map(|x| buf[(x, 0)].symbol().to_string())
                 .collect::<String>()
         };
 
@@ -1370,9 +1370,7 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         // Column indices, not byte offsets — the border glyphs are multi-byte.
-        let top: Vec<String> = (0..40)
-            .map(|x| buf.get(x, 0).symbol().to_string())
-            .collect();
+        let top: Vec<String> = (0..40).map(|x| buf[(x, 0)].symbol().to_string()).collect();
         let badge_at = top.iter().position(|c| c == "1").expect("the badge digit");
         let title_at = top.iter().position(|c| c == "c").expect("the title");
         assert!(
@@ -1382,7 +1380,7 @@ mod tests {
         );
 
         // Inverse, so it is legible as a chip rather than reading as text.
-        let cell = buf.get(badge_at as u16, 0);
+        let cell = &buf[(badge_at as u16, 0)];
         assert_eq!(cell.bg, t.brand, "the badge sits on the accent");
         assert_ne!(cell.fg, t.brand, "and its digit is not the same colour");
     }
@@ -1400,7 +1398,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
         terminal
             .draw(|f| {
-                let inner = Panel::new("title").meta("meta").render(f, &theme, f.size());
+                let inner = Panel::new("title").meta("meta").render(f, &theme, f.area());
                 assert_eq!(inner.width, 38, "a panel insets by one column a side");
                 assert_eq!(inner.height, 3);
             })
@@ -1411,7 +1409,7 @@ mod tests {
         // offsets, and the box-drawing glyphs are three bytes each.
         let cols = |y: u16| -> Vec<String> {
             (0..buf.area.width)
-                .map(|x| buf.get(x, y).symbol().to_string())
+                .map(|x| buf[(x, y)].symbol().to_string())
                 .collect()
         };
         let col_of = |row: &[String], needle: &str| -> u16 {
@@ -1438,8 +1436,8 @@ mod tests {
 
         // The title reads in the accent, the metadata stays dim: a heading
         // and its context must not look like the same thing.
-        assert_eq!(buf.get(title_x, 0).fg, theme.brand);
-        assert_eq!(buf.get(meta_x, 0).fg, theme.text_muted);
+        assert_eq!(buf[(title_x, 0)].fg, theme.brand);
+        assert_eq!(buf[(meta_x, 0)].fg, theme.text_muted);
     }
 
     #[test]
@@ -1451,12 +1449,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
         terminal
             .draw(|f| {
-                Panel::plain().render(f, &theme, f.size());
+                Panel::plain().render(f, &theme, f.area());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
-        assert_eq!(buf.get(0, 0).symbol(), "╭");
-        assert_eq!(buf.get(19, 3).symbol(), "╯");
+        assert_eq!(buf[(0, 0)].symbol(), "╭");
+        assert_eq!(buf[(19, 3)].symbol(), "╯");
     }
 
     #[test]
@@ -1551,14 +1549,12 @@ mod tests {
         for name in crate::theme::THEME_NAMES {
             app.theme = crate::theme::by_name(name);
             let mut terminal = Terminal::new(TestBackend::new(160, 3)).unwrap();
-            terminal.draw(|f| render_header(f, &app, f.size())).unwrap();
+            terminal.draw(|f| render_header(f, &app, f.area())).unwrap();
             let buf = terminal.backend().buffer().clone();
-            let row: String = (0..buf.area.width)
-                .map(|x| buf.get(x, 1).symbol())
-                .collect();
+            let row: String = (0..buf.area.width).map(|x| buf[(x, 1)].symbol()).collect();
             assert!(row.contains("◌ no issues"), "{name}: {row}");
             for x in 0..buf.area.width {
-                let cell = buf.get(x, 1);
+                let cell = &buf[(x, 1)];
                 assert!(
                     cell.symbol() == " " || cell.fg != app.theme.status_good,
                     "{name}: green {:?} at column {x} of {row}",

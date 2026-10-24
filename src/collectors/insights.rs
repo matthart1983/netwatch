@@ -586,6 +586,8 @@ mod tests {
         expert: ExpertSeverity,
     ) -> CapturedPacket {
         CapturedPacket {
+            capture: None,
+            annotation: None,
             id: 1,
             timestamp: "00:00:00.000".into(),
             src_ip: src.into(),

@@ -68,7 +68,7 @@ loss on the path · severity High
 
 **Recovery:** a later trace to the same target shows no hop losing packets
 
-**Platforms:** native trace on linux ipv4; elsewhere a traceroute subprocess, which cannot always tell whether the destination replied
+**Platforms:** native trace on linux ipv4 and on windows; elsewhere a traceroute subprocess, which cannot always tell whether the destination replied
 
 **Suppresses:** `tcp.retrans_burst`
 

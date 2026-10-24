@@ -2,6 +2,7 @@
 //! and `matches_packet`. Drives which captured packets are visible on the
 //! Packets tab (list, detail pane, and scroll/selection).
 
+use super::format::{canonical_ip, parse_ip};
 use super::CapturedPacket;
 
 // ── Display filters ─────────────────────────────────────────
@@ -158,11 +159,15 @@ fn parse_atom(tokens: &[String]) -> Option<(FilterExpr, &[String])> {
 
     // ip.src == x
     if tokens[0].eq_ignore_ascii_case("ip.src") && tokens.len() >= 3 && tokens[1] == "==" {
-        return Some((FilterExpr::SrcIp(tokens[2].to_lowercase()), &tokens[3..]));
+        return Some((FilterExpr::SrcIp(address_value(&tokens[2])), &tokens[3..]));
     }
     // ip.dst == x
     if tokens[0].eq_ignore_ascii_case("ip.dst") && tokens.len() >= 3 && tokens[1] == "==" {
-        return Some((FilterExpr::DstIp(tokens[2].to_lowercase()), &tokens[3..]));
+        return Some((FilterExpr::DstIp(address_value(&tokens[2])), &tokens[3..]));
+    }
+    // ip.addr == x: either end, as Wireshark spells it
+    if tokens[0].eq_ignore_ascii_case("ip.addr") && tokens.len() >= 3 && tokens[1] == "==" {
+        return Some((FilterExpr::Ip(address_value(&tokens[2])), &tokens[3..]));
     }
     // port [==] N
     if tokens[0].eq_ignore_ascii_case("port") && tokens.len() >= 2 {
@@ -238,7 +243,11 @@ fn parse_atom(tokens: &[String]) -> Option<(FilterExpr, &[String])> {
         ));
     }
 
-    // Bare IP address (contains a dot and digits)
+    // Bare IP address: any whole address, or digits and dots (`192.168.`).
+    // A quoted one stays a text search.
+    if let Some(ip) = canonical_ip(word) {
+        return Some((FilterExpr::Ip(ip), &tokens[1..]));
+    }
     if word.contains('.') && word.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return Some((FilterExpr::Ip(word.to_string()), &tokens[1..]));
     }
@@ -257,12 +266,34 @@ fn parse_atom(tokens: &[String]) -> Option<(FilterExpr, &[String])> {
     Some((FilterExpr::Contains(val), &tokens[1..]))
 }
 
+/// The value of an address filter as typed. A whole address is stored in
+/// the spelling packet decoding uses, so `2001:DB8:0:0:0:0:0:1`,
+/// `[2001:db8::1]`, `fe80::1%eth0` and `::ffff:192.0.2.1` (as `ss` shows a
+/// dual-stack socket's IPv4 peer) each find their packets. Anything else is
+/// kept as text to match against.
+fn address_value(token: &str) -> String {
+    let token = token.trim_matches('"');
+    canonical_ip(token).unwrap_or_else(|| token.to_lowercase())
+}
+
+/// Whether a packet address matches an address filter's value. A whole
+/// address matches the same address, compared as addresses: as text,
+/// compressed IPv6 matches far too much, since `::1` is inside `2001:db8::1`
+/// and `fe80::1` inside `fe80::1c2:3`, and `10.0.0.1` inside `10.0.0.10`
+/// never meant that either. A fragment such as `192.168.` matches as text.
+fn address_matches(addr: &str, wanted: &str) -> bool {
+    match parse_ip(wanted) {
+        Some(wanted) => parse_ip(addr) == Some(wanted),
+        None => addr.contains(wanted),
+    }
+}
+
 pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
     match expr {
         FilterExpr::Protocol(p) => pkt.protocol.eq_ignore_ascii_case(p),
-        FilterExpr::SrcIp(ip) => pkt.src_ip.contains(ip.as_str()),
-        FilterExpr::DstIp(ip) => pkt.dst_ip.contains(ip.as_str()),
-        FilterExpr::Ip(ip) => pkt.src_ip.contains(ip.as_str()) || pkt.dst_ip.contains(ip.as_str()),
+        FilterExpr::SrcIp(ip) => address_matches(&pkt.src_ip, ip),
+        FilterExpr::DstIp(ip) => address_matches(&pkt.dst_ip, ip),
+        FilterExpr::Ip(ip) => address_matches(&pkt.src_ip, ip) || address_matches(&pkt.dst_ip, ip),
         FilterExpr::Port(p) => pkt.src_port == Some(*p) || pkt.dst_port == Some(*p),
         FilterExpr::Stream(n) => pkt.stream_index == Some(*n),
         FilterExpr::Contains(s) => {

@@ -424,6 +424,19 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied
             );
             std::fs::write(exports.join("allowed"), b"ok").unwrap();
+            // Packet exports publish by hard link and incident bundles by
+            // renaming their directory, both within the exports directory,
+            // so neither needs a grant beyond it.
+            crate::collectors::packets::export::atomic_write(
+                &exports.join("published.pcapng"),
+                |file| std::io::Write::write_all(file, b"ok"),
+            )
+            .unwrap();
+            let mut recorder = crate::collectors::incident::IncidentRecorder::new();
+            recorder.arm();
+            recorder.freeze("confined export").unwrap();
+            let bundle = recorder.export_bundle(&exports).unwrap();
+            assert!(bundle.join("manifest.json").exists());
             assert_eq!(
                 std::fs::write(escape, b"blocked").unwrap_err().kind(),
                 std::io::ErrorKind::PermissionDenied

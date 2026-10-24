@@ -16,21 +16,21 @@
   | IPv4: 192.0.2.1 → 192.0.2.10, TTL: 64, Proto: UDP (17), Len: 73
   | UDP: 53 (DNS) → 53001 (—), Len: 53
   | DNS: example.com (type=1, NOERROR)
-#3 DNS 2001:db8:0:0:0:0:0:10:53002 -> 2001:db8:0:0:0:0:0:20:53 len=91 expert=Chat
-  info: 2001:db8:0:0:0:0:0:10:53002 → 2001:db8:0:0:0:0:0:20:53 example.com (type=28)
+#3 DNS [2001:db8::10]:53002 -> [2001:db8::20]:53 len=91 expert=Chat
+  info: [2001:db8::10]:53002 → [2001:db8::20]:53 example.com (type=28)
   stream: 1
   app: Dns { qname: "example.com", qtype: 28, rcode: None }
   | Frame: 91 bytes on wire
   | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv6 (0x86dd)
-  | IPv6: 2001:db8:0:0:0:0:0:10 → 2001:db8:0:0:0:0:0:20, Hop Limit: 64, Next: UDP (17), Payload: 37
+  | IPv6: 2001:db8::10 → 2001:db8::20, Hop Limit: 64, Next: UDP (17), Payload: 37
   | UDP: 53002 (—) → 53 (DNS), Len: 37
   | DNS: example.com (type=28)
-#4 DNS 2001:db8:0:0:0:0:0:20:53 -> 2001:db8:0:0:0:0:0:10:53002 len=119 expert=Chat
-  info: 2001:db8:0:0:0:0:0:20:53 → 2001:db8:0:0:0:0:0:10:53002 example.com (type=28, NOERROR)
+#4 DNS [2001:db8::20]:53 -> [2001:db8::10]:53002 len=119 expert=Chat
+  info: [2001:db8::20]:53 → [2001:db8::10]:53002 example.com (type=28, NOERROR)
   stream: 1
   app: Dns { qname: "example.com", qtype: 28, rcode: None }
   | Frame: 119 bytes on wire
   | Ethernet: 02:00:00:00:00:02 → 02:00:00:00:00:01, Type: IPv6 (0x86dd)
-  | IPv6: 2001:db8:0:0:0:0:0:20 → 2001:db8:0:0:0:0:0:10, Hop Limit: 64, Next: UDP (17), Payload: 65
+  | IPv6: 2001:db8::20 → 2001:db8::10, Hop Limit: 64, Next: UDP (17), Payload: 65
   | UDP: 53 (DNS) → 53002 (—), Len: 65
   | DNS: example.com (type=28, NOERROR)

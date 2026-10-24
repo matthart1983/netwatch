@@ -46,7 +46,7 @@ NetWatch currently exposes these runtime tabs:
 - Active connections with process attribution (Linux eBPF kprobe / macOS PKTAP / lsof fallback)
 - Network config discovery for gateway, DNS, and hostname
 - Health probing for gateway and DNS targets
-- Packet capture with 15 L7 classifiers (`src/dpi/`), display filters, BPF filters, bookmarks, PCAP export
+- Packet capture with 15 L7 classifiers (`src/dpi/`), display filters, BPF filters, bookmarks, PCAPNG and PCAP export
 - TLS 1.3 decryption via `SSLKEYLOGFILE` and JA4/JA4Q fingerprinting
 - Threat detection (port scan, beaconing, DNS tunnel) via `network_intel.rs`
 - Stream reassembly with text and hex views
@@ -165,7 +165,7 @@ The flight recorder is one of the major product behaviors worth keeping document
 
 - `Shift+R` arms or disarms a rolling recorder window
 - `Shift+F` freezes the current incident window
-- `Shift+E` exports the current bundle to the user's home directory
+- `Shift+E` previews the frozen bundle, then writes it to the exports directory in netwatch's cache
 - Critical network-intel alerts can freeze an armed recorder automatically
 
 ### Export contents
@@ -179,7 +179,7 @@ An exported incident bundle includes:
 - `bandwidth.json`
 - `dns.json`
 - `alerts.json`
-- `packets.pcap` when the recorder actually captured packets
+- `packets.pcapng` when any recorded packet can be exported, and `packets.pcap` as well when they share one link type and are dated before 2106 (see "Capture export" in REFERENCE.md)
 
 The export format is implemented in `src/collectors/incident.rs`.
 
