@@ -1,5 +1,8 @@
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
+/// ICMP echo outcomes as Windows' ICMP API reports them. Platform-neutral so
+/// the decoding is tested everywhere; only the calls are Windows-only.
+pub mod icmp;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]

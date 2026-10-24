@@ -3,6 +3,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::process::Command;
 
+pub mod icmp;
 mod iphlpapi;
 
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {

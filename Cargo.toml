@@ -142,6 +142,18 @@ nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"]
 landlock = "0.4"
 caps = "0.5"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 # ── Distro packages ───────────────────────────────────────────────────
 #
 # `cargo deb` and `cargo generate-rpm` build these from the already-compiled

@@ -33,6 +33,40 @@ All notable changes to NetWatch will be documented in this file.
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns
   every key overflowed.
+- **Windows: gateway and internet latency on any display language.** The
+  probes ran `ping.exe` and read its English summary. On a German, Russian
+  or other non-English install that summary never matched, so the probes
+  got no ICMP figure and fell back to timing a TCP connect, or showed
+  "unmeasured" where nothing answered that either. netwatch now sends the
+  echoes itself through the Windows ICMP API (`IcmpSendEcho2`, IPv4 and
+  IPv6), which needs no administrator rights and answers with a status code
+  instead of text. A reply under a millisecond shows its measured fraction,
+  not 0. netwatch runs `ping.exe` only if it cannot open the ICMP API.
+- **Windows: traceroute works.** Since 0.32 the trace subprocess refused to
+  start off Unix, so `T` ended in an error on Windows. Windows now traces
+  natively through the ICMP API, IPv4 and IPv6, with three probes a hop up
+  to 30 hops, and records whether the destination itself answered, which
+  Diagnose's path rules read. A target that rejects pings with an
+  unreachable of its own (an iptables REJECT, a firewalld icmp-block) counts
+  as answered, as it does on Linux. `tracert` remains the fallback for a
+  target that is not an address, and netwatch now reads its output
+  correctly. `<1 ms` is under a millisecond rather than a hop named "<1",
+  `*` is a probe with no answer, a hop's address comes only from a token
+  that parses as one, so "Request timed out." no longer leaves "out." as
+  the address, and "Transmit error: code 1231." is no hop rather than a
+  1231 ms one. The tests cover English, German and Russian output.
+- **Diagnose: the PMTU experiment is "unsupported" on Windows.** It
+  confirms a black hole by repeating a transfer at a reduced TCP MSS, and
+  Windows cannot set the MSS of one socket, so the experiment could never
+  find a black hole there. The coverage row now says why and no longer
+  suggests `t`, and both `t` and `diagnose coverage --test pmtu.blackhole`
+  refuse it, before asking for a `pmtu_url`, as the IPv6 experiment does
+  off Linux.
+
+### Dependencies
+- **windows-sys 0.61 (Windows only)**, for the ICMP API calls. Their
+  structures and constants come from Microsoft's metadata instead of
+  declarations written by hand.
 
 ## [0.37.0] - 2026-10-22
 

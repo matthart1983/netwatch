@@ -1257,6 +1257,15 @@ fn coverage_hints(
             ),
         );
     }
+    if !super::active::PMTU_SUPPORTED {
+        hints.insert(
+            "pmtu.blackhole".into(),
+            (
+                Availability::Unsupported,
+                super::active::PMTU_UNSUPPORTED.into(),
+            ),
+        );
+    }
     let tcp_status = if !crate::collectors::tcp_info::platform_supported() {
         Some((
             Availability::Unsupported,
