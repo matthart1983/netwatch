@@ -217,6 +217,38 @@ All notable changes to NetWatch will be documented in this file.
   can change after upgrading: an `allow_sni` list stops flagging allowed
   IPv6 traffic that had no name before, and a `deny_sni` list now catches
   IPv6 traffic it used to miss.
+- **Worker threads carry their names.** They were started unnamed, so the
+  log recorded a panic in any of them as `thread="unnamed"`, and `top -H`
+  or `ps -L` listed every worker as `netwatch`. Each now has its worker's
+  name (`connections`, `health`, `reverse-dns` and so on), which the kernel
+  shortens to 15 characters.
+
+### Security
+- **Run as root, the sandbox now takes the capabilities netwatch never
+  uses from every confined thread.** It removes capabilities by a
+  deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.
+  Under sudo, every confined thread, the packet parser included, kept 38 of
+  root's 41 capabilities (37 with `--sandbox-strict`). One was
+  CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
+  memory, page cache included, through `/proc/kcore`, past every filesystem
+  rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
+  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more, and keep 11 (10 in
+  strict mode): file access in the user's directories, resource limits and
+  scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
+  CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
+  remains defence in depth, not containment. Runs without elevation, with
+  the documented `setcap` line or under the systemd unit drop what they did
+  before.
+- **The process-attribution thread no longer keeps every capability
+  netwatch started with.** It reads other processes' socket fds in `/proc`
+  to name each connection's owner, so it runs outside the sandbox, and it
+  never dropped anything: in every mode, `--sandbox-strict` included, it
+  held CAP_NET_RAW, CAP_BPF and CAP_PERFMON under the `setcap` line and all
+  41 of root's capabilities under sudo. Strict mode's promise to drop
+  CAP_NET_RAW was therefore untrue of the process. Before its first scan the
+  thread now drops everything except CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
+  the two it needs to read another user's sockets under root, so
+  connections are attributed as before.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**

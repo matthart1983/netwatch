@@ -11,7 +11,7 @@
 use super::paths::SandboxPaths;
 use super::{Mode, Report};
 
-use caps::{CapSet, Capability};
+use caps::{CapSet, Capability, CapsHashSet};
 use landlock::{
     Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, ABI,
@@ -20,18 +20,65 @@ use std::path::{Path, PathBuf};
 
 /// Highest requested ABI. Only filesystem access types are handled here;
 /// compatibility is best-effort on kernels supporting fewer access types.
-const TARGET_ABI: ABI = ABI::V4;
+pub(crate) const TARGET_ABI: ABI = ABI::V4;
 
-/// Capabilities dropped in every mode that runs `drop_caps`. These are
-/// the BPF-related capabilities: once the kprobe is attached and the
-/// ringbuffer is open, we don't need to load new BPF programs at runtime,
-/// so giving them up shrinks the blast radius if netwatch is compromised.
-const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
+/// Capabilities dropped in every mode that runs `drop_caps`.
+///
+/// Without elevation the thread holds none of them and this changes nothing.
+/// Under the documented `setcap` line it takes CAP_BPF and CAP_PERFMON. Under
+/// root it takes everything no code path uses after startup: a confined
+/// thread otherwise keeps almost every capability, and with CAP_SYS_RAWIO and
+/// the `/proc` grant it could read kernel memory, page cache included, through
+/// `/proc/kcore`, which no filesystem rule stops. What root keeps is file
+/// access in the user's directories (CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH,
+/// CAP_FOWNER, CAP_CHOWN, CAP_FSETID), limits and scheduling
+/// (CAP_SYS_RESOURCE, CAP_SYS_NICE, CAP_IPC_LOCK), CAP_NET_BIND_SERVICE for a
+/// metrics port below 1024, CAP_NET_RAW to reopen capture (see
+/// `CAPS_TO_DROP_STRICT`), and for now CAP_NET_ADMIN.
+pub(crate) const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
+    // Once the kprobe is attached and the ringbuffer is open, we don't need
+    // to load new BPF programs at runtime.
     Capability::CAP_BPF,
     Capability::CAP_PERFMON,
     // CAP_SYS_ADMIN is the legacy fallback for BPF on pre-5.8 kernels.
     // Drop it too — modern userspaces don't need it post-attach.
     Capability::CAP_SYS_ADMIN,
+    // Kernel memory, modules, the clock and the machine itself.
+    Capability::CAP_SYS_RAWIO,
+    Capability::CAP_SYS_MODULE,
+    Capability::CAP_SYS_BOOT,
+    Capability::CAP_SYS_TIME,
+    Capability::CAP_SYS_PACCT,
+    Capability::CAP_SYS_TTY_CONFIG,
+    Capability::CAP_SYSLOG,
+    Capability::CAP_WAKE_ALARM,
+    Capability::CAP_BLOCK_SUSPEND,
+    // Other processes. Landlock already refuses a confined thread ptrace
+    // access outside its domain; the ProcBroker, which never enters, keeps
+    // CAP_SYS_PTRACE for its socket scan (`CAPS_FOR_PROC_BROKER`).
+    Capability::CAP_SYS_PTRACE,
+    Capability::CAP_KILL,
+    Capability::CAP_CHECKPOINT_RESTORE,
+    Capability::CAP_IPC_OWNER,
+    // Identity and capability changes.
+    Capability::CAP_SETUID,
+    Capability::CAP_SETGID,
+    Capability::CAP_SETPCAP,
+    Capability::CAP_SETFCAP,
+    // Filesystem objects and attributes netwatch never creates or sets.
+    Capability::CAP_MKNOD,
+    Capability::CAP_SYS_CHROOT,
+    Capability::CAP_LINUX_IMMUTABLE,
+    Capability::CAP_LEASE,
+    // LSM and audit.
+    Capability::CAP_MAC_ADMIN,
+    Capability::CAP_MAC_OVERRIDE,
+    Capability::CAP_AUDIT_CONTROL,
+    Capability::CAP_AUDIT_WRITE,
+    Capability::CAP_AUDIT_READ,
+    // Checked nowhere in the kernel; dropped so every capability is either
+    // here or kept for a reason above.
+    Capability::CAP_NET_BROADCAST,
 ];
 
 /// Additional caps dropped in `Mode::Strict` only. CAP_NET_RAW is the
@@ -43,15 +90,22 @@ const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
 /// Operation not permitted` the moment a user pressed `c` twice. Strict
 /// users have opted into "fail closed" semantics — we keep dropping it
 /// there.
-const CAPS_TO_DROP_STRICT: &[Capability] = &[Capability::CAP_NET_RAW];
+pub(crate) const CAPS_TO_DROP_STRICT: &[Capability] = &[Capability::CAP_NET_RAW];
 
 /// What loading and attaching a BPF program needs. CAP_SYS_ADMIN is the
 /// pre-5.8 fallback and is listed for the same kernels the drop list names.
-const CAPS_FOR_BPF_LOAD: &[Capability] = &[
+pub(crate) const CAPS_FOR_BPF_LOAD: &[Capability] = &[
     Capability::CAP_BPF,
     Capability::CAP_PERFMON,
     Capability::CAP_SYS_ADMIN,
 ];
+
+/// What the ProcBroker keeps of whatever the process started with. Under
+/// root, listing another user's `/proc/<pid>/fd` takes CAP_DAC_READ_SEARCH,
+/// and reading its links, `exe` and `ns/net` takes CAP_SYS_PTRACE. The scan
+/// does nothing else.
+pub(crate) const CAPS_FOR_PROC_BROKER: &[Capability] =
+    &[Capability::CAP_SYS_PTRACE, Capability::CAP_DAC_READ_SEARCH];
 
 /// Drop the load capabilities on the calling thread.
 ///
@@ -60,29 +114,50 @@ const CAPS_FOR_BPF_LOAD: &[Capability] = &[
 pub fn drop_bpf_caps() -> Result<(), String> {
     for cap in CAPS_FOR_BPF_LOAD {
         for set in [CapSet::Effective, CapSet::Inheritable, CapSet::Permitted] {
-            caps::drop(None, set, *cap).map_err(|e| format!("{} {set:?}: {e}", cap_name(*cap)))?;
+            caps::drop(None, set, *cap).map_err(|e| format!("{cap} {set:?}: {e}"))?;
             if caps::has_cap(None, set, *cap).unwrap_or(true) {
-                return Err(format!("{} still present in {set:?}", cap_name(*cap)));
+                return Err(format!("{cap} still present in {set:?}"));
             }
         }
     }
     Ok(())
 }
 
+/// Drop every capability but [`CAPS_FOR_PROC_BROKER`] from the calling
+/// thread's Effective, Inheritable, Permitted and Ambient sets. No Landlock.
+pub fn relinquish_caps(report: &mut Report) {
+    let held = held_caps(report);
+    for cap in broker_drop_set(&held) {
+        drop_verified(
+            cap,
+            &[
+                CapSet::Effective,
+                CapSet::Inheritable,
+                CapSet::Permitted,
+                CapSet::Ambient,
+            ],
+            report,
+        );
+    }
+    record_retained(report);
+}
+
+/// Everything in `held` the broker does not keep, in capability order.
+fn broker_drop_set(held: &CapsHashSet) -> Vec<Capability> {
+    let mut drop: Vec<_> = held
+        .iter()
+        .filter(|cap| !CAPS_FOR_PROC_BROKER.contains(cap))
+        .copied()
+        .collect();
+    drop.sort_by_key(|cap| cap.index());
+    drop
+}
+
 pub fn apply(mode: Mode, paths: &SandboxPaths, retain: super::Retain, report: &mut Report) {
     report.mode.effective = Some(mode.label());
 
     drop_caps(mode, retain, report);
-    match caps::read(None, CapSet::Effective) {
-        Ok(caps) => {
-            report.platform.caps_retained = caps.iter().map(|c| format!("{c:?}")).collect();
-            report.platform.caps_retained.sort();
-        }
-        Err(error) => report
-            .mode
-            .warnings
-            .push(format!("retained capabilities unknown: {error}")),
-    }
+    record_retained(report);
 
     let result = if let Some(prepared) = super::worker::prepared_ruleset() {
         match prepared {
@@ -116,58 +191,86 @@ fn drop_caps(mode: Mode, retain: super::Retain, report: &mut Report) {
     } else {
         &[]
     };
+    let held = held_caps(report);
     for cap in CAPS_TO_DROP_DEFAULT.iter().chain(extra.iter()) {
         // Held deliberately and briefly — see `Retain`. The worker drops
         // them itself once the load is done, and the report says which
         // worker held what until it did.
         if matches!(retain, super::Retain::BpfLoad) && CAPS_FOR_BPF_LOAD.contains(cap) {
-            report
-                .platform
-                .caps_retained_for_load
-                .push(cap_name(*cap).to_string());
+            report.platform.caps_retained_for_load.push(cap.to_string());
             continue;
         }
-        // Try to drop from every set we have access to. `caps::drop`
-        // returns Ok(()) even if the cap wasn't present, so the no-cap
-        // (unprivileged) path is silently fine.
-        let permitted_before = caps::has_cap(None, CapSet::Permitted, *cap).unwrap_or(false);
-
-        let mut verified = true;
-        for set in [CapSet::Effective, CapSet::Inheritable, CapSet::Permitted] {
-            if let Err(error) = caps::drop(None, set, *cap) {
-                verified = false;
-                report
-                    .mode
-                    .warnings
-                    .push(format!("{} {set:?} drop failed: {error}", cap_name(*cap)));
-            }
-            match caps::has_cap(None, set, *cap) {
-                Ok(false) => {}
-                other => {
-                    verified = false;
-                    report.mode.warnings.push(format!(
-                        "{} {set:?} removal unverified: {other:?}",
-                        cap_name(*cap)
-                    ));
-                }
-            }
-        }
-        if verified && permitted_before {
-            report
-                .platform
-                .caps_dropped
-                .push(cap_name(*cap).to_string());
+        // Only what the thread holds: every worker entry runs this, and an
+        // unprivileged one holds nothing on the list.
+        if held.contains(cap) {
+            drop_verified(
+                *cap,
+                &[CapSet::Effective, CapSet::Inheritable, CapSet::Permitted],
+                report,
+            );
         }
     }
 }
 
-fn cap_name(cap: Capability) -> &'static str {
-    match cap {
-        Capability::CAP_NET_RAW => "CAP_NET_RAW",
-        Capability::CAP_BPF => "CAP_BPF",
-        Capability::CAP_PERFMON => "CAP_PERFMON",
-        Capability::CAP_SYS_ADMIN => "CAP_SYS_ADMIN",
-        _ => "CAP_OTHER",
+/// Every capability the calling thread holds in any set. Effective is within
+/// Permitted, and Ambient within both Permitted and Inheritable, so those two
+/// cover all four. If either can't be read, every capability is tried, so the
+/// failure is reported rather than read as nothing to drop.
+fn held_caps(report: &mut Report) -> CapsHashSet {
+    match (
+        caps::read(None, CapSet::Permitted),
+        caps::read(None, CapSet::Inheritable),
+    ) {
+        (Ok(permitted), Ok(inheritable)) => &permitted | &inheritable,
+        (Err(error), _) | (_, Err(error)) => {
+            report
+                .mode
+                .warnings
+                .push(format!("held capabilities unknown: {error}"));
+            caps::all()
+        }
+    }
+}
+
+/// Drop `cap` from each of `sets` on the calling thread and check it is gone.
+fn drop_verified(cap: Capability, sets: &[CapSet], report: &mut Report) {
+    let permitted_before = caps::has_cap(None, CapSet::Permitted, cap).unwrap_or(false);
+
+    let mut verified = true;
+    for &set in sets {
+        if let Err(error) = caps::drop(None, set, cap) {
+            verified = false;
+            report
+                .mode
+                .warnings
+                .push(format!("{cap} {set:?} drop failed: {error}"));
+        }
+        match caps::has_cap(None, set, cap) {
+            Ok(false) => {}
+            other => {
+                verified = false;
+                report
+                    .mode
+                    .warnings
+                    .push(format!("{cap} {set:?} removal unverified: {other:?}"));
+            }
+        }
+    }
+    if verified && permitted_before {
+        report.platform.caps_dropped.push(cap.to_string());
+    }
+}
+
+fn record_retained(report: &mut Report) {
+    match caps::read(None, CapSet::Effective) {
+        Ok(caps) => {
+            report.platform.caps_retained = caps.iter().map(|c| c.to_string()).collect();
+            report.platform.caps_retained.sort();
+        }
+        Err(error) => report
+            .mode
+            .warnings
+            .push(format!("retained capabilities unknown: {error}")),
     }
 }
 
@@ -485,6 +588,124 @@ mod tests {
             CAPS_TO_DROP_STRICT.contains(&Capability::CAP_NET_RAW),
             "Strict mode should still drop CAP_NET_RAW (opt-in trade-off)"
         );
+    }
+
+    #[test]
+    fn default_drop_list_covers_dangerous_root_caps() {
+        // Under root a confined thread starts with every capability, so the
+        // deny-list is all that stands between a parser bug and these.
+        for cap in [
+            Capability::CAP_SYS_RAWIO,
+            Capability::CAP_SYS_MODULE,
+            Capability::CAP_SYS_BOOT,
+            Capability::CAP_SYS_PTRACE,
+            Capability::CAP_SETUID,
+            Capability::CAP_SETGID,
+            Capability::CAP_SETPCAP,
+            Capability::CAP_SETFCAP,
+            Capability::CAP_MKNOD,
+            Capability::CAP_SYS_CHROOT,
+            Capability::CAP_SYS_TIME,
+            Capability::CAP_MAC_ADMIN,
+            Capability::CAP_MAC_OVERRIDE,
+            Capability::CAP_LINUX_IMMUTABLE,
+            Capability::CAP_SYSLOG,
+            Capability::CAP_AUDIT_CONTROL,
+            Capability::CAP_AUDIT_WRITE,
+            Capability::CAP_AUDIT_READ,
+            Capability::CAP_KILL,
+            Capability::CAP_BPF,
+            Capability::CAP_PERFMON,
+            Capability::CAP_SYS_ADMIN,
+        ] {
+            assert!(CAPS_TO_DROP_DEFAULT.contains(&cap), "{cap} kept under root");
+        }
+        // Everything else is kept on purpose: a root session's file access in
+        // the user's directories, limits and scheduling, a low metrics port,
+        // reopening capture, and for now CAP_NET_ADMIN. A capability in
+        // neither list, such as one a caps upgrade adds, fails here until
+        // someone decides.
+        let kept = [
+            Capability::CAP_CHOWN,
+            Capability::CAP_DAC_OVERRIDE,
+            Capability::CAP_DAC_READ_SEARCH,
+            Capability::CAP_FOWNER,
+            Capability::CAP_FSETID,
+            Capability::CAP_SYS_RESOURCE,
+            Capability::CAP_SYS_NICE,
+            Capability::CAP_IPC_LOCK,
+            Capability::CAP_NET_BIND_SERVICE,
+            Capability::CAP_NET_ADMIN,
+            Capability::CAP_NET_RAW,
+        ];
+        for cap in caps::all() {
+            assert_ne!(
+                CAPS_TO_DROP_DEFAULT.contains(&cap),
+                kept.contains(&cap),
+                "{cap} must be either dropped or kept"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_relinquish_keeps_only_ptrace_and_dac_read_search() {
+        // Root's set, which the broker starts with under sudo.
+        let full = caps::all();
+        let dropped = broker_drop_set(&full);
+        assert_eq!(dropped.len(), full.len() - CAPS_FOR_PROC_BROKER.len());
+        for cap in [Capability::CAP_SYS_PTRACE, Capability::CAP_DAC_READ_SEARCH] {
+            assert!(!dropped.contains(&cap), "{cap} dropped");
+        }
+        for cap in [
+            Capability::CAP_NET_RAW,
+            Capability::CAP_NET_ADMIN,
+            Capability::CAP_BPF,
+            Capability::CAP_PERFMON,
+            Capability::CAP_SYS_ADMIN,
+            Capability::CAP_DAC_OVERRIDE,
+        ] {
+            assert!(dropped.contains(&cap), "{cap} kept");
+        }
+
+        // On a real thread, whatever it held, only those two remain.
+        let (report, permitted) = std::thread::spawn(|| {
+            let mut report = Report::default();
+            relinquish_caps(&mut report);
+            (report, caps::read(None, CapSet::Permitted).unwrap())
+        })
+        .join()
+        .unwrap();
+        assert!(
+            report.mode.warnings.is_empty(),
+            "{:?}",
+            report.mode.warnings
+        );
+        assert!(
+            permitted.iter().all(|c| CAPS_FOR_PROC_BROKER.contains(c)),
+            "{permitted:?}"
+        );
+    }
+
+    #[test]
+    fn unprivileged_runs_drop_nothing_and_warn_about_nothing() {
+        std::thread::spawn(|| {
+            if !caps::read(None, CapSet::Permitted).unwrap().is_empty() {
+                // A privileged test run; the user-namespace lab covers it.
+                return;
+            }
+            let mut report = Report::default();
+            drop_caps(Mode::Strict, super::super::Retain::Nothing, &mut report);
+            relinquish_caps(&mut report);
+            assert!(
+                report.mode.warnings.is_empty(),
+                "{:?}",
+                report.mode.warnings
+            );
+            assert!(report.platform.caps_dropped.is_empty());
+            assert!(report.platform.caps_retained.is_empty());
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

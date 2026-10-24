@@ -1810,8 +1810,10 @@ fn overlay_proc_attribution(connections: &mut [Connection], brokered: Option<&Pr
 /// Landlock confines per thread. The collector worker parses packet-derived
 /// data and runs confined, which blocks reading other processes' socket fds;
 /// this broker is started before any confinement (from `App::prepare`) and
-/// only reads kernel procfs tables, never packet data. It holds no strong
-/// reference to itself, so its thread exits when the collector is dropped.
+/// only reads kernel procfs tables, never packet data. Its thread gives up
+/// every capability but the two that scan needs before it reads anything
+/// (`worker::relinquish`). It holds no strong reference to itself, so its
+/// thread exits when the collector is dropped.
 #[cfg(target_os = "linux")]
 pub struct ProcBroker {
     latest: RwLock<Option<Arc<ProcSnapshot>>>,
@@ -1827,13 +1829,16 @@ impl ProcBroker {
         let weak = Arc::downgrade(&broker);
         let spawned = std::thread::Builder::new()
             .name("netwatch-proc-broker".into())
-            .spawn(move || loop {
-                std::thread::sleep(interval);
-                let Some(broker) = weak.upgrade() else {
-                    break;
-                };
-                let snapshot = Arc::new(capture_proc_snapshot());
-                *safe_write(&broker.latest, "proc_broker::publish") = Some(snapshot);
+            .spawn(move || {
+                crate::sandbox::worker::relinquish("proc-broker");
+                loop {
+                    std::thread::sleep(interval);
+                    let Some(broker) = weak.upgrade() else {
+                        break;
+                    };
+                    let snapshot = Arc::new(capture_proc_snapshot());
+                    *safe_write(&broker.latest, "proc_broker::publish") = Some(snapshot);
+                }
             });
         if let Err(error) = spawned {
             tracing::warn!(%error, "proc attribution broker did not start");
@@ -2404,6 +2409,12 @@ mod tests {
         };
         let first = broker.latest().unwrap().captured_at;
         assert!(eventually(&|| broker.latest().unwrap().captured_at > first));
+        // Its thread gave up its capabilities before that first scan.
+        let record = crate::sandbox::worker::relinquished().remove("proc-broker");
+        assert!(
+            record.as_ref().is_some_and(|r| r.mode.warnings.is_empty()),
+            "{record:?}"
+        );
         let weak = Arc::downgrade(&broker);
         drop(broker);
         assert!(eventually(&|| weak.upgrade().is_none()));
