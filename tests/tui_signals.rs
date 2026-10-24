@@ -180,7 +180,11 @@ fn stops_cleanly(stop: impl FnOnce(&mut Pty)) {
     let after = tcgetattr(&pty.slave).unwrap();
     let canonical = LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG;
     assert!(pty.before.local_flags.contains(canonical));
-    assert_eq!(after.local_flags, pty.before.local_flags);
+    // PENDIN is kernel-maintained input state on macOS after restoring ICANON.
+    assert_eq!(
+        after.local_flags & !LocalFlags::PENDIN,
+        pty.before.local_flags & !LocalFlags::PENDIN
+    );
     assert_eq!(after.input_flags, pty.before.input_flags);
     assert_eq!(after.output_flags, pty.before.output_flags);
 }

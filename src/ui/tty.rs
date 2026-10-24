@@ -296,7 +296,13 @@ mod tests {
         use nix::sys::termios::LocalFlags;
         let flags = LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG;
         assert!(run.before.local_flags.contains(flags));
-        assert_eq!(run.after.local_flags, run.before.local_flags);
+        // macOS sets PENDIN itself when ICANON is restored; it is pending
+        // input state, not a mode the application failed to restore.
+        // https://github.com/apple/darwin-xnu/blob/main/bsd/kern/tty.c#L1202
+        assert_eq!(
+            run.after.local_flags & !LocalFlags::PENDIN,
+            run.before.local_flags & !LocalFlags::PENDIN
+        );
         assert_eq!(run.after.input_flags, run.before.input_flags);
         assert_eq!(run.after.output_flags, run.before.output_flags);
     }
