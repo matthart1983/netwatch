@@ -269,6 +269,16 @@ jobs:
           cp target/${{ matrix.target }}/release/netwatch ${{ matrix.name }}
           tar czf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
 
+      # The check ci.yml makes, run on the binary about to be zipped. This
+      # build adds `--target` and `cargo auditable`, which CI's does not. It
+      # takes seconds and installs or writes nothing. A dispatch runs main's
+      # copy of this file against the tag's tree, and tags before 0.38 have
+      # no script (their CI never ran it either), so those skip the step.
+      - name: Smoke-test the binary (Windows)
+        if: runner.os == 'Windows' && hashFiles('scripts/windows-smoke.ps1') != ''
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1 target/${{ matrix.target }}/release/netwatch.exe
+
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
