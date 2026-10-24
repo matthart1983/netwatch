@@ -49,16 +49,17 @@ pcap = "2"
 tls-parser = "0.12"
 httparse = "1.10"
 # Developer target probes time the TLS handshake themselves and need the
-# certificate error class, which ureq hides. Both are already in the tree
-# through ureq with these features, so this adds no new crates.
+# certificate error class, which ureq hides; the diagnostic load upload
+# shares their TLS set-up. Both are already in the tree through ureq with
+# these features, so this adds no new crates.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 # QUIC Initial decryption (Phase 9 hard mode) uses ring's `aead::quic`
 # header-protection primitive + `aead::AES_128_GCM` + the `hkdf` module.
 # ring is already a direct dep above for TLS work.
 socket2 = { version = "0.6", features = ["all"] }
 url = "2"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3.5", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
