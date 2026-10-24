@@ -696,7 +696,8 @@ fn direct_lookup(resolver: IpAddr, host: &str) -> LookupOutcome {
     }
 }
 
-fn tls_config() -> Arc<rustls::ClientConfig> {
+/// Shared with the diagnostic load upload, so both trust the same roots.
+pub(super) fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
     CONFIG
         .get_or_init(|| {

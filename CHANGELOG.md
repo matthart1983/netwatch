@@ -54,6 +54,44 @@ All notable changes to NetWatch will be documented in this file.
   link. Nothing started the built binary on Windows before. The release
   workflow runs the same check on the Windows binary before packaging it.
 
+### Dependencies
+- **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
+  toml 0.8 parsed through its own copy of toml_edit 0.22, next to the
+  toml_edit 0.25 the egress policy writer uses; toml 1.x needs neither.
+  config.toml and the egress policy are written byte for byte as before,
+  `--generate-config` included. config.toml and egress-policy.toml can now
+  also use TOML 1.1: an inline table may span lines and end in a comma, and
+  strings take `\e` and `\xHH` escapes. netwatch 0.37 and earlier can't read
+  a file that does. They run on defaults in place of such a config.toml, and
+  they skip such an egress policy and enforce none of it, which shows only as
+  a log warning and in Diagnose coverage. Keep a file shared across machines,
+  such as a distributed egress policy, to TOML 1.0 until every host runs
+  0.38. Parse errors are worded a little differently.
+- **dirs 5 → 7.** Config, cache and state stay where they were on every
+  platform. The one location dirs 7 moved, `preference_dir` on Windows, is
+  not one netwatch uses.
+- **ureq 2 → 3.5 and webpki-roots 0.26 → 1.** The remote publisher, the geo
+  and whois lookups and AI insights behave as before. They keep their
+  timeouts, connect directly even when `HTTPS_PROXY` is set, which ureq 3
+  would otherwise honour, follow at most four redirects and send compact
+  JSON. A reply is still capped at 10 MiB once gzip is undone. The remote
+  URL is still sent as the url crate reads it, so a trailing newline from a
+  secret file, a space in the path or a non-ASCII host works as it did, and
+  a URL ureq 3 cannot send to is refused at start-up. Three things differ.
+  An ingest POST answered with a 307 or 308 is now retried, where ureq 2
+  counted it as delivered and dropped the batch. A response body now has
+  30 s to arrive, a redirect's included, since ureq 3 reads a redirect's
+  body before following it where ureq 2 dropped it unread. AI insights now
+  use the shared client, so the Ollama endpoint gets 5 s to accept the
+  connection and still 30 s to answer. The diagnose load test no longer
+  uploads through ureq, because ureq 3 takes a custom resolver only through
+  an API outside semver. It sends the same 25 MB over the cancellable
+  lookup and sockets the other probes use, and still never follows a
+  redirect. It times connections under load only once the upload's body is
+  going out, so an upload that loses its first seconds to addresses that
+  never answer gives no verdict from idle samples. Only one webpki-roots
+  remains in the build.
+
 ## [0.37.0] - 2026-10-22
 
 ### Dependencies
