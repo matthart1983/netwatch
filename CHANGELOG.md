@@ -215,6 +215,16 @@ All notable changes to NetWatch will be documented in this file.
   offer it files from outside. They now list a linked file but do not
   descend into a linked directory.
 
+### CI
+- **Connection-table scale tests.** A generator builds connection tables
+  shaped like a busy host's. In every run, a 10,000-row table must show its
+  true count and scroll to its last row, and the Timeline must keep every
+  active connection when 10,000 are open. Timed tests for frames, the scroll
+  key, the tick and Diagnose's socket join at 2,000, 10,000 and 50,000 rows,
+  and for a real poll of up to 50,000 loopback sockets, run in a new weekly
+  perf workflow that gates nothing yet. `scripts/scale-bench.sh` prints
+  their numbers as a table.
+
 ## [0.38.0] - 2026-10-25
 
 ### Added

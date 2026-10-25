@@ -185,6 +185,12 @@ impl TcpInfoCollector {
         self.snapshot.read().unwrap().clone()
     }
 
+    /// Publish `flows` as if a dump had just completed, for tests.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, flows: FlowMap) {
+        *self.snapshot.write().unwrap() = (Arc::new(flows), Some(std::time::Instant::now()));
+    }
+
     pub fn get(&self, local: &str, remote: &str) -> Option<TcpInfo> {
         self.snapshot()
             .get(&(normalize_endpoint(local), normalize_endpoint(remote)))
