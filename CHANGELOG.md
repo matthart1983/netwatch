@@ -25,13 +25,22 @@ All notable changes to NetWatch will be documented in this file.
   `RX 60s`, and a bar chart narrower than 60 columns dropped the oldest
   samples it claimed to show. Both graphs now spread their whole history
   across the chart, and the label follows the refresh interval: at 500 ms
-  they read `RX 15s` and `RX 30s`.
+  they read `RX 15s` and `RX 30s`, and at 5000 ms `RX 150s` and `RX 5m`.
 - **Dense view's process header rows draw the traffic their DOWN column
   reports.** A process with several sockets summed its sockets' sparklines,
   but every socket to the same host carries that host's whole history, so a
   host with five open sockets was counted five times. The sparkline
   overstated whichever hosts had the most sockets, and its newest point
   disagreed with DOWN. Each host is now counted once.
+- **Chart window labels between two and ten minutes give the exact number
+  of seconds.** A window of two minutes or more was rounded to the nearest
+  minute, so 148 seconds read `2m` and 150 seconds `3m`. At the default
+  1-second refresh, Dense's throughput axis was off at nearly every terminal
+  size (80 columns plot 148 seconds), and so was Lite's axis on terminals
+  wider than about 120 columns. The connection sparkline labels in Dense and
+  Lite were off at refresh intervals above 4 seconds. Those windows now read
+  `148s` and `150s`. A whole number of minutes still reads `2m` or `5m`, and
+  a window of ten minutes or more is given to the nearest minute.
 - **With `x` on, the Packets detail pane stops showing a packet the list
   hides.** Turning `x` on with a packet selected that is not an expert
   finding left that packet decoded in the detail pane, while the list showed

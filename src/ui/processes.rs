@@ -740,7 +740,13 @@ mod tests {
             (GraphStyle::Bars, 40),
         ] {
             app.graph_style = style;
-            for refresh_rate_ms in [1000, 500, 5000] {
+            // 60 samples at each rate. 150 seconds is not `3m`.
+            for (refresh_rate_ms, label) in [
+                (1000, "RX 60s"),
+                (500, "RX 30s"),
+                (2500, "RX 150s"),
+                (5000, "RX 5m"),
+            ] {
                 app.user_config.refresh_rate_ms = refresh_rate_ms;
                 let area = Rect::new(0, 0, width, 6);
                 let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
@@ -749,11 +755,7 @@ mod tests {
                     .unwrap();
                 let buf = terminal.backend().buffer();
                 let header: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
-                let window = crate::ui::lite::window_label(
-                    crate::app::TOP_PROC_HISTORY_LEN,
-                    refresh_rate_ms,
-                );
-                assert_eq!(header.trim_end(), format!("RX {window}"));
+                assert_eq!(header.trim_end(), label);
                 // A full-scale sample reaches the chart's top row.
                 for x in 0..width {
                     assert_ne!(
