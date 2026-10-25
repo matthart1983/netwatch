@@ -259,11 +259,18 @@ mod tests {
                     output.extend(chunk);
                 }
             };
-            // Whatever the child wrote before it exited, then nothing more.
-            while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
+            let after = tcgetattr(&pty.slave).unwrap();
+            // Whatever the child wrote before it exited. With the last slave
+            // fd closed, the reader stops at the end of it, however long a
+            // loaded machine takes to get there; a quiet spell is no sign of
+            // the end on a FreeBSD runner.
+            drop(pty.slave);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Ok(chunk) =
+                rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
                 output.extend(chunk);
             }
-            let after = tcgetattr(&pty.slave).unwrap();
             Run {
                 status,
                 output: String::from_utf8_lossy(&output).into_owned(),
