@@ -1,0 +1,39 @@
+name: Nix
+
+# Builds the flake (flake.nix, package.nix) the way a Nix user would, with
+# the package's checkPhase running the test suite inside the Nix sandbox.
+# Nothing built it before, and it went unbuildable for months: its pinned
+# nixpkgs fell behind `rust-version` and nobody noticed. The weekly run
+# catches the same kind of drift when no change lands here. It lives
+# outside ci.yml because the release guard (scripts/release-guard.sh) waits
+# on every ci.yml run, and a Nix-only failure should not hold a release.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+
+      # Every system the flake declares must still evaluate, macOS included,
+      # though only Linux is built here.
+      - name: Evaluate the flake on every system
+        run: nix flake check --all-systems --no-build
+
+      # checkPhase runs the test suite; installCheckPhase (versionCheckHook)
+      # runs the built binary's `--version` against Cargo.toml.
+      - name: Build and test the package
+        run: nix build -L .#default
