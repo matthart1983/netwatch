@@ -197,8 +197,9 @@ pub fn link_speed_bps(iface: &str) -> Option<u64> {
 /// macOS and FreeBSD: `ifi_baudrate` from `getifaddrs`, which is the link's
 /// currently negotiated rate — a real gigabit figure on Ethernet, and the live
 /// PHY rate on Wi-Fi (it moves as the radio renegotiates, because the capacity
-/// really does move). FreeBSD's `<net/if.h>` has the same `struct if_data`
-/// with the same field.
+/// really does move). FreeBSD's `<net/if.h>` has an `ifi_baudrate` in its
+/// `struct if_data` too, but the layouts differ and the field is a u64 there
+/// where macOS has a u32, so it is read by name from the target's own struct.
 ///
 /// `getifaddrs` is a syscall, deliberately: this is read on every refresh, and
 /// the rest of this module already shells out to `netstat`/`ifconfig` per tick.
