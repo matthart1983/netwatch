@@ -2,6 +2,13 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Dense view's connection and process sparklines now use their full width,
+  including on wide terminals. Their time labels reflect the retained history
+  and refresh interval instead of always saying `60s`.
+
 ## [0.38.0] - 2026-10-25
 
 ### Added
