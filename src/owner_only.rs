@@ -70,7 +70,7 @@ pub fn create(path: &Path) -> io::Result<File> {
 pub fn create_dir_all(dir: &Path) -> io::Result<()> {
     dir_builder().recursive(true).create(dir)?;
     #[cfg(unix)]
-    narrow_dir(dir, unsafe { nix::libc::geteuid() });
+    narrow_dir(dir, nix::unistd::geteuid().as_raw());
     Ok(())
 }
 

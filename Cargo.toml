@@ -145,7 +145,7 @@ required-features = ["ebpf"]
 embed-manifest = "1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"] }
+nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll", "user"] }
 # The TUI's shutdown deadline waits for signals on a thread of its own.
 # crossterm already depends on it, so nothing new is compiled.
 signal-hook = "0.3"
@@ -171,7 +171,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
+    "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
