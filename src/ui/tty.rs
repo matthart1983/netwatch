@@ -127,20 +127,36 @@ pub fn install_panic_hook() {
 }
 
 /// Print a fatal panic's report as the default hook would, with `clean` in
-/// place of what it says: the backtrace if `RUST_BACKTRACE` asks for one, and
-/// how to ask if not. Not `eprintln!`, which panics if the terminal has hung
-/// up, and a panic in the hook aborts.
+/// place of what it says: the backtrace if `RUST_BACKTRACE` asks for one, in
+/// full for `full`, and how to ask if not. `RUST_BACKTRACE` decides alone, as
+/// it does for the default hook. `Backtrace::capture` would also obey
+/// `RUST_LIB_BACKTRACE`, whose 0 anyhow documents for keeping panic
+/// backtraces while turning error ones off. Not `eprintln!`, which panics if
+/// the terminal has hung up, and a panic in the hook aborts.
 fn print_report(thread: &str, clean: &str) {
     let mut err = io::stderr().lock();
     let _ = writeln!(err, "\nthread '{}' {clean}", sanitize::display(thread));
-    let trace = Backtrace::capture();
-    let _ = match trace.status() {
-        BacktraceStatus::Captured => writeln!(err, "stack backtrace:\n{trace}"),
-        BacktraceStatus::Disabled => writeln!(
+    let style = std::env::var_os("RUST_BACKTRACE").filter(|style| style != "0");
+    let Some(style) = style else {
+        let _ = writeln!(
             err,
             "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
-        ),
-        _ => Ok(()),
+        );
+        return;
+    };
+    let trace = Backtrace::force_capture();
+    if trace.status() != BacktraceStatus::Captured {
+        return;
+    }
+    // Each frame ends its own line.
+    let _ = if style == "full" {
+        write!(err, "stack backtrace:\n{trace:#}")
+    } else {
+        writeln!(
+            err,
+            "stack backtrace:\n{trace}note: Some details are omitted, \
+             run with `RUST_BACKTRACE=full` for a verbose backtrace."
+        )
     };
 }
 
@@ -183,9 +199,11 @@ mod tests {
 
         /// Run the test `name` of this binary as a child, with `child` set in
         /// its environment and a fresh pty as its stdio, and collect what it
-        /// writes until it exits. Backtraces are on, as a user reporting a
-        /// panic would be asked to turn them on.
-        pub fn run_child(name: &str, child: &str) -> Run {
+        /// writes until it exits. `RUST_BACKTRACE` is `backtrace`, as a user
+        /// reporting a panic would be asked to set it. `RUST_LIB_BACKTRACE`
+        /// is 0, which anyhow documents for panic backtraces without error
+        /// ones, so it must not turn the panic's off.
+        pub fn run_child(name: &str, child: &str, backtrace: &str) -> Run {
             let size = Winsize {
                 ws_row: 24,
                 ws_col: 80,
@@ -198,7 +216,8 @@ mod tests {
             let mut cmd = Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", name, "--nocapture"])
                 .env(child, "1")
-                .env("RUST_BACKTRACE", "1")
+                .env("RUST_BACKTRACE", backtrace)
+                .env("RUST_LIB_BACKTRACE", "0")
                 .stdin(stdio(&pty.slave))
                 .stdout(stdio(&pty.slave))
                 .stderr(stdio(&pty.slave));
@@ -306,6 +325,7 @@ mod tests {
         let run = pty::run_child(
             "ui::tty::tests::a_tui_panic_restores_the_terminal_before_the_report",
             CHILD,
+            "1",
         );
         let out = &run.output;
         let at = |seq: &str| out.find(seq).unwrap_or_else(|| panic!("{seq:?}: {out:?}"));
@@ -347,11 +367,45 @@ mod tests {
         let run = pty::run_child(
             "ui::tty::tests::a_tui_panic_report_keeps_its_backtrace",
             CHILD,
+            "1",
         );
         let out = &run.output;
         let at = |seq: &str| out.find(seq).unwrap_or_else(|| panic!("{seq:?}: {out:?}"));
         assert!(at("\x1b[?1049l") < at("tui-sentinel"), "{out:?}");
         assert!(at("tui-sentinel") < at("stack backtrace:"), "{out:?}");
+    }
+
+    /// `RUST_BACKTRACE=full` asks for every frame with its address. The report
+    /// the hook prints itself gives that, as the default hook's does.
+    #[cfg(unix)]
+    #[test]
+    fn a_sanitised_panic_report_gives_the_full_backtrace_when_asked() {
+        const CHILD: &str = "NETWATCH_TTY_FULL_BACKTRACE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            install_panic_hook();
+            let _session = enter().unwrap();
+            panic!("tui-sentinel \x1b]52;c;AAAA\x07");
+        }
+        let run = pty::run_child(
+            "ui::tty::tests::a_sanitised_panic_report_gives_the_full_backtrace_when_asked",
+            CHILD,
+            "full",
+        );
+        let out = &run.output;
+        let at = |seq: &str| out.find(seq).unwrap_or_else(|| panic!("{seq:?}: {out:?}"));
+        assert!(
+            at("tui-sentinel ·]52;c;AAAA·") < at("stack backtrace:"),
+            "{out:?}"
+        );
+        // Only the full form gives each frame's address: "   4:     0x55783bf14237 - …".
+        let addressed = out[at("stack backtrace:")..].lines().any(|line| {
+            line.trim_start()
+                .split_once(':')
+                .is_some_and(|(index, rest)| {
+                    index.parse::<usize>().is_ok() && rest.trim_start().starts_with("0x")
+                })
+        });
+        assert!(addressed, "{out:?}");
     }
 
     #[cfg(unix)]
@@ -376,6 +430,7 @@ mod tests {
         let run = pty::run_child(
             "ui::tty::tests::a_background_panic_leaves_the_tui_up",
             CHILD,
+            "1",
         );
         let out = &run.output;
         assert!(run.status.success(), "{out:?}");
