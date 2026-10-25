@@ -65,7 +65,7 @@ impl Owner {
 fn current_uid() -> Option<u32> {
     #[cfg(unix)]
     {
-        Some(unsafe { nix::libc::geteuid() })
+        Some(nix::unistd::geteuid().as_raw())
     }
     #[cfg(not(unix))]
     {

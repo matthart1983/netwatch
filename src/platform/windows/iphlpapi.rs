@@ -124,6 +124,7 @@ fn read_adapters(flags: u32) -> Result<Vec<Adapter>, u32> {
     let mut size: u32 = 15_000;
     for _ in 0..4 {
         // u64 elements keep the buffer 8-byte aligned for the records.
+        const { assert!(align_of::<IP_ADAPTER_ADDRESSES_LH>() <= align_of::<u64>()) };
         let mut buf = vec![0u64; (size as usize).div_ceil(8)];
         // SAFETY: `buf` is at least `size` bytes, writable and aligned for
         // the records the API places in it, and `size` is a live u32 the call

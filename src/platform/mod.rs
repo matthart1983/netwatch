@@ -194,59 +194,71 @@ pub fn link_speed_bps(iface: &str) -> Option<u64> {
     Some(mbps as u64 * 1_000_000)
 }
 
-/// macOS: `ifi_baudrate` from `getifaddrs`, which is the link's currently
-/// negotiated rate — a real gigabit figure on Ethernet, and the live PHY rate
-/// on Wi-Fi (it moves as the radio renegotiates, because the capacity really
-/// does move).
+/// macOS and FreeBSD: `ifi_baudrate` from `getifaddrs`, which is the link's
+/// currently negotiated rate — a real gigabit figure on Ethernet, and the live
+/// PHY rate on Wi-Fi (it moves as the radio renegotiates, because the capacity
+/// really does move). FreeBSD's `<net/if.h>` has an `ifi_baudrate` in its
+/// `struct if_data` too, but the layouts differ and the field is a u64 there
+/// where macOS has a u32, so it is read by name from the target's own struct.
 ///
 /// `getifaddrs` is a syscall, deliberately: this is read on every refresh, and
 /// the rest of this module already shells out to `netstat`/`ifconfig` per tick.
 /// Adding a fourth fork to the tick path to fetch one integer would be a poor
 /// trade.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub fn link_speed_bps(iface: &str) -> Option<u64> {
-    use std::ffi::CStr;
-
     let mut ifap: *mut nix::libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills `ifap` with an owned list we free below; every
-    // pointer is null-checked before it is read.
+    // SAFETY: `getifaddrs` fills `ifap` with an owned list we free below.
     if unsafe { nix::libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
         return None;
     }
-    let mut speed = None;
-    let mut cur = ifap;
-    while !cur.is_null() {
-        let entry = unsafe { &*cur };
-        cur = entry.ifa_next;
-        if entry.ifa_addr.is_null() || entry.ifa_data.is_null() {
-            continue;
-        }
-        // Only the AF_LINK entry carries `if_data`; the AF_INET ones don't.
-        if i32::from(unsafe { (*entry.ifa_addr).sa_family }) != nix::libc::AF_LINK {
-            continue;
-        }
-        let name = unsafe { CStr::from_ptr(entry.ifa_name) };
-        if name.to_string_lossy() != iface {
-            continue;
-        }
-        let data = unsafe { &*(entry.ifa_data as *const nix::libc::if_data) };
-        if data.ifi_baudrate > 0 {
-            speed = Some(u64::from(data.ifi_baudrate));
-        }
-        break;
-    }
+    // SAFETY: `ifap` is the list `getifaddrs` just returned, not yet freed.
+    let speed = unsafe { link_baudrate(ifap, iface) };
     // SAFETY: `ifap` came from a successful `getifaddrs` and is freed once.
     unsafe { nix::libc::freeifaddrs(ifap) };
     speed
 }
 
-/// FreeBSD: same `getifaddrs`/`AF_LINK`/`if_data.ifi_baudrate` approach as
-/// macOS — the struct and field are shared BSD ABI. Lives in `freebsd.rs`
-/// since that module also needs `getifaddrs` for nothing else, unlike macOS
-/// where this function sits directly in this file.
-#[cfg(target_os = "freebsd")]
-pub fn link_speed_bps(iface: &str) -> Option<u64> {
-    freebsd::link_speed_bps(iface)
+/// `ifi_baudrate` from `iface`'s `AF_LINK` entry in a `getifaddrs` list, when
+/// it reports one. Only the `AF_LINK` entry carries `if_data`; the `AF_INET`
+/// ones don't.
+///
+/// # Safety
+///
+/// `list` is null or the head of a live list laid out as `getifaddrs` returns
+/// it: every non-null `ifa_next`, `ifa_name` and `ifa_addr` points at an
+/// entry, a NUL-terminated name and a `sockaddr`, and an `AF_LINK` entry's
+/// non-null `ifa_data` points at its `if_data`.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+unsafe fn link_baudrate(list: *const nix::libc::ifaddrs, iface: &str) -> Option<u64> {
+    use std::ffi::CStr;
+
+    let mut cur = list;
+    // SAFETY: `cur` is the head or an `ifa_next`, so null or a live entry.
+    while let Some(entry) = unsafe { cur.as_ref() } {
+        cur = entry.ifa_next;
+        if entry.ifa_name.is_null() || entry.ifa_addr.is_null() || entry.ifa_data.is_null() {
+            continue;
+        }
+        // SAFETY: checked non-null above, and a `sockaddr` by the contract.
+        if i32::from(unsafe { (*entry.ifa_addr).sa_family }) != nix::libc::AF_LINK {
+            continue;
+        }
+        // SAFETY: checked non-null above, and NUL-terminated by the contract.
+        if unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy() != iface {
+            continue;
+        }
+        let data = entry.ifa_data.cast::<nix::libc::if_data>();
+        // SAFETY: checked non-null above, and this entry's `if_data` by the
+        // contract. Only the one field is read, without a reference to the
+        // whole struct, so nothing is assumed about the bytes around it.
+        let baud = unsafe { std::ptr::addr_of!((*data).ifi_baudrate).read_unaligned() };
+        // u32 on macOS, u64 on FreeBSD.
+        #[cfg(target_os = "macos")]
+        let baud = u64::from(baud);
+        return (baud > 0).then_some(baud);
+    }
+    None
 }
 
 /// Windows would come from `GetIfEntry2`'s `TransmitLinkSpeed`; not wired up
@@ -315,6 +327,44 @@ mod link_speed_tests {
                 );
             }
         }
+    }
+
+    /// The walk reads each entry's name as a C string, so a null one has to
+    /// be passed over, not read.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn null_ifa_name_is_skipped() {
+        use nix::libc::{if_data, ifaddrs, sa_family_t, sockaddr, AF_LINK};
+        use std::ptr::addr_of_mut;
+
+        let mut addr = sockaddr {
+            sa_family: AF_LINK as sa_family_t,
+            ..Default::default()
+        };
+        // libc has no `Default` for FreeBSD's `if_data`, whose timestamps
+        // are unions.
+        // SAFETY: `if_data` is integers and unions of integers and
+        // timevals, for which all-zero bytes are a valid value.
+        let mut data: if_data = unsafe { std::mem::zeroed() };
+        data.ifi_baudrate = 1_000_000_000;
+        let mut named = ifaddrs {
+            ifa_name: c"en0".as_ptr().cast_mut(),
+            ifa_addr: addr_of_mut!(addr),
+            ifa_data: addr_of_mut!(data).cast(),
+            ..Default::default()
+        };
+        // An AF_LINK entry with data but no name, ahead of the one we want.
+        let unnamed = ifaddrs {
+            ifa_next: addr_of_mut!(named),
+            ifa_addr: addr_of_mut!(addr),
+            ifa_data: addr_of_mut!(data).cast(),
+            ..Default::default()
+        };
+
+        // SAFETY: both entries and everything they point at live on this
+        // frame for the whole call, and the walk only reads them.
+        let speed = unsafe { super::link_baudrate(&unnamed, "en0") };
+        assert_eq!(speed, Some(1_000_000_000));
     }
 }
 

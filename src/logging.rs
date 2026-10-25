@@ -116,7 +116,7 @@ mod tests {
         // write and the "unwritable" premise below doesn't hold — this is
         // normal Unix behavior, not a bug, and CI's FreeBSD VM runner runs
         // as root.
-        if unsafe { nix::libc::geteuid() } == 0 {
+        if nix::unistd::geteuid().as_raw() == 0 {
             eprintln!("skipping appender_is_none_when_dir_unwritable: running as root");
             return;
         }

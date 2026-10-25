@@ -249,46 +249,6 @@ fn parse_route_get_interface(text: &str) -> Option<String> {
     })
 }
 
-/// `ifi_baudrate` from `getifaddrs`'s `AF_LINK` entry — ported from
-/// `platform::mod`'s `#[cfg(target_os = "macos")]` block, since FreeBSD's
-/// `<net/if.h>` defines the same `struct if_data` with the same field,
-/// exposed the same way through `nix::libc`.
-pub fn link_speed_bps(iface: &str) -> Option<u64> {
-    use std::ffi::CStr;
-
-    let mut ifap: *mut nix::libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills `ifap` with an owned list we free below;
-    // every pointer is null-checked before it is read.
-    if unsafe { nix::libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
-        return None;
-    }
-    let mut speed = None;
-    let mut cur = ifap;
-    while !cur.is_null() {
-        let entry = unsafe { &*cur };
-        cur = entry.ifa_next;
-        if entry.ifa_addr.is_null() || entry.ifa_data.is_null() {
-            continue;
-        }
-        // Only the AF_LINK entry carries `if_data`; the AF_INET ones don't.
-        if i32::from(unsafe { (*entry.ifa_addr).sa_family }) != nix::libc::AF_LINK {
-            continue;
-        }
-        let name = unsafe { CStr::from_ptr(entry.ifa_name) };
-        if name.to_string_lossy() != iface {
-            continue;
-        }
-        let data = unsafe { &*(entry.ifa_data as *const nix::libc::if_data) };
-        if data.ifi_baudrate > 0 {
-            speed = Some(u64::from(data.ifi_baudrate));
-        }
-        break;
-    }
-    // SAFETY: `ifap` came from a successful `getifaddrs` and is freed once.
-    unsafe { nix::libc::freeifaddrs(ifap) };
-    speed
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

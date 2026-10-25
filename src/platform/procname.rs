@@ -123,13 +123,9 @@ pub fn name_from_path(path: &Path) -> Option<String> {
 /// caller lacks the privilege to ask.
 #[cfg(target_os = "macos")]
 pub fn executable_path(pid: u32) -> Option<PathBuf> {
-    use std::os::raw::{c_int, c_void};
-
     // `proc_pidpath` lives in libproc, which is part of libSystem and so is
     // already linked — no extra dependency.
-    extern "C" {
-        fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
-    }
+    use nix::libc::{c_int, c_void, proc_pidpath};
 
     // PROC_PIDPATHINFO_MAXSIZE (sys/proc_info.h).
     const MAX: usize = 4 * 1024;
