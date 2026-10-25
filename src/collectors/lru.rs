@@ -1,7 +1,7 @@
 //! A map capped at a fixed number of entries, evicted least recently used
 //! first. The reverse-DNS, GeoIP and WHOIS caches each keep one, keyed by
-//! peer address, so a host that talks to millions of peers keeps a few
-//! thousand.
+//! peer address, so a host that talks to millions of peers keeps
+//! thousands.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;

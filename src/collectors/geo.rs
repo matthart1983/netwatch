@@ -6,7 +6,15 @@ use std::time::{Duration, Instant};
 
 use super::lru::BoundedLru;
 
-const GEO_CACHE_MAX: usize = 4096;
+/// More than the 10,000 connections netwatch is sized for. The egress view
+/// looks up every public peer on every tick, and an LRU smaller than the set
+/// it cycles through evicts each entry before it is asked for again.
+const GEO_CACHE_MAX: usize = 16_384;
+
+/// Online lookups queued for the worker at most. A lookup that finds the
+/// queue full is dropped and asked again on a later lookup. The worker
+/// answers one every 1.4 s, so a full queue is six minutes of work.
+const GEO_QUEUE_MAX: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct GeoInfo {
@@ -122,7 +130,7 @@ pub struct GeoCache {
     /// Keyed by [`lookup_addr`]'s canonical address.
     cache: Arc<Mutex<BoundedLru<IpAddr, GeoEntry>>>,
     mmdb: Arc<Option<MaxMindReader>>,
-    online_tx: std_mpsc::Sender<IpAddr>,
+    online_tx: std_mpsc::SyncSender<IpAddr>,
     pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<IpAddr>>>>,
     /// Opt-in: without it, an IP with no offline DB hit simply has no geo
     /// info rather than being sent to ip-api.com. See `geoip_online` in
@@ -157,7 +165,7 @@ impl GeoCache {
         let has_db = reader.city_reader.is_some();
         let mmdb = Arc::new(if has_db { Some(reader) } else { None });
 
-        let (tx, rx) = std_mpsc::channel::<IpAddr>();
+        let (tx, rx) = std_mpsc::sync_channel::<IpAddr>(GEO_QUEUE_MAX);
         let cache = Arc::new(Mutex::new(BoundedLru::new(GEO_CACHE_MAX)));
 
         Self {
@@ -251,26 +259,36 @@ impl GeoCache {
             return None;
         }
         let mut cache = self.cache.lock().unwrap();
-        cache.put(addr, GeoEntry::Pending);
-        if let Err(e) = self.online_tx.send(addr) {
-            tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
+        match self.online_tx.try_send(addr) {
+            Ok(()) => cache.put(addr, GeoEntry::Pending),
+            // Queue full: record nothing, so the next lookup asks again.
+            Err(std_mpsc::TrySendError::Full(_)) => {}
+            Err(e @ std_mpsc::TrySendError::Disconnected(_)) => {
+                tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
+            }
         }
         None
     }
 }
 
 /// The address a GeoIP or WHOIS lookup is made for, or None when `ip` should
-/// not be looked up at all. A `%zone` is dropped and a v4-mapped address
-/// becomes the IPv4 one it carries, so `::ffff:8.8.8.8` and `8.8.8.8` share
-/// a cache entry. Anything that is not global unicast is None: a private,
-/// shared, documentation or multicast address has no location or owner
-/// worth showing, and asking a remote service about one tells it about the
-/// local network.
+/// not be looked up at all. Brackets and a `%zone` are dropped and a
+/// v4-mapped address becomes the IPv4 one it carries, so `[::ffff:8.8.8.8]`,
+/// `::ffff:8.8.8.8` and `8.8.8.8` share a cache entry. Anything that is not
+/// global unicast is None: a multicast address, or one the IANA
+/// special-purpose registries mark not globally reachable, such as a
+/// private, shared, documentation or benchmarking address. It has no
+/// location or owner worth showing, and asking a remote service about one
+/// tells it about the local network.
 ///
 /// Stricter than [`is_private_ip`], which stays as it is: topology, egress,
 /// beacon detection and diagnose use it to decide what counts as local, and
 /// widening it would change what they report.
 pub(crate) fn lookup_addr(ip: &str) -> Option<IpAddr> {
+    let ip = ip
+        .strip_prefix('[')
+        .and_then(|ip| ip.strip_suffix(']'))
+        .unwrap_or(ip);
     let ip = ip.split_once('%').map_or(ip, |(addr, _zone)| addr);
     let addr = ip.parse::<IpAddr>().ok()?.to_canonical();
     let global = match addr {
@@ -280,16 +298,19 @@ pub(crate) fn lookup_addr(ip: &str) -> Option<IpAddr> {
     global.then_some(addr)
 }
 
-/// IPv4 networks that are not global unicast (RFC 6890 and its updates).
-const NON_GLOBAL_V4: [(Ipv4Addr, u32); 14] = [
+/// IPv4 networks that are not global unicast: those the IANA special-purpose
+/// registry (RFC 6890 and its updates) marks not globally reachable, as
+/// std's unstable `Ipv4Addr::is_global` does, and multicast.
+const NON_GLOBAL_V4: [(Ipv4Addr, u32); 15] = [
     (Ipv4Addr::new(0, 0, 0, 0), 8),       // "this network"
     (Ipv4Addr::new(10, 0, 0, 0), 8),      // private
     (Ipv4Addr::new(100, 64, 0, 0), 10),   // shared: carrier-grade NAT, Tailscale
     (Ipv4Addr::new(127, 0, 0, 0), 8),     // loopback
     (Ipv4Addr::new(169, 254, 0, 0), 16),  // link-local
     (Ipv4Addr::new(172, 16, 0, 0), 12),   // private
-    (Ipv4Addr::new(192, 0, 0, 0), 24),    // IETF protocol assignments
+    (Ipv4Addr::new(192, 0, 0, 0), 24),    // IETF protocol assignments, but see GLOBAL_V4
     (Ipv4Addr::new(192, 0, 2, 0), 24),    // documentation
+    (Ipv4Addr::new(192, 88, 99, 2), 32),  // 6a44 relay anycast
     (Ipv4Addr::new(192, 168, 0, 0), 16),  // private
     (Ipv4Addr::new(198, 18, 0, 0), 15),   // benchmarking
     (Ipv4Addr::new(198, 51, 100, 0), 24), // documentation
@@ -298,9 +319,19 @@ const NON_GLOBAL_V4: [(Ipv4Addr, u32); 14] = [
     (Ipv4Addr::new(240, 0, 0, 0), 4),     // reserved, and 255.255.255.255
 ];
 
-/// IPv6 networks that are not global unicast. NAT64 and 6to4 addresses are
-/// left to [`is_global_v6`], which judges them by the IPv4 address inside.
-const NON_GLOBAL_V6: [(Ipv6Addr, u32); 8] = [
+/// Addresses inside [`NON_GLOBAL_V4`] that the registry marks globally
+/// reachable.
+const GLOBAL_V4: [(Ipv4Addr, u32); 2] = [
+    (Ipv4Addr::new(192, 0, 0, 9), 32),  // PCP anycast
+    (Ipv4Addr::new(192, 0, 0, 10), 32), // TURN anycast
+];
+
+/// IPv6 networks that are not global unicast: those the IANA special-purpose
+/// registry marks not globally reachable, as std's unstable
+/// `Ipv6Addr::is_global` does, multicast and deprecated site-local. NAT64
+/// and 6to4 addresses are left to [`is_global_v6`], which judges them by the
+/// IPv4 address inside.
+const NON_GLOBAL_V6: [(Ipv6Addr, u32); 12] = [
     (Ipv6Addr::UNSPECIFIED, 127),                         // :: and ::1
     (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),      // unique local
     (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),     // link-local
@@ -309,13 +340,42 @@ const NON_GLOBAL_V6: [(Ipv6Addr, u32); 8] = [
     (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32), // documentation
     (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),     // documentation
     (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),      // discard-only
+    (Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64),      // dummy prefix
+    // Local-use NAT64. Its prefix can be any length from /48 to /96, so the
+    // IPv4 address inside is not always in the last 32 bits.
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    // IETF protocol assignments, Teredo and benchmarking among them, but
+    // see GLOBAL_V6.
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16), // SRv6 segment IDs
 ];
 
-fn is_global_v4(ip: Ipv4Addr) -> bool {
+/// Blocks inside [`NON_GLOBAL_V6`] that the registry marks globally
+/// reachable.
+const GLOBAL_V6: [(Ipv6Addr, u32); 7] = [
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1), 128), // PCP anycast
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2), 128), // TURN anycast
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3), 128), // DNS-SD SRP anycast
+    (Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32),  // AMT
+    (Ipv6Addr::new(0x2001, 4, 0x112, 0, 0, 0, 0, 0), 48), // AS112
+    (Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28), // ORCHIDv2
+    (Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28), // drone remote ID tags
+];
+
+fn in_v4(ip: Ipv4Addr, nets: &[(Ipv4Addr, u32)]) -> bool {
     let bits = u32::from(ip);
-    !NON_GLOBAL_V4
-        .iter()
+    nets.iter()
         .any(|&(net, len)| bits >> (32 - len) == u32::from(net) >> (32 - len))
+}
+
+fn in_v6(ip: Ipv6Addr, nets: &[(Ipv6Addr, u32)]) -> bool {
+    let bits = u128::from(ip);
+    nets.iter()
+        .any(|&(net, len)| bits >> (128 - len) == u128::from(net) >> (128 - len))
+}
+
+fn is_global_v4(ip: Ipv4Addr) -> bool {
+    in_v4(ip, &GLOBAL_V4) || !in_v4(ip, &NON_GLOBAL_V4)
 }
 
 fn is_global_v6(ip: Ipv6Addr) -> bool {
@@ -329,10 +389,7 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
     if seg[0] == 0x2002 {
         return is_global_v4(embedded(seg[1], seg[2]));
     }
-    let bits = u128::from(ip);
-    !NON_GLOBAL_V6
-        .iter()
-        .any(|&(net, len)| bits >> (128 - len) == u128::from(net) >> (128 - len))
+    in_v6(ip, &GLOBAL_V6) || !in_v6(ip, &NON_GLOBAL_V6)
 }
 
 pub fn is_private_ip(ip: &str) -> bool {
@@ -661,11 +718,53 @@ mod tests {
         }
     }
 
+    /// netwatch is sized for 10,000 connections, and the egress view looks
+    /// up every public peer on every tick. With fewer entries than peers,
+    /// each tick evicted the ones the next would ask for, so every lookup
+    /// went back to the database.
+    #[test]
+    fn ten_thousand_peers_stay_cached() {
+        let cache = GeoCache::with_reader(every_address_us(), false);
+        let peers: Vec<IpAddr> = (0..10_000u32)
+            .map(|i| IpAddr::from(Ipv4Addr::from(0x0800_0000 + i)))
+            .collect();
+        for peer in &peers {
+            assert!(cache.lookup(&peer.to_string()).is_some());
+        }
+        let c = cache.cache.lock().unwrap();
+        assert!(peers.iter().all(|peer| c.contains_key(peer)));
+    }
+
+    /// The online queue had no limit, and a pending entry the cache evicted
+    /// was queued again on the next tick's lookup, so with more peers than
+    /// cache entries every tick queued every peer behind a worker that
+    /// answers one every 1.4 s.
+    #[test]
+    fn a_full_online_queue_drops_the_request_and_records_nothing() {
+        let cache = GeoCache::with_mmdb_and_online("", "", true);
+        let peers: Vec<String> = (0..10_000u32)
+            .map(|i| Ipv4Addr::from(0x0800_0000 + i).to_string())
+            .collect();
+        // Two ticks: the second queues nothing new.
+        for _ in 0..2 {
+            for peer in &peers {
+                assert!(cache.lookup(peer).is_none());
+            }
+        }
+        assert_eq!(cache.cache.lock().unwrap().len(), GEO_QUEUE_MAX);
+        assert_eq!(queued(&cache).len(), GEO_QUEUE_MAX);
+        // With room again, a dropped request is asked for on its next lookup.
+        let dropped = peers.last().unwrap();
+        cache.lookup(dropped);
+        assert_eq!(queued(&cache), [dropped.as_str()]);
+    }
+
     #[test]
     fn v4_mapped_and_plain_share_one_entry() {
         let cache = GeoCache::with_reader(every_address_us(), false);
         assert!(cache.lookup("8.8.8.8").is_some());
         assert!(cache.lookup("::ffff:8.8.8.8").is_some());
+        assert!(cache.lookup("[::ffff:8.8.8.8]").is_some());
         assert_eq!(cache.cache.lock().unwrap().len(), 1);
 
         // Online, the mapped form is asked for once, as the IPv4 address.
@@ -697,7 +796,9 @@ mod tests {
             "127.0.0.1",
             "169.254.1.1",
             "172.31.255.255",
-            "192.0.0.9",
+            "192.0.0.8",
+            "192.0.0.170",
+            "192.88.99.2",
             "198.19.255.255",
             "198.51.100.1",
             "203.0.113.1",
@@ -713,6 +814,23 @@ mod tests {
             "100::1",
             // 6to4 for 192.168.1.1.
             "2002:c0a8:101::1",
+            // The rest of the registry: local-use NAT64, whatever the
+            // prefix length, the dummy prefix, SRv6, and the IETF block
+            // with Teredo and benchmarking in it.
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1:c0a8:1:500::",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+            "100:0:0:1::1",
+            "5f00::1",
+            "2001::1",
+            "2001:1::5",
+            "2001:2::1",
+            "2001:5::1",
+            "2001:10::1",
+            "2001:1ff:ffff::1",
+            // A connection row's host, as Linux prints a dual-stack peer.
+            "[::ffff:192.168.1.5]",
+            "[fe80::1%eth0]",
             "",
             "—",
             "not-an-ip",
@@ -735,6 +853,19 @@ mod tests {
             "223.255.255.255",
             "64:ff9b::808:808",
             "2002:808:808::1",
+            "[::ffff:8.8.8.8]",
+            "[2606:4700:4700::1111]",
+            // Blocks inside the ones above that IANA marks global.
+            "192.0.0.9",
+            "192.0.0.10",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:3f::1",
+            "2001:200::1",
         ] {
             assert!(offline.lookup(ip).is_some(), "{ip}");
         }
