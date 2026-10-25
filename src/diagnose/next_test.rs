@@ -1853,7 +1853,11 @@ mod tests {
         }
         fn sleep(&self, d: Duration) {
             self.still.set(0);
-            self.elapsed.set(self.elapsed.get() + d);
+            let elapsed = self.elapsed.get() + d;
+            self.elapsed.set(elapsed);
+            // A loop that misses its way out would sleep on this one forever.
+            // The test's whole timeline is under 2 s.
+            assert!(elapsed < Duration::from_secs(60), "the clock ran on");
         }
     }
 
