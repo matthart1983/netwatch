@@ -1714,7 +1714,7 @@ impl PacketCollector {
         let bpf = bpf_filter.map(|s| s.to_string());
         let interface_ref: Arc<str> = interface.as_str().into();
 
-        self.handle = Some(thread::spawn(move || {
+        let run = move || {
             // Resource preparation stays off the UI thread (device resolution
             // may invoke PowerShell). No packet is read during preparation.
             let mut cap = match prepare_capture(&interface, bpf.as_deref()) {
@@ -1865,7 +1865,19 @@ impl PacketCollector {
                     pkts.drain(0..excess);
                 }
             }
-        }));
+        };
+        // Named like the workers `worker::spawn` starts, so the panic hook and
+        // the log can say a parser panic happened here.
+        match thread::Builder::new().name("capture".into()).spawn(run) {
+            Ok(handle) => self.handle = Some(handle),
+            Err(error) => {
+                tracing::error!(target: "netwatch::capture", %error, "capture thread did not start");
+                let message = format!("Capture failed: {error}");
+                crate::sandbox::worker::fail("capture", message.clone());
+                *crate::app::safe_lock(&self.error, "packets::capture_spawn_error") = Some(message);
+                self.capturing.store(false, Ordering::SeqCst);
+            }
+        }
     }
 
     pub fn stop_capture(&mut self) {
@@ -5771,5 +5783,19 @@ mod lifecycle_tests {
             10,
         );
         assert_eq!((ladder.total, ladder.position), (3, Some(3)));
+    }
+
+    #[test]
+    fn capture_thread_is_named() {
+        // The panic hook logs the thread's name, and a parser panic happens on
+        // this thread; unnamed, it was logged as thread="unnamed".
+        let mut collector = PacketCollector::new();
+        collector.start_capture("netwatch-pr04-nonexistent-interface", None);
+        let name = collector
+            .handle
+            .as_ref()
+            .and_then(|h| h.thread().name().map(str::to_owned));
+        collector.stop_capture();
+        assert_eq!(name.as_deref(), Some("capture"));
     }
 }
