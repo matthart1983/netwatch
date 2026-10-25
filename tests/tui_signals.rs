@@ -4,8 +4,9 @@
 //! started: out of raw mode, off the alternate screen, mouse reporting off and
 //! the cursor shown. Until 0.38.1 only `Ctrl+C` typed at the keyboard did;
 //! SIGTERM, SIGINT and SIGHUP killed the process with the terminal still raw.
-//! The last two tests take the terminal away or stop it reading, where the
-//! pty cannot be put back; netwatch must still end, and not by crashing.
+//! The last three tests take the terminal away or stop it reading, where the
+//! pty cannot be put back. A hangup must still exit 0, and SIGTERM must still
+//! end netwatch when its terminal has stopped reading.
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::termios::{tcgetattr, LocalFlags, Termios};
@@ -218,80 +219,155 @@ fn ctrl_c_typed_restores_the_terminal_and_exits_0() {
     stops_cleanly(|pty| pty.master.write_all(b"\x03").unwrap());
 }
 
+/// `netwatch --demo` with the pty as its controlling terminal, the way a
+/// terminal emulator or sshd runs it: closing the master hangs the pty up,
+/// every write fails, and the kernel sends netwatch SIGHUP. Linux only:
+/// macOS revokes the slave when the session leader exits (see `Pty::spawn`).
+#[cfg(target_os = "linux")]
+struct Ctty {
+    child: Child,
+    master: Option<fs::File>,
+    slave: OwnedFd,
+    _fixture: Fixture,
+}
+
+#[cfg(target_os = "linux")]
+impl Ctty {
+    /// Start netwatch and wait for its first frame.
+    fn spawn() -> Self {
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        use std::os::fd::AsFd;
+
+        let fixture = Fixture::new();
+        let mut cmd = fixture.command();
+        cmd.arg("--demo");
+        let size = Winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = openpty(&size, None).unwrap();
+        let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
+        cmd.stdin(stdio()).stdout(stdio()).stderr(stdio());
+        // SAFETY: setsid and ioctl are async-signal-safe, which is all that may
+        // run between fork and exec, and touch only the child.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid()?;
+                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // openpty's descriptors survive exec, and a child holding the master
+        // would keep the pty from hanging up. A clone is close-on-exec.
+        let mut master = fs::File::from(pty.master.try_clone().unwrap());
+        drop(pty.master);
+        let child = cmd.spawn().unwrap();
+        drop(cmd);
+        let mut tty = Self {
+            child,
+            master: None,
+            slave: pty.slave,
+            _fixture: fixture,
+        };
+        // Read here rather than on a thread, which would hold the master open.
+        let mut output = String::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !first_frame(&output) {
+            assert!(Instant::now() < deadline, "no first frame: {output:?}");
+            let mut fds = [PollFd::new(master.as_fd(), PollFlags::POLLIN)];
+            if poll(&mut fds, PollTimeout::from(100u16)).unwrap() > 0 {
+                let mut buf = [0; 16384];
+                let n = master.read(&mut buf).unwrap();
+                output.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        }
+        tty.master = Some(master);
+        tty
+    }
+
+    /// Close the master, as a terminal window closing or an SSH connection
+    /// dropping does.
+    fn hang_up(&mut self) {
+        self.master = None;
+    }
+
+    /// Whether netwatch's main thread, the one that draws, is in write(2).
+    fn writing(&self) -> bool {
+        let syscall = fs::read_to_string(format!("/proc/{}/syscall", self.child.id()));
+        let number = syscall.ok().and_then(|s| {
+            s.split_whitespace()
+                .next()?
+                .parse::<nix::libc::c_long>()
+                .ok()
+        });
+        number.is_some_and(|n| n == nix::libc::SYS_write || n == nix::libc::SYS_writev)
+    }
+
+    fn wait(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "netwatch did not exit");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Ctty {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// Closing the terminal window or losing the SSH connection hangs the pty up:
 /// netwatch gets SIGHUP and every write fails. A failed write on the way out
 /// panicked, the panic report's own write panicked again, and the process
 /// aborted with a core dump. `kill -HUP` above leaves the pty working, so it
-/// never saw this.
+/// never saw this. Exit 0 means netwatch answered the SIGHUP and saved the
+/// session.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_hangup_ends_without_a_panic() {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    use std::os::fd::AsFd;
-    use std::os::unix::process::ExitStatusExt;
+fn a_hangup_exits_0() {
+    let mut tty = Ctty::spawn();
+    tty.hang_up();
+    let status = tty.wait();
+    assert!(status.success(), "{status}");
+}
 
-    let fixture = Fixture::new();
-    let mut cmd = fixture.command();
-    cmd.arg("--demo");
-    let size = Winsize {
-        ws_row: 40,
-        ws_col: 120,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let pty = openpty(&size, None).unwrap();
-    let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
-    cmd.stdin(stdio()).stdout(stdio()).stderr(stdio());
-    // The pty is netwatch's controlling terminal, so closing its master
-    // hangs it up the way a terminal emulator closing does.
-    // SAFETY: setsid and ioctl are async-signal-safe, which is all that may
-    // run between fork and exec, and touch only the child.
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid()?;
-            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    // openpty's descriptors survive exec, and a child holding the master
-    // would keep the pty from hanging up. A clone is close-on-exec.
-    let mut master = fs::File::from(pty.master.try_clone().unwrap());
-    drop(pty.master);
-    let mut child = cmd.spawn().unwrap();
-    drop(cmd);
-    drop(pty.slave);
-    // Read here rather than on a thread, which would hold the master open.
-    let mut output = String::new();
+/// The hangup that ends a frozen SSH session: netwatch is blocked writing a
+/// frame to a terminal that stopped reading when the terminal goes. The
+/// write fails as the SIGHUP arrives, and netwatch used to exit 1 on the
+/// write's error without saving the session.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hangup_during_a_stalled_write_exits_0() {
+    use nix::sys::termios::{tcflow, FlowArg};
+
+    let mut tty = Ctty::spawn();
+    // Suspend the pty's output, so the next frame's write blocks.
+    tcflow(&tty.slave, FlowArg::TCOOFF).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !first_frame(&output) {
-        assert!(Instant::now() < deadline, "no first frame: {output:?}");
-        let mut fds = [PollFd::new(master.as_fd(), PollFlags::POLLIN)];
-        if poll(&mut fds, PollTimeout::from(100u16)).unwrap() > 0 {
-            let mut buf = [0; 16384];
-            let n = master.read(&mut buf).unwrap();
-            output.push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
-    }
-    drop(master);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("netwatch did not exit after the hangup");
-        }
+    // Twice, so a write that was about to finish cannot pass for a blocked one.
+    while !(tty.writing() && {
+        thread::sleep(Duration::from_millis(200));
+        tty.writing()
+    }) {
+        assert!(Instant::now() < deadline, "netwatch never blocked writing");
         thread::sleep(Duration::from_millis(50));
-    };
-    // 101 is a panic that unwound out of `main`.
-    assert!(
-        status.signal().is_none() && status.code() != Some(101),
-        "{status}"
-    );
+    }
+    tty.hang_up();
+    let status = tty.wait();
+    assert!(status.success(), "{status}");
 }
 
 /// A terminal that stops reading, as a frozen SSH session does, blocks the

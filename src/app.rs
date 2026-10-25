@@ -1707,16 +1707,27 @@ where
     // Each iteration is: render → wait → handle → repeat.
     // Collectors run on background threads and share state via Arc<Mutex<T>>.
     loop {
-        terminal.draw(|f| draw_frame(f, &mut app))?;
+        if let Err(error) = terminal.draw(|f| draw_frame(f, &mut app)) {
+            // A hangup fails the frame's write, the one the TUI is blocked in
+            // when a frozen SSH session drops. Its SIGHUP comes from the
+            // kernel before the write fails when netwatch leads the session,
+            // or a moment later from a shell that leads it and passes its own
+            // on. That signal is why the draw failed, so answer it. Without
+            // one, the session is still saved.
+            let wait = std::time::Duration::from_millis(500);
+            if tokio::time::timeout(wait, &mut shutdown).await.is_ok() {
+                answer_shutdown(&mut app);
+                return Ok(());
+            }
+            ui::tty::restore();
+            finish_session(&mut app);
+            return Err(error.into());
+        }
 
         let mut event = tokio::select! {
             event = events.next() => event?,
             _ = &mut shutdown => {
-                // The shell first: if saving hangs, the SIGKILL that follows
-                // still leaves a usable terminal.
-                ui::tty::restore();
-                SHUTDOWN_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
-                finish_session(&mut app);
+                answer_shutdown(&mut app);
                 return Ok(());
             }
         };
@@ -1770,7 +1781,16 @@ fn handle_event(
     false
 }
 
-/// What every session does on its way out, however it was asked to stop.
+/// Hand the shell back, then save the session. The shell first: if saving
+/// hangs, the SIGKILL that follows still leaves a usable terminal.
+fn answer_shutdown(app: &mut App) {
+    ui::tty::restore();
+    SHUTDOWN_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    finish_session(app);
+}
+
+/// What every session does on its way out, however it was asked to stop, and
+/// when the TUI can no longer draw.
 fn finish_session(app: &mut App) {
     app.packet_collector.stop_capture();
     app.egress_profiler.persist_now();

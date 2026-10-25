@@ -100,16 +100,18 @@ All notable changes to NetWatch will be documented in this file.
   microsecond. `--demo` packets, which were never captured, are left out
   and counted instead of written with an invented time.
 - **The terminal is restored on a TUI panic or shutdown signal.** SIGTERM,
-  SIGINT and SIGHUP exit cleanly on Unix, the hangup from closing the
-  terminal window or losing the SSH connection included. If the terminal
-  has stopped reading output, as a frozen SSH session does, it cannot be
-  restored, and after 5 seconds the signal ends netwatch the way it used to.
-  Windows handles Ctrl+C and console close notifications. Raw mode, mouse
-  capture and the alternate screen are undone before a fatal panic report
-  is printed, with the backtrace `RUST_BACKTRACE` asks for and any terminal
-  control characters replaced. Background panics stay in the log. Bare
-  mouse motion no longer redraws the screen, and queued input is processed
-  in bounded batches.
+  SIGINT and SIGHUP save the session and exit cleanly on Unix, the hangup
+  from closing the terminal window or losing the SSH connection included.
+  A terminal that has stopped reading output, as a frozen SSH session does,
+  cannot be restored. If the connection then drops, netwatch still saves
+  the session and exits cleanly; a signal that comes while the session is
+  frozen ends netwatch after 5 seconds, the way it used to. Windows handles
+  Ctrl+C and console close notifications. Raw mode, mouse capture and the
+  alternate screen are undone before a fatal panic report is printed, with
+  the backtrace `RUST_BACKTRACE` asks for and any terminal control
+  characters replaced. Background panics stay in the log. Bare mouse
+  motion no longer redraws the screen, and queued input is processed in
+  bounded batches.
 - **Lite view: keys no longer overflow in a terminal smaller than its
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns
