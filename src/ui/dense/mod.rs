@@ -917,12 +917,20 @@ fn rollup(conns: &[ConnRow]) -> ConnRollup {
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(s, _)| s.to_string())
         .unwrap_or_default();
-    // Histories all end at now; sum them aligned at the right edge.
-    let len = conns.iter().map(|c| c.history.len()).max().unwrap_or(0);
+    // Histories all end at now; sum them aligned at the right edge. Every
+    // socket to a host carries the same cached history, one per (process,
+    // host) and already summed over those sockets, so each host counts once.
+    let mut hosts_summed = std::collections::HashSet::new();
+    let shared: Vec<&[u64]> = conns
+        .iter()
+        .filter(|c| hosts_summed.insert(crate::app::top_conn_host(&c.remote)))
+        .map(|c| c.history.as_slice())
+        .collect();
+    let len = shared.iter().map(|h| h.len()).max().unwrap_or(0);
     let mut history = vec![0u64; len];
-    for c in conns {
-        let off = len - c.history.len();
-        for (i, v) in c.history.iter().enumerate() {
+    for h in shared {
+        let off = len - h.len();
+        for (i, v) in h.iter().enumerate() {
             history[off + i] += v;
         }
     }
@@ -3558,7 +3566,29 @@ mod group_tests {
         assert!(r.degraded, "one retransmitting socket marks the group");
         assert_eq!(r.rtt_ms, Some(2.0), "best rtt, not first");
         assert_eq!(r.state, "ESTABLISHED", "dominant state");
-        assert_eq!(r.history, vec![3, 3, 3], "sparklines summed");
+        // b and c once each: the two sockets to c share c's history.
+        assert_eq!(r.history, vec![2, 2, 2], "sparklines summed");
+    }
+
+    /// The cache keeps one history per (process, host), already summed over
+    /// that host's sockets, and hands it to each of them. Adding it once per
+    /// socket counted five sockets to one host five times, so the header's
+    /// sparkline disagreed with its own DOWN.
+    #[test]
+    fn a_host_history_counts_once_however_many_sockets_share_it() {
+        let mut rows: Vec<ConnRow> = (0..5)
+            .map(|_| {
+                let mut c = conn("curl", 1, "10.1.1.1", 20.0, 0, "ESTABLISHED");
+                c.history = vec![100, 100];
+                c
+            })
+            .collect();
+        let mut big = conn("curl", 1, "10.2.2.2", 400.0, 0, "ESTABLISHED");
+        big.history = vec![0, 400];
+        rows.push(big);
+        let r = &conn_groups(rows)[0].rollup;
+        assert_eq!(r.rx_rate, 500.0);
+        assert_eq!(r.history, vec![100, 500], "the newest sample matches DOWN");
     }
 
     /// A closing socket dims however its platform spells the state, and a

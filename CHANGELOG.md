@@ -26,6 +26,12 @@ All notable changes to NetWatch will be documented in this file.
   samples it claimed to show. Both graphs now spread their whole history
   across the chart, and the label follows the refresh interval: at 500 ms
   they read `RX 15s` and `RX 30s`.
+- **Dense view's process header rows draw the traffic their DOWN column
+  reports.** A process with several sockets summed its sockets' sparklines,
+  but every socket to the same host carries that host's whole history, so a
+  host with five open sockets was counted five times. The sparkline
+  overstated whichever hosts had the most sockets, and its newest point
+  disagreed with DOWN. Each host is now counted once.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
