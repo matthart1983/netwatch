@@ -1657,6 +1657,8 @@ where
     // hands the shell back instead of killing the process.
     let shutdown = shutdown_signal(true);
     tokio::pin!(shutdown);
+    #[cfg(unix)]
+    shutdown_deadline();
     let mut app = App::prepare();
     crate::runtime::bootstrap::start(
         &mut app,
@@ -1713,6 +1715,7 @@ where
                 // The shell first: if saving hangs, the SIGKILL that follows
                 // still leaves a usable terminal.
                 ui::tty::restore();
+                SHUTDOWN_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
                 finish_session(&mut app);
                 return Ok(());
             }
@@ -1847,6 +1850,35 @@ fn shutdown_signal(hangup: bool) -> impl std::future::Future<Output = ()> {
             else => std::future::pending().await,
         }
     }
+}
+
+/// Set once the TUI has answered a shutdown signal and handed the terminal
+/// back. On Unix, [`shutdown_deadline`]'s thread reads it.
+static SHUTDOWN_ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// End the process by a shutdown signal's default action if the TUI has not
+/// answered the signal within 5 seconds. [`shutdown_signal`] is only polled
+/// between frames, on the thread that draws, so a TUI blocked writing to a
+/// terminal that has stopped reading (a frozen SSH session) never answers,
+/// and nothing but SIGKILL would end it. A thread of its own waits for the
+/// same signals beside those listeners, which still get every one. If the
+/// thread cannot start, the TUI waits as it would without it.
+#[cfg(unix)]
+fn shutdown_deadline() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("shutdown-deadline".into())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if !SHUTDOWN_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                }
+            }
+        });
 }
 
 /// Run netwatch as a headless agent: the same collectors as the TUI, no

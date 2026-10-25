@@ -146,6 +146,9 @@ embed-manifest = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll"] }
+# The TUI's shutdown deadline waits for signals on a thread of its own.
+# crossterm already depends on it, so nothing new is compiled.
+signal-hook = "0.3"
 
 # The terminal-restore tests run netwatch on a pty (`term`) and signal it
 # (`signal`). Same crate as above, so nothing new is compiled.

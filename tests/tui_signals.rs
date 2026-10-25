@@ -4,6 +4,8 @@
 //! started: out of raw mode, off the alternate screen, mouse reporting off and
 //! the cursor shown. Until 0.38.1 only `Ctrl+C` typed at the keyboard did;
 //! SIGTERM, SIGINT and SIGHUP killed the process with the terminal still raw.
+//! The last two tests take the terminal away or stop it reading, where the
+//! pty cannot be put back; netwatch must still end, and not by crashing.
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::termios::{tcgetattr, LocalFlags, Termios};
@@ -290,4 +292,28 @@ fn a_hangup_ends_without_a_panic() {
         status.signal().is_none() && status.code() != Some(101),
         "{status}"
     );
+}
+
+/// A terminal that stops reading, as a frozen SSH session does, blocks the
+/// TUI in a write, where it cannot answer a signal. SIGTERM's default action
+/// used to end it there; with the signal handled, nothing did until SIGKILL.
+/// Now the default action ends it once it has had 5 seconds to answer.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_ends_a_tui_whose_terminal_stopped_reading() {
+    use nix::sys::termios::{tcflow, FlowArg};
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = Fixture::new();
+    let mut cmd = fixture.command();
+    cmd.arg("--demo");
+    let mut pty = Pty::spawn(cmd);
+    let started = pty.read_until(Duration::from_secs(10), first_frame);
+    assert!(started, "no first frame: {:?}", pty.output);
+    // Suspend the pty's output: every write netwatch makes from here on,
+    // the restore's included, blocks.
+    tcflow(&pty.slave, FlowArg::TCOOFF).unwrap();
+    signal(Signal::SIGTERM)(&mut pty);
+    let status = pty.wait(Duration::from_secs(15));
+    assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "{status}");
 }

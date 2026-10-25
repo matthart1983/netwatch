@@ -1281,6 +1281,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "signal-hook",
  "socket2",
  "tls-parser",
  "tokio",
