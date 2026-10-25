@@ -73,6 +73,19 @@ All notable changes to NetWatch will be documented in this file.
   or `ps -L` listed every worker as `netwatch`. Each now has its worker's
   name (`capture`, `connections`, `health`, `reverse-dns` and so on), which
   the kernel shortens to 15 characters.
+- **The terminal is restored on a TUI panic or shutdown signal.** SIGTERM,
+  SIGINT and SIGHUP save the session and exit cleanly on Unix, the hangup
+  from closing the terminal window or losing the SSH connection included.
+  A terminal that has stopped reading output, as a frozen SSH session does,
+  cannot be restored. If the connection then drops, netwatch still saves
+  the session and exits cleanly; a signal that comes while the session is
+  frozen ends netwatch after 5 seconds, the way it used to. Windows handles
+  Ctrl+C and console close notifications. Raw mode, mouse capture and the
+  alternate screen are undone before a fatal panic report is printed, with
+  the backtrace `RUST_BACKTRACE` asks for and any terminal control
+  characters replaced. Background panics stay in the log. Bare mouse
+  motion no longer redraws the screen, and queued input is processed in
+  bounded batches.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
