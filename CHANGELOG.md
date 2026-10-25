@@ -102,10 +102,12 @@ All notable changes to NetWatch will be documented in this file.
 - **The terminal is restored on a TUI panic or shutdown signal.** SIGTERM,
   SIGINT and SIGHUP exit cleanly on Unix, the hangup from closing the
   terminal window or losing the SSH connection included; Windows handles
-  Ctrl+C and console close notifications. Raw mode, mouse capture and the alternate screen are
-  undone before a fatal panic report, whose terminal control characters are
-  replaced. Background panics stay in the log. Bare mouse motion no longer
-  redraws the screen, and queued input is processed in bounded batches.
+  Ctrl+C and console close notifications. Raw mode, mouse capture and the
+  alternate screen are undone before a fatal panic report is printed, with
+  the backtrace `RUST_BACKTRACE` asks for and any terminal control
+  characters replaced. Background panics stay in the log. Bare mouse motion
+  no longer redraws the screen, and queued input is processed in bounded
+  batches.
 - **Lite view: keys no longer overflow in a terminal smaller than its
   grid.** The key handler sized its layout from the last frame without the
   80×24 check the renderer makes, so in a terminal under about 40 columns

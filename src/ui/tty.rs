@@ -8,6 +8,8 @@
 //! exit reaches it: the [`Session`] guard, the panic hook, the signal path in
 //! `app::run`, and `main` after a normal return.
 
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Once, OnceLock};
@@ -82,12 +84,13 @@ fn restore_into(out: &mut impl Write, raw_off: impl FnOnce() -> io::Result<()>) 
 /// Every panic goes to the log with its thread's name. A panic on the TUI
 /// thread ends the session, and so does any panic when the build aborts on
 /// panic, so the hook restores the terminal before the report is printed into
-/// the user's shell. A report that quotes a peer's bytes is printed with them
-/// replaced, because after the restore the shell is what reads it. A panic on
-/// another thread leaves the TUI running and stays off the screen, where the
-/// default hook would write it over the frame (a capture-thread panic caught
-/// by `run_capture_step` is one). The first is kept for
-/// [`background_panic`].
+/// the user's shell. The previous hook prints it, with the backtrace
+/// `RUST_BACKTRACE` asks for. A report that quotes a peer's bytes is printed
+/// here instead, with them replaced, because after the restore the shell is
+/// what reads it. A panic on another thread leaves the TUI running and stays
+/// off the screen, where the default hook would write it over the frame (a
+/// capture-thread panic caught by `run_capture_step` is one). The first is
+/// kept for [`background_panic`].
 ///
 /// The TUI thread must never `catch_unwind`. The hook takes any panic there
 /// as the end of the session and has handed the terminal back before the
@@ -96,6 +99,7 @@ fn restore_into(out: &mut impl Write, raw_off: impl FnOnce() -> io::Result<()>) 
 pub fn install_panic_hook() {
     PANIC_HOOK_INIT.call_once(|| {
         let tui = std::thread::current().id();
+        let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let thread = std::thread::current();
             let name = thread.name().unwrap_or("unnamed");
@@ -114,16 +118,30 @@ pub fn install_panic_hook() {
                 return;
             }
             restore();
-            // Not `eprintln!`, which panics if the terminal has hung up, and
-            // a panic in the hook aborts.
-            let _ = writeln!(
-                io::stderr(),
-                "\nthread '{}' {}",
-                sanitize::display(name),
-                sanitize::display_multiline(&report)
-            );
+            match sanitize::display_multiline(&report) {
+                Cow::Borrowed(_) => prev(info),
+                Cow::Owned(clean) => print_report(name, &clean),
+            }
         }));
     });
+}
+
+/// Print a fatal panic's report as the default hook would, with `clean` in
+/// place of what it says: the backtrace if `RUST_BACKTRACE` asks for one, and
+/// how to ask if not. Not `eprintln!`, which panics if the terminal has hung
+/// up, and a panic in the hook aborts.
+fn print_report(thread: &str, clean: &str) {
+    let mut err = io::stderr().lock();
+    let _ = writeln!(err, "\nthread '{}' {clean}", sanitize::display(thread));
+    let trace = Backtrace::capture();
+    let _ = match trace.status() {
+        BacktraceStatus::Captured => writeln!(err, "stack backtrace:\n{trace}"),
+        BacktraceStatus::Disabled => writeln!(
+            err,
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+        ),
+        _ => Ok(()),
+    };
 }
 
 /// A panic ends the process when it is on the TUI thread, whose unwind leaves
@@ -164,7 +182,9 @@ mod tests {
         }
 
         /// Run the test `name` of this binary as a child, with `child` set in
-        /// its environment and a fresh pty as its stdio, and collect what it writes until it exits.
+        /// its environment and a fresh pty as its stdio, and collect what it
+        /// writes until it exits. Backtraces are on, as a user reporting a
+        /// panic would be asked to turn them on.
         pub fn run_child(name: &str, child: &str) -> Run {
             let size = Winsize {
                 ws_row: 24,
@@ -178,6 +198,7 @@ mod tests {
             let mut cmd = Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", name, "--nocapture"])
                 .env(child, "1")
+                .env("RUST_BACKTRACE", "1")
                 .stdin(stdio(&pty.slave))
                 .stdout(stdio(&pty.slave))
                 .stderr(stdio(&pty.slave));
@@ -293,9 +314,11 @@ mod tests {
         assert!(at("\x1b[?1049l") < report, "{out:?}");
         assert!(at("\x1b[?1000l") < report, "{out:?}");
         assert!(at("\x1b[?25h") < report, "{out:?}");
-        // Printed into the shell with the peer's bytes replaced.
+        // Printed into the shell with the peer's bytes replaced, and the
+        // backtrace still after it.
         assert!(!out[at("\x1b[?1049l")..].contains("\x1b]52"), "{out:?}");
         assert!(out.contains("tui-sentinel ·]52;c;AAAA·"), "{out:?}");
+        assert!(report < at("stack backtrace:"), "{out:?}");
         use nix::sys::termios::LocalFlags;
         let flags = LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG;
         assert!(run.before.local_flags.contains(flags));
@@ -308,6 +331,27 @@ mod tests {
         );
         assert_eq!(run.after.input_flags, run.before.input_flags);
         assert_eq!(run.after.output_flags, run.before.output_flags);
+    }
+
+    /// The report a user pastes into an issue: after the restore, and with
+    /// the backtrace they were asked to turn on.
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_panic_report_keeps_its_backtrace() {
+        const CHILD: &str = "NETWATCH_TTY_TUI_BACKTRACE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            install_panic_hook();
+            let _session = enter().unwrap();
+            panic!("tui-sentinel");
+        }
+        let run = pty::run_child(
+            "ui::tty::tests::a_tui_panic_report_keeps_its_backtrace",
+            CHILD,
+        );
+        let out = &run.output;
+        let at = |seq: &str| out.find(seq).unwrap_or_else(|| panic!("{seq:?}: {out:?}"));
+        assert!(at("\x1b[?1049l") < at("tui-sentinel"), "{out:?}");
+        assert!(at("tui-sentinel") < at("stack backtrace:"), "{out:?}");
     }
 
     #[cfg(unix)]
