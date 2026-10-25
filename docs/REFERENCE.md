@@ -273,9 +273,12 @@ and what netwatch decoded from them, down to the SNI or request path that every 
 flow carries. Past either limit the oldest go first, so under bulk traffic, where one GSO
 frame can be 64 KiB, the packets cover less than the whole window.
 
-The connection snapshots hold at most 50,000 rows between them, about 55 MB. Past that the
+The connection snapshots hold at most 50,000 rows and 64 MiB between them. Rows of the usual
+size reach 50,000 first, at about 55 MB. Each row also carries its flow's SNI or request
+path, which the peer picks and can make kilobytes long, and a table of such rows reaches
+64 MiB first, so fewer snapshots fit than the table below says. Past either limit the
 recorder leaves out whole older snapshots, each time the one whose loss leaves the shortest
-gap. How much history stays depends on the size of the table:
+gap. With rows of the usual size, how much history stays depends on the size of the table:
 
 | Connections | Snapshots kept | What they cover |
 |-------------|----------------|-----------------|
@@ -283,7 +286,7 @@ gap. How much history stays depends on the size of the table:
 | 16,667 to 25,000 | 2 | The newest, and one older snapshot whose age cycles from a second to five minutes |
 | Over 25,000 | 1 | The newest only |
 
-The newest snapshot is always whole, even when it alone is over 50,000 rows. The recorder
+The newest snapshot is always whole, even when it alone is over the budget. The recorder
 picks snapshots by time, not size. A burst of connections pushes older snapshots out while
 it is the newest, and the recorder usually drops it once it takes the next one. To keep a
 burst, freeze during it. A critical alert freezes the recorder on its own.
@@ -298,7 +301,7 @@ left out.
 | `packet_export` | `packets` written, `omitted` (no capture metadata), and `annotated` (with a socket owner) |
 | `packet_annotations` | Whether packet comments were on |
 | `last_capture_status` | The capture's `session`, `sampled_at_utc_ms` and `drops` (packets libpcap dropped, null when it had not reported recently), last sampled while recording. `drops` counts from the last capture start, so it also covers any earlier `session` that ended when the stream indexes ran out. Not a loss total for the incident window |
-| `connection_rows_dropped` | Connection rows left out for the 50,000-row budget, counting snapshots taken inside the window. Whole snapshots are left out, never single rows. `0` when none were |
+| `connection_rows_dropped` | Connection rows left out for the budget of 50,000 rows and 64 MiB, counting snapshots taken inside the window. Whole snapshots are left out, never single rows. `0` when none were |
 | `capture_limitations` | What the packet files cannot show, in prose |
 
 Version 1 bundles, from netwatch 0.37 and earlier, have `packets.pcap` only, with times

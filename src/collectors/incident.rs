@@ -20,10 +20,16 @@ const MAX_RECORDED_PACKETS: usize = 20_000;
 /// rather than the count is what limits the recorder.
 const MAX_RECORDED_PACKET_BYTES: usize = 64 << 20;
 const MAX_SNAPSHOTS: usize = 600;
-/// Connection rows all the snapshots may hold together, about 55 MB at
-/// 1.1 KB a row. A host with 10,000 connections fills it in five snapshots.
-/// `summary.md` and REFERENCE write the number out.
+/// Connection rows all the snapshots may hold together, about 55 MB at the
+/// usual 1.1 KB a row. A host with 10,000 connections fills it in five
+/// snapshots. `summary.md` and REFERENCE write the number out.
 const MAX_CONNECTION_ROWS: usize = 50_000;
+/// What the snapshots may hold together, as [`connection_held_bytes`]
+/// counts it. Rows of the usual size reach [`MAX_CONNECTION_ROWS`] first.
+/// A row carries its flow's classification, and the peer picks the SNI or
+/// request path in it, so 1,024 rows, as many flows as the stream tracker
+/// classifies, can hold 8 MB.
+const MAX_CONNECTION_BYTES: usize = 64 << 20;
 const MAX_ALERT_EVENTS: usize = 200;
 const TOP_PROCESS_COUNT: usize = 10;
 
@@ -159,8 +165,9 @@ impl TimedPacket {
 
 /// The text a flow's classification holds. Every packet of the flow carries
 /// its own copy, empty ACKs included, and the peer picks the SNI or request
-/// path, so one long name is held once per packet. Every field is named, so
-/// a new variant or field has to be counted here before this compiles.
+/// path, so one long name is held once per packet, and again in the flow's
+/// row of every connection snapshot. Every field is named, so a new
+/// variant or field has to be counted here before this compiles.
 fn app_protocol_bytes(app: &AppProtocol) -> usize {
     let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
     match app {
@@ -197,6 +204,31 @@ fn app_protocol_bytes(app: &AppProtocol) -> usize {
             mode: _,
         } => 0,
     }
+}
+
+/// What a connection row costs against [`MAX_CONNECTION_BYTES`]: the struct,
+/// its text and its flow's classification.
+fn connection_held_bytes(conn: &Connection) -> usize {
+    let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    let evidence = &conn.evidence;
+    std::mem::size_of::<Connection>()
+        + conn.protocol.len()
+        + conn.local_addr.len()
+        + conn.remote_addr.len()
+        + conn.state.len()
+        + text(&conn.process_name)
+        + evidence.process.as_ref().map_or(0, |p| {
+            p.session.len() + p.start_token.len() + text(&p.executable) + text(&p.network_namespace)
+        })
+        + text(&evidence.corroborated_by)
+        + evidence.flow.as_ref().map_or(0, |f| {
+            f.session.len()
+                + f.protocol.len()
+                + f.local.len()
+                + f.remote.len()
+                + text(&f.network_namespace)
+        })
+        + conn.app_protocol.as_ref().map_or(0, app_protocol_bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -595,25 +627,34 @@ impl IncidentRecorder {
         }
     }
 
-    /// Keep the connection snapshots within [`MAX_CONNECTION_ROWS`]. Every
-    /// snapshot kept is whole, since a snapshot missing rows would read as
-    /// connections that had closed, and the newest is always kept, even
-    /// alone over the budget. Older ones go one at a time, each time the one
-    /// whose loss leaves the shortest gap, with the window's start standing
-    /// in for the snapshot before the oldest. While three or more fit, up to
-    /// 16,666 rows each, those left stay spread across the window. With two,
-    /// the older one's age cycles from a second to the whole window, and
-    /// past 25,000 rows only the newest is left. The choice goes by time,
-    /// not size, so a snapshot from a short burst of connections is usually
+    /// Keep the connection snapshots within [`MAX_CONNECTION_ROWS`] and
+    /// [`MAX_CONNECTION_BYTES`]. Every snapshot kept is whole, since a
+    /// snapshot missing rows would read as connections that had closed, and
+    /// the newest is always kept, even alone over the budget. Older ones go
+    /// one at a time, each time the one whose loss leaves the shortest gap,
+    /// with the window's start standing in for the snapshot before the
+    /// oldest. While three or more fit, up to 16,666 rows each at the usual
+    /// row size, those left stay spread across the window. With two, the
+    /// older one's age cycles from a second to the whole window, and past
+    /// 25,000 rows only the newest is left. The choice goes by time, not
+    /// size, so a snapshot from a short burst of connections is usually
     /// dropped as soon as a newer one is taken.
     fn thin_connection_snapshots(&mut self, now: DateTime<Utc>) {
         let start = now - self.window;
+        let held = |rows: &[Connection]| rows.iter().map(connection_held_bytes).sum::<usize>();
         let mut rows: usize = self
             .connection_snapshots
             .iter()
             .map(|s| s.value.connections.len())
             .sum();
-        while rows > MAX_CONNECTION_ROWS && self.connection_snapshots.len() > 1 {
+        let mut bytes: usize = self
+            .connection_snapshots
+            .iter()
+            .map(|s| held(&s.value.connections))
+            .sum();
+        while (rows > MAX_CONNECTION_ROWS || bytes > MAX_CONNECTION_BYTES)
+            && self.connection_snapshots.len() > 1
+        {
             let snapshots = &self.connection_snapshots;
             let gap_without = |i: usize| {
                 let before = if i == 0 {
@@ -630,6 +671,7 @@ impl IncidentRecorder {
                 break;
             };
             rows -= dropped.value.connections.len();
+            bytes -= held(&dropped.value.connections);
             self.dropped_connection_rows
                 .push((dropped.observed_at, dropped.value.connections.len()));
         }
@@ -741,7 +783,7 @@ impl IncidentRecorder {
             // The newest snapshot is kept whole even over the budget, so
             // this says what the rows went for, not that the bundle fits.
             out.push_str(&format!(
-                "- Connection rows dropped: `{}` (whole older snapshots, for the 50,000-row budget)\n",
+                "- Connection rows dropped: `{}` (whole older snapshots, for the budget of 50,000 rows and 64 MiB)\n",
                 rows_dropped
             ));
         }
@@ -1510,8 +1552,95 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Every row of a classified flow carries the flow's SNI or request
+    /// path, which the peer picks. 1,024 rows, as many flows as the stream
+    /// tracker classifies, are far inside the row budget, but at 8 KB of
+    /// text each the window would hold 2.7 GB. The byte budget counts it,
+    /// and the snapshots it leaves stay whole and spread across the window.
+    #[test]
+    fn recorder_counts_row_classification_against_the_byte_budget() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let long = || Some("a".repeat(8_192));
+        let table: Vec<Connection> = (0..1_024u32)
+            .map(|i| Connection {
+                remote_addr: format!("203.0.113.7:{}", 40_000 + i),
+                app_protocol: Some(if i % 2 == 0 {
+                    AppProtocol::Tls {
+                        sni: long(),
+                        alpn: None,
+                        ech: false,
+                        ja4: None,
+                    }
+                } else {
+                    AppProtocol::Http {
+                        method: "GET".into(),
+                        host: None,
+                        path: long(),
+                        status: None,
+                    }
+                }),
+                ..make_connection()
+            })
+            .collect();
+        let snapshot_bytes: usize = table.iter().map(connection_held_bytes).sum();
+        let held = |recorder: &IncidentRecorder| -> usize {
+            recorder
+                .connection_snapshots
+                .iter()
+                .flat_map(|s| s.value.connections.iter())
+                .map(connection_held_bytes)
+                .sum()
+        };
+        let start = Utc::now();
+        let ticks = 600;
+        for tick in 0..ticks {
+            let now = start + Duration::seconds(tick);
+            recorder.record_at(
+                now,
+                &[],
+                &table,
+                &make_health(),
+                &[],
+                &[],
+                &DnsAnalytics::default(),
+                &[],
+            );
+            assert!(
+                held(&recorder) <= MAX_CONNECTION_BYTES,
+                "tick {tick}: {} MiB held",
+                held(&recorder) >> 20
+            );
+            let newest = recorder.connection_snapshots.back().unwrap();
+            assert_eq!(newest.observed_at, now);
+            assert_eq!(newest.value.connections.len(), table.len());
+            let taken = (tick.min(recorder.window.num_seconds()) + 1) as usize;
+            assert_eq!(
+                recorder.connection_rows_dropped(),
+                (taken - recorder.connection_snapshots.len()) * table.len(),
+                "tick {tick}"
+            );
+        }
+
+        // The bytes, not the rows, are what stopped it.
+        let kept = &recorder.connection_snapshots;
+        assert_eq!(kept.len(), MAX_CONNECTION_BYTES / snapshot_bytes);
+        assert!(kept.len() * table.len() < MAX_CONNECTION_ROWS / 4);
+        assert!(kept
+            .iter()
+            .all(|s| s.value.connections.len() == table.len()));
+        let even = recorder.window / kept.len() as i32;
+        let mut before = start + Duration::seconds(ticks - 1) - recorder.window;
+        for snapshot in kept {
+            let gap = snapshot.observed_at - before;
+            assert!(gap <= even * 2, "{}s gap", gap.num_seconds());
+            before = snapshot.observed_at;
+        }
+    }
+
     /// The newest snapshot stays whole even when it alone is over the row
     /// budget, and the summary does not then say the bundle is within it.
+    /// Arming again starts the count of dropped rows afresh.
     #[test]
     fn newest_snapshot_over_the_row_budget_stays_whole() {
         let mut recorder = IncidentRecorder::new();
@@ -1543,9 +1672,11 @@ mod tests {
         let summary = recorder.build_summary();
         assert!(
             summary.contains(
-                "- Connection rows dropped: `60000` (whole older snapshots, for the 50,000-row budget)\n"
+                "- Connection rows dropped: `60000` (whole older snapshots, for the budget of 50,000 rows and 64 MiB)\n"
             ),
             "{summary}"
         );
+        recorder.arm();
+        assert_eq!(recorder.connection_rows_dropped(), 0);
     }
 }
