@@ -158,15 +158,21 @@ write: /dev/null
 3. The SDK reader inherits the eBPF worker's layers but keeps its creation-time
    load capabilities; it has no separate entry hook
    ([eBPF startup](../src/ebpf/conn_tracker.rs#L130)).
-4. Only TCP bind and connect are denied, only on parser and capture threads, and
-   only from Linux 6.7. UDP, ICMP, SCTP and netlink sockets stay open to those
-   threads, and so does MPTCP, which falls back to TCP: on Linux 7.1 an MPTCP
-   socket on a parser thread connected to a plain TCP listener. Accepting on a
-   listener bound before entry is not mediated either, which is how the metrics
-   threads serve. Main, the network workers and the proc broker have no network
-   restriction, and a parser running injected code can reach them through shared
-   memory (item 1) or use a socket another thread holds. The deny raises the cost
-   of exfiltration after code execution; it does not prevent it
+4. Only connect(2) and bind(2) on TCP sockets are denied, only on parser and
+   capture threads, and only from Linux 6.7. UDP, ICMP, SCTP and netlink sockets
+   stay open to those threads, and so does MPTCP, which falls back to TCP: on
+   Linux 7.1 an MPTCP socket on a parser thread connected to a plain TCP
+   listener. Two TCP calls get past the deny. A TCP Fast Open send (`sendto` or
+   `sendmsg` with `MSG_FASTOPEN`) opens a connection and delivers its data
+   without connect(2), and listen(2) on an unbound socket takes an ephemeral port
+   on every address without bind(2). Both work from a parser thread on Linux 7.1,
+   and a test fails if that changes
+   ([gap tests](../src/sandbox/linux.rs#L1122)). Accepting on a listener bound
+   before entry is not mediated either, which is how the metrics threads serve.
+   Main, the network workers and the proc broker have no network restriction,
+   and a parser running injected code can reach them through shared memory
+   (item 1) or use a socket another thread holds. The deny raises the cost of
+   exfiltration after code execution; it does not prevent it
    ([layer](../src/sandbox/linux.rs#L501)).
 5. Unix sockets and signals are scoped on parser and capture threads only, and
    only where the kernel has the feature: abstract sockets from Linux 6.12,

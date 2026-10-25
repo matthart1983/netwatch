@@ -110,8 +110,11 @@ pub struct ModeReport {
 pub struct PlatformReport {
     /// Linux: Landlock ABI level actually enforced (0 = not applied).
     pub landlock_abi: u32,
-    /// Linux: TCP bind and connect denied on this thread by its parser or
-    /// capture layer. Main and the network workers leave this false.
+    /// Linux: connect(2) and bind(2) on TCP sockets denied on this thread by
+    /// its parser or capture layer. The network stays reachable: UDP, MPTCP,
+    /// a TCP Fast Open send and listen(2) on an unbound socket all get past
+    /// it (docs/THREAT-MODEL.md, item 4). Main and the network workers leave
+    /// this false.
     pub landlock_network_blocked: bool,
     /// Linux: the layer this thread's role stacks on the filesystem one,
     /// "parser" or "capture", whether or not the kernel enforced it. `None`
@@ -148,7 +151,7 @@ impl Report {
                         parts.push(format!("Landlock ABI V{}", self.platform.landlock_abi));
                     }
                     if self.platform.landlock_network_blocked {
-                        parts.push("network blocked".into());
+                        parts.push("TCP connect and bind denied".into());
                     }
                     if !self.platform.caps_dropped.is_empty() {
                         parts.push(format!("{} caps dropped", self.platform.caps_dropped.len()));

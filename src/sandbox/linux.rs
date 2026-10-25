@@ -1139,6 +1139,96 @@ mod tests {
     }
 
     #[test]
+    fn parser_layer_leaves_fast_open_and_autobind_open() {
+        // Landlock checks connect(2) and bind(2). A TCP Fast Open sendto
+        // connects without the first, and listen(2) on an unbound socket
+        // takes an ephemeral port on every address without the second. The
+        // threat model says so; this fails if that changes under it.
+        use nix::sys::socket::{
+            listen, sendto, socket, AddressFamily, Backlog, MsgFlags, SockFlag, SockType,
+            SockaddrIn,
+        };
+        use std::os::fd::AsRawFd;
+        if !kernel_denies_tcp() {
+            eprintln!("skipped: kernel Landlock ABI below 4");
+            return;
+        }
+        let outside = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(addr) = outside.local_addr().unwrap() else {
+            unreachable!()
+        };
+        // Bit 0 enables the client side; it is on by default.
+        let fast_open = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fastopen")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .is_some_and(|v| v & 1 != 0);
+        let (sent, stream, server) = std::thread::spawn(move || {
+            let report = enter_as(Role::Parser, &SandboxPaths::default());
+            assert!(report.platform.landlock_network_blocked, "{report:?}");
+            let tcp = || {
+                socket(
+                    AddressFamily::Inet,
+                    SockType::Stream,
+                    SockFlag::empty(),
+                    None,
+                )
+            };
+            let stream = tcp().unwrap();
+            assert_eq!(
+                std::net::TcpStream::connect(addr)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(nix::libc::EACCES)
+            );
+            let sent = fast_open.then(|| {
+                sendto(
+                    stream.as_raw_fd(),
+                    b"fast-open",
+                    &SockaddrIn::from(addr),
+                    MsgFlags::from_bits_retain(nix::libc::MSG_FASTOPEN),
+                )
+            });
+            let server = tcp().unwrap();
+            listen(&server, Backlog::new(1).unwrap()).unwrap();
+            (
+                sent,
+                std::net::TcpStream::from(stream),
+                std::net::TcpListener::from(server),
+            )
+        })
+        .join()
+        .unwrap();
+
+        if let Some(sent) = sent {
+            assert_eq!(sent, Ok(9));
+            outside.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut accepted = loop {
+                match outside.accept() {
+                    Ok((accepted, _)) => break accepted,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "nothing arrived");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            accepted.set_nonblocking(false).unwrap();
+            accepted
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut data = [0; 9];
+            std::io::Read::read_exact(&mut accepted, &mut data).unwrap();
+            assert_eq!(&data, b"fast-open");
+        }
+        drop(stream);
+
+        let bound = server.local_addr().unwrap();
+        assert!(bound.ip().is_unspecified(), "{bound}");
+        std::net::TcpStream::connect(("127.0.0.1", bound.port())).unwrap();
+    }
+
+    #[test]
     fn parser_layer_scopes_abstract_sockets_and_signals() {
         use std::os::linux::net::SocketAddrExt;
         let name = format!("netwatch-roles-{}", uuid::Uuid::new_v4());

@@ -236,8 +236,8 @@ All notable changes to NetWatch will be documented in this file.
   at startup. `netwatch doctor` said eBPF was disabled by the sandbox
   policy, untrue since 0.32.2; it now says eBPF loads under the policy and
   its reader keeps the load capabilities.
-- **Parser threads can no longer open TCP connections or listen on a
-  port.** On Linux 6.7 or newer, the workers that read packets, files,
+- **Parser threads can no longer call `connect` or `bind` on a TCP
+  socket.** On Linux 6.7 or newer, the workers that read packets, files,
   kernel tables or subprocess output now stack a second Landlock layer that
   denies TCP bind and connect. Capture, the TLS keylog reader, the metrics
   endpoint, eBPF and connections are among them. Before, a parser bug that
@@ -251,10 +251,14 @@ All notable changes to NetWatch will be documented in this file.
   do the workers whose job is a connection: reverse DNS, WHOIS, GeoIP,
   health, traceroute, Insights, remote publishing and the Diagnose probes.
   A worker missing from the role table counts as a parser. UDP, ICMP and
-  MPTCP stay open to parser threads, and MPTCP falls back to TCP, so this
-  makes sending data out after code execution harder without preventing
-  it. On older kernels best-effort logs `parser network deny unavailable`
-  once and runs as before.
+  MPTCP stay open to parser threads, and MPTCP falls back to TCP. Two TCP
+  calls also get past the deny, because Landlock checks only `connect` and
+  `bind`: a TCP Fast Open send (`sendto` with `MSG_FASTOPEN`) opens a
+  connection, and `listen` on an unbound socket takes a random port on
+  every address and accepts connections on it. So this makes sending data
+  out after code execution harder without preventing it. On older kernels
+  best-effort logs `parser network deny unavailable` once and runs as
+  before.
 - **Parser and capture threads drop CAP_NET_RAW in best-effort mode too.**
   Under the `setcap` line or sudo, every confined thread kept CAP_NET_RAW
   unless `--sandbox-strict` was given, so a compromised parser could open
