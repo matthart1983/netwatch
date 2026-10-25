@@ -503,10 +503,16 @@ mod capture_fix_tests {
         // machine cannot be found.
         let tools = root.join("tools");
         std::fs::create_dir(&tools).unwrap();
+        // PATH first: the Nix build sandbox has them nowhere else.
+        let dirs: Vec<_> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
         for tool in ["tr", "grep", "readlink", "cp"] {
-            let found = ["/usr/bin", "/bin"]
+            let found = dirs
                 .iter()
-                .map(|dir| Path::new(dir).join(tool))
+                .map(|dir| dir.as_path())
+                .chain([Path::new("/usr/bin"), Path::new("/bin")])
+                .map(|dir| dir.join(tool))
                 .find(|p| p.exists())
                 .unwrap_or_else(|| panic!("no {tool}"));
             std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
