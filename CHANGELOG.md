@@ -224,8 +224,8 @@ All notable changes to NetWatch will be documented in this file.
   the kernel shortens to 15 characters.
 
 ### Security
-- **Run as root, the sandbox now takes the capabilities netwatch never
-  uses from every confined thread.** It removes capabilities by a
+- **Run as root, the sandbox now takes the capabilities netwatch does not
+  need from every confined thread.** It removes capabilities by a
   deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.
   Under sudo, every confined thread, the packet parser included, kept 38 of
   root's 41 capabilities (37 with `--sandbox-strict`). One was
@@ -236,9 +236,17 @@ All notable changes to NetWatch will be documented in this file.
   strict mode): file access in the user's directories, resource limits and
   scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
   CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
-  remains defence in depth, not containment. Runs without elevation, with
-  the documented `setcap` line or under the systemd unit drop what they did
-  before.
+  remains defence in depth, not containment. Losing CAP_SYS_PTRACE costs
+  something under sudo on a kernel where Landlock does not enforce (older
+  than 5.13, or Landlock missing from `lsm=`): confined threads can no
+  longer read `/proc/<pid>/exe` or the socket links in `/proc/<pid>/fd` of
+  a process root does not own, yours included, or of one that is not
+  dumpable. Such a process is named by the kernel's 15-character `comm`
+  rather than its executable, and its connections have no owner before the
+  process-attribution thread's first scan or when its latest scan is more
+  than 5 seconds old. Where Landlock enforces, it already refused those
+  reads. Runs without elevation, with the documented `setcap` line or under
+  the systemd unit drop what they did before.
 - **The process-attribution thread no longer keeps every capability
   netwatch started with.** It reads other processes' socket fds in `/proc`
   to name each connection's owner, so it runs outside the sandbox, and it
@@ -247,8 +255,8 @@ All notable changes to NetWatch will be documented in this file.
   41 of root's capabilities under sudo. Strict mode's promise to drop
   CAP_NET_RAW was therefore untrue of the process. Before its first scan the
   thread now drops everything except CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
-  the two it needs to read another user's sockets under root, so
-  connections are attributed as before.
+  the two it needs to read another user's sockets under root, so its scans
+  attribute connections as before.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
