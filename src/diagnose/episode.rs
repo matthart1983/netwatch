@@ -181,10 +181,12 @@ impl ProbeAges {
     fn to_times(&self, origin: Instant, frame_secs: f64) -> ObservationTimes {
         let at = |age: Option<f64>| {
             let secs = ((frame_secs - age?) * 10.0).round() / 10.0;
+            // An age no `Duration` holds reads as no completion, as one
+            // past what an `Instant` reaches already does.
             if secs >= 0.0 {
-                origin.checked_add(Duration::from_secs_f64(secs))
+                origin.checked_add(Duration::try_from_secs_f64(secs).ok()?)
             } else {
-                origin.checked_sub(Duration::from_secs_f64(-secs))
+                origin.checked_sub(Duration::try_from_secs_f64(-secs).ok()?)
             }
         };
         let mut times = ObservationTimes {
@@ -1197,7 +1199,14 @@ pub fn drive(episode: &Episode, mut on_step: impl FnMut(Step<'_>)) {
         let Some(store) = store.as_mut() else {
             continue;
         };
-        let now = base + Duration::from_secs_f64((frame.at - t0).max(0.0));
+        // A frame further on than an `Instant` reaches is not one netwatch
+        // recorded, and there is no time to evaluate it at.
+        let Some(now) = Duration::try_from_secs_f64((frame.at - t0).max(0.0))
+            .ok()
+            .and_then(|d| base.checked_add(d))
+        else {
+            continue;
+        };
         let times = frame.ages.to_times(base, frame.at - t0);
         for event in &frame.events {
             engine.apply_event(event);
@@ -2537,6 +2546,23 @@ mod tests {
         ep.frames[0].ts = "\x1b]52;c;aGk=\x07".into();
         let report = replay(&ep);
         assert_eq!(report.frames, ep.frames.len());
+    }
+
+    /// Replay turns a frame's time and its probe ages into instants, and a
+    /// file can carry any number in either. Seconds past what a `Duration`
+    /// holds, or past what an `Instant` can add, panicked.
+    #[test]
+    fn replay_survives_times_no_instant_can_hold() {
+        let mut ep = incident().finished.remove(0);
+        // Past `Duration`, then past `Instant` but not `Duration`.
+        ep.frames[1].at = 1e20;
+        ep.frames[2].at = 1e19;
+        ep.frames[0].ages.interface = Some(1e20);
+        ep.frames[3].ages.egress = Some(-1e20);
+        let report = replay(&ep);
+        assert_eq!(report.frames, ep.frames.len());
+        let times = ep.frames[0].ages.to_times(Instant::now(), 0.0);
+        assert_eq!(times.interface, None);
     }
 
     /// Just over a megabyte of gzip that inflates to 1 GiB of zeros, close to

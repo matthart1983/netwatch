@@ -236,7 +236,10 @@ All notable changes to NetWatch will be documented in this file.
   the same strings. `diagnose episodes` and the `export` preview no longer
   panic on an id with a multi-byte character across its eighth byte. Replay
   no longer panics when the first frame's time does not parse, as happened
-  to any recording that began in the hour a clock goes back.
+  to any recording that began in the hour a clock goes back. Nor do
+  `replay` and `features` on a frame time or probe age hundreds of billions
+  of years out, which only a crafted file holds: they skip that frame, and
+  that probe counts as one that has not answered.
 - **An episode stops loading past 84,000 frames or 820 MiB uncompressed.**
   `diagnose episodes`, `replay`, `features` and `export` inflated a gzipped
   episode in full before parsing it, so a gzip of zeros a few megabytes long
