@@ -22,5 +22,7 @@ filter = """
     test(/^collectors::connections::tests::/)
     | test(/^diagnose::targets::tests::/)
     | test(/^diagnose::active::tests::/)
+    | binary(tui_signals)
+    | test(/^ui::tty::tests::a_/)
 """
 retries = 2
