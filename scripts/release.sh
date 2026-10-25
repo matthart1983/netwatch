@@ -17,8 +17,8 @@
 # `[Unreleased]` with no notes, or no git user.name and user.email for the
 # RPM %changelog entry.
 #
-# package.nix is not touched: it is still at 0.26.1, and should be bumped by
-# someone who can check that it builds with nix.
+# package.nix is not touched: it reads its version from Cargo.toml, and
+# .github/workflows/nix.yml builds it.
 set -euo pipefail
 
 usage="usage: release.sh X.Y.Z \"summary\""

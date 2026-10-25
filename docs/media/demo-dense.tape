@@ -35,8 +35,12 @@
 #     screen that looks like one you've had open — which is the honest picture,
 #     not a doctored one.
 #
-# Record with:  vhs docs/media/demo-dense.tape
-# Needs: ./target/release/netwatch, vhs, scripts/demo-dense-{env,traffic}.sh.
+# Record on Linux with: vhs docs/media/demo-dense.tape
+# Needs: ./target/release/netwatch with capture permission, vhs, setsid,
+#        scripts/demo-dense-{env,traffic}.sh.
+# The 0.38.0 take uses a separate network/PID namespace for the terminal
+# session, with /proc and /sys mounted there. Keep the recorder outside it
+# so its browser sockets do not appear in the connection table.
 
 # THEN RE-ENCODE IT, for the same reason the hero tape documents: vhs v0.11.0
 # ignores `Set Framerate` for the GIF and writes 25 fps whatever the tape says,
@@ -44,13 +48,16 @@
 # 25 fps; the same recording at 10 fps is 2.8 MB.
 #
 #   ffmpeg -i docs/media/demo-dense.gif \
-#     -vf "fps=10,palettegen=stats_mode=diff:max_colors=64" -y /tmp/pal.png
+#     -vf "fps=10,palettegen=stats_mode=full:max_colors=128" -y /tmp/pal.png
 #   ffmpeg -i docs/media/demo-dense.gif -i /tmp/pal.png \
 #     -lavfi "fps=10[x];[x][1:v]paletteuse=dither=none:diff_mode=rectangle" \
-#     -loop 0 -y docs/media/demo-dense.gif
+#     -loop 0 -y /tmp/demo-dense-optimized.gif
+#   mv /tmp/demo-dense-optimized.gif docs/media/demo-dense.gif
 #
 # `dither=none` is deliberate: terminal output is flat colour, so dithering
 # buys nothing visible and costs most of the inter-frame compression.
+# A full-frame palette keeps the static Nord accents; a 64-colour diff-only
+# palette spent too many entries on the graph and washed out those accents.
 
 Output docs/media/demo-dense.gif
 
@@ -64,15 +71,20 @@ Set Framerate 10
 Set Padding 10
 
 # Hidden setup, as in the Lite tape: point `netwatch` at this repo's release
-# build for the recording only, redirect HOME to a scratch config so the GIF
+# build for the recording only, use a scratch config so the GIF
 # doesn't inherit the operator's theme, and arm the traffic generator to start
 # once capture is up.
 Hide
+Type "unset NO_COLOR; export COLORTERM=truecolor"
+Enter
 Type "export PATH=$PWD/target/release:$PATH"
 Enter
-Type "export HOME=$(./scripts/demo-dense-env.sh)"
+Type "NW_DEMO_HOME=$(./scripts/demo-dense-env.sh) && export XDG_CONFIG_HOME=$NW_DEMO_HOME/.config"
 Enter
-Type "(sleep 5; ./scripts/demo-dense-traffic.sh >/dev/null 2>&1) &"
+# Disable job control so setsid does not fork away from the PID we save.
+Type "set +m"
+Enter
+Type "setsid bash -c 'sleep 5; exec ./scripts/demo-dense-traffic.sh' >$NW_DEMO_HOME/traffic.log 2>&1 & NW_DEMO_TRAFFIC_PID=$!"
 Enter
 Type "clear"
 Enter
@@ -82,7 +94,11 @@ Enter
 # starts at the point a real session becomes worth looking at.
 Type "netwatch --view dense"
 Enter
-Sleep 75s
+Sleep 95s
+# Connections now start grouped and folded. Expand them before the reveal so
+# the tour's selection keys show individual sockets and their TCP details.
+Type "z"
+Sleep 1s
 Show
 
 # The screen, in full. Four boxes: the mirrored graph over per-interface rates
@@ -126,6 +142,6 @@ Enter
 Sleep 500ms
 
 # Tear down the traffic generator.
-Type "pkill -f demo-dense-traffic.sh; pkill -f 'curl -s --limit-rate'"
+Type "kill -- -$NW_DEMO_TRAFFIC_PID 2>/dev/null; wait $NW_DEMO_TRAFFIC_PID 2>/dev/null"
 Enter
 Sleep 500ms
