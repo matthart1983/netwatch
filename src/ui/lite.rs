@@ -93,16 +93,22 @@ pub const SPARK_W: u16 = 9;
 /// a 78-sample chart "78s" is only right at the 1000ms default; at 500ms the
 /// same chart covers 39 seconds. Both the axis and the sparkline header derive
 /// their label through here so neither can drift from the data again.
+///
+/// Under ten minutes the label is the nearest second, written as minutes only
+/// when it is a whole number of them (`2m`, `150s`): rounding every window
+/// from two minutes up to the nearest minute printed `3m` over 150 seconds.
+/// From ten minutes it is the nearest minute, which is at most 5% off and
+/// keeps the label within the four columns the Dense compact axis gives it.
 pub fn window_label(samples: usize, refresh_rate_ms: u64) -> String {
-    let secs = (samples as u64 * refresh_rate_ms) as f64 / 1000.0;
-    if secs >= 120.0 {
-        format!("{}m", (secs / 60.0).round() as u64)
-    } else if secs >= 10.0 {
-        format!("{}s", secs.round() as u64)
+    let ms = samples as u64 * refresh_rate_ms;
+    // Never a zero-second window at the fastest refresh.
+    let secs = ((ms + 500) / 1000).max(1);
+    if secs >= 600 {
+        format!("{}m", (ms + 30_000) / 60_000)
+    } else if secs >= 120 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
     } else {
-        // Sub-10s windows round badly to whole seconds — a 100ms refresh over
-        // 30 samples is 3 seconds, and "3s" beats "3.0s".
-        format!("{}s", secs.max(1.0).round() as u64)
+        format!("{secs}s")
     }
 }
 
@@ -1534,7 +1540,19 @@ mod tests {
         // the numbers coincide; at any other rate they must not.
         assert_eq!(window_label(78, 1000), "78s");
         assert_eq!(window_label(78, 500), "39s");
-        assert_eq!(window_label(78, 2000), "3m");
+        // Under ten minutes a window that is not whole minutes is given in
+        // seconds: 156 seconds is not `3m`, nor 150 seconds.
+        assert_eq!(window_label(78, 2000), "156s");
+        assert_eq!(window_label(30, 5000), "150s");
+        assert_eq!(window_label(60, 2500), "150s");
+        assert_eq!(window_label(30, 4500), "135s");
+        assert_eq!(window_label(60, 2000), "2m");
+        assert_eq!(window_label(60, 5000), "5m");
+        assert_eq!(window_label(119, 5000), "595s");
+        // From ten minutes it is the nearest minute, at most 5% off, and short
+        // enough for the Dense compact axis's four columns.
+        assert_eq!(window_label(148, 5000), "12m");
+        assert_eq!(window_label(150, 4000), "10m");
         // The sparkline's window is its own depth, not the chart width.
         assert_eq!(window_label(30, 1000), "30s");
         assert_eq!(window_label(30, 500), "15s");

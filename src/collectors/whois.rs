@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 
 const WHOIS_CACHE_MAX: usize = 2048;
 
+/// Where a W press sends the selected address. rdap.org is free, needs no key,
+/// answers in JSON and redirects to the registry that holds the address.
+pub const RDAP_URL: &str = "https://rdap.org/ip/";
+
 #[derive(Clone, Debug)]
 pub struct WhoisInfo {
     pub net_name: String,
@@ -89,25 +93,18 @@ impl WhoisCache {
         true
     }
 
+    /// What an earlier `request` found for `ip`, if it has finished. Reads
+    /// the cache only. The detail panes call this on every frame for the
+    /// selected row, and drawing a row must not send its address anywhere.
     pub fn lookup(&self, ip: &str) -> Option<WhoisInfo> {
-        if ip == "—" || ip.is_empty() || is_private_ip(ip) {
-            return None;
-        }
-        let mut cache = self.cache.lock().unwrap();
-        match cache.get(ip) {
+        match self.cache.lock().unwrap().get(ip) {
             Some(WhoisEntry::Resolved(info)) => Some(info.clone()),
-            Some(WhoisEntry::Failed) | Some(WhoisEntry::Pending) => None,
-            None => {
-                cache.insert(ip.to_string(), WhoisEntry::Pending);
-                if let Err(e) = self.tx.send(ip.to_string()) {
-                    tracing::error!(target: "netwatch::whois", error = %e, "whois resolver thread is gone; lookups will not progress");
-                }
-                None
-            }
+            Some(WhoisEntry::Failed) | Some(WhoisEntry::Pending) | None => None,
         }
     }
 
-    /// Queue an IP for lookup if not already cached (explicit trigger)
+    /// Queue `ip` for an RDAP lookup unless it is private or already cached.
+    /// Only the W key calls this.
     pub fn request(&self, ip: &str) {
         if ip == "—" || ip.is_empty() || is_private_ip(ip) {
             return;
@@ -117,7 +114,19 @@ impl WhoisCache {
             return;
         }
         cache.insert(ip.to_string(), WhoisEntry::Pending);
-        let _ = self.tx.send(ip.to_string());
+        if let Err(e) = self.tx.send(ip.to_string()) {
+            tracing::error!(target: "netwatch::whois", error = %e, "whois resolver thread is gone; lookups will not progress");
+        }
+    }
+
+    /// Drain the addresses queued for the worker, for tests. Empty once the
+    /// worker has started and taken the receiver.
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(&self) -> Vec<String> {
+        let rx = self.pending_rx.lock().unwrap();
+        rx.as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -154,8 +163,7 @@ fn is_private_ip(ip: &str) -> bool {
 }
 
 fn lookup_whois(ip: &str) -> Option<WhoisInfo> {
-    // Use rdap.org (free, no auth, JSON WHOIS)
-    let url = format!("https://rdap.org/ip/{}", ip);
+    let url = format!("{RDAP_URL}{ip}");
     let body = crate::http::get_text(&url).ok()?;
     parse_rdap(&body)
 }
@@ -286,6 +294,71 @@ mod lifecycle_tests {
         let clone = cache.clone();
         assert!(clone.start());
         assert!(!cache.start());
+    }
+
+    #[test]
+    fn lookup_never_queues() {
+        // The detail panes call `lookup` on every frame for whatever row is
+        // selected. A miss must not send the address to rdap.org.
+        let cache = WhoisCache::new();
+        assert!(cache.lookup("8.8.8.8").is_none());
+        assert!(cache.lookup("8.8.8.8").is_none());
+        assert!(cache.lookup("2606:4700:4700::1111").is_none());
+        assert!(cache.queued_for_test().is_empty());
+
+        // Nor may it leave a marker behind that makes a later W a no-op.
+        cache.request("8.8.8.8");
+        assert_eq!(cache.queued_for_test(), ["8.8.8.8"]);
+    }
+
+    #[test]
+    fn lookup_returns_resolved_entry() {
+        let cache = WhoisCache::new();
+        let info = WhoisInfo {
+            net_name: "GOGL".into(),
+            net_range: "8.8.8.0 - 8.8.8.255".into(),
+            org: "Google LLC".into(),
+            country: "US".into(),
+            description: String::new(),
+        };
+        cache
+            .cache
+            .lock()
+            .unwrap()
+            .insert("8.8.8.8".into(), WhoisEntry::Resolved(info));
+        assert_eq!(cache.lookup("8.8.8.8").unwrap().org, "Google LLC");
+        assert!(cache.queued_for_test().is_empty());
+    }
+
+    #[test]
+    fn request_queues_once() {
+        let cache = WhoisCache::new();
+        cache.request("8.8.8.8");
+        cache.request("8.8.8.8");
+        assert_eq!(cache.queued_for_test(), ["8.8.8.8"]);
+        assert!(cache.lookup("8.8.8.8").is_none(), "pending shows nothing");
+    }
+
+    #[test]
+    fn request_skips_private() {
+        let cache = WhoisCache::new();
+        for ip in [
+            "",
+            "—",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "::",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+        ] {
+            cache.request(ip);
+        }
+        assert!(cache.queued_for_test().is_empty());
     }
 
     #[test]

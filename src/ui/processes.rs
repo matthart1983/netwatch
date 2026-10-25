@@ -574,9 +574,13 @@ fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth
     let buf = app.caches.top_proc_rx_history.get(&key);
     let data: Vec<u64> = buf.map(|b| b.iter().copied().collect()).unwrap_or_default();
 
+    let window = crate::ui::lite::window_label(
+        crate::app::TOP_PROC_HISTORY_LEN,
+        app.user_config.refresh_rate_ms,
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "RX 60s",
+            format!("RX {window}"),
             Style::default().fg(t.text_muted),
         ))),
         Rect::new(area.x, area.y, area.width, 1),
@@ -588,10 +592,18 @@ fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth
     }
     let chart_area = Rect::new(area.x, area.y + 1, area.width, chart_h);
     if !data.is_empty() {
+        // The whole buffer across the chart, so it is the window the header
+        // names: one sample per column left a wide chart empty on the left
+        // and cut a narrow one short.
+        let fitted = crate::ui::dense::fit_window(
+            &data,
+            crate::app::TOP_PROC_HISTORY_LEN,
+            chart_area.width as usize * crate::graph::samples_per_column(app.graph_style),
+        );
         crate::graph::render(
             f,
             chart_area,
-            &data,
+            &fitted,
             app.graph_style,
             t.rx_rate,
             t.status_warn,
@@ -694,5 +706,65 @@ mod tests {
         assert_eq!(socket_state_row("LISTEN"), "LISTEN");
         assert_eq!(socket_state_row("CLOSED"), "OTHER");
         assert_eq!(socket_state_row(""), "OTHER");
+    }
+
+    /// The RX chart spreads the per-process history across its width, in
+    /// either graph style, and its header names the window that history
+    /// covers. It drew one sample per column (two in the dots style) under a
+    /// fixed `RX 60s`, so a wide chart left its left side empty and a narrow
+    /// bar chart showed less than the 60 samples it claimed.
+    #[test]
+    fn the_rx_chart_fills_its_width_with_the_window_it_names() {
+        use crate::graph::GraphStyle;
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        let proc = crate::collectors::process_bandwidth::ProcessBandwidth {
+            process_name: "curl".into(),
+            pid: Some(1),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_rate: 1000.0,
+            tx_rate: 0.0,
+            connection_count: 1,
+            rtt_ms: None,
+            cpu_percent: None,
+        };
+        app.caches.top_proc_rx_history.insert(
+            ("curl".into(), Some(1)),
+            vec![1000; crate::app::TOP_PROC_HISTORY_LEN].into(),
+        );
+        for (style, width) in [
+            (GraphStyle::Bars, 80),
+            (GraphStyle::Dots, 80),
+            (GraphStyle::Bars, 40),
+        ] {
+            app.graph_style = style;
+            // 60 samples at each rate. 150 seconds is not `3m`.
+            for (refresh_rate_ms, label) in [
+                (1000, "RX 60s"),
+                (500, "RX 30s"),
+                (2500, "RX 150s"),
+                (5000, "RX 5m"),
+            ] {
+                app.user_config.refresh_rate_ms = refresh_rate_ms;
+                let area = Rect::new(0, 0, width, 6);
+                let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+                terminal
+                    .draw(|f| super::render_rx_chart(f, &app, area, &proc))
+                    .unwrap();
+                let buf = terminal.backend().buffer();
+                let header: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
+                assert_eq!(header.trim_end(), label);
+                // A full-scale sample reaches the chart's top row.
+                for x in 0..width {
+                    assert_ne!(
+                        buf[(x, 1)].symbol(),
+                        " ",
+                        "column {x} empty, {style:?} {width} wide at {refresh_rate_ms} ms"
+                    );
+                }
+            }
+        }
     }
 }
