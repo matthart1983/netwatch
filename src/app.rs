@@ -1720,7 +1720,8 @@ where
     crate::runtime::bootstrap::prime_collectors(&mut app);
     // Kick off a one-shot traceroute so the topology view's ISP gateway hop
     // is populated without requiring the user to press T first.
-    app.traceroute_runner.run("1.1.1.1");
+    app.traceroute_runner
+        .run(crate::collectors::traceroute::STARTUP_TARGET);
 
     // Event loop design:
     //   1. Render  — draw current app state to the terminal

@@ -53,26 +53,55 @@ fn threat_model_policy_tables_match_code() {
 #[test]
 fn threat_model_lists_every_outbound_endpoint() {
     use crate::{
-        collectors::{health, whois},
+        collectors::{health, traceroute, whois},
         diagnose::{active, next_test},
     };
-    let egress = block("egress");
+    // Each row's destinations as whole words, so a changed endpoint cannot
+    // pass on another row's address or a prefix of the documented URL.
+    let rows: std::collections::HashMap<&str, Vec<&str>> = block("egress")
+        .lines()
+        .filter_map(|line| {
+            let mut cells = line.split('|').skip(1).map(str::trim);
+            let service = cells.next()?;
+            let words = cells.next()?.split([' ', ',', ';']);
+            Some((service, words.filter(|w| !w.is_empty()).collect()))
+        })
+        .collect();
     let mut endpoints = vec![
-        health::REFERENCE_RESOLVER.to_owned(),
-        health::CROSS_CHECK_NAME.to_owned(),
-        health::INTERNET_TARGET.to_owned(),
-        whois::RDAP_URL.to_owned(),
+        ("Reference DNS", health::REFERENCE_RESOLVER.to_owned()),
+        ("Reference DNS", health::CROSS_CHECK_NAME.to_owned()),
+        ("Internet reachability", health::INTERNET_TARGET.to_owned()),
+        ("Startup trace", traceroute::STARTUP_TARGET.to_owned()),
+        ("WHOIS on W", whois::RDAP_URL.to_owned()),
     ];
-    endpoints.extend(health::STUN_SERVERS.iter().map(|s| (*s).to_owned()));
+    endpoints.extend(
+        health::STUN_SERVERS
+            .iter()
+            .map(|s| ("STUN", (*s).to_owned())),
+    );
     let config = active::Config::default();
-    endpoints.extend(config.portal_endpoints.into_iter().map(|e| e.url));
+    endpoints.extend(
+        config
+            .portal_endpoints
+            .into_iter()
+            .map(|e| ("Captive portal", e.url)),
+    );
     for pair in config.ipv6_pairs {
-        endpoints.push(pair.v4.to_string());
-        endpoints.push(pair.v6.to_string());
+        endpoints.push(("Dual-stack experiments", pair.v4.to_string()));
+        endpoints.push(("Dual-stack experiments", pair.v6.to_string()));
     }
-    endpoints.push(next_test::Context::new("1.1.1.1".parse().unwrap()).upload_url);
-    for endpoint in endpoints {
-        assert!(egress.contains(&endpoint), "missing {endpoint}");
+    endpoints.push((
+        "Explicit upload test",
+        next_test::Context::new("1.1.1.1".parse().unwrap()).upload_url,
+    ));
+    for (service, endpoint) in endpoints {
+        let row = rows
+            .get(service)
+            .unwrap_or_else(|| panic!("no {service} row"));
+        assert!(
+            row.contains(&endpoint.as_str()),
+            "{service}: missing {endpoint}"
+        );
     }
 }
 

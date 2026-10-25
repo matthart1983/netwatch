@@ -230,9 +230,10 @@ All notable changes to NetWatch will be documented in this file.
   Landlock, and outbound networking remains unrestricted. Root operation has
   limited containment. The preferred Linux setup restricts a
   capability-enabled binary to a dedicated group; policy and endpoint tables
-  are checked in tests. `netwatch doctor` said eBPF was disabled by the
-  sandbox policy, untrue since 0.32.2; it now says eBPF loads under the policy
-  and its reader keeps the load capabilities.
+  are checked in tests, and the outbound inventory lists the trace to 1.1.1.1
+  that every TUI session runs at startup. `netwatch doctor` said eBPF was
+  disabled by the sandbox policy, untrue since 0.32.2; it now says eBPF loads
+  under the policy and its reader keeps the load capabilities.
 - **Run as root, the sandbox now takes the capabilities netwatch never
   uses from every confined thread.** It removes capabilities by a
   deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.
