@@ -68,6 +68,11 @@ All notable changes to NetWatch will be documented in this file.
   and `y` (copy) now act only on a packet the list shows, where they used to
   act on the hidden one whether `x` or the display filter hid it. Turning `x`
   off shows the packet again.
+- **Worker threads carry their names.** They were started unnamed, so the
+  log recorded a panic in any of them as `thread="unnamed"`, and `top -H`
+  or `ps -L` listed every worker as `netwatch`. Each now has its worker's
+  name (`capture`, `connections`, `health`, `reverse-dns` and so on), which
+  the kernel shortens to 15 characters.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -85,6 +90,43 @@ All notable changes to NetWatch will be documented in this file.
   the detail pane stops showing it and asks for a selection. `W` still found
   that packet in the whole capture and sent its source and destination to
   rdap.org. `W` now looks up a packet only while its row is in the list.
+- **Run as root, the sandbox now takes the capabilities netwatch does not
+  need from every confined thread.** It removes capabilities by a
+  deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.
+  Under sudo, every confined thread, the packet parser included, kept 38 of
+  root's 41 capabilities (37 with `--sandbox-strict`). One was
+  CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
+  memory, page cache included, through `/proc/kcore`, past every filesystem
+  rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
+  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more, and keep 11 (10 in
+  strict mode): file access in the user's directories, resource limits and
+  scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
+  CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
+  remains defence in depth, not containment. Losing CAP_SYS_PTRACE costs
+  something under sudo on a kernel where Landlock does not enforce (older
+  than 5.13, or Landlock missing from `lsm=`): confined threads can no
+  longer read `/proc/<pid>/exe` or the socket links in `/proc/<pid>/fd` of
+  almost any process but netwatch itself. Without CAP_SYS_PTRACE the kernel
+  allows those reads of another process only if it runs as root, is dumpable
+  and holds no capability the reading thread lacks. That rules out your
+  processes and other users', and also most root daemons, systemd among
+  them, because they hold capabilities a confined thread has dropped. Such a
+  process is named by the kernel's 15-character `comm` rather than its
+  executable, and its connections have no owner on a poll that finds the
+  latest process-attribution scan more than 5 seconds old. Where Landlock
+  enforces, it already refused those reads. Runs without elevation, with the
+  documented `setcap` line or under the systemd unit drop what they did
+  before.
+- **The process-attribution thread no longer keeps every capability
+  netwatch started with.** It reads other processes' socket fds in `/proc`
+  to name each connection's owner, so it runs outside the sandbox, and it
+  never dropped anything: in every mode, `--sandbox-strict` included, it
+  held CAP_NET_RAW, CAP_BPF and CAP_PERFMON under the `setcap` line and all
+  41 of root's capabilities under sudo. Strict mode's promise to drop
+  CAP_NET_RAW was therefore untrue of the process. Before its first scan the
+  thread now drops everything except CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
+  the two it needs to read another user's sockets under root, so its scans
+  attribute connections as before.
 - **netwatch.log no longer records credentials from the `--remote` URL.**
   When a POST to the remote backend failed, the warning carried the whole
   ingest URL, so a user name and password in it, or a token in its query
