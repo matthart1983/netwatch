@@ -379,7 +379,7 @@ pub mod conn_col {
 /// Connection table columns for a terminal `w` wide.
 ///
 /// Fixed up to `PROTO`; the extra width goes to `REMOTE` (hostnames are what
-/// actually get cut) and to the sparkline (more history at the same glance).
+/// actually get cut) and to the sparkline (more detail in the same retained history).
 /// Rates, RTT and state keep their widths — a number column gains nothing from
 /// being wider, and moving them would only make the eye re-find them.
 pub fn conn_cols(w: u16) -> Vec<Col> {
@@ -399,7 +399,7 @@ pub fn conn_cols(w: u16) -> Vec<Col> {
         right(83 + shift, 8, "UP"),
         right(93 + shift, 7, "RTT"),
         left(102 + shift, 8, "STATE"),
-        left(spark_x, content_x_end.saturating_sub(spark_x) + 1, "60s"),
+        left(spark_x, content_x_end.saturating_sub(spark_x) + 1, ""),
     ]
 }
 
@@ -520,7 +520,7 @@ pub fn cpt_cols(w: u16) -> Vec<Col> {
         right(38 + shift, 8, "DOWN"),
         right(48 + shift, 8, "UP"),
         right(58 + shift, 6, "RTT"),
-        left(spark_x, x_end.saturating_sub(spark_x) + 1, "60s"),
+        left(spark_x, x_end.saturating_sub(spark_x) + 1, ""),
     ]
 }
 
@@ -546,6 +546,26 @@ pub fn fit_samples(data: &[u64], out: usize) -> Vec<u64> {
     let mut v = vec![0u64; out - data.len()];
     v.extend_from_slice(data);
     v
+}
+
+/// Fit the connection cache's fixed time window to the available sub-columns.
+/// Unlike the scrolling throughput plot, these histories have only 30 samples:
+/// one sample per sub-column would leave a permanent empty left edge once the
+/// sparkline is wider than 15 cells. Pad missing history *before* resampling so
+/// new connections still fill from the right. Narrow plots retain bucket peaks;
+/// wide plots repeat samples, keeping the same time span at every width.
+fn fit_conn_history(data: &[u64], out: usize) -> Vec<u64> {
+    if out == 0 {
+        return Vec::new();
+    }
+    let window = fit_samples(data, crate::app::TOP_CONN_HISTORY_LEN);
+    (0..out)
+        .map(|i| {
+            let start = i * window.len() / out;
+            let end = ((i + 1) * window.len() / out).max(start + 1);
+            window[start..end].iter().copied().max().unwrap_or(0)
+        })
+        .collect()
 }
 
 /// The last `window` samples bucketed into `out` sub-columns, taking the
@@ -1062,6 +1082,19 @@ fn header(f: &mut Frame, y: u16, cols: &[Col], sort: Option<usize>, t: &Theme) {
         };
         cell(f, c, y, c.label, style);
     }
+}
+
+fn conn_history_header(f: &mut Frame, col: &Col, y: u16, app: &App, t: &Theme) {
+    cell(
+        f,
+        col,
+        y,
+        &crate::ui::lite::window_label(
+            crate::app::TOP_CONN_HISTORY_LEN,
+            app.user_config.refresh_rate_ms,
+        ),
+        Style::default().fg(t.text_muted),
+    );
 }
 
 fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
@@ -1954,6 +1987,7 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
     }
 
     header(f, l.row_conn_head, &l.conn_cols, Some(conn_col::DOWN), t);
+    conn_history_header(f, &l.conn_cols[conn_col::SPARK], l.row_conn_head, app, t);
     for (i, row) in visible.iter().enumerate() {
         let y = l.row_conn_first + i as u16;
         let is_sel = page_start + i == sel;
@@ -2066,7 +2100,7 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
         if dead || c.history.is_empty() {
             paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
         } else {
-            let s = fit_samples(&c.history, spark.w as usize * 2);
+            let s = fit_conn_history(&c.history, spark.w as usize * 2);
             let ramp = if c.retransmits > 0 {
                 &ramps.load
             } else {
@@ -2169,7 +2203,7 @@ fn render_group_row(
     if r.dead || r.history.is_empty() {
         paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
     } else {
-        let s = fit_samples(&r.history, spark.w as usize * 2);
+        let s = fit_conn_history(&r.history, spark.w as usize * 2);
         let ramp = if r.degraded { &ramps.load } else { &ramps.down };
         paint::spark(f.buffer_mut(), spark.x, y, spark.w, &s, chart_max(&s), ramp);
     }
@@ -2369,9 +2403,13 @@ fn render_detail(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, c: &ConnRow
     );
     put_right(f, l.content_x_end, l.row_detail_2, &internals, dim);
 
-    put(f, 4, l.row_detail_3, "rate 60s", dim);
+    let window = crate::ui::lite::window_label(
+        crate::app::TOP_CONN_HISTORY_LEN,
+        app.user_config.refresh_rate_ms,
+    );
+    put(f, 4, l.row_detail_3, &format!("rate {window}"), dim);
     if !c.history.is_empty() {
-        let s = fit_samples(&c.history, l.detail_spark_w as usize * 2);
+        let s = fit_conn_history(&c.history, l.detail_spark_w as usize * 2);
         paint::spark(
             f.buffer_mut(),
             l.detail_spark_x,
@@ -2558,6 +2596,7 @@ fn render_compact(f: &mut Frame, app: &App, area: Rect) {
         },
     );
     header(f, cl.row_head, &cl.cols, Some(cpt_col::DOWN), t);
+    conn_history_header(f, &cl.cols[cpt_col::SPARK], cl.row_head, app, t);
     for (i, c) in visible.iter().enumerate() {
         let y = cl.row_first + i as u16;
         let is_sel = page_start + i == sel;
@@ -2618,7 +2657,7 @@ fn render_compact(f: &mut Frame, app: &App, area: Rect) {
         if c.history.is_empty() {
             paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
         } else {
-            let s = fit_samples(&c.history, spark.w as usize * 2);
+            let s = fit_conn_history(&c.history, spark.w as usize * 2);
             paint::spark(
                 f.buffer_mut(),
                 spark.x,
@@ -3037,6 +3076,27 @@ mod tests {
         assert!(fit_samples(&[1, 2], 0).is_empty());
     }
 
+    #[test]
+    fn connection_history_warms_up_without_stretching_its_age() {
+        let depth = crate::app::TOP_CONN_HISTORY_LEN;
+        let fitted = fit_conn_history(&[10, 20], depth * 2);
+        assert!(fitted[..(depth - 2) * 2].iter().all(|&v| v == 0));
+        assert_eq!(&fitted[(depth - 2) * 2..], &[10, 10, 20, 20]);
+        assert_eq!(fit_conn_history(&[], 8), vec![0; 8]);
+        assert!(fit_conn_history(&[10], 0).is_empty());
+    }
+
+    #[test]
+    fn narrow_connection_sparklines_keep_old_and_new_peaks() {
+        let mut history = vec![1; crate::app::TOP_CONN_HISTORY_LEN];
+        history[0] = 100;
+        *history.last_mut().unwrap() = 200;
+        let fitted = fit_conn_history(&history, 10);
+        assert_eq!(fitted[0], 100);
+        assert_eq!(fitted[9], 200);
+        assert_eq!(&fitted[1..9], &[1; 8]);
+    }
+
     /// A list that reorders under the cursor is the difference between a live
     /// view and a jittery one — and because the selection is positional, a swap
     /// silently retargets the detail block to another connection.
@@ -3332,6 +3392,42 @@ mod zoom_tests {
 #[cfg(test)]
 mod group_tests {
     use super::*;
+
+    #[test]
+    fn a_full_process_history_reaches_both_edges_at_every_width() {
+        let mut row = conn("curl", 1, "example.test", 1000.0, 0, "ESTABLISHED");
+        row.history = vec![1000; crate::app::TOP_CONN_HISTORY_LEN];
+        let groups = conn_groups(vec![row]);
+        let theme = crate::theme::nord();
+        let ramps = Ramps::from_theme(&theme);
+        for width in [130, 160, 240, 400] {
+            let layout = Layout::new(Rect::new(0, 0, width, 44));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 44)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_group_row(
+                        frame,
+                        &theme,
+                        &ramps,
+                        &layout,
+                        &groups[0],
+                        true,
+                        false,
+                        layout.row_conn_first,
+                    );
+                })
+                .unwrap();
+            let spark = &layout.conn_cols[conn_col::SPARK];
+            for x in spark.x..spark.x + spark.w {
+                assert_eq!(
+                    terminal.backend().buffer()[(x, layout.row_conn_first)].symbol(),
+                    "⣿",
+                    "full history must fill column {x} at terminal width {width}"
+                );
+            }
+        }
+    }
 
     fn conn(process: &str, pid: u32, host: &str, rx: f64, retrans: u32, state: &str) -> ConnRow {
         ConnRow {
