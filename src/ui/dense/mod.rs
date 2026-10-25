@@ -551,44 +551,35 @@ pub fn fit_samples(data: &[u64], out: usize) -> Vec<u64> {
 /// Fit the connection cache's fixed time window to the available sub-columns.
 /// Unlike the scrolling throughput plot, these histories have only 30 samples:
 /// one sample per sub-column would leave a permanent empty left edge once the
-/// sparkline is wider than 15 cells. Pad missing history *before* resampling so
-/// new connections still fill from the right. Narrow plots retain bucket peaks;
-/// wide plots repeat samples, keeping the same time span at every width.
+/// sparkline is wider than 15 cells. [`fit_window`] keeps the same time span
+/// at every width.
 fn fit_conn_history(data: &[u64], out: usize) -> Vec<u64> {
-    if out == 0 {
-        return Vec::new();
-    }
-    let window = fit_samples(data, crate::app::TOP_CONN_HISTORY_LEN);
-    (0..out)
-        .map(|i| {
-            let start = i * window.len() / out;
-            let end = ((i + 1) * window.len() / out).max(start + 1);
-            window[start..end].iter().copied().max().unwrap_or(0)
-        })
-        .collect()
+    fit_window(data, crate::app::TOP_CONN_HISTORY_LEN, out)
 }
 
-/// The last `window` samples bucketed into `out` sub-columns, taking the
-/// **max** of each bucket.
+/// The last `window` samples spread across `out` sub-columns.
 ///
 /// For plots whose header claims a fixed span — the `60s` sparkline in the
-/// interface table — where the column is far narrower than the window. Max per
-/// bucket rather than decimation so a spike inside a bucket survives; dropping
-/// it would hide the one thing worth seeing in a 15-cell graph.
+/// interface table, the connection histories here and the detail graphs on
+/// the Connections and Processes tabs — at whatever width they get.
+/// Missing history is padded *before* resampling, so a short one fills from
+/// the right at its real age instead of being stretched across the plot.
+///
+/// Narrower than the window, each sub-column takes the **max** of its bucket
+/// rather than decimating, so a spike inside a bucket survives; dropping it
+/// would hide the one thing worth seeing in a 15-cell graph. Wider, samples
+/// repeat. One sample per sub-column there left the plot's left side blank
+/// whenever it had more sub-columns than the window had samples.
 pub fn fit_window(data: &[u64], window: usize, out: usize) -> Vec<u64> {
     if out == 0 {
         return Vec::new();
     }
-    let start = data.len().saturating_sub(window.max(1));
-    let win = &data[start..];
-    if win.len() <= out {
-        return fit_samples(win, out);
-    }
+    let win = fit_samples(data, window.max(1));
     (0..out)
         .map(|i| {
             let a = i * win.len() / out;
             let b = ((i + 1) * win.len() / out).max(a + 1);
-            win[a..b.min(win.len())].iter().copied().max().unwrap_or(0)
+            win[a..b].iter().copied().max().unwrap_or(0)
         })
         .collect()
 }
@@ -926,12 +917,20 @@ fn rollup(conns: &[ConnRow]) -> ConnRollup {
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(s, _)| s.to_string())
         .unwrap_or_default();
-    // Histories all end at now; sum them aligned at the right edge.
-    let len = conns.iter().map(|c| c.history.len()).max().unwrap_or(0);
+    // Histories all end at now; sum them aligned at the right edge. Every
+    // socket to a host carries the same cached history, one per (process,
+    // host) and already summed over those sockets, so each host counts once.
+    let mut hosts_summed = std::collections::HashSet::new();
+    let shared: Vec<&[u64]> = conns
+        .iter()
+        .filter(|c| hosts_summed.insert(crate::app::top_conn_host(&c.remote)))
+        .map(|c| c.history.as_slice())
+        .collect();
+    let len = shared.iter().map(|h| h.len()).max().unwrap_or(0);
     let mut history = vec![0u64; len];
-    for c in conns {
-        let off = len - c.history.len();
-        for (i, v) in c.history.iter().enumerate() {
+    for h in shared {
+        let off = len - h.len();
+        for (i, v) in h.iter().enumerate() {
             history[off + i] += v;
         }
     }
@@ -3030,6 +3029,83 @@ mod tests {
         );
     }
 
+    /// A short history sits at its real age in the window rather than being
+    /// stretched across it, wide or narrow.
+    #[test]
+    fn fit_window_pads_a_short_history_to_its_window() {
+        assert_eq!(fit_window(&[10, 20], 4, 8), [0, 0, 0, 0, 10, 10, 20, 20]);
+        let mut narrow = vec![0; 29];
+        narrow.push(20);
+        assert_eq!(fit_window(&[10, 20], 60, 30), narrow);
+        assert!(fit_window(&[10], 60, 0).is_empty());
+    }
+
+    /// The interface sparkline covers the 60s its header claims at every
+    /// width and refresh rate. It drew one sample per sub-column whenever the
+    /// window held fewer samples than the plot had sub-columns, and left the
+    /// rest blank: 266 of 326 sub-columns at 400 columns, and 18 of 30 at a
+    /// 5-second refresh on the narrowest grid.
+    #[test]
+    fn a_busy_interface_fills_its_sparkline_at_every_width() {
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.interface_info = vec![crate::platform::InterfaceInfo {
+            name: "eth0".into(),
+            ipv4: None,
+            ipv6: None,
+            mac: None,
+            mtu: None,
+            is_up: true,
+            is_wireless: None,
+        }];
+        app.traffic
+            .publish_for_test(vec![crate::collectors::traffic::InterfaceTraffic {
+                name: "eth0".into(),
+                rx_rate: 500.0,
+                tx_rate: 0.0,
+                rx_bytes_total: 0,
+                tx_bytes_total: 0,
+                rx_packets: 0,
+                tx_packets: 0,
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_drops: 0,
+                tx_drops: 0,
+                signal_dbm: None,
+                tx_retries: None,
+                rx_history: vec![500; 600].into(),
+                tx_history: vec![0; 600].into(),
+                sample_times: Default::default(),
+            }]);
+        let theme = crate::theme::nord();
+        let ramps = Ramps::from_theme(&theme);
+        let mut layouts: Vec<(u16, Layout)> = [130, 160, 240, 400]
+            .map(|w| (w, Layout::new(Rect::new(0, 0, w, 44))))
+            .into();
+        layouts.push((
+            130,
+            Layout::zoomed(Rect::new(0, 0, 130, 44), DenseBox::Ifaces),
+        ));
+        for refresh_rate_ms in [1000, 5000] {
+            app.user_config.refresh_rate_ms = refresh_rate_ms;
+            for (width, l) in &layouts {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(*width, 44)).unwrap();
+                terminal
+                    .draw(|f| render_ifaces(f, &app, &theme, &ramps, l))
+                    .unwrap();
+                let spark = &l.if_cols[if_col::SPARK];
+                for x in spark.x..spark.x + spark.w {
+                    assert_eq!(
+                        terminal.backend().buffer()[(x, l.row_if_first)].symbol(),
+                        "⣿",
+                        "column {x} at width {width}, {refresh_rate_ms} ms refresh"
+                    );
+                }
+            }
+        }
+    }
+
     /// An exact-max scale rescales the whole plot every time the peak moves.
     #[test]
     fn chart_ceilings_snap_to_round_numbers() {
@@ -3490,7 +3566,29 @@ mod group_tests {
         assert!(r.degraded, "one retransmitting socket marks the group");
         assert_eq!(r.rtt_ms, Some(2.0), "best rtt, not first");
         assert_eq!(r.state, "ESTABLISHED", "dominant state");
-        assert_eq!(r.history, vec![3, 3, 3], "sparklines summed");
+        // b and c once each: the two sockets to c share c's history.
+        assert_eq!(r.history, vec![2, 2, 2], "sparklines summed");
+    }
+
+    /// The cache keeps one history per (process, host), already summed over
+    /// that host's sockets, and hands it to each of them. Adding it once per
+    /// socket counted five sockets to one host five times, so the header's
+    /// sparkline disagreed with its own DOWN.
+    #[test]
+    fn a_host_history_counts_once_however_many_sockets_share_it() {
+        let mut rows: Vec<ConnRow> = (0..5)
+            .map(|_| {
+                let mut c = conn("curl", 1, "10.1.1.1", 20.0, 0, "ESTABLISHED");
+                c.history = vec![100, 100];
+                c
+            })
+            .collect();
+        let mut big = conn("curl", 1, "10.2.2.2", 400.0, 0, "ESTABLISHED");
+        big.history = vec![0, 400];
+        rows.push(big);
+        let r = &conn_groups(rows)[0].rollup;
+        assert_eq!(r.rx_rate, 500.0);
+        assert_eq!(r.history, vec![100, 500], "the newest sample matches DOWN");
     }
 
     /// A closing socket dims however its platform spells the state, and a
