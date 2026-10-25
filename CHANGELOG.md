@@ -4,6 +4,24 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Less `unsafe` code, and the raw-pointer reads this change touches check
+  what they assume.** Six places that read the effective user ID, and three
+  in tests, call nix's safe wrapper instead of libc inside an `unsafe`
+  block. The sandbox's Landlock write-grant check still calls libc. On
+  Windows, the Npcap loader and doctor's query of the Npcap driver service
+  call the windows-sys declarations instead of hand-written ones, and on
+  macOS the process path lookup uses libc's declaration of `proc_pidpath`.
+  Reading the Windows socket tables now checks that the buffer holds the
+  whole table struct, a header and one row, before it reads the row count,
+  which only the caller guaranteed before, and the build fails if the
+  alignment the socket table, adapter and ICMP buffers rely on stops
+  holding. macOS and FreeBSD share one walk of the `getifaddrs` list for the
+  link speed. It skips an entry with no name instead of reading a null
+  pointer, and reads only the speed field rather than borrowing the whole
+  `if_data` record. Nothing netwatch shows changes, and no new crate is
+  compiled.
+
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
   including on wide terminals. Their time labels reflect the retained history
@@ -156,22 +174,6 @@ All notable changes to NetWatch will be documented in this file.
   bundles are written under a temporary name and moved into place when
   complete; a cancelled or failed export removes them. The exports directory
   must be on a filesystem with hard links.
-- **Less `unsafe` code, and the raw-pointer reads this change touches check
-  what they assume.** Six places that read the effective user ID, and three
-  in tests, call nix's safe wrapper instead of libc inside an `unsafe`
-  block. The sandbox's Landlock write-grant check still calls libc. On
-  Windows, the Npcap loader and doctor's query of the Npcap driver service
-  call the windows-sys declarations instead of hand-written ones, and on
-  macOS the process path lookup uses libc's declaration of `proc_pidpath`.
-  Reading the Windows socket tables now checks that the buffer holds the
-  whole table struct, a header and one row, before it reads the row count,
-  which only the caller guaranteed before, and the build fails if the
-  alignment the socket table, adapter and ICMP buffers rely on stops
-  holding. macOS and FreeBSD share one walk of the `getifaddrs` list for the
-  link speed. It skips an entry with no name instead of reading a null
-  pointer, and reads only the speed field rather than borrowing the whole
-  `if_data` record. Nothing netwatch shows changes, and no new crate is
-  compiled.
 
 ### Fixed
 - **Exported captures carry the real capture time and wire length.** PCAP
