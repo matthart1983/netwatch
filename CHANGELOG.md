@@ -139,6 +139,10 @@ All notable changes to NetWatch will be documented in this file.
   `[2606:4700:4700::1111]`, which the lookup could not parse, so every IPv6
   row showed a dash. So did an IPv4 peer of a dual-stack socket, which
   Linux shows as `[::ffff:8.8.8.8]`. The lookup now drops the brackets.
+- **Dense shows the org and city of a peer that sent a server name.** The
+  line under the selected connection looked up the TLS or QUIC server name
+  instead of the address, and a GeoIP database knows only addresses, so
+  those rows never showed one. It now looks up the address.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -250,6 +254,10 @@ All notable changes to NetWatch will be documented in this file.
   registries mark as not globally reachable. A NAT64 address in
   `64:ff9b::/96` or a 6to4 address in `2002::/16` counts as global only if
   the IPv4 address inside it does.
+- **Dense no longer sends server names to ip-api.com.** With
+  `geoip_online` on, the line under the selected connection sent
+  ip-api.com, in cleartext, the server name a TLS or QUIC connection had
+  sent instead of its address. It now sends the address.
 
 ## [0.38.0] - 2026-10-25
 

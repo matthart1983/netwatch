@@ -263,7 +263,10 @@ impl GeoCache {
             Ok(()) => cache.put(addr, GeoEntry::Pending),
             // Queue full: record nothing, so the next lookup asks again.
             Err(std_mpsc::TrySendError::Full(_)) => {}
+            // Worker gone: nothing will answer, so record the address as
+            // failed and log it once rather than on every later lookup.
             Err(e @ std_mpsc::TrySendError::Disconnected(_)) => {
+                cache.put(addr, GeoEntry::Failed);
                 tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
             }
         }
@@ -457,6 +460,15 @@ fn parse_ip_api(body: &str) -> Option<GeoInfo> {
 }
 
 #[cfg(test)]
+impl GeoCache {
+    /// A cache whose database puts every address in Ashburn, United States,
+    /// for tests outside this module.
+    pub(crate) fn every_address_us_for_test() -> Self {
+        Self::with_reader(tests::every_address_us(), false)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -645,10 +657,10 @@ mod tests {
         assert_eq!(info.org, "Evil·Net");
     }
 
-    /// A MaxMind DB that puts every address, v4 or v6, in the United States:
-    /// one search-tree node whose two records both point at the only data
-    /// record. Enough to drive the offline path without a database file.
-    fn every_address_us() -> MaxMindReader {
+    /// A MaxMind DB that puts every address, v4 or v6, in Ashburn, United
+    /// States: one search-tree node whose two records both point at the only
+    /// data record. Enough to drive the offline path without a database file.
+    pub(super) fn every_address_us() -> MaxMindReader {
         // A UTF-8 string shorter than 29 bytes: type 2 in the top three
         // bits, length in the low five.
         fn text(s: &str) -> Vec<u8> {
@@ -662,8 +674,15 @@ mod tests {
         // 1 + 16 + offset 0.
         let mut db = vec![0, 0, 17, 0, 0, 17];
         db.extend_from_slice(&[0; 16]);
-        // {country: {iso_code: "US", names: {en: "United States"}}}
+        // {city: {names: {en: "Ashburn"}},
+        //  country: {iso_code: "US", names: {en: "United States"}}}
+        db.push(0xE2);
+        db.extend(text("city"));
         db.push(0xE1);
+        db.extend(text("names"));
+        db.push(0xE1);
+        db.extend(text("en"));
+        db.extend(text("Ashburn"));
         db.extend(text("country"));
         db.push(0xE2);
         db.extend(text("iso_code"));
@@ -757,6 +776,37 @@ mod tests {
         let dropped = peers.last().unwrap();
         cache.lookup(dropped);
         assert_eq!(queued(&cache), [dropped.as_str()]);
+    }
+
+    /// Once the worker has gone, after a panic or at shutdown while the UI
+    /// still ticks, a lookup that records nothing tries the send again next
+    /// time. The egress view looks up every public peer on every tick, so
+    /// that was an error in the log per peer per tick.
+    #[test]
+    fn a_gone_worker_is_logged_once_per_address() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&events)));
+        let cache = GeoCache::with_mmdb_and_online("", "", true);
+        drop(cache.pending_rx.lock().unwrap().take());
+        tracing::subscriber::with_default(subscriber, || {
+            for _tick in 0..10 {
+                for i in 0..100u32 {
+                    let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
+                    assert!(cache.lookup(&ip).is_none());
+                }
+            }
+        });
+        assert_eq!(events.load(Ordering::Relaxed), 100);
     }
 
     #[test]
