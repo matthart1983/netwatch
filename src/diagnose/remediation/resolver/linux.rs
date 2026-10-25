@@ -85,7 +85,7 @@ fn trusted_directory(path: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 fn live_store() -> io::Result<Store> {
-    if unsafe { libc::geteuid() } != 0 {
+    if nix::unistd::geteuid().as_raw() != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "resolver command requires explicit root authority",
@@ -501,7 +501,7 @@ mod tests {
         Ok(Session {
             store: Store::open(&root.join("state"))?,
             path: root.join("resolv.conf"),
-            uid: unsafe { libc::geteuid() },
+            uid: nix::unistd::geteuid().as_raw(),
             owner: Owner::current(),
             active: None,
             live: false,
@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn pid_reuse_missing_tokens_and_other_namespaces_are_distinguished() {
         let mut owner = Owner::current();
-        let uid = unsafe { libc::geteuid() };
+        let uid = nix::unistd::geteuid().as_raw();
         assert_eq!(owner_status(&owner, uid), OwnerStatus::Alive);
         owner.process_start = Some("0".into());
         assert_eq!(owner_status(&owner, uid), OwnerStatus::Gone);

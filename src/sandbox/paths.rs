@@ -136,7 +136,7 @@ fn prepare_directory(path: &std::path::Path) -> std::io::Result<()> {
             .read(true)
             .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
             .open(path)?;
-        if directory.metadata()?.uid() != unsafe { nix::libc::geteuid() } {
+        if directory.metadata()?.uid() != nix::unistd::geteuid().as_raw() {
             return Err(std::io::Error::other(
                 "sandbox directory is owned by a different user",
             ));
