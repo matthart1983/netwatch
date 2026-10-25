@@ -268,6 +268,16 @@ written into a hidden `.netwatch_incident_<id>.tmp` directory beside it and rena
 place once every file is complete; the directory is 0700 and its files 0600 on Unix. The
 incident JSON names processes and endpoints whether or not packet comments are on.
 
+The recorder holds at most 20,000 packets and 64 MiB of them, counting the captured bytes
+and what netwatch decoded from them. Past either limit the oldest go first, so under bulk
+traffic, where one GSO frame can be 64 KiB, the packets cover less than the whole window.
+The connection snapshots hold at most 50,000 rows between them, about 55 MB. A host with
+10,000 connections fills that with five snapshots, so older snapshots are then left out
+whole and the rest stay evenly spread across the window: the bundle still covers five
+minutes, at a longer interval. The newest snapshot is always whole, even when it alone is
+over 50,000 rows. `connection_rows_dropped` in the manifest and a line in `summary.md` say
+how many rows were left out.
+
 `manifest.json` is version **2**. Besides the counts of what was recorded, it has:
 
 | Key | Meaning |
@@ -276,6 +286,7 @@ incident JSON names processes and endpoints whether or not packet comments are o
 | `packet_export` | `packets` written, `omitted` (no capture metadata), and `annotated` (with a socket owner) |
 | `packet_annotations` | Whether packet comments were on |
 | `last_capture_status` | The capture's `session`, `sampled_at_utc_ms` and `drops` (packets libpcap dropped, null when it had not reported recently), last sampled while recording. `drops` counts from the last capture start, so it also covers any earlier `session` that ended when the stream indexes ran out. Not a loss total for the incident window |
+| `connection_rows_dropped` | Connection rows left out to keep the snapshots within 50,000 rows, counting snapshots taken inside the window. Whole snapshots are left out, never single rows. `0` when none were |
 | `capture_limitations` | What the packet files cannot show, in prose |
 
 Version 1 bundles, from netwatch 0.37 and earlier, have `packets.pcap` only, with times

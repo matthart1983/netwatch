@@ -118,6 +118,20 @@ All notable changes to NetWatch will be documented in this file.
   past the 20 that raise the alert, and each window starts with an empty
   set. Domain counts are cut to the 500 most queried as soon as a new name
   would take them past 1,000.
+- **An armed flight recorder no longer grows to gigabytes on a busy host.**
+  It kept up to 20,000 packets whatever their size, and a copy of the whole
+  connection table at every refresh for five minutes. Under bulk TCP, where
+  one GSO frame can be 64 KiB, each recorded frame held about 380 KB with
+  its hex and text, so 20,000 could reach 7 GB. A host with 10,000
+  connections reached 3 million rows, about 3.3 GB. The recorder now also
+  stops at 64 MiB of packets, dropping the oldest first, and at 50,000
+  connection rows across its snapshots. Past that it leaves out whole older
+  snapshots and keeps the rest evenly spread across the window, so the
+  bundle still covers five minutes at a longer interval. The newest snapshot
+  is always whole. A new manifest key, `connection_rows_dropped`, and a line
+  in `summary.md` give the number of rows left out, and `connections.json`
+  keeps its shape. The bundle's JSON files are also written through a buffer
+  now; 50,000 rows took about 12 million write calls before.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
