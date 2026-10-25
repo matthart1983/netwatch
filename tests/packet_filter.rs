@@ -6,6 +6,8 @@
 //!
 //! A test binary of its own, because counting allocations needs a global
 //! allocator, and the library's unit tests should not run on a counting one.
+// A global allocator is an unsafe impl; this one only counts and forwards.
+#![allow(unsafe_code)]
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fs;

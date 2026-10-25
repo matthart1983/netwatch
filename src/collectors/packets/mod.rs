@@ -5,10 +5,10 @@ use std::thread;
 
 const MAX_PACKETS: usize = 5000; // ring buffer; oldest packets are discarded when full
 
-/// How many packets the ring holds before the oldest are discarded. Public
-/// because the capture strip states it: a count read off a bounded ring means
-/// something different from a session total, and the screen has to say which
-/// it is showing.
+/// The most packets the ring holds. Past it, or past [`RING_BYTE_BUDGET`],
+/// the oldest are discarded. Public because the capture strip states both: a
+/// count read off a bounded ring means something different from a session
+/// total, and the screen has to say which it is showing.
 pub const RING_CAPACITY: usize = MAX_PACKETS;
 
 /// Bytes the ring's packets may hold between them, beside the count cap; see
@@ -28,16 +28,19 @@ const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024; // 2 MB per reassembled stream
 pub(crate) const MAX_STREAMS: usize = 1024;
 pub(crate) const STREAM_EVICT_BATCH: usize = 256;
 /// Most bytes all streams may hold between them: payloads, decrypted
-/// plaintext, QUIC CRYPTO and HTTP/3 buffers, and per-segment overhead. The
-/// per-stream and stream-count caps alone let a peer that opens enough flows
-/// fill 1280 × 2 MB, 2.5 GB. Past the budget the least recently seen streams
-/// go, down to 7/8 of it, so one sweep covers many packets. A host with less
-/// than 2 GiB gets less; see [`stream_budget`].
+/// plaintext, QUIC CRYPTO and HTTP/3 buffers, per-segment overhead and each
+/// flow's DPI label. The per-stream and stream-count caps alone let a peer
+/// that opens enough flows fill 1280 × 2 MB, 2.5 GB. Past the budget the
+/// least recently seen streams go, down to 7/8 of it, so one sweep covers
+/// many packets. A host with less than 2 GiB gets less; see
+/// [`stream_budget`].
 const MAX_ALL_STREAMS_BYTES: usize = 256 * 1024 * 1024;
 // `StreamTracker::charge` never evicts the stream it charges, so one flow's
-// HTTP/3 buffers and bodies must fit well inside the budget. On a host small
-// enough to scale the budget down, one decrypted HTTP/3 flow can pass it by
-// up to MAX_H3_FLOW_BYTES, which is still under this ceiling.
+// HTTP/3 buffers and bodies must fit well inside the budget. One decrypted
+// HTTP/3 flow can hold about 69 MiB: MAX_H3_FLOW_BYTES of HTTP/3 buffers and
+// up to 2 MB of payload with its plaintext and segment overhead. A budget
+// below that, on a host under about 550 MiB, can be passed by the difference
+// until a charge to another flow drops this one.
 const _: () = assert!(crate::dpi::http3::MAX_H3_FLOW_BYTES <= MAX_ALL_STREAMS_BYTES / 4);
 const CAPTURE_SNAPLEN: i32 = 65535; // capture full frames (no truncation)
 const CAPTURE_TIMEOUT_MS: i32 = 100; // pcap read timeout; controls batch latency
@@ -467,6 +470,8 @@ pub struct StreamTracker {
     held_bytes: usize,
     /// [`stream_budget`] for this host; a field so tests can use a small one.
     byte_budget: usize,
+    /// Flows dropped to stay inside the stream-count cap or `byte_budget`.
+    dropped_flows: u64,
 }
 
 /// The stream budget for a host with `mem_total` bytes of memory, an eighth
@@ -596,6 +601,7 @@ impl StreamTracker {
             quic_h3: HashMap::new(),
             held_bytes: 0,
             byte_budget: host_stream_budget(),
+            dropped_flows: 0,
         }
     }
 
@@ -612,14 +618,14 @@ impl StreamTracker {
         self.byte_budget
     }
 
-    /// Whether the tracker is dropping flows to stay inside its caps. It is
-    /// once it holds more than [`MAX_STREAMS`] flows, which only eviction
-    /// brings back down, or more bytes than an eviction sweep leaves. A dropped flow has
-    /// no byte counts, so rates read from the tracker then cover only some
-    /// connections.
+    /// How many flows the tracker has dropped to stay inside its caps since
+    /// it was last cleared: past [`MAX_STREAMS`] + [`STREAM_EVICT_BATCH`]
+    /// flows, or past `byte_budget()` bytes, the least recently seen go. A
+    /// dropped flow's byte counts go with it, so once this is above zero,
+    /// rates read from the tracker can cover only some connections.
     #[doc(hidden)]
-    pub fn at_capacity(&self) -> bool {
-        self.all_streams.len() > MAX_STREAMS || self.held_bytes > self.sweep_target()
+    pub fn dropped_flows(&self) -> u64 {
+        self.dropped_flows
     }
 
     /// Where an eviction sweep brings `held_bytes` down to, 7/8 of the budget.
@@ -665,6 +671,7 @@ impl StreamTracker {
                 break;
             }
             self.remove_stream(old);
+            self.dropped_flows += 1;
         }
     }
 
@@ -711,6 +718,7 @@ impl StreamTracker {
         by_age.sort_unstable();
         for &(_, idx) in by_age.iter().take(STREAM_EVICT_BATCH) {
             self.remove_stream(idx);
+            self.dropped_flows += 1;
         }
     }
 
@@ -894,6 +902,12 @@ impl StreamTracker {
         const MAX_CLASSIFY_BYTES: usize = 4096;
         const MAX_QUIC_CRYPTO_BUF: usize = 16 * 1024;
         let is_tcp = matches!(protocol, StreamProtocol::Tcp);
+        // The label and the CRYPTO buffer below are charged as they grow and
+        // given back as they shrink.
+        let extras = |s: &Stream| {
+            s.app_protocol.as_ref().map_or(0, label_bytes) + s.quic_crypto_buf.capacity()
+        };
+        let extras_held = extras(stream);
 
         if !stream.app_protocol_attempted && payload.len() >= 16 {
             let slice = &payload[..payload.len().min(MAX_CLASSIFY_BYTES)];
@@ -948,9 +962,7 @@ impl StreamTracker {
         }
 
         // Cross-packet QUIC CRYPTO reassembly. Runs while we still
-        // haven't extracted a hostname for this stream. The buffer is
-        // charged as it grows and given back when it is released.
-        let crypto_held = stream.quic_crypto_buf.capacity();
+        // haven't extracted a hostname for this stream.
         if !is_tcp
             && !matches!(
                 stream.app_protocol,
@@ -1019,11 +1031,11 @@ impl StreamTracker {
             }
         }
 
-        let crypto_now = stream.quic_crypto_buf.capacity();
-        let released = crypto_held.saturating_sub(crypto_now);
+        let extras_now = extras(stream);
+        let released = extras_held.saturating_sub(extras_now);
         stream.held_bytes = stream.held_bytes.saturating_sub(released);
         self.held_bytes = self.held_bytes.saturating_sub(released);
-        let mut cost = crypto_now.saturating_sub(crypto_held);
+        let mut cost = extras_now.saturating_sub(extras_held);
 
         if !payload.is_empty()
             && stream.segments.len() < MAX_STREAM_SEGMENTS
@@ -1492,6 +1504,7 @@ impl StreamTracker {
         self.tls_keys.clear();
         self.quic_h3.clear();
         self.held_bytes = 0;
+        self.dropped_flows = 0;
     }
 }
 
@@ -1679,9 +1692,35 @@ fn run_capture_step(
     false
 }
 
-/// What a packet costs against [`RING_BYTE_BUDGET`], which is its own size
-/// and the buffers that grow with the frame. The cost is fixed once the
-/// packet reaches the ring. The annotation added later is small and left out.
+/// The bytes behind a flow's DPI label. Every packet on the flow carries a
+/// copy, and a peer chooses how long some of it is: a QUIC ClientHello can
+/// name a 15,000-byte SNI over MTU-sized Initials.
+fn label_bytes(p: &crate::dpi::AppProtocol) -> usize {
+    use crate::dpi::AppProtocol as P;
+    let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    match p {
+        P::Tls { sni, alpn, ja4, .. } => opt(sni) + opt(alpn) + opt(ja4),
+        P::Http {
+            method, host, path, ..
+        } => method.len() + opt(host) + opt(path),
+        P::Dns { qname, .. } | P::Llmnr { qname, .. } => qname.len(),
+        P::Ssh { version } => version.len(),
+        P::Quic { sni, ja4, .. } => opt(sni) + opt(ja4),
+        P::Mqtt { client_id } => opt(client_id),
+        P::Stun { message_type } => message_type.len(),
+        P::BitTorrent { info_hash } => opt(info_hash),
+        P::NetBios { service } => service.len(),
+        P::Snmp { version, community } => version.len() + opt(community),
+        P::Ssdp { method, target } => method.len() + opt(target),
+        P::Ftp { command } => command.len(),
+        P::Dhcp { .. } | P::Ntp { .. } => 0,
+    }
+}
+
+/// What a packet costs against [`RING_BYTE_BUDGET`], which is its own size,
+/// the buffers that grow with the frame and its copy of the flow's label.
+/// The cost is fixed once the packet reaches the ring. The annotation added
+/// later is small and left out.
 fn ring_cost(p: &CapturedPacket) -> usize {
     std::mem::size_of::<CapturedPacket>()
         + p.info.len()
@@ -1690,6 +1729,7 @@ fn ring_cost(p: &CapturedPacket) -> usize {
         + p.payload_text.len()
         + p.raw_bytes.len()
         + p.decrypted_plaintext.as_ref().map_or(0, Vec::len)
+        + p.app_protocol.as_ref().map_or(0, label_bytes)
 }
 
 /// Move `batch` into the ring, then drop its oldest packets until it is
@@ -4915,8 +4955,73 @@ mod tests {
             Some(crate::dpi::AppProtocol::Quic { sni: Some(sni), .. }) if sni == "example.com"
         ));
         assert_eq!(tracker.all_streams[&idx].quic_crypto_buf.capacity(), 0);
-        assert_eq!(tracker.held_bytes, segments(&tracker, idx));
+        // The label the flow now carries is charged in its place.
+        let label = match &tracker.all_streams[&idx].app_protocol {
+            Some(crate::dpi::AppProtocol::Quic { sni, ja4, .. }) => {
+                sni.as_ref().map_or(0, String::len) + ja4.as_ref().map_or(0, String::len)
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(tracker.held_bytes, segments(&tracker, idx) + label);
         assert_eq!(tracker.all_streams[&idx].held_bytes, tracker.held_bytes);
+    }
+
+    /// Ethernet, IPv4 and UDP from 203.0.113.9:50000 to 192.0.2.1:443,
+    /// carrying `payload`.
+    fn quic_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0x01, 0x08, 0x00];
+        frame.extend_from_slice(&[0x45, 0]);
+        frame.extend_from_slice(&(28 + payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0, 203, 0, 113, 9, 192, 0, 2, 1]);
+        frame.extend_from_slice(&50_000u16.to_be_bytes());
+        frame.extend_from_slice(&443u16.to_be_bytes());
+        frame.extend_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Every packet carries a copy of its flow's label, and a peer chooses
+    /// how long that is. Fourteen QUIC Initials, none over 1,150 bytes, name
+    /// a 15,000-byte SNI, then one-byte datagrams follow on the flow. The
+    /// ring kept 5,000 of them and left 143 MiB of copies out of its count.
+    #[test]
+    fn ring_charges_each_packet_its_flows_label() {
+        let replay = Replay::new();
+        let hello = quic_client_hello(&[0x01; 15_000]);
+        let initials: Vec<CapturedPacket> = hello
+            .chunks(1100)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let initial = sealed_initial((i * 1100) as u16, chunk);
+                assert!(initial.len() < 1150);
+                replay.frame(&quic_frame(&initial)).unwrap()
+            })
+            .collect();
+        let sni = match &initials.last().unwrap().app_protocol {
+            Some(crate::dpi::AppProtocol::Quic { sni: Some(sni), .. }) => sni.len(),
+            other => panic!("{other:?}"),
+        };
+        assert!(sni >= 15_000);
+
+        let collector = PacketCollector::new();
+        let datagrams = (0..RING_CAPACITY).map(|_| replay.frame(&quic_frame(b"x")).unwrap());
+        flush_in_batches(&collector, initials.into_iter().chain(datagrams));
+        let ring = collector.get_packets();
+        assert!(
+            ring.len() * sni <= RING_BYTE_BUDGET,
+            "{} packets",
+            ring.len()
+        );
+        assert_eq!(
+            collector.ring_bytes(),
+            ring.iter().map(ring_cost).sum::<usize>()
+        );
+        // The flow's own label counts against the stream budget too.
+        let tracker = replay.tracker.lock().unwrap();
+        let stream = tracker.all_streams.values().next().unwrap();
+        let segments: usize = stream.segments.iter().map(|s| s.held_bytes()).sum();
+        assert!(stream.held_bytes >= segments + sni, "{}", stream.held_bytes);
     }
 
     #[test]
@@ -4933,22 +5038,65 @@ mod tests {
         assert_eq!(stream_budget(Some(0)), 256 * MIB);
     }
 
+    /// The tracker takes this host's budget, read from its own
+    /// /proc/meminfo. On a host with 2 GiB or more that is the ceiling, so
+    /// only a smaller one can tell the two apart.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn at_capacity_once_the_tracker_drops_flows_or_bytes() {
+    fn the_tracker_takes_the_budget_from_this_hosts_meminfo() {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+        let total = meminfo_total(&meminfo);
+        assert!(total.is_some_and(|t| t > 0), "{meminfo}");
+        assert_eq!(host_stream_budget(), stream_budget(total));
+        assert_eq!(StreamTracker::new().byte_budget(), host_stream_budget());
+    }
+
+    #[test]
+    fn dropped_flows_counts_only_flows_the_caps_drop() {
+        // Up to the high-water mark every flow is kept.
         let mut tracker = StreamTracker::new();
-        track_on(&mut tracker, 40_000, b"x", 0);
-        assert!(!tracker.at_capacity());
-        for i in 1..=MAX_STREAMS as u64 {
+        let high_water = (MAX_STREAMS + STREAM_EVICT_BATCH) as u64;
+        for i in 0..high_water {
             track_on(&mut tracker, 40_000 + i as u16, b"", i);
         }
-        assert!(tracker.at_capacity(), "{} flows", tracker.all_streams.len());
+        assert_eq!(tracker.all_streams.len() as u64, high_water);
+        assert_eq!(tracker.dropped_flows(), 0);
+        // One more drops a batch.
+        track_on(&mut tracker, 40_000 + high_water as u16, b"", high_water);
+        assert_eq!(tracker.all_streams.len(), MAX_STREAMS + 1);
+        assert_eq!(tracker.dropped_flows(), STREAM_EVICT_BATCH as u64);
 
+        // Close to the byte budget nothing is dropped yet. Past it, the
+        // sweep drops the oldest flow and leaves the tracker under 7/8 of
+        // the budget, and the count stays.
         let mut tracker = StreamTracker::new();
         tracker.byte_budget = 64 * 1024;
-        track_on(&mut tracker, 40_000, &[0; 50_000], 0);
-        assert!(!tracker.at_capacity());
-        track_on(&mut tracker, 40_000, &[0; 10_000], 1);
-        assert!(tracker.at_capacity(), "{} bytes", tracker.held_bytes());
+        track_on(&mut tracker, 40_000, &[0; 30_000], 0);
+        track_on(&mut tracker, 40_001, &[0; 30_000], 1);
+        assert_eq!(tracker.all_streams.len(), 2);
+        assert_eq!(tracker.dropped_flows(), 0, "{} bytes", tracker.held_bytes());
+        track_on(&mut tracker, 40_002, &[0; 10_000], 2);
+        assert!(tracker.get_stream(0).is_none());
+        assert!(tracker.held_bytes() <= tracker.sweep_target());
+        assert_eq!(tracker.dropped_flows(), 1);
+        // A flow replaced by a new handshake on its addresses was not
+        // dropped for room.
+        tracker.track_packet(
+            "10.0.0.1",
+            40_001,
+            "10.0.0.2",
+            80,
+            StreamProtocol::Tcp,
+            b"",
+            3,
+            "t",
+            Some(TCP_FLAG_SYN),
+            Some(7),
+            3,
+        );
+        assert_eq!(tracker.dropped_flows(), 1);
+        tracker.clear();
+        assert_eq!(tracker.dropped_flows(), 0);
     }
 
     /// One 64 KB TCP segment of text, as a local bulk transfer hands libpcap

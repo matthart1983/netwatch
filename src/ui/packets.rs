@@ -142,12 +142,27 @@ fn render_capture_strip(f: &mut Frame, app: &App, packets: &[CapturedPacket], ar
 
     let shown = visible_packets(app, packets).len();
     let dropped = stats.dropped();
+    // The ring stops at whichever cap it reaches first: 5,000 packets, or
+    // 32 MiB of them when frames are large. It is measured against the one
+    // it is nearer, so a short list of large frames reads as full.
+    let ring = {
+        use crate::collectors::packets::{RING_BYTE_BUDGET, RING_CAPACITY};
+        let bytes = app.packet_collector.ring_bytes();
+        let mib = |n: usize| n as f64 / (1024.0 * 1024.0);
+        if bytes as f64 / RING_BYTE_BUDGET as f64 > packets.len() as f64 / RING_CAPACITY as f64 {
+            format!(
+                "ring {} · {:.1}/{:.0} MiB",
+                packets.len(),
+                mib(bytes),
+                mib(RING_BYTE_BUDGET)
+            )
+        } else {
+            format!("ring {}/{RING_CAPACITY}", packets.len())
+        }
+    };
     let mut meta = vec![
         Span::styled(
-            format!(
-                "ring {} · {shown} shown · ",
-                crate::collectors::packets::RING_CAPACITY
-            ),
+            format!("{ring} · {shown} shown · "),
             Style::default().fg(t.text_muted),
         ),
         // Drops are the one number here that changes what the list means, so
@@ -2685,7 +2700,7 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         // Every byte value, then a short last line.
         let raw: Vec<u8> = (0..=255).chain(0..=40).collect();
-        for len in [0, 1, 15, 16, 17, raw.len()] {
+        for len in 0..=raw.len() {
             assert_eq!(hex_dump(&raw[..len]), old_hex_dump(&raw[..len]), "{len}");
             assert_eq!(
                 ascii_dump(&raw[..len]),
@@ -2722,6 +2737,56 @@ mod tests {
             };
             assert_eq!(draw(false), draw(true), "{width}x{height}");
         }
+    }
+
+    /// The ring stops at 5,000 packets or 32 MiB of them, and the strip
+    /// measures it against the cap it is nearer. It said `ring 5000` while
+    /// 64 KB frames held the ring to a few hundred.
+    #[test]
+    fn the_capture_strip_measures_the_ring_against_its_nearer_cap() {
+        use crate::collectors::packets::{RING_BYTE_BUDGET, RING_CAPACITY};
+        use ratatui::{backend::TestBackend, Terminal};
+        let screen = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+            terminal.draw(|f| render(f, app, f.area())).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        // Small frames fill the count first.
+        let app = crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector.seed_demo_capture();
+        let held = app.packet_collector.get_packets().len();
+        let ring = format!("ring {held}/{RING_CAPACITY} · {held} shown");
+        let s = screen(&app);
+        assert!(s.contains(&ring), "no {ring:?} in {s}");
+
+        let app = crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        // Ethernet, IPv4 and TCP carrying 64,000 bytes of text, as a bulk
+        // transfer with segmentation offload hands them to libpcap.
+        let payload = b"HTTP/1.1 200 OK\r\n".repeat(64_000 / 17);
+        let mut frame = vec![0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0x01, 0x08, 0x00];
+        frame.extend_from_slice(&[0x45, 0]);
+        frame.extend_from_slice(&(40 + payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0, 192, 0, 2, 20, 192, 0, 2, 10]);
+        frame.extend_from_slice(&[0, 80, 0xc3, 0x50, 0, 0, 0, 1, 0, 0, 0, 1, 0x50, 0x10]);
+        frame.extend_from_slice(&[0xfa, 0xf0, 0, 0, 0, 0]);
+        frame.extend_from_slice(&payload);
+        for _ in 0..RING_BYTE_BUDGET / payload.len() + 50 {
+            app.packet_collector.ingest_frame_for_test(&frame).unwrap();
+        }
+        let held = app.packet_collector.get_packets().len();
+        assert!(held < RING_CAPACITY / 5, "{held} packets");
+        let mib = app.packet_collector.ring_bytes() as f64 / (1024.0 * 1024.0);
+        assert!(mib > 31.0, "{mib} MiB");
+        let ring = format!("ring {held} · {mib:.1}/32 MiB · {held} shown");
+        let s = screen(&app);
+        assert!(s.contains(&ring), "no {ring:?} in {s}");
     }
 
     /// Selecting a packet sends neither of its addresses to rdap.org; only W

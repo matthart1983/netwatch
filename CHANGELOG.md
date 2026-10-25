@@ -28,8 +28,10 @@ All notable changes to NetWatch will be documented in this file.
   256 MiB. macOS, Windows and FreeBSD keep 256 MiB. Past the budget the
   tracker drops the least recently seen streams, as before, so a small host
   keeps payloads for fewer flows under heavy traffic. One decrypted HTTP/3
-  flow can still hold up to 64 MiB on its own, so with an SSLKEYLOGFILE on a
-  host under 2 GiB the tracker can pass its budget by that much.
+  flow can hold about 69 MiB on its own, and the tracker does not drop a flow
+  while that flow is the one growing. With an SSLKEYLOGFILE on a host under
+  about 550 MiB, the tracker can pass its budget by the difference, about
+  5 MiB on a 512 MiB host, until another flow's traffic drops that one.
 - **The `M` overlay shows the bytes the packet list and the stream tracker
   hold, in MiB, against their budgets.** It also took the packet list's
   count cap from a copy of 5000, and now reads the constant the list uses.
@@ -37,7 +39,7 @@ All notable changes to NetWatch will be documented in this file.
   callers can build the same text from `raw_bytes` with
   `collectors::packets::hex_dump` and `ascii_dump`. `PacketCollector::ring_bytes`
   and the hidden `StreamTracker::held_bytes`, `byte_budget` and
-  `at_capacity` are new. The 1.0 contract does not cover the library.
+  `dropped_flows` are new. The library is not a stable interface.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
@@ -145,17 +147,24 @@ All notable changes to NetWatch will be documented in this file.
   is ever drawn, so the Packets tab now builds it from the frame as it
   draws, and only as many lines as the pane has rows. The list keeps 5,000
   packets or 32 MiB of them, whichever is fewer. That is about 500 of those
-  64 KB frames, or 5,000 full-size ones in 18 MB. Decoding full-size frames
-  went from about 13,000 to about 150,000 a second on the development
-  machine.
-- **The stream tracker's byte budget counts everything the streams hold.**
-  The tracker charged each stored segment its payload and its own size, but
-  not the `Arc` it lives in or its slot in the stream's list, 24 bytes a
-  segment on a 64-bit host. It did not charge a QUIC flow's CRYPTO
-  reassembly buffer at all, up to 16 KiB. Small UDP payloads over a
-  thousand flows filled 300 MiB against the 256 MiB budget. The tracker
-  charges both now and stays under its budget, and it takes the CRYPTO
-  buffer's charge back when it frees the buffer.
+  64 KB frames, or 5,000 full-size ones in 18 MB. Each packet's copy of its
+  flow's DPI label counts too, since a peer chooses how long it is: a few
+  QUIC Initials of ordinary size can name a 15,000-byte SNI, which every
+  later datagram on the flow then carries. The capture strip said
+  `ring 5000` whatever the list held. It now measures the list against the
+  cap it is nearer, `ring 3120/5000`, or `ring 494 · 31.9/32 MiB` under
+  large frames. Decoding full-size frames went from about 13,000 to about
+  150,000 a second on the development machine.
+- **The stream tracker charges each segment its full cost, and charges the
+  QUIC CRYPTO buffer and each flow's DPI label.** The tracker charged each
+  stored segment its payload and its own size, but not the `Arc` it lives in
+  or its slot in the stream's list, 24 bytes a segment on a 64-bit host. It
+  did not charge a QUIC flow's CRYPTO reassembly buffer at all, up to
+  16 KiB, or the flow's label, whose SNI a peer can make 15,000 bytes long.
+  Small UDP payloads over a thousand flows filled 300 MiB against the
+  256 MiB budget. The tracker charges all three now and stays under its
+  budget, and it takes the CRYPTO buffer's charge back when it frees the
+  buffer.
 - **A text filter on the Packets tab no longer slows every frame.** A bare
   word or a `contains` filter lowercased a copy of each packet's info,
   addresses, host names and payload text to search them. It did that for
