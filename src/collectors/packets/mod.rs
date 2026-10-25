@@ -4361,6 +4361,39 @@ mod tests {
         assert!(collector.get_stream_in_session(0, Some(&current)).is_some());
     }
 
+    /// A packet without capture metadata (`--demo`, or a frame whose pcap
+    /// header did not add up) cannot say which numbering it came from, so
+    /// once the indices have run out it names no stream at all.
+    #[test]
+    fn a_packet_without_capture_metadata_names_no_stream_once_the_indices_run_out() {
+        let collector = PacketCollector::new();
+        collector
+            .stream_tracker
+            .lock()
+            .unwrap()
+            .start_session("old-session".into());
+        collector.ingest_frame_for_test(&UDP_FRAME).unwrap();
+        let old = collector.get_packets()[0].clone();
+        assert!(old.capture.is_none());
+        assert_eq!(old.stream_index, Some(0));
+        assert!(
+            collector.get_stream_for_packet(&old).is_some(),
+            "before the indices run out the packet names its stream"
+        );
+        {
+            let mut tracker = collector.stream_tracker.lock().unwrap();
+            tracker.clear();
+            tracker.next_index = u32::MAX;
+        }
+        collector.ingest_frame_for_test(&UDP_FRAME).unwrap();
+        assert!(collector.get_stream(0).is_some(), "a newer flow took 0");
+        assert!(
+            collector.get_stream_for_packet(&old).is_none(),
+            "the packet must not resolve the newer flow's stream 0"
+        );
+        assert!(collector.get_stream_in_session(0, None).is_none());
+    }
+
     /// `stream N` means the flow numbered N now. Once the indices have run
     /// out, the list can still hold packets numbered N for an older flow.
     #[test]
@@ -4399,13 +4432,45 @@ mod tests {
         let new = udp_from(2000);
         assert_eq!((old.stream_index, new.stream_index), (Some(0), Some(0)));
 
+        // The index space reaches `stream N` inside `and`, `or` and `not` too.
+        for (filter, expected) in [
+            ("stream 0", [new.id]),
+            ("port 53 and stream 0", [new.id]),
+            ("stream 0 or port 9", [new.id]),
+            ("! stream 0", [old.id]),
+        ] {
+            app.ui.packet_filter_active = Some(filter.into());
+            let packets = app.packet_collector.get_packets();
+            let shown: Vec<u64> = crate::ui::packets::visible_packets(&app, &packets)
+                .iter()
+                .map(|p| p.id)
+                .collect();
+            assert_eq!(shown, expected, "{filter}");
+        }
+
+        // The decode pane agrees with the list: a selected packet the filter
+        // leaves out is not decoded.
         app.ui.packet_filter_active = Some("stream 0".into());
-        let packets = app.packet_collector.get_packets();
-        let shown: Vec<u64> = crate::ui::packets::visible_packets(&app, &packets)
-            .iter()
-            .map(|p| p.id)
-            .collect();
-        assert_eq!(shown, [new.id]);
+        for (selected, decoded) in [(old.id, false), (new.id, true)] {
+            use ratatui::{backend::TestBackend, Terminal};
+            app.ui.scroll.packet_selected = Some(selected);
+            let mut terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
+            terminal
+                .draw(|f| crate::ui::packets::render(f, &app, f.area()))
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert_eq!(
+                !screen.contains("Select a packet with ↑↓ to inspect"),
+                decoded,
+                "packet {selected}:\n{screen}"
+            );
+        }
     }
 
     #[test]
