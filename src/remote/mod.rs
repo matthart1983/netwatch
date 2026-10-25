@@ -116,6 +116,16 @@ fn ingest_endpoint(url: &str) -> String {
     format!("{}/api/v1/ingest", url.trim_end_matches('/'))
 }
 
+/// `url` as the log may show it: scheme, host, port and path. A user name,
+/// password or query token in the URL stays out of a file that outlives the
+/// session and gets attached to bug reports.
+fn redacted(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => format!("{}{}", parsed.origin().ascii_serialization(), parsed.path()),
+        Err(_) => "(unparsable URL)".into(),
+    }
+}
+
 pub struct RemoteConfig {
     /// As [`check_url`] returns it.
     pub url: String,
@@ -384,13 +394,13 @@ fn try_flush_once(
         SendOutcome::Ack => queue.remove(batch.len()),
         SendOutcome::Poison => {
             if let Err(e) = &result {
-                tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, batch = batch.len(), "dropping unacceptable ingest batch (4xx)");
+                tracing::warn!(target: "netwatch::remote", endpoint = %redacted(endpoint), error = %e, batch = batch.len(), "dropping unacceptable ingest batch (4xx)");
             }
             queue.remove(batch.len());
         }
         SendOutcome::Retry => {
             if let Err(e) = &result {
-                tracing::warn!(target: "netwatch::remote", endpoint = %endpoint, error = %e, queued = queue.len(), "ingest POST failed; will retry");
+                tracing::warn!(target: "netwatch::remote", endpoint = %redacted(endpoint), error = %e, queued = queue.len(), "ingest POST failed; will retry");
             }
         }
     }
@@ -887,6 +897,87 @@ mod tests {
         assert!(queue.is_empty());
         let (head, _) = server.join().unwrap();
         assert!(head.starts_with("post /api/v1/ingest "), "{head}");
+    }
+
+    /// What the `fmt` layer writes, kept for the test to read.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The log file outlives the session and gets attached to bug reports,
+    /// so a failed POST names the backend without the credentials a URL can
+    /// carry. http:// here only because the test server has no TLS.
+    #[test]
+    fn ingest_failure_log_omits_userinfo_and_query() {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let mut hosts = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            for status in ["401 Unauthorized", "503 Service Unavailable"] {
+                let (endpoint, server) = ingest_once(status);
+                let host = endpoint
+                    .strip_prefix("http://")
+                    .and_then(|e| e.strip_suffix("/api/v1/ingest"))
+                    .unwrap()
+                    .to_string();
+                let url = check_url(&format!("http://u:secret@{host}/?t=tok"), true).unwrap();
+                let queue = SnapshotQueue::new(QUEUE_CAP);
+                queue.push(json!({"n": 1}));
+                try_flush_once(
+                    &ingest_endpoint(&url),
+                    "key",
+                    &json!({}),
+                    &AtomicBool::new(true),
+                    &queue,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                );
+                server.join().unwrap();
+                hosts.push(host);
+            }
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("dropping unacceptable ingest batch"), "{log}");
+        assert!(log.contains("will retry"), "{log}");
+        for host in hosts {
+            assert!(log.contains(&format!("http://{host}/")), "{log}");
+        }
+        assert!(!log.contains("secret"), "{log}");
+        assert!(!log.contains("tok"), "{log}");
+    }
+
+    #[test]
+    fn the_logged_url_keeps_only_the_host_and_path() {
+        for (url, logged) in [
+            (
+                "https://agent:s3cret@cloud.example.com/api/v1/ingest",
+                "https://cloud.example.com/api/v1/ingest",
+            ),
+            (
+                "https://cloud.example.com:8443/base/?token=s3cret#s3cret",
+                "https://cloud.example.com:8443/base/",
+            ),
+            (
+                "http://agent@[2001:db8::1]:8080/?t=s3cret/api/v1/ingest",
+                "http://[2001:db8::1]:8080/",
+            ),
+            ("https://agent:s3cret@", "(unparsable URL)"),
+        ] {
+            assert_eq!(redacted(url), logged, "{url}");
+        }
     }
 
     #[test]

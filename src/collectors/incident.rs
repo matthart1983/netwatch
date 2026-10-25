@@ -352,7 +352,7 @@ impl IncidentRecorder {
             packet_artifacts: artifacts,
             packet_annotations: annotations,
             last_capture_status: self.last_capture_status.clone(),
-            capture_limitations: "Retained packets only; not a complete wire capture. last_capture_status is the latest session sample, not an incident-window or multi-session loss total. Unknown ownership is not resolved at export. Comments contain bracketed socket observations, not proof of packet ownership. Packet bytes and incident JSON are not redacted. Session keys and separately decrypted plaintext are excluded.".into(),
+            capture_limitations: "Retained packets only; not a complete wire capture. last_capture_status is the latest sample, not an incident-window loss total; its drops count from the last capture start, so they include any earlier session that ended when the stream indexes ran out. Unknown ownership is not resolved at export. Comments contain bracketed socket observations, not proof of packet ownership. Packet bytes and incident JSON are not redacted. Session keys and separately decrypted plaintext are excluded.".into(),
             state: match self.state {
                 RecorderState::Off => "off",
                 RecorderState::Armed => "armed",

@@ -73,6 +73,51 @@ All notable changes to NetWatch will be documented in this file.
   or `ps -L` listed every worker as `netwatch`. Each now has its worker's
   name (`capture`, `connections`, `health`, `reverse-dns` and so on), which
   the kernel shortens to 15 characters.
+- **The terminal is restored on a TUI panic or shutdown signal.** SIGTERM,
+  SIGINT and SIGHUP save the session and exit cleanly on Unix, the hangup
+  from closing the terminal window or losing the SSH connection included.
+  A terminal that has stopped reading output, as a frozen SSH session does,
+  cannot be restored. If the connection then drops, netwatch still saves
+  the session and exits cleanly; a signal that comes while the session is
+  frozen ends netwatch after 5 seconds, the way it used to. Windows handles
+  Ctrl+C and console close notifications. Raw mode, mouse capture and the
+  alternate screen are undone before a fatal panic report is printed, with
+  the backtrace `RUST_BACKTRACE` asks for and any terminal control
+  characters replaced. Background panics stay in the log. Bare mouse
+  motion no longer redraws the screen, and queued input is processed in
+  bounded batches.
+- **A packet from before the stream indices ran out no longer shows a newer
+  flow's stream.** Once a capture had numbered 2^32 flows the numbers began
+  again, and a packet still in the list from before could show the stream
+  details, handshake time, HTTP/3 bodies, conversation ladder and stream
+  view of the newer flow that took its number; a `stream N` filter listed
+  both flows. Such a packet now shows no stream, and `stream N` matches only
+  the flow numbered N now. Packets from before a capture restart or an
+  interface switch still show theirs, as numbering carries on across those.
+- **The drop count and packet rate stay right past four billion packets.**
+  libpcap counts received and dropped packets in 32 bits, which wrap within
+  the hour at 1.2 million packets a second. netwatch showed libpcap's count
+  as it stood, so after a wrap the drops in the Packets header and in an
+  incident bundle's `last_capture_status` fell back towards zero, and the
+  rate read 0 pkt/s for a second. Each poll now adds the change since the
+  last one to 64-bit totals.
+- **A stream index names one flow per capture session, even after four
+  billion flows.** Capture numbers each flow with a 32-bit index. After
+  2^32 flows, about seven hours of new connections at full decode speed, the
+  numbering wrapped to 0, and one index in one `capture_session` could name
+  two flows, so two flows' packets could carry the same `capture_generation`
+  in a PCAPNG export. netwatch now forgets every stream, numbers from 0
+  again and starts a new `capture_session`. The drops in an incident
+  bundle's `last_capture_status` still count from the capture start.
+- **A port scan or a flood of DNS names no longer swells the detectors'
+  memory.** The port-scan detector kept every port each source touched in
+  its 30-second window, up to all 65,536 for each of 1,000 sources, about
+  400 MB, and kept that memory after the window ended. Query counts per
+  domain were trimmed every 30 seconds, so a flood of unique names added an
+  entry per query until then. Each source now keeps at most 256 ports, well
+  past the 20 that raise the alert, and each window starts with an empty
+  set. Domain counts are cut to the 500 most queried as soon as a new name
+  would take them past 1,000.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -127,6 +172,48 @@ All notable changes to NetWatch will be documented in this file.
   thread now drops everything except CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
   the two it needs to read another user's sockets under root, so its scans
   attribute connections as before.
+- **netwatch.log no longer records credentials from the `--remote` URL.**
+  When a POST to the remote backend failed, the warning carried the whole
+  ingest URL, so a user name and password in it, or a token in its query
+  string, went into a file that outlives the session and gets attached to
+  bug reports. The log now names the backend by scheme, host, port and path.
+- **`netwatch diagnose` prints a shared episode as plain text.** `episodes`,
+  `replay`, `features` and the `export` preview printed ids, times, issue
+  keys, causes and lab scenario names as the file had them, so an episode
+  someone sent you could carry escape sequences that retitle the terminal or
+  write the clipboard through OSC 52. Those characters now print as `·`, as
+  in the TUI, and so do the same characters in file names and in load
+  errors, which can quote the file. `features --out` writes the `·` to its
+  CSV file too. `replay --json` escaped C0 controls only; it now writes DEL,
+  C1 controls and bidi overrides as `\u` escapes as well, which decode to
+  the same strings. `diagnose episodes` and the `export` preview no longer
+  panic on an id with a multi-byte character across its eighth byte. Replay
+  no longer panics when the first frame's time does not parse, as happened
+  to any recording that began in the hour a clock goes back. Nor do
+  `replay` and `features` on a frame time or probe age hundreds of billions
+  of years out, which only a crafted file holds: they skip that frame, and
+  that probe counts as one that has not answered.
+- **An episode stops loading past 84,000 frames or 820 MiB uncompressed.**
+  `diagnose episodes`, `replay`, `features` and `export` inflated a gzipped
+  episode in full before parsing it, so a gzip of zeros a few megabytes long
+  could take all the memory there was, and a 100 KB file of a million empty
+  frames took 2.6 GB. Loading now stops at either limit with an error that
+  says which. A recording holds at most 72,000 frames, one per 100 ms tick
+  for two hours, which inflate to about 650 MB on a busy host. The limits
+  bound the input, not the memory: a crafted episode under both can still
+  take gigabytes to parse. `netwatch uptime` likewise skips a log line
+  longer than 64 KiB and warns how many it skipped, where it used to read a
+  line of any length. A line that is not valid UTF-8 now costs that line
+  only; it used to end the rest of that day's file.
+- **`netwatch diagnose` no longer follows a link into another directory.**
+  Given a directory, `episodes`, `replay`, `features` and `export` walked
+  every link in it, so two links back up the tree, as an archive someone
+  sends you can hold, kept them walking until killed, and a link out of it
+  listed episodes from elsewhere. netwatch cleans its own episode directory
+  the same way after each recording, deleting what is past 90 days or
+  300 MiB, so a link there could keep that cleanup running for good or
+  offer it files from outside. They now list a linked file but do not
+  descend into a linked directory.
 - **The threat model states the limits of the Linux sandbox.** The 0.17.0
   release notes overstated protection by saying a compromised parser cannot
   read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.

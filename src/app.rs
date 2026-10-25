@@ -1210,7 +1210,7 @@ impl App {
         }
 
         self.incident_recorder.record_capture_status(
-            self.packet_collector.capture_session.clone(),
+            self.packet_collector.capture_session(),
             self.packet_collector.stats.observed_drops(),
         );
         let connections = self.connection_collector.connections();
@@ -1642,35 +1642,6 @@ fn draw_frame(f: &mut Frame, app: &mut App) {
     }
 }
 
-static TUI_PANIC_HOOK_INIT: std::sync::Once = std::sync::Once::new();
-
-/// Install a panic hook (idempotently) that sends a panic on any thread but
-/// the calling one, which draws the TUI, to the log instead of stderr. The
-/// default hook writes the report onto the alternate screen, over the frame,
-/// where it stays until each cell happens to redraw and is lost on exit. It
-/// can also quote a peer's bytes, as a capture-thread panic caught by
-/// `run_capture_step` might. A panic on the TUI thread goes to the previous
-/// hook as before.
-fn install_tui_panic_hook() {
-    TUI_PANIC_HOOK_INIT.call_once(|| {
-        let tui = std::thread::current().id();
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let thread = std::thread::current();
-            if thread.id() == tui {
-                prev(info);
-                return;
-            }
-            tracing::error!(
-                target: "netwatch::panic",
-                thread = thread.name().unwrap_or("unnamed"),
-                panic = %ui::sanitize::display(&info.to_string()),
-                "a background thread panicked"
-            );
-        }));
-    });
-}
-
 // Backends name their own error type since ratatui 0.30; anyhow takes any of
 // them that can cross threads.
 pub async fn run<B: Backend>(
@@ -1683,8 +1654,12 @@ pub async fn run<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    // `main` has handed the terminal to the TUI.
-    install_tui_panic_hook();
+    // Before anything else, so a signal from here on saves the session and
+    // hands the shell back instead of killing the process.
+    let shutdown = shutdown_signal(true);
+    tokio::pin!(shutdown);
+    #[cfg(unix)]
+    shutdown_deadline();
     let mut app = App::prepare();
     crate::runtime::bootstrap::start(
         &mut app,
@@ -1725,39 +1700,51 @@ where
 
     // Event loop design:
     //   1. Render  — draw current app state to the terminal
-    //   2. Wait    — block on the next AppEvent (key, mouse, or tick)
+    //   2. Wait    — block on the next AppEvent (key, mouse, or tick), or a
+    //                shutdown signal
     //   3. Key/Mouse → update app state directly (synchronous, no I/O)
     //   4. Tick    → app.tick() refreshes all collectors and feeds background threads
+    //   5. Handle whatever else is already queued the same way, so a burst of
+    //      input costs one frame rather than one each
     // Each iteration is: render → wait → handle → repeat.
     // Collectors run on background threads and share state via Arc<Mutex<T>>.
     loop {
-        terminal.draw(|f| draw_frame(f, &mut app))?;
+        if let Err(error) = terminal.draw(|f| draw_frame(f, &mut app)) {
+            // A hangup fails the frame's write, the one the TUI is blocked in
+            // when a frozen SSH session drops. Its SIGHUP comes from the
+            // kernel before the write fails when netwatch leads the session,
+            // or a moment later from a shell that leads it and passes its own
+            // on. That signal is why the draw failed, so answer it. Without
+            // one, the session is still saved.
+            let wait = std::time::Duration::from_millis(500);
+            if tokio::time::timeout(wait, &mut shutdown).await.is_ok() {
+                answer_shutdown(&mut app);
+                return Ok(());
+            }
+            ui::tty::restore();
+            finish_session(&mut app);
+            return Err(error.into());
+        }
 
-        match events.next().await? {
-            AppEvent::Key(key) => {
-                if handle_key(&mut app, key) {
-                    app.packet_collector.stop_capture();
-                    app.egress_profiler.persist_now();
-                    // Preserve unresolved legacy recovery and save live baselines.
-                    app.shutdown_diagnose();
-                    app.uptime.stop();
-                    return Ok(());
-                }
+        let mut event = tokio::select! {
+            event = events.next() => event?,
+            _ = &mut shutdown => {
+                answer_shutdown(&mut app);
+                return Ok(());
             }
-            AppEvent::Mouse(mouse) => {
-                if app.capture_export.is_none() {
-                    handle_mouse(&mut app, mouse);
-                }
+        };
+        // Bound each batch so continuous input cannot starve rendering or signals.
+        for index in 0..64 {
+            if handle_event(&mut app, event, remote) {
+                finish_session(&mut app);
+                return Ok(());
             }
-            AppEvent::Tick => {
-                app.tick();
-                if let Some(publisher) = remote {
-                    publisher.update(
-                        &app.traffic.interfaces(),
-                        &app.health_prober,
-                        &app.connection_collector,
-                    );
-                }
+            if index == 63 {
+                break;
+            }
+            match events.try_next() {
+                Some(next) => event = next,
+                None => break,
             }
         }
 
@@ -1767,6 +1754,51 @@ where
         // without a restart.
         events.set_tick_rate(app.user_config.refresh_rate_ms);
     }
+}
+
+/// Apply one event to the app. True when it ends the session.
+fn handle_event(
+    app: &mut App,
+    event: AppEvent,
+    remote: Option<&crate::remote::RemotePublisher>,
+) -> bool {
+    match event {
+        AppEvent::Key(key) => return handle_key(app, key),
+        AppEvent::Mouse(mouse) => {
+            if app.capture_export.is_none() {
+                handle_mouse(app, mouse);
+            }
+        }
+        AppEvent::Tick => {
+            app.tick();
+            if let Some(publisher) = remote {
+                publisher.update(
+                    &app.traffic.interfaces(),
+                    &app.health_prober,
+                    &app.connection_collector,
+                );
+            }
+        }
+    }
+    false
+}
+
+/// Hand the shell back, then save the session. The shell first: if saving
+/// hangs, the SIGKILL that follows still leaves a usable terminal.
+fn answer_shutdown(app: &mut App) {
+    ui::tty::restore();
+    SHUTDOWN_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    finish_session(app);
+}
+
+/// What every session does on its way out, however it was asked to stop, and
+/// when the TUI can no longer draw.
+fn finish_session(app: &mut App) {
+    app.packet_collector.stop_capture();
+    app.egress_profiler.persist_now();
+    // Preserve unresolved legacy recovery and save live baselines.
+    app.shutdown_diagnose();
+    app.uptime.stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -1799,29 +1831,76 @@ fn collectors_panicked() -> bool {
     COLLECTOR_PANICKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Resolve when the process is asked to terminate: SIGTERM (unix) or Ctrl-C
-/// (any platform). Used to trigger a graceful flush of the remote queue.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = tokio::signal::ctrl_c() => {}
-                }
-            }
-            // If we can't install the SIGTERM handler, Ctrl-C still works.
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+/// Resolve when the process is asked to terminate: SIGTERM or SIGINT (unix)
+/// or Ctrl-C (Windows), and with `hangup` also SIGHUP or the console closing.
+/// The daemon passes false and keeps SIGHUP's default action; the TUI passes
+/// true, since a hangup there means its terminal has gone.
+///
+/// The listeners register when this is called, not when the future is first
+/// polled, and a signal that arrives between polls waits for the next one. So
+/// call it once, before the work it should interrupt, and poll that future
+/// every time round. A listener that fails to register leaves its signal's
+/// default action, as before.
+#[cfg(unix)]
+fn shutdown_signal(hangup: bool) -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+    async fn recv(signal: &mut Option<Signal>) -> Option<()> {
+        signal.as_mut()?.recv().await
+    }
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut int = signal(SignalKind::interrupt()).ok();
+    let mut hup = hangup.then(|| signal(SignalKind::hangup()).ok()).flatten();
+    async move {
+        tokio::select! {
+            Some(()) = recv(&mut term) => {}
+            Some(()) = recv(&mut int) => {}
+            Some(()) = recv(&mut hup) => {}
+            else => std::future::pending().await,
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(windows)]
+fn shutdown_signal(hangup: bool) -> impl std::future::Future<Output = ()> {
+    use tokio::signal::windows::{ctrl_c, ctrl_close};
+    let mut ctrl_c = ctrl_c().ok();
+    let mut close = hangup.then(|| ctrl_close().ok()).flatten();
+    async move {
+        tokio::select! {
+            Some(()) = async { ctrl_c.as_mut()?.recv().await } => {}
+            Some(()) = async { close.as_mut()?.recv().await } => {}
+            else => std::future::pending().await,
+        }
     }
+}
+
+/// Set once the TUI has answered a shutdown signal and handed the terminal
+/// back. On Unix, [`shutdown_deadline`]'s thread reads it.
+static SHUTDOWN_ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// End the process by a shutdown signal's default action if the TUI has not
+/// answered the signal within 5 seconds. [`shutdown_signal`] is only polled
+/// between frames, on the thread that draws, so a TUI blocked writing to a
+/// terminal that has stopped reading (a frozen SSH session) never answers,
+/// and nothing but SIGKILL would end it. A thread of its own waits for the
+/// same signals beside those listeners, which still get every one. If the
+/// thread cannot start, the TUI waits as it would without it.
+#[cfg(unix)]
+fn shutdown_deadline() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("shutdown-deadline".into())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if !SHUTDOWN_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                }
+            }
+        });
 }
 
 /// Run netwatch as a headless agent: the same collectors as the TUI, no
@@ -1855,6 +1934,8 @@ pub async fn run_headless(
         "netwatch daemon started"
     );
 
+    let shutdown = shutdown_signal(false);
+    tokio::pin!(shutdown);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_rate));
     // If a tick is missed (e.g. a long collector cycle), skip rather than
     // burst-fire to catch up — we want steady cadence, not backlog replay.
@@ -1883,7 +1964,7 @@ pub async fn run_headless(
                     exporter.set_collectors_ok(healthy);
                 }
             }
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 tracing::info!(target: "netwatch::daemon", "shutdown signal received; draining");
                 break;
             }
@@ -1891,10 +1972,7 @@ pub async fn run_headless(
     }
 
     // Graceful shutdown: stop capture, then flush whatever is still buffered.
-    app.packet_collector.stop_capture();
-    app.egress_profiler.persist_now();
-    app.shutdown_diagnose();
-    app.uptime.stop();
+    finish_session(&mut app);
     if let Some(publisher) = remote {
         publisher.shutdown(std::time::Duration::from_secs(8));
     }
@@ -3398,25 +3476,32 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             if let Some(sel_id) = app.ui.scroll.packet_selected {
                 // Only a packet the list shows, as for `W`.
                 let idx = ui::packets::selected_packet(app, &app.packet_collector.get_packets())
-                    .and_then(|p| p.stream_index);
-                if let Some(idx) = idx {
+                    .and_then(|p| {
+                        p.stream_index
+                            .map(|i| (i, p.capture.as_ref().map(|m| m.session.to_string())))
+                    });
+                if let Some((idx, session)) = idx {
                     app.ui.stream_view_open = true;
                     app.ui.stream_view_index = Some(idx);
+                    app.ui.stream_view_session = session;
                     app.ui.stream_direction_filter = StreamDirectionFilter::Both;
                     app.ui.stream_hex_mode = false;
                     // Remember which packet was selected so the stream view
                     // highlights it, and scroll so its bytes are on screen.
                     app.ui.stream_view_focus_packet = Some(sel_id);
-                    let focus_line = app.packet_collector.get_stream(idx).and_then(|s| {
-                        crate::ui::packets::build_stream_lines(
-                            &s,
-                            false,
-                            StreamDirectionFilter::Both,
-                            Some(sel_id),
-                            &app.theme,
-                        )
-                        .1
-                    });
+                    let focus_line = app
+                        .packet_collector
+                        .get_stream_in_session(idx, app.ui.stream_view_session.as_deref())
+                        .and_then(|s| {
+                            crate::ui::packets::build_stream_lines(
+                                &s,
+                                false,
+                                StreamDirectionFilter::Both,
+                                Some(sel_id),
+                                &app.theme,
+                            )
+                            .1
+                        });
                     app.ui.scroll.stream_scroll = focus_line.map_or(0, |l| l.saturating_sub(2));
                 }
             }
@@ -3863,10 +3948,7 @@ fn yank_selected_packet(app: &mut App) {
         app.ui.export_status_tick = 0;
         return;
     };
-    let h3_bodies = pkt
-        .stream_index
-        .map(|i| app.packet_collector.quic_h3_bodies(i))
-        .unwrap_or_default();
+    let h3_bodies = app.packet_collector.quic_h3_bodies_for_packet(pkt);
     let text = crate::ui::packets::format_packet_for_clipboard(pkt, &h3_bodies);
     match crate::clipboard::copy(&text) {
         Ok(tool) => {
@@ -5480,40 +5562,6 @@ mod render_safety_tests {
                 "{view:?}"
             );
         }
-    }
-
-    /// A capture-thread panic is caught and capture stops, but the default
-    /// hook had already written its report, peer bytes and all, over the TUI.
-    #[test]
-    fn a_background_panic_is_not_written_to_the_terminal() {
-        const CHILD: &str = "NETWATCH_TUI_PANIC_HOOK_TEST";
-        // The hook is process-wide, and would hide other tests' panics, so
-        // install it in a child.
-        if std::env::var_os(CHILD).is_none() {
-            let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "app::render_safety_tests::a_background_panic_is_not_written_to_the_terminal",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            assert!(result.status.success(), "{stderr}");
-            assert!(!stderr.contains("capture-sentinel"), "{stderr}");
-            assert!(!stderr.contains('\x1b'), "{stderr}");
-            // The TUI thread's own panics still reach the previous hook.
-            assert!(stderr.contains("tui-sentinel"), "{stderr}");
-            return;
-        }
-        install_tui_panic_hook();
-        let capture = std::thread::Builder::new()
-            .name("packet-capture".into())
-            .spawn(|| panic!("bad SNI \x1b]52;c;AAAA\x07 capture-sentinel"))
-            .unwrap();
-        assert!(capture.join().is_err());
-        assert!(std::panic::catch_unwind(|| panic!("tui-sentinel")).is_err());
     }
 }
 

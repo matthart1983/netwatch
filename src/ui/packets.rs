@@ -1,6 +1,6 @@
 use crate::app::{App, StreamDirectionFilter};
 use crate::collectors::packets::{
-    format_endpoint, matches_packet, parse_filter, port_label, CapturedPacket, ExpertSeverity,
+    format_endpoint, matches_packet_in, parse_filter, port_label, CapturedPacket, ExpertSeverity,
     FilterExpr, StreamDirection,
 };
 use crate::ui::stream_context;
@@ -473,9 +473,13 @@ pub fn effective_packet_filter(app: &App) -> Option<FilterExpr> {
 /// passed slice; callers hold the packet-store guard for its lifetime.
 pub fn visible_packets<'a>(app: &App, packets: &'a [CapturedPacket]) -> Vec<&'a CapturedPacket> {
     let expr = effective_packet_filter(app);
+    let index_space = app.packet_collector.index_space();
     packets
         .iter()
-        .filter(|p| expr.as_ref().is_none_or(|e| matches_packet(e, p)))
+        .filter(|p| {
+            expr.as_ref()
+                .is_none_or(|e| matches_packet_in(e, p, &index_space))
+        })
         .filter(|p| !app.ui.packet_expert_only || is_expert(p))
         .collect()
 }
@@ -1007,10 +1011,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 // across packets when the body spans more than one (Phase 3b).
                 // The decoded bytes render in the Payload Content pane.
                 if is_quic {
-                    let bodies = pkt
-                        .stream_index
-                        .map(|i| app.packet_collector.quic_h3_bodies(i))
-                        .unwrap_or_default();
+                    let bodies = app.packet_collector.quic_h3_bodies_for_packet(pkt);
                     for decoded in &bodies {
                         detail_lines.push(Line::from(Span::styled(
                             format!(
@@ -1106,25 +1107,23 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
             }
 
             // TCP handshake timing (if this packet belongs to a stream with handshake data)
-            if let Some(stream_idx) = pkt.stream_index {
-                if let Some(stream) = app.packet_collector.get_stream(stream_idx) {
-                    if let Some(ref hs) = stream.handshake {
-                        let mut hs_parts = Vec::new();
-                        if let Some(syn_sa) = hs.syn_to_syn_ack_ms() {
-                            hs_parts.push(format!("SYN→SYN-ACK: {:.2}ms", syn_sa));
-                        }
-                        if let Some(sa_ack) = hs.syn_ack_to_ack_ms() {
-                            hs_parts.push(format!("SYN-ACK→ACK: {:.2}ms", sa_ack));
-                        }
-                        if let Some(total) = hs.total_ms() {
-                            hs_parts.push(format!("Total: {:.2}ms", total));
-                        }
-                        if !hs_parts.is_empty() {
-                            detail_lines.push(Line::from(Span::styled(
-                                format!("  ⏱ Handshake: {}", hs_parts.join("  │  ")),
-                                Style::default().fg(app.theme.status_good),
-                            )));
-                        }
+            if let Some(stream) = app.packet_collector.get_stream_for_packet(pkt) {
+                if let Some(ref hs) = stream.handshake {
+                    let mut hs_parts = Vec::new();
+                    if let Some(syn_sa) = hs.syn_to_syn_ack_ms() {
+                        hs_parts.push(format!("SYN→SYN-ACK: {:.2}ms", syn_sa));
+                    }
+                    if let Some(sa_ack) = hs.syn_ack_to_ack_ms() {
+                        hs_parts.push(format!("SYN-ACK→ACK: {:.2}ms", sa_ack));
+                    }
+                    if let Some(total) = hs.total_ms() {
+                        hs_parts.push(format!("Total: {:.2}ms", total));
+                    }
+                    if !hs_parts.is_empty() {
+                        detail_lines.push(Line::from(Span::styled(
+                            format!("  ⏱ Handshake: {}", hs_parts.join("  │  ")),
+                            Style::default().fg(app.theme.status_good),
+                        )));
                     }
                 }
             }
@@ -1180,10 +1179,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                             // Surface the decompressed HTTP/3 body (reassembled
                             // across packets, Phase 3b) beneath the raw frames so
                             // the readable content is in one pane.
-                            let bodies = pkt
-                                .stream_index
-                                .map(|i| app.packet_collector.quic_h3_bodies(i))
-                                .unwrap_or_default();
+                            let bodies = app.packet_collector.quic_h3_bodies_for_packet(pkt);
                             for decoded in &bodies {
                                 body.push_str(&format!(
                                     "\n── HTTP/3 stream {} · {} body ({}) ──\n",
@@ -1406,7 +1402,10 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let stream = match app.packet_collector.get_stream(stream_index) {
+    let stream = match app
+        .packet_collector
+        .get_stream_in_session(stream_index, app.ui.stream_view_session.as_deref())
+    {
         Some(s) => s,
         None => {
             let hint = Paragraph::new(format!(" Stream #{stream_index} not found"))
@@ -1893,9 +1892,11 @@ fn render_stream_summary(f: &mut Frame, app: &App, packets: &[CapturedPacket], a
     // alone, and a conversation that has aged out of the ring are three
     // different things for an operator to know.
     let selected = selected_packet(app, packets);
-    let resolved = selected
-        .and_then(|p| p.stream_index)
-        .and_then(|i| app.packet_collector.get_stream(i).map(|s| (i, s)));
+    let resolved = selected.and_then(|p| {
+        app.packet_collector
+            .get_stream_for_packet(p)
+            .map(|s| (s.index, s))
+    });
 
     let (Some(pkt), Some((idx, stream))) = (selected, resolved) else {
         let msg = match selected {
@@ -1926,7 +1927,15 @@ fn render_stream_summary(f: &mut Frame, app: &App, packets: &[CapturedPacket], a
         .saturating_sub(2)
         .saturating_sub(overhead);
 
-    let convo = stream_context::conversation(&stream, packets, idx, Some(pkt.id), ladder_rows);
+    let index_space = app.packet_collector.index_space();
+    let convo = stream_context::conversation(
+        &stream,
+        packets,
+        &index_space,
+        idx,
+        Some(pkt.id),
+        ladder_rows,
+    );
 
     let title = vec![
         Span::styled(
@@ -2221,13 +2230,36 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn an_open_stream_view_does_not_follow_a_different_session() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector.seed_demo_capture();
+        assert!(app.packet_collector.get_stream(1).is_some());
+        app.ui.stream_view_index = Some(1);
+        app.ui.stream_view_session = Some("previous-capture".into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render_stream_view(f, &app, f.area()))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Stream #1 not found"), "{screen}");
+    }
+
     fn demo_conversation(selected: Option<u64>) -> stream_context::Conversation {
         let c = crate::collectors::packets::PacketCollector::default();
         c.seed_demo_capture();
         let packets = c.get_packets().clone();
         // Stream #1 is the tls connection seeded by the demo.
         let stream = c.get_stream(1).expect("the demo seeds a tcp stream");
-        stream_context::conversation(&stream, &packets, 1, selected, 12)
+        stream_context::conversation(&stream, &packets, &c.index_space(), 1, selected, 12)
     }
 
     /// Every rung lines up. The cursor marker replaces a space rather than
