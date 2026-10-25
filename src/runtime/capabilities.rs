@@ -908,7 +908,14 @@ pub fn capture_child(interface: &str, mode: Mode) -> anyhow::Result<()> {
             protection: None,
         },
         Ok(capture) => {
-            let report = sandbox::apply(mode, &sandbox::SandboxPaths::default());
+            // The capture thread's policy, so strict fails here where it
+            // would refuse capture.
+            let report = sandbox::apply_retaining(
+                mode,
+                &sandbox::SandboxPaths::default(),
+                sandbox::Retain::Nothing,
+                sandbox::Role::Capture,
+            );
             let rejected = matches!(mode, Mode::Strict) && !report.mode.warnings.is_empty();
             let result = CaptureResult {
                 interface: interface.into(),

@@ -27,6 +27,9 @@ All notable changes to NetWatch will be documented in this file.
   before, netwatch now refuses to start in strict mode and says the kernel
   cannot deny TCP. Older kernels already failed strict. Best-effort runs on
   any kernel as before and logs one line when the deny is unavailable.
+  `netwatch doctor --check-capture` now checks under the capture thread's
+  policy, so on those kernels it reports capture as unavailable in strict
+  mode, where it used to report it ready.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
