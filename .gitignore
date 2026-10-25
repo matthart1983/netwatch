@@ -1,4 +1,6 @@
 /target
+# Per-worktree build dirs (cross-checks, reviews), never part of the repo
+/target-*/
 /result
 *.DS_Store
 

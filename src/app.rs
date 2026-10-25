@@ -2149,7 +2149,11 @@ pub(crate) fn top_conn_host(addr: &str) -> String {
     }
 }
 
-const TOP_PROC_HISTORY_LEN: usize = 60;
+/// Samples retained per (process, pid) for the Processes tab's RX chart.
+///
+/// Public because that chart's header names the window it covers, which is
+/// this many samples at the refresh interval.
+pub const TOP_PROC_HISTORY_LEN: usize = 60;
 const IFACE_EVENTS_CAP: usize = 200;
 
 #[derive(Debug, Clone)]
@@ -3390,11 +3394,8 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         KeyCode::Char('s') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
             if let Some(sel_id) = app.ui.scroll.packet_selected {
-                let idx = app
-                    .packet_collector
-                    .get_packets()
-                    .iter()
-                    .find(|p| p.id == sel_id)
+                // Only a packet the list shows, as for `W`.
+                let idx = ui::packets::selected_packet(app, &app.packet_collector.get_packets())
                     .and_then(|p| {
                         p.stream_index
                             .map(|i| (i, p.capture.as_ref().map(|m| m.session.to_string())))
@@ -3467,7 +3468,10 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.export_status = Some("Capture cleared".into());
         }
         KeyCode::Char('m') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
-            if let Some(sel_id) = app.ui.scroll.packet_selected {
+            // Only a packet the list shows, as for `W`.
+            let shown = ui::packets::selected_packet(app, &app.packet_collector.get_packets())
+                .map(|p| p.id);
+            if let Some(sel_id) = shown {
                 if !app.caches.bookmarks.remove(&sel_id) {
                     app.caches.bookmarks.insert(sel_id);
                 }
@@ -3574,12 +3578,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.export_status_tick = 0;
         }
         KeyCode::Char('W') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
-            if let Some(sel_id) = app.ui.scroll.packet_selected {
-                let packets = app.packet_collector.get_packets();
-                if let Some(pkt) = packets.iter().find(|p| p.id == sel_id) {
-                    app.whois_cache.request(&pkt.src_ip);
-                    app.whois_cache.request(&pkt.dst_ip);
-                }
+            // Only a packet the list shows. A selection the display filter or
+            // `x` hides stays set, and must not send its addresses anywhere.
+            let packets = app.packet_collector.get_packets();
+            if let Some(pkt) = ui::packets::selected_packet(app, &packets) {
+                app.whois_cache.request(&pkt.src_ip);
+                app.whois_cache.request(&pkt.dst_ip);
             }
         }
         KeyCode::Char('W') if app.ui.current_tab == Tab::Connections => {
@@ -3859,7 +3863,7 @@ fn yank_selected_packet(app: &mut App) {
         return;
     };
     let packets = app.packet_collector.get_packets();
-    let Some(pkt) = packets.iter().find(|p| p.id == pid) else {
+    let Some(pkt) = crate::ui::packets::selected_packet(app, &packets) else {
         app.ui.export_status = Some(format!("Packet #{pid} not found in current view"));
         app.ui.export_status_tick = 0;
         return;
@@ -4056,6 +4060,72 @@ mod quit_key_tests {
             let summary = app.capture_export.take().unwrap().summary();
             assert_eq!(summary.packets + summary.omitted, shown, "{expert_only}");
         }
+    }
+
+    /// `W` looks up the packet the list shows. It searched the whole capture,
+    /// so a selection the display filter had hidden, which the detail pane no
+    /// longer showed, still sent its addresses to rdap.org.
+    #[test]
+    fn shift_w_skips_a_packet_the_list_hides() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        app.packet_collector.seed_demo_capture();
+        // Packet 3 is the SYN to 93.184.216.34, which `dns` hides.
+        app.ui.scroll.packet_selected = Some(3);
+        for k in "/dns".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            handle_key(&mut app, key(k));
+        }
+        assert_eq!(app.ui.packet_filter_active.as_deref(), Some("dns"));
+        handle_key(&mut app, key(KeyCode::Char('W')));
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+
+        // `x` hides it the same way.
+        app.ui.packet_filter_active = None;
+        app.ui.packet_expert_only = true;
+        let mut packets = app.packet_collector.packets.write().unwrap();
+        packets.iter_mut().find(|p| p.id == 3).unwrap().expert =
+            crate::collectors::packets::ExpertSeverity::Chat;
+        drop(packets);
+        handle_key(&mut app, key(KeyCode::Char('W')));
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+
+        app.ui.packet_expert_only = false;
+        handle_key(&mut app, key(KeyCode::Char('W')));
+        assert_eq!(app.whois_cache.queued_for_test(), ["93.184.216.34"]);
+    }
+
+    /// `s`, `m` and `y` act on the packet the detail pane shows, which is
+    /// none when `x` hides the selection.
+    #[test]
+    fn stream_bookmark_and_yank_skip_a_packet_the_list_hides() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        app.packet_collector.seed_demo_capture();
+        app.ui.scroll.packet_selected = Some(3);
+        app.ui.packet_expert_only = true;
+        let mut packets = app.packet_collector.packets.write().unwrap();
+        packets.iter_mut().find(|p| p.id == 3).unwrap().expert =
+            crate::collectors::packets::ExpertSeverity::Chat;
+        drop(packets);
+
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert!(!app.caches.bookmarks.contains(&3));
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        assert!(!app.ui.stream_view_open);
+        // Hidden, `y` stops before it reaches the clipboard.
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert_eq!(
+            app.ui.export_status.as_deref(),
+            Some("Packet #3 not found in current view")
+        );
+
+        app.ui.packet_expert_only = false;
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert!(app.caches.bookmarks.contains(&3));
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        assert!(app.ui.stream_view_open);
     }
 
     #[test]
