@@ -92,9 +92,13 @@ All notable changes to NetWatch will be documented in this file.
   must be on a filesystem with hard links.
 
 ### Fixed
-- **Old packets cannot resolve a stream from a later capture session.** Stream
-  details, HTTP/3 bodies, the conversation ladder and an already-open stream
-  view keep the capture session as well as the index when indices wrap.
+- **A packet from before the stream indices ran out no longer shows a newer
+  flow's stream.** Once a capture had numbered 2^32 flows the numbers began
+  again, and a packet still in the list from before could show the stream
+  details, handshake time, HTTP/3 bodies, conversation ladder and stream
+  view of the newer flow that took its number. Such a packet now shows no
+  stream. Packets from before a capture restart or an interface switch still
+  show theirs, as numbering carries on across those.
 - **Exported captures carry the real capture time and wire length.** PCAP
   export rebuilt each timestamp from the time of day shown in the packet
   list, so every packet was dated 1 January 1970 and a capture across

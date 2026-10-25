@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -460,11 +460,13 @@ pub struct StreamTracker {
     /// references resolve to None rather than aliasing a different flow.
     pub all_streams: HashMap<u32, Stream>,
     next_index: u32,
-    /// The capture session the indices count within, as packets' capture
-    /// metadata names it. 2^32 flows use the indices up; the tracker then
-    /// forgets every stream, starts again at 0 and takes a new session, so a
-    /// session and an index still name one flow. `None` outside live capture.
+    /// The latest capture session, as packets' capture metadata names it.
+    /// 2^32 flows use the indices up; the tracker then forgets every stream,
+    /// starts again at 0 and takes a new session, so a session and an index
+    /// still name one flow. `None` outside live capture.
     session: Option<Arc<str>>,
+    /// The sessions whose packets' indices name the streams held here.
+    index_space: IndexSpace,
     /// Per-stream TLS 1.3 decryption state, keyed by stream index. Lives
     /// outside `Stream` because `aead::LessSafeKey` isn't `Clone`, and
     /// `Stream` needs to stay Clone for the public `get_stream` API.
@@ -485,6 +487,43 @@ pub struct StreamTracker {
     held_bytes: usize,
     /// [`MAX_ALL_STREAMS_BYTES`]; a field so tests can use a small one.
     byte_budget: usize,
+}
+
+/// The capture sessions whose packets' stream indices still name the
+/// tracker's streams. A capture restart keeps the streams and carries on
+/// numbering, so each start adds its session. Running out of indices starts
+/// numbering again under a new session, and only that one is left.
+#[derive(Debug, Clone, Default)]
+pub struct IndexSpace {
+    sessions: HashSet<Arc<str>>,
+    /// The indices have run out at least once. A packet without capture
+    /// metadata (`--demo`, a frame whose pcap header did not add up) cannot
+    /// say whether it came before that, so it no longer names a stream.
+    exhausted: bool,
+}
+
+impl IndexSpace {
+    /// Whether `packet`'s stream index names one of the tracker's streams,
+    /// rather than a flow numbered before the indices ran out.
+    pub fn holds(&self, packet: &CapturedPacket) -> bool {
+        self.holds_session(packet.capture.as_ref().map(|m| m.session.as_ref()))
+    }
+
+    fn holds_session(&self, session: Option<&str>) -> bool {
+        match session {
+            Some(session) => self.sessions.contains(session),
+            None => !self.exhausted,
+        }
+    }
+
+    /// The numbering after the indices ran out, holding `sessions`.
+    #[cfg(test)]
+    pub(crate) fn exhausted_for_test(sessions: &[&str]) -> Self {
+        Self {
+            sessions: sessions.iter().map(|&s| s.into()).collect(),
+            exhausted: true,
+        }
+    }
 }
 
 /// Per-stream AEAD state for TLS application data, tagged by protocol
@@ -531,6 +570,7 @@ impl StreamTracker {
             all_streams: HashMap::new(),
             next_index: 0,
             session: None,
+            index_space: IndexSpace::default(),
             tls_keys: HashMap::new(),
             keylog: crate::dpi::tls_decrypt::KeylogStore::new(),
             quic_h3: HashMap::new(),
@@ -580,6 +620,13 @@ impl StreamTracker {
         }
     }
 
+    /// A capture start. Streams and numbering carry on from the last one, so
+    /// packets from earlier sessions still name their streams.
+    fn start_session(&mut self, session: Arc<str>) {
+        self.index_space.sessions.insert(Arc::clone(&session));
+        self.session = Some(session);
+    }
+
     /// The next unused stream index. When none is left, every stream is
     /// dropped and counting restarts at 0 under a new session. At the
     /// measured decode rate that takes about seven hours of new flows.
@@ -589,8 +636,12 @@ impl StreamTracker {
         }
         self.clear();
         self.next_index = 1;
+        self.index_space = IndexSpace {
+            sessions: HashSet::new(),
+            exhausted: true,
+        };
         if self.session.is_some() {
-            self.session = Some(uuid::Uuid::new_v4().to_string().into());
+            self.start_session(uuid::Uuid::new_v4().to_string().into());
         }
         tracing::warn!(target: "netwatch::capture", "stream indices exhausted; streams cleared and a new capture session started");
         0
@@ -1642,8 +1693,8 @@ impl PacketCollector {
         }
         self.annotation_history.clear();
         let mut session_ref: Arc<str> = uuid::Uuid::new_v4().to_string().into();
-        crate::app::safe_lock(&self.stream_tracker, "packets::start_session").session =
-            Some(Arc::clone(&session_ref));
+        crate::app::safe_lock(&self.stream_tracker, "packets::start_session")
+            .start_session(Arc::clone(&session_ref));
         // Every generation owns its cancellation flag, including detached old workers.
         self.capturing = Arc::new(AtomicBool::new(true));
         self.ready = Arc::new(AtomicBool::new(false));
@@ -2199,7 +2250,8 @@ impl PacketCollector {
             .cloned()
     }
 
-    /// Resolve a saved packet only within the session that allocated its index.
+    /// A saved packet's stream, unless its index was handed out before the
+    /// indices ran out and may now name another flow.
     pub fn get_stream_for_packet(&self, packet: &CapturedPacket) -> Option<Stream> {
         self.get_stream_in_session(
             packet.stream_index?,
@@ -2207,16 +2259,26 @@ impl PacketCollector {
         )
     }
 
-    /// An open stream view keeps its original session even after index exhaustion.
+    /// An open stream view keeps the session it was opened from, and loses
+    /// its stream if the indices run out.
     pub fn get_stream_in_session(&self, index: u32, session: Option<&str>) -> Option<Stream> {
         let tracker = crate::app::safe_lock(&self.stream_tracker, "packets::get_stream_in_session");
-        if tracker.session.as_deref() != session {
+        if !tracker.index_space.holds_session(session) {
             return None;
         }
         tracker.get_stream(index).cloned()
     }
 
-    /// A packet must not borrow decoded HTTP/3 content from a later session.
+    /// The sessions whose packets' stream indices name the current streams,
+    /// for the conversation ladder and the `stream N` filter.
+    pub fn index_space(&self) -> IndexSpace {
+        crate::app::safe_lock(&self.stream_tracker, "packets::index_space")
+            .index_space
+            .clone()
+    }
+
+    /// A packet must not borrow decoded HTTP/3 content from a flow numbered
+    /// after the indices ran out.
     pub fn quic_h3_bodies_for_packet(
         &self,
         packet: &CapturedPacket,
@@ -2226,7 +2288,7 @@ impl PacketCollector {
         };
         let mut tracker =
             crate::app::safe_lock(&self.stream_tracker, "packets::quic_h3_bodies_for_packet");
-        if tracker.session.as_deref() != packet.capture.as_ref().map(|m| m.session.as_ref()) {
+        if !tracker.index_space.holds(packet) {
             return Vec::new();
         }
         tracker.quic_h3_bodies(index)
@@ -4270,7 +4332,11 @@ mod tests {
     fn an_old_packet_does_not_resolve_a_reused_stream_index() {
         let collector = PacketCollector::new();
         let first: Arc<str> = "old-session".into();
-        collector.stream_tracker.lock().unwrap().session = Some(first.clone());
+        collector
+            .stream_tracker
+            .lock()
+            .unwrap()
+            .start_session(first.clone());
         collector.ingest_frame_for_test(&UDP_FRAME).unwrap();
         let mut old = collector.get_packets()[0].clone();
         let mut meta = metadata(1);
@@ -4301,7 +4367,7 @@ mod tests {
         let tracker = Mutex::new(StreamTracker::new());
         {
             let mut t = tracker.lock().unwrap();
-            t.session = Some(Arc::clone(&first));
+            t.start_session(Arc::clone(&first));
             t.next_index = u32::MAX - 1;
         }
         let counter = Arc::new(Mutex::new(0));
@@ -4343,7 +4409,7 @@ mod tests {
         let collector = PacketCollector::new();
         {
             let mut t = collector.stream_tracker.lock().unwrap();
-            t.session = Some(Arc::clone(&first));
+            t.start_session(Arc::clone(&first));
             t.next_index = u32::MAX;
         }
         collector.ingest_frame_for_test(&UDP_FRAME).unwrap();
@@ -5492,5 +5558,106 @@ mod lifecycle_tests {
             assert!(collector.packets.read().unwrap().is_empty());
             collector.stop_capture();
         }
+    }
+
+    /// Decode `frame` as the capture thread would under the collector's
+    /// current session, and keep it in the list.
+    fn ingest(collector: &PacketCollector, frame: &[u8], at_ns: u64) -> CapturedPacket {
+        let capture = export::CaptureMetadata {
+            session: collector.capture_session().unwrap().into(),
+            interface: "eth0".into(),
+            link_type: 1,
+            timestamp_ns: at_ns,
+            original_len: frame.len() as u32,
+        };
+        let frame = Frame {
+            data: frame,
+            ethernet: true,
+            capture: Some(capture),
+        };
+        let pkt = decode_and_track(
+            frame,
+            &collector.counter,
+            &collector.dns_cache,
+            &collector.stream_tracker,
+        )
+        .unwrap();
+        collector.packets.write().unwrap().push(pkt.clone());
+        pkt
+    }
+
+    /// `--demo` starts capture, which fails without the privilege, and then
+    /// seeds its conversation. The seeded packets carry no capture session
+    /// and must still find their streams.
+    #[test]
+    fn demo_packets_find_their_streams_after_capture_has_started() {
+        let mut collector = PacketCollector::new();
+        collector.start_capture("netwatch-pr04-nonexistent-interface", None);
+        collector.stop_capture();
+        collector.seed_demo_capture();
+        let packets = collector.get_packets().clone();
+        let tracked: Vec<_> = packets
+            .iter()
+            .filter(|p| p.stream_index.is_some())
+            .collect();
+        assert!(!tracked.is_empty());
+        for p in tracked {
+            assert!(
+                collector.get_stream_for_packet(p).is_some(),
+                "demo packet {} lost its stream",
+                p.id
+            );
+        }
+        assert!(collector.get_stream_in_session(1, None).is_some());
+    }
+
+    /// `c` twice, `i` while capturing and the recorder re-arming all restart
+    /// capture and keep the list. Numbering carries on, so a packet from
+    /// before the restart still names its stream, and a connection that
+    /// spans the restart is one conversation.
+    #[test]
+    fn packets_from_before_a_capture_restart_keep_their_stream() {
+        let (c, s) = (
+            "192.0.2.10:50000".parse().unwrap(),
+            "198.51.100.7:443".parse().unwrap(),
+        );
+        let mut collector = PacketCollector::new();
+        collector.start_capture("netwatch-pr04-nonexistent-interface", None);
+        collector.stop_capture();
+        let syn = ingest(
+            &collector,
+            &super::tests::tcp_frame(c, s, TCP_FLAG_SYN, (1000, 0), b""),
+            1_000,
+        );
+        ingest(
+            &collector,
+            &super::tests::tcp_frame(s, c, TCP_FLAG_SYN | TCP_FLAG_ACK, (5000, 1001), b""),
+            2_000,
+        );
+        assert!(collector.get_stream_for_packet(&syn).is_some());
+
+        collector.start_capture("netwatch-pr04-nonexistent-interface", None);
+        collector.stop_capture();
+        assert!(
+            collector.get_stream_for_packet(&syn).is_some(),
+            "the restart cut the SYN off from its stream"
+        );
+        let data = ingest(
+            &collector,
+            &super::tests::tcp_frame(c, s, TCP_FLAG_ACK | TCP_FLAG_PSH, (1001, 5001), b"hello"),
+            3_000,
+        );
+        assert_eq!(data.stream_index, syn.stream_index);
+        let stream = collector.get_stream_for_packet(&data).unwrap();
+        let packets = collector.get_packets().clone();
+        let ladder = crate::ui::stream_context::conversation(
+            &stream,
+            &packets,
+            &collector.index_space(),
+            stream.index,
+            Some(data.id),
+            10,
+        );
+        assert_eq!((ladder.total, ladder.position), (3, Some(3)));
     }
 }

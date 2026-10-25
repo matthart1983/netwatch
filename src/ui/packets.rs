@@ -1929,7 +1929,15 @@ fn render_stream_summary(f: &mut Frame, app: &App, packets: &[CapturedPacket], a
         .saturating_sub(2)
         .saturating_sub(overhead);
 
-    let convo = stream_context::conversation(&stream, packets, idx, Some(pkt.id), ladder_rows);
+    let index_space = app.packet_collector.index_space();
+    let convo = stream_context::conversation(
+        &stream,
+        packets,
+        &index_space,
+        idx,
+        Some(pkt.id),
+        ladder_rows,
+    );
 
     let title = vec![
         Span::styled(
@@ -2253,7 +2261,7 @@ mod tests {
         let packets = c.get_packets().clone();
         // Stream #1 is the tls connection seeded by the demo.
         let stream = c.get_stream(1).expect("the demo seeds a tcp stream");
-        stream_context::conversation(&stream, &packets, 1, selected, 12)
+        stream_context::conversation(&stream, &packets, &c.index_space(), 1, selected, 12)
     }
 
     /// Every rung lines up. The cursor marker replaces a space rather than

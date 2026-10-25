@@ -13,8 +13,8 @@
 //! lives here where it can be.
 
 use crate::collectors::packets::{
-    CapturedPacket, Stream, StreamProtocol, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
-    TCP_FLAG_SYN,
+    CapturedPacket, IndexSpace, Stream, StreamProtocol, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
+    TCP_FLAG_RST, TCP_FLAG_SYN,
 };
 
 /// What one packet is doing in its conversation.
@@ -252,9 +252,14 @@ fn short_info(info: &str, fallback: &str) -> String {
 /// question "what happened just before this" is most of why anyone opens this
 /// panel, and a ladder anchored to the top of the conversation answers it only
 /// for the first few packets.
+///
+/// `index_space` says which packets' indices are the tracker's current
+/// numbering: once the indices run out, the ring can hold older packets that
+/// carry `stream_index` for a different flow.
 pub fn conversation(
     stream: &Stream,
     packets: &[CapturedPacket],
+    index_space: &IndexSpace,
     stream_index: u32,
     selected_id: Option<u64>,
     max_rungs: usize,
@@ -264,21 +269,9 @@ pub fn conversation(
         .initiator
         .as_ref()
         .is_none_or(|init| *init == stream.key.addr_a);
-    // An index can be reused after exhaustion, but never within one session.
-    let anchor = selected_id
-        .and_then(|id| packets.iter().find(|p| p.id == id))
-        .or_else(|| {
-            packets
-                .iter()
-                .find(|p| p.stream_index == Some(stream_index))
-        });
-    let session = anchor.and_then(|p| p.capture.as_ref().map(|m| m.session.as_ref()));
     let mut mine: Vec<&CapturedPacket> = packets
         .iter()
-        .filter(|p| {
-            p.stream_index == Some(stream_index)
-                && p.capture.as_ref().map(|m| m.session.as_ref()) == session
-        })
+        .filter(|p| p.stream_index == Some(stream_index) && index_space.holds(p))
         .collect();
     mine.sort_by_key(|p| p.timestamp_ns);
 
@@ -491,7 +484,14 @@ mod tests {
                 original_len: packet.length,
             });
         }
-        let c = conversation(&stream(), &[old, current], 0, Some(2), 10);
+        let c = conversation(
+            &stream(),
+            &[old, current],
+            &IndexSpace::exhausted_for_test(&["current"]),
+            0,
+            Some(2),
+            10,
+        );
         assert_eq!(c.total, 1);
         assert_eq!(c.position, Some(1));
     }
@@ -506,7 +506,14 @@ mod tests {
         let mut ack = pkt(3, 24_000_000, "10.0.0.1", 5000, "10.0.0.2", 443);
         ack.tcp_flags = Some(TCP_FLAG_ACK);
 
-        let c = conversation(&stream(), &[syn, synack, ack], 0, Some(2), 10);
+        let c = conversation(
+            &stream(),
+            &[syn, synack, ack],
+            &IndexSpace::default(),
+            0,
+            Some(2),
+            10,
+        );
         let labels: Vec<&str> = c.rungs.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, ["syn", "syn·ack", "ack"]);
         assert_eq!(
@@ -533,7 +540,14 @@ mod tests {
         let mut rst = pkt(3, 2_000_000, "10.0.0.2", 443, "10.0.0.1", 5000);
         rst.tcp_flags = Some(TCP_FLAG_RST);
 
-        let c = conversation(&stream(), &[syn, data, rst], 0, None, 10);
+        let c = conversation(
+            &stream(),
+            &[syn, data, rst],
+            &IndexSpace::default(),
+            0,
+            None,
+            10,
+        );
         assert_eq!(c.phase, Phase::Reset);
         assert_eq!(c.rungs[2].role, Role::Rst);
         assert!(c.rungs[2].role.is_alarming());
@@ -556,6 +570,7 @@ mod tests {
         let c = conversation(
             &stream(),
             &[mk(1, 0, 100), mk(2, 1, 200), mk(3, 2, 100), mk(4, 3, 150)],
+            &IndexSpace::default(),
             0,
             None,
             10,
@@ -581,7 +596,7 @@ mod tests {
         data.tcp_seq = Some(1001);
         data.payload_text = "hello".into();
 
-        let c = conversation(&stream(), &[ack, data], 0, None, 10);
+        let c = conversation(&stream(), &[ack, data], &IndexSpace::default(), 0, None, 10);
         assert_eq!(c.retransmits, 0, "{:?}", c.rungs);
         assert!(c.rungs.iter().all(|r| r.note.is_none()), "{:?}", c.rungs);
 
@@ -590,7 +605,14 @@ mod tests {
         again.tcp_flags = Some(TCP_FLAG_PSH | TCP_FLAG_ACK);
         again.tcp_seq = Some(1001);
         again.payload_text = "hello".into();
-        let c = conversation(&stream(), &[ack_clone(), data_clone(), again], 0, None, 10);
+        let c = conversation(
+            &stream(),
+            &[ack_clone(), data_clone(), again],
+            &IndexSpace::default(),
+            0,
+            None,
+            10,
+        );
         assert_eq!(c.retransmits, 1);
         assert_eq!(c.rungs[2].note, Some(Note::Retransmit));
     }
@@ -618,13 +640,13 @@ mod tests {
         s.total_bytes_a_to_b = 100;
         s.total_bytes_b_to_a = 900;
 
-        let c = conversation(&s, &[], 0, None, 4);
+        let c = conversation(&s, &[], &IndexSpace::default(), 0, None, 4);
         assert_eq!((c.bytes_out, c.bytes_in), (100, 900), "initiator is addr_a");
 
         // Now the server opened the connection, so the same raw counters mean
         // the opposite thing.
         s.initiator = Some(("10.0.0.2".into(), 443));
-        let c = conversation(&s, &[], 0, None, 4);
+        let c = conversation(&s, &[], &IndexSpace::default(), 0, None, 4);
         assert_eq!(
             (c.bytes_out, c.bytes_in),
             (900, 100),
@@ -658,7 +680,7 @@ mod tests {
             ),
         ] {
             s.initiator = Some((init.0.into(), init.1));
-            let c = conversation(&s, &[], 0, None, 4);
+            let c = conversation(&s, &[], &IndexSpace::default(), 0, None, 4);
             assert_eq!(
                 (c.initiator.as_deref(), c.peer.as_deref()),
                 (Some(want.0), Some(want.1))
@@ -674,7 +696,7 @@ mod tests {
         a.tcp_seq = Some(1);
         let mut b = pkt(2, 1, "10.0.0.2", 443, "10.0.0.1", 5000);
         b.tcp_seq = Some(1);
-        let c = conversation(&stream(), &[a, b], 0, None, 10);
+        let c = conversation(&stream(), &[a, b], &IndexSpace::default(), 0, None, 10);
         assert_eq!(c.retransmits, 0, "{:?}", c.rungs);
     }
 
@@ -686,7 +708,7 @@ mod tests {
         let all: Vec<CapturedPacket> = (1..=40)
             .map(|i| pkt(i, i * 1_000_000, "10.0.0.1", 5000, "10.0.0.2", 443))
             .collect();
-        let c = conversation(&stream(), &all, 0, Some(20), 7);
+        let c = conversation(&stream(), &all, &IndexSpace::default(), 0, Some(20), 7);
         assert_eq!(c.rungs.len(), 7);
         assert!(
             c.rungs.iter().any(|r| r.selected),
@@ -699,12 +721,12 @@ mod tests {
         assert_eq!(c.total, 40);
 
         // Clamped at the start rather than running off the front.
-        let c = conversation(&stream(), &all, 0, Some(1), 7);
+        let c = conversation(&stream(), &all, &IndexSpace::default(), 0, Some(1), 7);
         assert_eq!(c.rungs[0].packet_id, 1);
         assert!(!c.truncated_above && c.truncated_below);
 
         // And at the end.
-        let c = conversation(&stream(), &all, 0, Some(40), 7);
+        let c = conversation(&stream(), &all, &IndexSpace::default(), 0, Some(40), 7);
         assert_eq!(c.rungs.last().unwrap().packet_id, 40);
         assert!(c.truncated_above && !c.truncated_below);
     }
@@ -716,7 +738,7 @@ mod tests {
         let all: Vec<CapturedPacket> = (1..=20)
             .map(|i| pkt(i, i * 1_000_000, "10.0.0.1", 5000, "10.0.0.2", 443))
             .collect();
-        let c = conversation(&stream(), &all, 0, None, 5);
+        let c = conversation(&stream(), &all, &IndexSpace::default(), 0, None, 5);
         assert_eq!(
             c.rungs.iter().map(|r| r.packet_id).collect::<Vec<_>>(),
             [16, 17, 18, 19, 20]
@@ -732,7 +754,14 @@ mod tests {
         mine.stream_index = Some(0);
         let mut theirs = pkt(2, 1, "10.0.0.9", 6000, "10.0.0.8", 443);
         theirs.stream_index = Some(7);
-        let c = conversation(&stream(), &[mine, theirs], 0, None, 10);
+        let c = conversation(
+            &stream(),
+            &[mine, theirs],
+            &IndexSpace::default(),
+            0,
+            None,
+            10,
+        );
         assert_eq!(c.total, 1);
         assert_eq!(c.rungs[0].packet_id, 1);
     }
@@ -743,7 +772,7 @@ mod tests {
     fn the_ladder_is_ordered_by_time_not_by_capture_order() {
         let a = pkt(1, 30_000_000, "10.0.0.1", 5000, "10.0.0.2", 443);
         let b = pkt(2, 10_000_000, "10.0.0.1", 5000, "10.0.0.2", 443);
-        let c = conversation(&stream(), &[a, b], 0, None, 10);
+        let c = conversation(&stream(), &[a, b], &IndexSpace::default(), 0, None, 10);
         assert_eq!(
             c.rungs.iter().map(|r| r.packet_id).collect::<Vec<_>>(),
             [2, 1]
@@ -762,7 +791,7 @@ mod tests {
         r.protocol = "DNS".into();
         r.info = "Response A 93.184.216.34".into();
 
-        let c = conversation(&stream(), &[q, r], 0, None, 10);
+        let c = conversation(&stream(), &[q, r], &IndexSpace::default(), 0, None, 10);
         assert_eq!(c.rungs[0].role, Role::Query);
         assert_eq!(c.rungs[1].role, Role::Reply);
         assert_eq!(c.phase, Phase::Active);
@@ -772,7 +801,7 @@ mod tests {
         let mut long = pkt(3, 6_000_000, "10.0.0.1", 5000, "10.0.0.2", 53);
         long.protocol = "DNS".into();
         long.info = "Standard query A a-very-long-name.example.invalid".into();
-        let c = conversation(&stream(), &[long], 0, None, 10);
+        let c = conversation(&stream(), &[long], &IndexSpace::default(), 0, None, 10);
         assert_eq!(c.rungs[0].label, "query");
     }
 
@@ -785,6 +814,7 @@ mod tests {
         let c = conversation(
             &s,
             &[pkt(1, 0, "10.0.0.1", 5000, "10.0.0.2", 443)],
+            &IndexSpace::default(),
             0,
             None,
             10,
@@ -797,7 +827,7 @@ mod tests {
     /// the arithmetic.
     #[test]
     fn an_empty_conversation_is_not_a_panic() {
-        let c = conversation(&stream(), &[], 0, Some(1), 8);
+        let c = conversation(&stream(), &[], &IndexSpace::default(), 0, Some(1), 8);
         assert!(c.rungs.is_empty());
         assert_eq!(c.total, 0);
         assert_eq!(c.position, None);
@@ -807,6 +837,7 @@ mod tests {
         let c = conversation(
             &stream(),
             &[pkt(1, 0, "10.0.0.1", 5000, "10.0.0.2", 443)],
+            &IndexSpace::default(),
             0,
             None,
             0,
