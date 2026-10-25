@@ -31,7 +31,7 @@ use super::detectors::{classify_socket, Observations, SocketVerdict};
 use super::engine::{Engine, FixedClock, ObservationTimes, Settings};
 use super::issue::{Issue, Subject};
 use super::live::Reading;
-use crate::ui::sanitize::{display, display_owned};
+use crate::ui::sanitize::{display, display_owned, is_unsafe};
 
 pub const SCHEMA_VERSION: u16 = 1;
 
@@ -1465,7 +1465,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
                 }
             }
             if json {
-                println!("{}", serde_json::to_string_pretty(&reports)?);
+                println!("{}", replay_json(&reports)?);
             }
             if !all_match {
                 anyhow::bail!("replay diverged from the recording");
@@ -1478,6 +1478,26 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
             "usage: netwatch diagnose run [--target NAME] [--budget 30s] [--format json|text]\n       netwatch diagnose coverage [--json] [--seconds N] [--test ID]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]"
         ),
     }
+}
+
+/// `replay --json`, with every unsafe character in its strings written as a
+/// `\u` escape. serde_json escapes C0 controls only, so DEL, C1 (the 8-bit
+/// CSI among them) and bidi overrides from the file would reach the terminal
+/// as they are. Outside its strings, pretty JSON holds only spaces and
+/// newlines, so every other unsafe character is inside one and the escape
+/// decodes to the same value. Each is in the BMP, so one `\u` covers it.
+fn replay_json(reports: &[ReplayReport]) -> serde_json::Result<String> {
+    use std::fmt::Write as _;
+    let json = serde_json::to_string_pretty(reports)?;
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c != '\n' && is_unsafe(c) {
+            let _ = write!(out, "\\u{:04x}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
 }
 
 /// A path for the terminal. Episodes are files people pass around, so a
@@ -2489,6 +2509,24 @@ mod tests {
         for line in printed.lines() {
             assert!(!line.chars().any(is_unsafe), "{line:?}");
         }
+    }
+
+    /// serde_json escapes C0 controls only. DEL, C1 (the 8-bit CSI among
+    /// them) and bidi overrides from the file reached the terminal as they
+    /// were.
+    #[test]
+    fn replay_json_escapes_what_serde_json_leaves() {
+        use crate::ui::sanitize::is_unsafe;
+        let mut report = replay(&incident().finished.remove(0));
+        let key = "k\u{9d}52;c;aGk=\u{9c}\u{202e}evil\u{7f}\x1b";
+        report.issues[0].key = key.into();
+        let reports = vec![report];
+        let json = replay_json(&reports).unwrap();
+        assert!(!json.chars().any(|c| c != '\n' && is_unsafe(c)), "{json}");
+        assert!(json.contains(r#""k\u009d52;c;aGk=\u009c\u202eevil\u007f\u001b""#));
+        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, serde_json::to_value(&reports).unwrap());
+        assert_eq!(back[0]["issues"][0]["key"], key);
     }
 
     /// The engine's clock starts at the first frame's time, and a file can

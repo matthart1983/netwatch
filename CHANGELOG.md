@@ -224,16 +224,19 @@ All notable changes to NetWatch will be documented in this file.
   ingest URL, so a user name and password in it, or a token in its query
   string, went into a file that outlives the session and gets attached to
   bug reports. The log now names the backend by scheme, host, port and path.
-- **`netwatch diagnose episodes` and `replay` print a shared episode as
-  plain text.** They printed ids, times, issue keys, causes and lab scenario
-  names as the file had them, so an episode someone sent you could carry
-  escape sequences that retitle the terminal or write the clipboard through
-  OSC 52. Those characters now print as `·`, as in the TUI, and so do the
-  same characters in file names and in load errors, which can quote the
-  file. `diagnose episodes` no longer panics on an id with a multi-byte
-  character across its eighth byte. Replay no longer panics when the first
-  frame's time does not parse, as happened to any recording that began in
-  the hour a clock goes back.
+- **`netwatch diagnose` prints a shared episode as plain text.** `episodes`,
+  `replay`, `features` and the `export` preview printed ids, times, issue
+  keys, causes and lab scenario names as the file had them, so an episode
+  someone sent you could carry escape sequences that retitle the terminal or
+  write the clipboard through OSC 52. Those characters now print as `·`, as
+  in the TUI, and so do the same characters in file names and in load
+  errors, which can quote the file. `features --out` writes the `·` to its
+  CSV file too. `replay --json` escaped C0 controls only; it now writes DEL,
+  C1 controls and bidi overrides as `\u` escapes as well, which decode to
+  the same strings. `diagnose episodes` and the `export` preview no longer
+  panic on an id with a multi-byte character across its eighth byte. Replay
+  no longer panics when the first frame's time does not parse, as happened
+  to any recording that began in the hour a clock goes back.
 - **An episode stops loading past 84,000 frames or 820 MiB uncompressed.**
   `diagnose episodes`, `replay`, `features` and `export` inflated a gzipped
   episode in full before parsing it, so a gzip of zeros a few megabytes long
