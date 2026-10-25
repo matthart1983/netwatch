@@ -224,16 +224,22 @@ All notable changes to NetWatch will be documented in this file.
   shortens to 15 characters.
 
 ### Security
-- **The threat model states the limits of the Linux sandbox.** Earlier release
-  notes overstated protection by saying a compromised parser cannot read SSH
-  keys. Threads share memory and descriptors, the proc broker is outside
-  Landlock, and outbound networking remains unrestricted. Root operation has
-  limited containment. The preferred Linux setup restricts a
-  capability-enabled binary to a dedicated group; policy and endpoint tables
-  are checked in tests, and the outbound inventory lists the trace to 1.1.1.1
-  that every TUI session runs at startup. `netwatch doctor` said eBPF was
-  disabled by the sandbox policy, untrue since 0.32.2; it now says eBPF loads
-  under the policy and its reader keeps the load capabilities.
+- **The threat model states the limits of the Linux sandbox.** The 0.17.0
+  release notes overstated protection by saying a compromised parser cannot
+  read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.
+  Threads share memory and descriptors, the proc broker is outside Landlock,
+  and outbound networking remains unrestricted. Under the `setcap` line or
+  sudo, the default best-effort mode leaves CAP_NET_RAW on every confined
+  thread, the parser included, so capture can reopen, and every thread
+  shares the open capture descriptor: a compromised parser can open or use
+  raw sockets. Only `--sandbox-strict` drops CAP_NET_RAW, and it does not
+  close a descriptor already open. Root operation has limited containment.
+  The preferred Linux setup restricts a capability-enabled binary to a
+  dedicated group; policy and endpoint tables are checked in tests, and the
+  outbound inventory lists the trace to 1.1.1.1 that every TUI session runs
+  at startup. `netwatch doctor` said eBPF was disabled by the sandbox
+  policy, untrue since 0.32.2; it now says eBPF loads under the policy and
+  its reader keeps the load capabilities.
 - **Run as root, the sandbox now takes the capabilities netwatch never
   uses from every confined thread.** It removes capabilities by a
   deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.
