@@ -140,6 +140,48 @@ All notable changes to NetWatch will be documented in this file.
   thread now drops everything except CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
   the two it needs to read another user's sockets under root, so its scans
   attribute connections as before.
+- **netwatch.log no longer records credentials from the `--remote` URL.**
+  When a POST to the remote backend failed, the warning carried the whole
+  ingest URL, so a user name and password in it, or a token in its query
+  string, went into a file that outlives the session and gets attached to
+  bug reports. The log now names the backend by scheme, host, port and path.
+- **`netwatch diagnose` prints a shared episode as plain text.** `episodes`,
+  `replay`, `features` and the `export` preview printed ids, times, issue
+  keys, causes and lab scenario names as the file had them, so an episode
+  someone sent you could carry escape sequences that retitle the terminal or
+  write the clipboard through OSC 52. Those characters now print as `·`, as
+  in the TUI, and so do the same characters in file names and in load
+  errors, which can quote the file. `features --out` writes the `·` to its
+  CSV file too. `replay --json` escaped C0 controls only; it now writes DEL,
+  C1 controls and bidi overrides as `\u` escapes as well, which decode to
+  the same strings. `diagnose episodes` and the `export` preview no longer
+  panic on an id with a multi-byte character across its eighth byte. Replay
+  no longer panics when the first frame's time does not parse, as happened
+  to any recording that began in the hour a clock goes back. Nor do
+  `replay` and `features` on a frame time or probe age hundreds of billions
+  of years out, which only a crafted file holds: they skip that frame, and
+  that probe counts as one that has not answered.
+- **An episode stops loading past 84,000 frames or 820 MiB uncompressed.**
+  `diagnose episodes`, `replay`, `features` and `export` inflated a gzipped
+  episode in full before parsing it, so a gzip of zeros a few megabytes long
+  could take all the memory there was, and a 100 KB file of a million empty
+  frames took 2.6 GB. Loading now stops at either limit with an error that
+  says which. A recording holds at most 72,000 frames, one per 100 ms tick
+  for two hours, which inflate to about 650 MB on a busy host. The limits
+  bound the input, not the memory: a crafted episode under both can still
+  take gigabytes to parse. `netwatch uptime` likewise skips a log line
+  longer than 64 KiB and warns how many it skipped, where it used to read a
+  line of any length. A line that is not valid UTF-8 now costs that line
+  only; it used to end the rest of that day's file.
+- **`netwatch diagnose` no longer follows a link into another directory.**
+  Given a directory, `episodes`, `replay`, `features` and `export` walked
+  every link in it, so two links back up the tree, as an archive someone
+  sends you can hold, kept them walking until killed, and a link out of it
+  listed episodes from elsewhere. netwatch cleans its own episode directory
+  the same way after each recording, deleting what is past 90 days or
+  300 MiB, so a link there could keep that cleanup running for good or
+  offer it files from outside. They now list a linked file but do not
+  descend into a linked directory.
 
 ## [0.38.0] - 2026-10-25
 

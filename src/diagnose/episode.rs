@@ -31,6 +31,7 @@ use super::detectors::{classify_socket, Observations, SocketVerdict};
 use super::engine::{Engine, FixedClock, ObservationTimes, Settings};
 use super::issue::{Issue, Subject};
 use super::live::Reading;
+use crate::ui::sanitize::{display, display_owned, is_unsafe};
 
 pub const SCHEMA_VERSION: u16 = 1;
 
@@ -47,6 +48,20 @@ pub const TOP_SOCKETS: usize = 20;
 
 pub const RETAIN_SECS: u64 = 90 * 24 * 3_600;
 pub const RETAIN_BYTES: u64 = 300 * 1024 * 1024;
+/// Most frames [`load`] accepts from one recording. netwatch ticks at most
+/// every 100 ms, its fastest refresh, and starts a new episode once one
+/// spans [`MAX_EPISODE_SECS`], so a recording holds at most 72,000 frames;
+/// the two rolls on top are headroom. A frame with every field empty is
+/// 35 bytes of JSON and 1.7 KB in memory, so a 100 KB gzip of a million of
+/// them took 2.6 GB.
+pub const MAX_LOAD_FRAMES: usize =
+    ((MAX_EPISODE_SECS + PRE_ROLL_SECS + POST_ROLL_SECS) * 10.0) as usize;
+/// Most [`load`] inflates from one recording: [`MAX_LOAD_FRAMES`] frames of
+/// 10 KiB. A busy host's frames average 9 KB, so two hours of them at the
+/// fastest refresh inflate to 650 MB. This bounds the input, not the memory
+/// parsing it takes: a list of empty strings takes eight times its JSON, so
+/// a crafted file under both limits can still need gigabytes.
+pub const MAX_LOAD_BYTES: u64 = MAX_LOAD_FRAMES as u64 * 10 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -166,10 +181,12 @@ impl ProbeAges {
     fn to_times(&self, origin: Instant, frame_secs: f64) -> ObservationTimes {
         let at = |age: Option<f64>| {
             let secs = ((frame_secs - age?) * 10.0).round() / 10.0;
+            // An age no `Duration` holds reads as no completion, as one
+            // past what an `Instant` reaches already does.
             if secs >= 0.0 {
-                origin.checked_add(Duration::from_secs_f64(secs))
+                origin.checked_add(Duration::try_from_secs_f64(secs).ok()?)
             } else {
-                origin.checked_sub(Duration::from_secs_f64(-secs))
+                origin.checked_sub(Duration::try_from_secs_f64(-secs).ok()?)
             }
         };
         let mut times = ObservationTimes {
@@ -297,11 +314,42 @@ pub struct Episode {
     /// [`MAX_EPISODE_SECS`].
     #[serde(default)]
     pub continues: Option<String>,
+    #[serde(deserialize_with = "at_most_max_frames")]
     pub frames: Vec<Frame>,
     #[serde(default)]
     pub issues: Vec<IssueSnapshot>,
     #[serde(default)]
     pub labels: Vec<Label>,
+}
+
+/// `frames`, failing at the first past [`MAX_LOAD_FRAMES`] instead of
+/// growing until memory runs out.
+fn at_most_max_frames<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<Frame>, D::Error> {
+    struct Frames;
+    impl<'de> serde::de::Visitor<'de> for Frames {
+        type Value = Vec<Frame>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a list of frames")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Vec<Frame>, A::Error> {
+            let mut frames = Vec::new();
+            while let Some(frame) = seq.next_element()? {
+                if frames.len() == MAX_LOAD_FRAMES {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "more than {MAX_LOAD_FRAMES} frames, more than any recording"
+                    )));
+                }
+                frames.push(frame);
+            }
+            Ok(frames)
+        }
+    }
+    de.deserialize_seq(Frames)
 }
 
 impl Episode {
@@ -735,13 +783,15 @@ pub fn save(dir: &Path, episode: &Episode) -> std::io::Result<PathBuf> {
 
 pub fn load(path: &Path) -> std::io::Result<Episode> {
     let file = std::fs::File::open(path)?;
-    let mut text = String::new();
-    if path.extension().is_some_and(|e| e == "gz") {
-        flate2::read::GzDecoder::new(file).read_to_string(&mut text)?;
+    let bytes = if path.extension().is_some_and(|e| e == "gz") {
+        read_capped(flate2::read::GzDecoder::new(file), MAX_LOAD_BYTES)?
     } else {
-        std::io::BufReader::new(file).read_to_string(&mut text)?;
-    }
-    let mut episode: Episode = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+        read_capped(std::io::BufReader::new(file), MAX_LOAD_BYTES)?
+    };
+    // A parse error can quote the file, such as the name of a variant it
+    // does not know, and the CLI prints it.
+    let mut episode: Episode = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::other(display_owned(e.to_string())))?;
     if episode.schema_version > SCHEMA_VERSION {
         return Err(std::io::Error::other(format!(
             "episode schema {} is newer than this netwatch ({SCHEMA_VERSION})",
@@ -750,6 +800,20 @@ pub fn load(path: &Path) -> std::io::Result<Episode> {
     }
     add_target_revisions(&mut episode);
     Ok(episode)
+}
+
+/// All of `reader`, or an error naming `cap` once it passes that many bytes.
+/// Nothing past the cap is read.
+fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(std::io::Error::other(format!(
+            "more than {} MiB uncompressed, larger than any recording",
+            cap >> 20
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Rename target issues recorded as `rule|name` to `rule|name|revision`.
@@ -935,7 +999,9 @@ pub fn list(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // Not `path.is_dir()`, which follows a link: one back up the tree
+            // is a loop, and one out of it hands `prune` other files.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push(path);
             } else if path.to_string_lossy().ends_with(".json.gz") {
                 // Only what `save` writes. `prune` deletes from this list, so
@@ -1113,13 +1179,10 @@ pub struct Step<'a> {
 /// did — evaluate at the recorded clock and probe ages, then learn — calling
 /// `on_step` between the two.
 pub fn drive(episode: &Episode, mut on_step: impl FnMut(Step<'_>)) {
-    let clock = std::sync::Arc::new(FixedClock::at(
-        episode
-            .frames
-            .first()
-            .map(|f| f.ts.as_str())
-            .unwrap_or("1970-01-01 00:00:00"),
-    ));
+    // Each frame sets the clock below. `FixedClock::at` panics on a time
+    // that does not parse, or that names two instants because a clock went
+    // back in that hour, and a recording can hold either.
+    let clock = std::sync::Arc::new(FixedClock::at("1970-01-01 00:00:00"));
     let mut engine = Engine::new(Box::new(clock.clone())).with_settings(episode.settings);
     let mut store: Option<BaselineStore> = None;
     // Real instants, offset by recorded time. Nothing here sleeps, so these
@@ -1138,7 +1201,14 @@ pub fn drive(episode: &Episode, mut on_step: impl FnMut(Step<'_>)) {
         let Some(store) = store.as_mut() else {
             continue;
         };
-        let now = base + Duration::from_secs_f64((frame.at - t0).max(0.0));
+        // A frame further on than an `Instant` reaches is not one netwatch
+        // recorded, and there is no time to evaluate it at.
+        let Some(now) = Duration::try_from_secs_f64((frame.at - t0).max(0.0))
+            .ok()
+            .and_then(|d| base.checked_add(d))
+        else {
+            continue;
+        };
         let times = frame.ages.to_times(base, frame.at - t0);
         for event in &frame.events {
             engine.apply_event(event);
@@ -1373,7 +1443,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
             for path in files {
                 match load(&path) {
                     Ok(ep) => println!("{}", summary_line(&ep, &path)),
-                    Err(e) => println!("{}  unreadable: {e}", path.display()),
+                    Err(e) => println!("{}  unreadable: {e}", shown(&path)),
                 }
             }
             Ok(())
@@ -1394,8 +1464,8 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
                     vec![path.to_path_buf()]
                 };
                 for file in files {
-                    let ep = load(&file)
-                        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                    let ep =
+                        load(&file).map_err(|e| anyhow::anyhow!("{}: {e}", shown(&file)))?;
                     let report = replay(&ep);
                     all_match &= report.matches();
                     if json {
@@ -1406,7 +1476,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
                 }
             }
             if json {
-                println!("{}", serde_json::to_string_pretty(&reports)?);
+                println!("{}", replay_json(&reports)?);
             }
             if !all_match {
                 anyhow::bail!("replay diverged from the recording");
@@ -1421,33 +1491,62 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// `replay --json`, with every unsafe character in its strings written as a
+/// `\u` escape. serde_json escapes C0 controls only, so DEL, C1 (the 8-bit
+/// CSI among them) and bidi overrides from the file would reach the terminal
+/// as they are. Outside its strings, pretty JSON holds only spaces and
+/// newlines, so every other unsafe character is inside one and the escape
+/// decodes to the same value. Each is in the BMP, so one `\u` covers it.
+fn replay_json(reports: &[ReplayReport]) -> serde_json::Result<String> {
+    use std::fmt::Write as _;
+    let json = serde_json::to_string_pretty(reports)?;
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c != '\n' && is_unsafe(c) {
+            let _ = write!(out, "\\u{:04x}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// A path for the terminal. Episodes are files people pass around, so a
+/// name in a directory listing is someone else's text too.
+fn shown(path: &Path) -> String {
+    display_owned(path.display().to_string())
+}
+
+/// One line of `diagnose episodes`. Its strings come from the file, so each
+/// goes through [`display`] on its way to the terminal, as in
+/// [`render_report`].
 fn summary_line(ep: &Episode, path: &Path) -> String {
     let source = match &ep.source {
         EpisodeSource::Live => "live".to_string(),
         EpisodeSource::QuietSample => "quiet".to_string(),
-        EpisodeSource::Lab { scenario, seed } => format!("lab:{scenario}#{seed}"),
+        EpisodeSource::Lab { scenario, seed } => format!("lab:{}#{seed}", display(scenario)),
     };
     let keys = ep.issue_keys();
     format!(
         "{}  {:<6} {}  {:>4}m  {:>5} frames  {}  {}",
-        &ep.id[..8.min(ep.id.len())],
+        display(&ep.id.chars().take(8).collect::<String>()),
         source,
-        ep.started,
+        display(&ep.started),
         (ep.duration_secs() / 60.0).round() as u64,
         ep.frames.len(),
         if keys.is_empty() {
             "no issues".to_string()
         } else {
-            keys.join(", ")
+            display_owned(keys.join(", "))
         },
-        path.display()
+        shown(path)
     )
 }
 
 fn render_report(report: &ReplayReport, path: &Path) -> String {
     let mut out = format!(
         "{}  {} frames  {}\n",
-        path.display(),
+        shown(path),
         report.frames,
         if report.matches() {
             "matches recording".to_string()
@@ -1458,14 +1557,16 @@ fn render_report(report: &ReplayReport, path: &Path) -> String {
     for span in &report.issues {
         out.push_str(&format!(
             "  {}  opened {}  {}  cause {}\n",
-            span.key,
-            span.opened,
+            display(&span.key),
+            display(&span.opened),
             match (&span.closed, &span.close_reason) {
-                (Some(c), Some(reason)) => format!("closed {c} ({reason})"),
-                (Some(c), None) => format!("closed {c}"),
+                (Some(c), Some(reason)) => {
+                    format!("closed {} ({})", display(c), display(reason))
+                }
+                (Some(c), None) => format!("closed {}", display(c)),
                 (None, _) => "still open".to_string(),
             },
-            span.top_cause.as_deref().unwrap_or("none")
+            display(span.top_cause.as_deref().unwrap_or("none"))
         ));
     }
     if !report.first_frame_open.is_empty() {
@@ -1474,14 +1575,20 @@ fn render_report(report: &ReplayReport, path: &Path) -> String {
     if let Some(d) = report.divergences.first() {
         let keys = |v: &[OpenIssue]| {
             v.iter()
-                .map(|o| format!("{} ({})", o.key, o.top_cause.as_deref().unwrap_or("-")))
+                .map(|o| {
+                    format!(
+                        "{} ({})",
+                        display(&o.key),
+                        display(o.top_cause.as_deref().unwrap_or("-"))
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
         out.push_str(&format!(
             "  first divergence at frame {} ({}):\n    recorded: {}\n    replayed: {}\n",
             d.frame,
-            d.ts,
+            display(&d.ts),
             keys(&d.recorded),
             keys(&d.replayed)
         ));
@@ -2364,6 +2471,212 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Byte 8 of this id falls inside the euro sign.
+    #[test]
+    fn summary_line_handles_multibyte_ids() {
+        let mut ep = incident().finished.remove(0);
+        ep.id = "aaaaaaa€".into();
+        let line = summary_line(&ep, Path::new("ep.json.gz"));
+        assert!(line.starts_with("aaaaaaa€  live "), "{line}");
+    }
+
+    /// An episode is a file someone can hand over, so whatever `episodes` and
+    /// `replay` print from it reaches the terminal as text, never escapes.
+    #[test]
+    fn replay_report_escapes_control_characters() {
+        use crate::ui::sanitize::is_unsafe;
+        const OSC52: &str = "\x1b]52;c;aGk=\x07";
+        let mut ep = incident().finished.remove(0);
+        ep.id = format!("{OSC52}0123456789");
+        ep.started = format!("{}{OSC52}", ep.started);
+        ep.source = EpisodeSource::Lab {
+            scenario: OSC52.into(),
+            seed: 1,
+        };
+        for open in ep.frames.iter_mut().flat_map(|f| &mut f.open) {
+            open.key = format!("{}{OSC52}", open.key);
+            open.top_cause = Some(OSC52.into());
+        }
+        let mut report = replay(&ep);
+        assert!(!report.matches(), "the recorded keys no longer match");
+        // Spans copy their times from the frames. A frame time that does not
+        // parse holds the replay's clock still and changes what replays, so
+        // the times are set on the report instead.
+        assert!(!report.issues.is_empty());
+        for span in &mut report.issues {
+            span.key = format!("{}{OSC52}", span.key);
+            span.opened = format!("{}{OSC52}", span.opened);
+            span.closed = Some(OSC52.into());
+            span.close_reason = Some(OSC52.into());
+        }
+        report.divergences[0].ts = OSC52.into();
+        let path = Path::new("episodes").join(format!("{OSC52}.json.gz"));
+        let printed = format!(
+            "{}\n{}",
+            summary_line(&ep, &path),
+            render_report(&report, &path)
+        );
+        assert!(printed.contains("first divergence"), "{printed:?}");
+        for line in printed.lines() {
+            assert!(!line.chars().any(is_unsafe), "{line:?}");
+        }
+    }
+
+    /// serde_json escapes C0 controls only. DEL, C1 (the 8-bit CSI among
+    /// them) and bidi overrides from the file reached the terminal as they
+    /// were.
+    #[test]
+    fn replay_json_escapes_what_serde_json_leaves() {
+        use crate::ui::sanitize::is_unsafe;
+        let mut report = replay(&incident().finished.remove(0));
+        let key = "k\u{9d}52;c;aGk=\u{9c}\u{202e}evil\u{7f}\x1b";
+        report.issues[0].key = key.into();
+        let reports = vec![report];
+        let json = replay_json(&reports).unwrap();
+        assert!(!json.chars().any(|c| c != '\n' && is_unsafe(c)), "{json}");
+        assert!(json.contains(r#""k\u009d52;c;aGk=\u009c\u202eevil\u007f\u001b""#));
+        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, serde_json::to_value(&reports).unwrap());
+        assert_eq!(back[0]["issues"][0]["key"], key);
+    }
+
+    /// The engine's clock starts at the first frame's time, and a file can
+    /// carry anything there.
+    #[test]
+    fn replay_survives_an_unparsable_first_timestamp() {
+        let mut ep = incident().finished.remove(0);
+        ep.frames[0].ts = "\x1b]52;c;aGk=\x07".into();
+        let report = replay(&ep);
+        assert_eq!(report.frames, ep.frames.len());
+    }
+
+    /// Replay turns a frame's time and its probe ages into instants, and a
+    /// file can carry any number in either. Seconds past what a `Duration`
+    /// holds, or past what an `Instant` can add, panicked.
+    #[test]
+    fn replay_survives_times_no_instant_can_hold() {
+        let mut ep = incident().finished.remove(0);
+        // Past `Duration`, then past `Instant` but not `Duration`.
+        ep.frames[1].at = 1e20;
+        ep.frames[2].at = 1e19;
+        ep.frames[0].ages.interface = Some(1e20);
+        ep.frames[3].ages.egress = Some(-1e20);
+        let report = replay(&ep);
+        assert_eq!(report.frames, ep.frames.len());
+        let times = ep.frames[0].ages.to_times(Instant::now(), 0.0);
+        assert_eq!(times.interface, None);
+    }
+
+    /// Just over a megabyte of gzip that inflates to 1 GiB of zeros, close to
+    /// the most deflate can pack.
+    fn gzip_bomb() -> Vec<u8> {
+        const SEGMENT: usize = 1 << 20;
+        let zeros = vec![0u8; SEGMENT];
+        // A full flush ends the deflate block on a byte boundary, so the
+        // same bytes can follow themselves; every distance back still lands
+        // on a zero.
+        let mut deflate = flate2::Compress::new(flate2::Compression::best(), false);
+        let mut block = Vec::with_capacity(SEGMENT);
+        deflate
+            .compress_vec(&zeros, &mut block, flate2::FlushCompress::Full)
+            .unwrap();
+        assert_eq!(deflate.total_in(), SEGMENT as u64);
+        let mut segment = flate2::Crc::new();
+        segment.update(&zeros);
+        let mut whole = flate2::Crc::new();
+        let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+        for _ in 0..1024 {
+            gz.extend_from_slice(&block);
+            whole.combine(&segment);
+        }
+        // An empty final block, then the trailer a whole file would have.
+        gz.extend_from_slice(&[0x03, 0x00]);
+        gz.extend_from_slice(&whole.sum().to_le_bytes());
+        gz.extend_from_slice(&whole.amount().to_le_bytes());
+        gz
+    }
+
+    /// Before the cap, this held the whole gigabyte in memory and then
+    /// failed to parse it.
+    #[test]
+    fn load_rejects_oversized_gzip() {
+        let bomb = gzip_bomb();
+        assert!(bomb.len() * 1000 < 1 << 30, "{} bytes", bomb.len());
+        let dir = std::env::temp_dir().join(format!("nw-bomb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bomb.json.gz");
+        std::fs::write(&path, bomb).unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            err.contains(&format!("more than {} MiB", MAX_LOAD_BYTES >> 20)),
+            "{err}"
+        );
+    }
+
+    /// serde quotes a variant it does not know as written, escapes and all,
+    /// and `diagnose episodes` prints the error.
+    #[test]
+    fn a_load_error_does_not_quote_escapes() {
+        let dir = std::env::temp_dir().join(format!("nw-bad-ep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"id":"x","source":{"kind":"\u001b]52;c;aGk=\u0007"}}"#,
+        )
+        .unwrap();
+        let err = load(&path).unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(err.contains("unknown variant"), "{err}");
+        assert!(!err.chars().any(crate::ui::sanitize::is_unsafe), "{err:?}");
+    }
+
+    /// A gzip of `frames` frames with every field empty, in an episode that
+    /// is otherwise real.
+    fn empty_frames(frames: usize) -> Vec<u8> {
+        let mut ep = incident().finished.remove(0);
+        ep.frames.clear();
+        let empty = r#"{"at":0,"ts":"","obs":{},"ages":{}}"#;
+        let json = serde_json::to_string(&ep).unwrap().replacen(
+            r#""frames":[]"#,
+            &format!(r#""frames":[{}]"#, vec![empty; frames].join(",")),
+            1,
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(json.as_bytes()).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A few kilobytes of gzip, nowhere near the byte limit. Before the frame
+    /// limit, a million of these frames took 2.6 GB.
+    #[test]
+    fn load_rejects_more_frames_than_a_recording_holds() {
+        let dir = std::env::temp_dir().join(format!("nw-frames-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frames.json.gz");
+        std::fs::write(&path, empty_frames(MAX_LOAD_FRAMES)).unwrap();
+        let most = load(&path).map(|ep| ep.frames.len());
+        let gz = empty_frames(MAX_LOAD_FRAMES + 1);
+        assert!(gz.len() < 64 << 10, "{} bytes", gz.len());
+        std::fs::write(&path, gz).unwrap();
+        let over = load(&path).map(|ep| ep.frames.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(most.unwrap(), MAX_LOAD_FRAMES);
+        let err = over.unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("more than {MAX_LOAD_FRAMES} frames")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn read_capped_takes_up_to_the_cap_and_no_more() {
+        let text = b"0123456789";
+        assert_eq!(read_capped(&text[..], 10).unwrap(), text);
+        assert!(read_capped(&text[..], 9).is_err());
+    }
+
     #[test]
     fn a_simulated_day_of_quiet_time_and_incidents_stays_under_five_megabytes() {
         let mut session = Session::new();
@@ -2543,5 +2856,27 @@ mod tests {
             .collect();
         assert_eq!(left, vec!["1.json.gz", "2.json.gz"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Path::is_dir` follows a link, so a link back up the tree was walked
+    /// until the path held more links than the kernel resolves, listing each
+    /// episode once a lap, and two such links did not finish. A link out of
+    /// the tree handed `prune` files that are not netwatch's.
+    #[cfg(unix)]
+    #[test]
+    fn list_does_not_follow_links_to_directories() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("nw-links-{}", uuid::Uuid::new_v4()));
+        let (root, outside) = (dir.join("episodes"), dir.join("elsewhere"));
+        std::fs::create_dir_all(root.join("2026-09")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let ep = root.join("2026-09").join("ep.json.gz");
+        std::fs::write(&ep, b"").unwrap();
+        std::fs::write(outside.join("theirs.json.gz"), b"").unwrap();
+        symlink(".", root.join("loop")).unwrap();
+        symlink(&outside, root.join("out")).unwrap();
+        let listed = list(&root);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(listed, vec![ep]);
     }
 }

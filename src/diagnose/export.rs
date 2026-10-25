@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::episode::{self, Episode};
+use crate::ui::sanitize::{display, display_owned};
 
 pub const FORMAT: &str = "netwatch-episode-export";
 pub const VERSION: u32 = 1;
@@ -556,6 +557,34 @@ pub fn write(bundle: &Bundle, path: &Path) -> std::io::Result<()> {
     result
 }
 
+/// One line per episode in the bundle, then one per file left out. Ids,
+/// times and keys come from the file, which can be someone else's, so each
+/// goes through [`display`] on its way to the terminal.
+fn preview_lines(preview: &Preview) -> Vec<String> {
+    let mut lines: Vec<String> = preview
+        .bundle
+        .episodes
+        .iter()
+        .map(|ep| {
+            format!(
+                "  {}  {}  {:>4}m  {}",
+                display(&ep.id.chars().take(8).collect::<String>()),
+                display(&ep.started),
+                (ep.duration_secs() / 60.0).round() as u64,
+                display_owned(ep.issue_keys().join(", "))
+            )
+        })
+        .collect();
+    for (path, why) in &preview.skipped {
+        lines.push(format!(
+            "  skipped {}: {}",
+            display_owned(path.display().to_string()),
+            display(why)
+        ));
+    }
+    lines
+}
+
 /// `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]`
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     let (mut since, mut out, mut dry_run, mut dir) = (7u64, None, false, None);
@@ -591,17 +620,8 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         "episodes from the last {since} days under {}:",
         dir.display()
     );
-    for ep in &preview.bundle.episodes {
-        println!(
-            "  {}  {}  {:>4}m  {}",
-            &ep.id[..8.min(ep.id.len())],
-            ep.started,
-            (ep.duration_secs() / 60.0).round() as u64,
-            ep.issue_keys().join(", ")
-        );
-    }
-    for (path, why) in &preview.skipped {
-        println!("  skipped {}: {why}", path.display());
+    for line in preview_lines(&preview) {
+        println!("{line}");
     }
     let redacted: Vec<String> = preview
         .counts
@@ -647,6 +667,42 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The preview prints episodes before anything is written, and the
+    /// redactor keeps ids, times and issue keys as the file had them.
+    #[test]
+    fn the_preview_prints_a_shared_episode_as_text() {
+        use crate::ui::sanitize::is_unsafe;
+        const OSC52: &str = "\x1b]52;c;aGk=\x07";
+        let mut ep = fixture_episode();
+        // Byte 8 falls inside the euro sign.
+        ep.id = "aaaaaaa€".into();
+        ep.started = format!("{}{OSC52}", ep.started);
+        ep.frames[0].open.push(episode::OpenIssue {
+            key: format!("rule|{OSC52}"),
+            top_cause: None,
+        });
+        let preview = Preview {
+            bundle: Bundle {
+                format: FORMAT,
+                version: VERSION,
+                created: String::new(),
+                install: String::new(),
+                redaction: REDACTION_NOTE,
+                episodes: vec![ep],
+            },
+            skipped: vec![(PathBuf::from(format!("{OSC52}.json.gz")), OSC52.into())],
+            counts: BTreeMap::new(),
+        };
+        let lines = preview_lines(&preview);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("  aaaaaaa€  "), "{lines:?}");
+        assert!(lines[0].contains("rule|·]52"), "{lines:?}");
+        assert!(lines[1].starts_with("  skipped ·]52"), "{lines:?}");
+        for line in &lines {
+            assert!(!line.chars().any(is_unsafe), "{line:?}");
+        }
+    }
 
     #[test]
     fn addresses_become_stable_classed_tokens() {
