@@ -1828,6 +1828,8 @@ mod tests {
     struct FakeTime {
         start: Instant,
         elapsed: std::cell::Cell<Duration>,
+        /// Reads since the clock last moved.
+        still: std::cell::Cell<u32>,
     }
 
     impl FakeTime {
@@ -1835,15 +1837,22 @@ mod tests {
             Self {
                 start: Instant::now(),
                 elapsed: Default::default(),
+                still: Default::default(),
             }
         }
         fn at(&self, ms: u64) -> Instant {
             self.start + Duration::from_millis(ms)
         }
         fn now(&self) -> Instant {
+            // A loop that sleeps on the real clock would read this one
+            // forever and hang the test instead of failing it.
+            let still = self.still.get() + 1;
+            assert!(still < 100, "the clock stood still: a real sleep?");
+            self.still.set(still);
             self.start + self.elapsed.get()
         }
         fn sleep(&self, d: Duration) {
+            self.still.set(0);
             self.elapsed.set(self.elapsed.get() + d);
         }
     }
@@ -1901,7 +1910,7 @@ mod tests {
             5,
             || panic!("no upload"),
             || time.now(),
-            |d| time.sleep(d),
+            |_| panic!("waited although the upload had failed"),
         );
         assert_eq!(failed, None);
         let soon = time.now() + Duration::from_millis(100);
