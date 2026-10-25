@@ -4,6 +4,24 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Less `unsafe` code, and the raw-pointer reads this change touches check
+  what they assume.** Six places that read the effective user ID, and three
+  in tests, call nix's safe wrapper instead of libc inside an `unsafe`
+  block. The sandbox's Landlock write-grant check still calls libc. On
+  Windows, the Npcap loader and doctor's query of the Npcap driver service
+  call the windows-sys declarations instead of hand-written ones, and on
+  macOS the process path lookup uses libc's declaration of `proc_pidpath`.
+  Reading the Windows socket tables now checks that the buffer holds the
+  whole table struct, a header and one row, before it reads the row count,
+  which only the caller guaranteed before, and the build fails if the
+  alignment the socket table, adapter and ICMP buffers rely on stops
+  holding. macOS and FreeBSD share one walk of the `getifaddrs` list for the
+  link speed. It skips an entry with no name instead of reading a null
+  pointer, and reads only the speed field rather than borrowing the whole
+  `if_data` record. Nothing netwatch shows changes, and no new crate is
+  compiled.
+
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
   including on wide terminals. Their time labels reflect the retained history
@@ -50,6 +68,11 @@ All notable changes to NetWatch will be documented in this file.
   and `y` (copy) now act only on a packet the list shows, where they used to
   act on the hidden one whether `x` or the display filter hid it. Turning `x`
   off shows the packet again.
+- **Worker threads carry their names.** They were started unnamed, so the
+  log recorded a panic in any of them as `thread="unnamed"`, and `top -H`
+  or `ps -L` listed every worker as `netwatch`. Each now has its worker's
+  name (`capture`, `connections`, `health`, `reverse-dns` and so on), which
+  the kernel shortens to 15 characters.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -67,6 +90,59 @@ All notable changes to NetWatch will be documented in this file.
   the detail pane stops showing it and asks for a selection. `W` still found
   that packet in the whole capture and sent its source and destination to
   rdap.org. `W` now looks up a packet only while its row is in the list.
+- **Run as root, the sandbox now takes the capabilities netwatch does not
+  need from every confined thread.** It removes capabilities by a
+  deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.
+  Under sudo, every confined thread, the packet parser included, kept 38 of
+  root's 41 capabilities (37 with `--sandbox-strict`). One was
+  CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
+  memory, page cache included, through `/proc/kcore`, past every filesystem
+  rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
+  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more, and keep 11 (10 in
+  strict mode): file access in the user's directories, resource limits and
+  scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
+  CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
+  remains defence in depth, not containment. Losing CAP_SYS_PTRACE costs
+  something under sudo on a kernel where Landlock does not enforce (older
+  than 5.13, or Landlock missing from `lsm=`): confined threads can no
+  longer read `/proc/<pid>/exe` or the socket links in `/proc/<pid>/fd` of
+  almost any process but netwatch itself. Without CAP_SYS_PTRACE the kernel
+  allows those reads of another process only if it runs as root, is dumpable
+  and holds no capability the reading thread lacks. That rules out your
+  processes and other users', and also most root daemons, systemd among
+  them, because they hold capabilities a confined thread has dropped. Such a
+  process is named by the kernel's 15-character `comm` rather than its
+  executable, and its connections have no owner on a poll that finds the
+  latest process-attribution scan more than 5 seconds old. Where Landlock
+  enforces, it already refused those reads. Runs without elevation, with the
+  documented `setcap` line or under the systemd unit drop what they did
+  before.
+- **The process-attribution thread no longer keeps every capability
+  netwatch started with.** It reads other processes' socket fds in `/proc`
+  to name each connection's owner, so it runs outside the sandbox, and it
+  never dropped anything: in every mode, `--sandbox-strict` included, it
+  held CAP_NET_RAW, CAP_BPF and CAP_PERFMON under the `setcap` line and all
+  41 of root's capabilities under sudo. Strict mode's promise to drop
+  CAP_NET_RAW was therefore untrue of the process. Before its first scan the
+  thread now drops everything except CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
+  the two it needs to read another user's sockets under root, so its scans
+  attribute connections as before.
+- **The threat model states the limits of the Linux sandbox.** The 0.17.0
+  release notes overstated protection by saying a compromised parser cannot
+  read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.
+  Threads share memory and descriptors, the proc broker is outside Landlock,
+  and outbound networking remains unrestricted. Under the `setcap` line or
+  sudo, the default best-effort mode leaves CAP_NET_RAW on every confined
+  thread, the parser included, so capture can reopen, and every thread
+  shares the open capture descriptor: a compromised parser can open or use
+  raw sockets. Only `--sandbox-strict` drops CAP_NET_RAW, and it does not
+  close a descriptor already open. Root operation has limited containment.
+  The preferred Linux setup restricts a capability-enabled binary to a
+  dedicated group; policy and endpoint tables are checked in tests, and the
+  outbound inventory lists the trace to 1.1.1.1 that every TUI session runs
+  at startup. `netwatch doctor` said eBPF was disabled by the sandbox
+  policy, untrue since 0.32.2; it now says eBPF loads under the policy and
+  its reader keeps the load capabilities.
 
 ## [0.38.0] - 2026-10-25
 
@@ -283,66 +359,6 @@ All notable changes to NetWatch will be documented in this file.
   can change after upgrading: an `allow_sni` list stops flagging allowed
   IPv6 traffic that had no name before, and a `deny_sni` list now catches
   IPv6 traffic it used to miss.
-- **Worker threads carry their names.** They were started unnamed, so the
-  log recorded a panic in any of them as `thread="unnamed"`, and `top -H`
-  or `ps -L` listed every worker as `netwatch`. Each now has its worker's
-  name (`connections`, `health`, `reverse-dns` and so on), which the kernel
-  shortens to 15 characters.
-
-### Security
-- **The threat model states the limits of the Linux sandbox.** The 0.17.0
-  release notes overstated protection by saying a compromised parser cannot
-  read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.
-  Threads share memory and descriptors, the proc broker is outside Landlock,
-  and outbound networking remains unrestricted. Under the `setcap` line or
-  sudo, the default best-effort mode leaves CAP_NET_RAW on every confined
-  thread, the parser included, so capture can reopen, and every thread
-  shares the open capture descriptor: a compromised parser can open or use
-  raw sockets. Only `--sandbox-strict` drops CAP_NET_RAW, and it does not
-  close a descriptor already open. Root operation has limited containment.
-  The preferred Linux setup restricts a capability-enabled binary to a
-  dedicated group; policy and endpoint tables are checked in tests, and the
-  outbound inventory lists the trace to 1.1.1.1 that every TUI session runs
-  at startup. `netwatch doctor` said eBPF was disabled by the sandbox
-  policy, untrue since 0.32.2; it now says eBPF loads under the policy and
-  its reader keeps the load capabilities.
-- **Run as root, the sandbox now takes the capabilities netwatch never
-  uses from every confined thread.** It removes capabilities by a
-  deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.
-  Under sudo, every confined thread, the packet parser included, kept 38 of
-  root's 41 capabilities (37 with `--sandbox-strict`). One was
-  CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
-  memory, page cache included, through `/proc/kcore`, past every filesystem
-  rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
-  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more, and keep 11 (10 in
-  strict mode): file access in the user's directories, resource limits and
-  scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
-  CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
-  remains defence in depth, not containment. Runs without elevation, with
-  the documented `setcap` line or under the systemd unit drop what they did
-  before.
-- **The process-attribution thread no longer keeps every capability
-  netwatch started with.** It reads other processes' socket fds in `/proc`
-  to name each connection's owner, so it runs outside the sandbox, and it
-  never dropped anything: in every mode, `--sandbox-strict` included, it
-  held CAP_NET_RAW, CAP_BPF and CAP_PERFMON under the `setcap` line and all
-  41 of root's capabilities under sudo. Strict mode's promise to drop
-  CAP_NET_RAW was therefore untrue of the process. Before its first scan the
-  thread now drops everything except CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
-  the two it needs to read another user's sockets under root, so
-  connections are attributed as before.
-
-### Security
-- **Selecting a packet or a connection no longer sends its addresses to
-  rdap.org. Only `W` does.** Since 0.8.0 the Packets detail pane, and since
-  0.16.1 the Connections detail strip, started a WHOIS lookup themselves the
-  first time they drew an address. Stepping through a capture sent the
-  source and destination of each packet you landed on to rdap.org over
-  HTTPS, and on to the regional registry it redirects to. Moving down the
-  Connections table, or leaving the cursor on a row while the live table
-  changed under it, did the same with each remote address. Addresses in the
-  private ranges WHOIS skips were not sent. The panes now show only what a
-  `W` press has already fetched.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**

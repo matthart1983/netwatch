@@ -26,10 +26,11 @@ pub(crate) const TARGET_ABI: ABI = ABI::V4;
 ///
 /// Without elevation the thread holds none of them and this changes nothing.
 /// Under the documented `setcap` line it takes CAP_BPF and CAP_PERFMON. Under
-/// root it takes everything no code path uses after startup: a confined
-/// thread otherwise keeps almost every capability, and with CAP_SYS_RAWIO and
-/// the `/proc` grant it could read kernel memory, page cache included, through
-/// `/proc/kcore`, which no filesystem rule stops. What root keeps is file
+/// root it takes everything no code path needs after startup (CAP_SYS_PTRACE
+/// costs process names; see below): a confined thread otherwise keeps
+/// almost every capability, and with CAP_SYS_RAWIO and the `/proc` grant it
+/// could read kernel memory, page cache included, through `/proc/kcore`,
+/// which no filesystem rule stops. What root keeps is file
 /// access in the user's directories (CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH,
 /// CAP_FOWNER, CAP_CHOWN, CAP_FSETID), limits and scheduling
 /// (CAP_SYS_RESOURCE, CAP_SYS_NICE, CAP_IPC_LOCK), CAP_NET_BIND_SERVICE for a
@@ -55,7 +56,20 @@ pub(crate) const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
     Capability::CAP_BLOCK_SUSPEND,
     // Other processes. Landlock already refuses a confined thread ptrace
     // access outside its domain; the ProcBroker, which never enters, keeps
-    // CAP_SYS_PTRACE for its socket scan (`CAPS_FOR_PROC_BROKER`).
+    // CAP_SYS_PTRACE for its socket scan (`CAPS_FOR_PROC_BROKER`). Where
+    // Landlock does not enforce, this drop is what refuses it, and under root
+    // that costs something. Without CAP_SYS_PTRACE the kernel's ptrace read
+    // check passes for another process only if its uids and gids match the
+    // reader's, it is dumpable, and its permitted set lies within the
+    // reader's effective set. A confined thread keeps at most 11
+    // capabilities, so the connections worker can no longer read
+    // `/proc/<pid>/exe` or the `/proc/<pid>/fd` links of almost any process
+    // but netwatch's own: not another user's, not one that is not dumpable,
+    // and not a root process holding a capability the thread dropped, which
+    // takes in most root daemons, systemd included. Such a process keeps the
+    // 15-character `comm` the broker gave it as its name, and a poll with no
+    // fresh broker snapshot leaves its sockets unattributed. Resolving names
+    // in the broker would bring them back.
     Capability::CAP_SYS_PTRACE,
     Capability::CAP_KILL,
     Capability::CAP_CHECKPOINT_RESTORE,

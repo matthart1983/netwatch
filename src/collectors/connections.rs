@@ -1821,7 +1821,9 @@ pub struct ProcBroker {
 
 #[cfg(target_os = "linux")]
 impl ProcBroker {
-    /// Must be called from a thread that has not applied the sandbox.
+    /// Must be called from a thread that has not applied the sandbox. The
+    /// first snapshot is taken here, on that thread, so owners are available
+    /// before the broker's own thread first scans one `interval` later.
     pub fn start(interval: std::time::Duration) -> Arc<Self> {
         let broker = Arc::new(Self {
             latest: RwLock::new(Some(Arc::new(capture_proc_snapshot()))),
@@ -2418,6 +2420,36 @@ mod tests {
         let weak = Arc::downgrade(&broker);
         drop(broker);
         assert!(eventually(&|| weak.upgrade().is_none()));
+    }
+    /// The broker's thread sleeps a whole interval before its first scan, so
+    /// `start` publishes a scan of its own, taken on the calling thread. A
+    /// confined poller therefore has owners from the first poll and does not
+    /// fall back to its own fd scan, which it may lack the capabilities for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_broker_attributes_before_its_thread_first_scans() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect("127.0.0.1:45680").unwrap();
+        let local = socket.local_addr().unwrap().to_string();
+        let conn = || make_conn("UDP", &local, "127.0.0.1:45680", "", 1);
+        // Retry for the same fork-to-exec window `snapshot_owning` waits out.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // Far longer than this test runs: the thread never scans here.
+            let broker = ProcBroker::start(std::time::Duration::from_secs(600));
+            let returned = Instant::now();
+            let snap = broker.latest().expect("start publishes a snapshot");
+            assert!(snap.captured_at <= returned);
+            let mut c = conn();
+            overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
+            if c.pid == Some(std::process::id()) || Instant::now() >= deadline {
+                assert_eq!(c.pid, Some(std::process::id()));
+                // From that snapshot, not from a local scan.
+                assert_eq!(c.evidence.owner_checked_utc_ms, Some(snap.scanned_utc_ms));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     #[cfg(target_os = "linux")]
     #[test]

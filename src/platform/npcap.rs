@@ -20,18 +20,15 @@
 //! and which lives beside it: the loader searches the `SetDllDirectoryW`
 //! directory when resolving a dependency, and would otherwise miss it too.
 
-use std::ffi::{c_void, OsString};
+use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
-
-// Three calls from kernel32, declared by hand rather than taking a dependency
-// on a Windows API crate for them. `kernel32` is already linked by std, and
-// these three signatures have been stable since Windows XP / Vista.
-extern "system" {
-    fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
-    fn SetDllDirectoryW(path: *const u16) -> i32;
-    fn LoadLibraryW(name: *const u16) -> *mut c_void;
-}
+use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, SetDllDirectoryW};
+use windows_sys::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+    SERVICE_QUERY_STATUS, SERVICE_STATUS,
+};
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
 fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -61,40 +58,14 @@ pub fn installed() -> bool {
         .is_some_and(|p| p.join("Npcap/wpcap.dll").is_file() || p.join("wpcap.dll").is_file())
 }
 
-// The Service Control Manager calls doctor uses to ask whether Npcap's driver
-// is running, declared by hand for the same reason as the kernel32 ones above.
-// Wireshark checks the same way before warning "The NPF driver isn't running".
-const SC_MANAGER_CONNECT: u32 = 0x0001;
-const SERVICE_QUERY_STATUS: u32 = 0x0004;
-
-/// `SERVICE_STATUS`: seven DWORDs, unchanged since Windows NT.
-#[repr(C)]
-#[derive(Default)]
-struct ServiceStatus {
-    service_type: u32,
-    current_state: u32,
-    controls_accepted: u32,
-    win32_exit_code: u32,
-    service_specific_exit_code: u32,
-    check_point: u32,
-    wait_hint: u32,
-}
-
-#[link(name = "advapi32")]
-extern "system" {
-    fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> *mut c_void;
-    fn OpenServiceW(manager: *mut c_void, name: *const u16, access: u32) -> *mut c_void;
-    fn QueryServiceStatus(service: *mut c_void, status: *mut ServiceStatus) -> i32;
-    fn CloseServiceHandle(handle: *mut c_void) -> i32;
-}
-
 /// The `npcap` driver service's `dwCurrentState`, or the Win32 error that kept
 /// us from reading it (1060 when no such service is registered).
 ///
 /// This asks the Service Control Manager, which normally needs no elevation
 /// for a status query, so doctor can tell "Npcap's files are there but its
 /// driver is not running" from a working install without loading `wpcap.dll`
-/// or opening the driver. Static doctor promises to do neither.
+/// or opening the driver. Static doctor promises to do neither. Wireshark asks
+/// the same way before warning "The NPF driver isn't running".
 pub fn driver_service_state() -> Result<u32, u32> {
     service_state("npcap")
 }
@@ -116,12 +87,12 @@ fn service_state(name: &str) -> Result<u32, u32> {
     let state = if service.is_null() {
         Err(last_error())
     } else {
-        let mut status = ServiceStatus::default();
+        let mut status = SERVICE_STATUS::default();
         // SAFETY: `service` was opened with SERVICE_QUERY_STATUS, and `status`
         // is a writable SERVICE_STATUS the call fills in.
         let ok = unsafe { QueryServiceStatus(service, &mut status) } != 0;
         let state = if ok {
-            Ok(status.current_state)
+            Ok(status.dwCurrentState)
         } else {
             Err(last_error())
         };
