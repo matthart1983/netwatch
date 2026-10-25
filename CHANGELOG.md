@@ -9,6 +9,18 @@ All notable changes to NetWatch will be documented in this file.
   including on wide terminals. Their time labels reflect the retained history
   and refresh interval instead of always saying `60s`.
 
+### Security
+- **Selecting a packet or a connection no longer sends its addresses to
+  rdap.org. Only `W` does.** Since 0.8.0 the Packets detail pane, and since
+  0.16.1 the Connections detail strip, started a WHOIS lookup themselves the
+  first time they drew an address. Stepping through a capture sent the
+  source and destination of each packet you landed on to rdap.org over
+  HTTPS, and on to the regional registry it redirects to. Moving down the
+  Connections table, or leaving the cursor on a row while the live table
+  changed under it, did the same with each remote address. Addresses in the
+  private ranges WHOIS skips were not sent. The panes now show only what a
+  `W` press has already fetched.
+
 ## [0.38.0] - 2026-10-25
 
 ### Added
