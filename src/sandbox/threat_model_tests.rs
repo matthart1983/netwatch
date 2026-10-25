@@ -40,29 +40,38 @@ fn threat_model_policy_tables_match_code() {
         geoip_asn_db_dir: Some("<asn-file>".into()),
         keylog_dir: Some("<keylog-file>".into()),
     };
-    let mut rows = Vec::new();
-    for (kind, entries) in [
-        ("read", linux::collect_read_only(&paths)),
-        ("write", linux::collect_read_write(&paths)),
-    ] {
-        rows.extend(entries.iter().map(|p| format!("{kind}: {}", p.display())));
-    }
+    // The rules the ruleset is built from, so each row's label is the one
+    // the ruleset gives its path.
+    let grants = linux::grants(&paths);
+    let rows: Vec<_> = grants
+        .iter()
+        .map(|g| {
+            let label = if g.write { "write" } else { "read" };
+            format!("{label}: {}", g.path.display())
+        })
+        .collect();
     assert_eq!(block("policy:grants"), rows.join("\n"));
-    // And the labels mean what the document says they grant.
+    // And each rule allows what the document says its label grants.
     use landlock::{Access, AccessFs, BitFlags};
     let abi = linux::TARGET_ABI;
-    assert_eq!(
-        linux::rule_access(false, true, false),
-        AccessFs::from_read(abi)
-    );
-    assert_eq!(
-        linux::rule_access(false, false, true),
-        BitFlags::from(AccessFs::ReadFile)
-    );
-    assert_eq!(
-        linux::rule_access(true, true, false),
-        AccessFs::from_all(abi)
-    );
+    let file_rights =
+        AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Execute | AccessFs::Truncate;
+    let files = ["<city-file>", "<asn-file>", "<keylog-file>"].map(std::path::Path::new);
+    for grant in &grants {
+        let (dir, file) = if files.contains(&grant.path.as_path()) {
+            (None, BitFlags::from(AccessFs::ReadFile))
+        } else if grant.write {
+            let all = AccessFs::from_all(abi);
+            (Some(all), all & file_rights)
+        } else {
+            let read = AccessFs::from_read(abi);
+            (Some(read), read & file_rights)
+        };
+        if let Some(dir) = dir {
+            assert_eq!(grant.access(true), dir, "{}", grant.path.display());
+        }
+        assert_eq!(grant.access(false), file, "{}", grant.path.display());
+    }
 }
 
 #[test]

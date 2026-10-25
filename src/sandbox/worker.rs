@@ -462,7 +462,21 @@ mod tests {
         std::os::unix::fs::symlink(&root, root.join("exports")).unwrap();
         let escape = root.join("exports").join("escape");
         let secret = root.join("secret");
+        // /proc is a read grant, and a thread may write its own name to
+        // /proc/thread-self/comm. Opening it for writing is allowed here and
+        // must be refused once confined, which it would not be if the
+        // ruleset gave a read row more than reading.
+        let open_comm_for_write = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/proc/thread-self/comm")
+        };
+        open_comm_for_write().unwrap();
         spawn("boundary-check", move || {
+            assert_eq!(
+                open_comm_for_write().unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
             assert_eq!(
                 std::fs::read(secret).unwrap_err().kind(),
                 std::io::ErrorKind::PermissionDenied

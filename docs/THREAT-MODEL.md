@@ -72,16 +72,18 @@ proc-broker: CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH
 <!-- /policy:caps -->
 ```
 
-The following grants are checked against the path collectors with every optional
-path supplied. Placeholders are prepared application directories or exact input
-files, not literal paths. Missing paths are skipped; grants are pinned to opened
-objects. A file replacement requires a new session. The test also checks what each
-label grants: a read row allows execute, read-file and read-directory beneath it;
-the city, ASN and keylog files allow read-file only; a write row allows every
-filesystem right the requested ABI handles, so read access accompanies it. A row
-that names a file rather than a directory keeps only the file rights. See
-[path collection](../src/sandbox/linux.rs#L283),
-[access per grant](../src/sandbox/linux.rs#L455) and
+The following grants are checked against the rule list the ruleset is built
+from, with every optional path supplied. Placeholders are prepared application
+directories or exact input files, not literal paths. Missing paths are skipped;
+grants are pinned to opened objects. A file replacement requires a new session.
+The test also checks that each rule allows what its label says: a read row allows
+execute, read-file and read-directory beneath it; the city, ASN and keylog files
+allow read-file only; a write row allows every filesystem right the requested ABI
+handles, so read access accompanies it. A row that names a file rather than a
+directory keeps only the file rights. The worker acceptance test checks the
+enforced result: a confined thread cannot open a file beneath the `/proc` read
+grant for writing. See [path collection](../src/sandbox/linux.rs#L283),
+[access per grant](../src/sandbox/linux.rs#L472) and
 [path preparation](../src/sandbox/paths.rs#L1).
 
 ```text

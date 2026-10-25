@@ -392,86 +392,102 @@ pub(super) fn prepare_ruleset(paths: &SandboxPaths) -> Result<landlock::RulesetC
         .map_err(|e| e.to_string())?
         .create()
         .map_err(|e| e.to_string())?;
-    for (paths_to_open, write) in [
-        (collect_read_only(paths), false),
-        (collect_read_write(paths), true),
-    ] {
-        for path in paths_to_open {
-            let configured_file = [
-                &paths.geoip_db_dir,
-                &paths.geoip_asn_db_dir,
-                &paths.keylog_dir,
+    for grant in grants(paths) {
+        let (path, write) = (&grant.path, grant.write);
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(nix::libc::O_PATH | if write { nix::libc::O_NOFOLLOW } else { 0 });
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !write => continue,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if grant.configured_file && !meta.is_file() {
+            return Err(format!("expected file grant: {}", path.display()));
+        }
+        if write && path != Path::new("/dev/null") {
+            if !meta.is_dir()
+                || meta.uid() != unsafe { nix::libc::geteuid() }
+                || meta.mode() & 0o077 != 0
+            {
+                return Err(format!(
+                    "directory must be owned and private: {}",
+                    path.display()
+                ));
+            }
+            for broad in [
+                Some(PathBuf::from("/")),
+                Some(PathBuf::from("/tmp")),
+                dirs::home_dir(),
             ]
             .into_iter()
             .flatten()
-            .any(|p| *p == path);
-            let mut options = std::fs::OpenOptions::new();
-            options
-                .read(true)
-                .custom_flags(nix::libc::O_PATH | if write { nix::libc::O_NOFOLLOW } else { 0 });
-            let file = match options.open(&path) {
-                Ok(file) => file,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !write => continue,
-                Err(e) => return Err(format!("{}: {e}", path.display())),
-            };
-            let meta = file.metadata().map_err(|e| e.to_string())?;
-            if configured_file && !meta.is_file() {
-                return Err(format!("expected file grant: {}", path.display()));
-            }
-            if write && path != Path::new("/dev/null") {
-                if !meta.is_dir()
-                    || meta.uid() != unsafe { nix::libc::geteuid() }
-                    || meta.mode() & 0o077 != 0
-                {
-                    return Err(format!(
-                        "directory must be owned and private: {}",
-                        path.display()
-                    ));
-                }
-                for broad in [
-                    Some(PathBuf::from("/")),
-                    Some(PathBuf::from("/tmp")),
-                    dirs::home_dir(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if let Ok(other) = std::fs::metadata(broad) {
-                        if meta.dev() == other.dev() && meta.ino() == other.ino() {
-                            return Err("broad directory grant rejected".into());
-                        }
+            {
+                if let Ok(other) = std::fs::metadata(broad) {
+                    if meta.dev() == other.dev() && meta.ino() == other.ino() {
+                        return Err("broad directory grant rejected".into());
                     }
                 }
             }
-            let access = rule_access(write, meta.is_dir(), configured_file);
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(file, access))
-                .map_err(|e| e.to_string())?;
         }
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(file, grant.access(meta.is_dir())))
+            .map_err(|e| e.to_string())?;
     }
     Ok(ruleset)
 }
 
-/// What one grant allows: every handled right for a write grant, reading
-/// for a read grant, and only reading the file itself for a configured
-/// GeoIP or keylog file. A non-directory takes only the file rights.
-pub(super) fn rule_access(
-    write: bool,
-    is_dir: bool,
+/// One rule [`prepare_ruleset`] adds, before its path is opened.
+pub(super) struct Grant {
+    pub(super) path: PathBuf,
+    /// A write grant, labelled `write:` in docs/THREAT-MODEL.md, rather
+    /// than a read grant, labelled `read:`.
+    pub(super) write: bool,
+    /// A GeoIP database or keylog file the user configured.
     configured_file: bool,
-) -> landlock::BitFlags<AccessFs> {
-    if configured_file {
-        return AccessFs::ReadFile.into();
+}
+
+/// Every rule [`prepare_ruleset`] adds, read grants first. The threat
+/// model's grants table is checked against this list, labels included.
+pub(super) fn grants(paths: &SandboxPaths) -> Vec<Grant> {
+    let configured = [
+        &paths.geoip_db_dir,
+        &paths.geoip_asn_db_dir,
+        &paths.keylog_dir,
+    ];
+    let read = collect_read_only(paths).into_iter().map(|p| (p, false));
+    let write = collect_read_write(paths).into_iter().map(|p| (p, true));
+    read.chain(write)
+        .map(|(path, write)| Grant {
+            configured_file: configured.iter().copied().flatten().any(|p| *p == path),
+            path,
+            write,
+        })
+        .collect()
+}
+
+impl Grant {
+    /// What the grant allows: every handled right for a write grant,
+    /// reading for a read grant, and only reading the file itself for a
+    /// configured GeoIP or keylog file. A non-directory takes only the file
+    /// rights.
+    pub(super) fn access(&self, is_dir: bool) -> landlock::BitFlags<AccessFs> {
+        if self.configured_file {
+            return AccessFs::ReadFile.into();
+        }
+        let mut access = if self.write {
+            AccessFs::from_all(TARGET_ABI)
+        } else {
+            AccessFs::from_read(TARGET_ABI)
+        };
+        if !is_dir {
+            access &=
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Execute | AccessFs::Truncate;
+        }
+        access
     }
-    let mut access = if write {
-        AccessFs::from_all(TARGET_ABI)
-    } else {
-        AccessFs::from_read(TARGET_ABI)
-    };
-    if !is_dir {
-        access &= AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Execute | AccessFs::Truncate;
-    }
-    access
 }
 
 fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<(), String> {
