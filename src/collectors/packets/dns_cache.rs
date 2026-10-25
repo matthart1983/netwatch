@@ -319,6 +319,16 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn the_cache_is_capped() {
+        let cache = DnsCache::new();
+        let mut entries = cache.cache.lock().unwrap();
+        for i in 0..=DNS_CACHE_MAX {
+            entries.put(format!("10.0.{}.{}", i / 256, i % 256), DnsEntry::Failed);
+            assert!(entries.len() <= DNS_CACHE_MAX);
+        }
+    }
+
+    #[test]
     fn a_request_waiting_in_the_queue_is_not_queued_again() {
         let cache = DnsCache::new();
         let ip = "198.51.100.7";
