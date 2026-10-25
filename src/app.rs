@@ -2149,7 +2149,11 @@ pub(crate) fn top_conn_host(addr: &str) -> String {
     }
 }
 
-const TOP_PROC_HISTORY_LEN: usize = 60;
+/// Samples retained per (process, pid) for the Processes tab's RX chart.
+///
+/// Public because that chart's header names the window it covers, which is
+/// this many samples at the refresh interval.
+pub const TOP_PROC_HISTORY_LEN: usize = 60;
 const IFACE_EVENTS_CAP: usize = 200;
 
 #[derive(Debug, Clone)]

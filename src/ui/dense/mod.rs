@@ -560,7 +560,8 @@ fn fit_conn_history(data: &[u64], out: usize) -> Vec<u64> {
 /// The last `window` samples spread across `out` sub-columns.
 ///
 /// For plots whose header claims a fixed span — the `60s` sparkline in the
-/// interface table, the connection histories — at whatever width they get.
+/// interface table, the connection histories here and the detail graphs on
+/// the Connections and Processes tabs — at whatever width they get.
 /// Missing history is padded *before* resampling, so a short one fills from
 /// the right at its real age instead of being stretched across the plot.
 ///

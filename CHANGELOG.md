@@ -17,6 +17,15 @@ All notable changes to NetWatch will be documented in this file.
   across the plot as if they covered all 60 seconds. The plot now spreads
   the last 60 seconds across the row at every width and refresh rate, and a
   short history fills in from the right.
+- **The Connections and Processes detail graphs fill their width, and their
+  labels name the window they draw.** The Connections detail graph drew its
+  30 samples at the right edge, one or two to a column, so in a wider pane
+  the rest stayed empty, and its label said `RX 30s` at every refresh rate.
+  The Processes RX chart did the same with its 60 samples under a fixed
+  `RX 60s`, and a bar chart narrower than 60 columns dropped the oldest
+  samples it claimed to show. Both graphs now spread their whole history
+  across the chart, and the label follows the refresh interval: at 500 ms
+  they read `RX 15s` and `RX 30s`.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
