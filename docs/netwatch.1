@@ -208,24 +208,35 @@ group can run, then log in again for the membership to take effect:
 .nf
 sudo groupadd \-f netwatch
 sudo usermod \-aG netwatch "$USER"
-bin=$(command \-v netwatch)
-if [ "$(stat \-c %U "$bin")" != root ]; then
-  sudo install \-o root \-g netwatch \-m 0750 "$bin" /usr/local/bin/netwatch
-  bin=/usr/local/bin/netwatch
-fi
+bin=$(echo "$PATH" | tr : '\en' | grep \-vx '/usr/local/bin/*' | while read \-r dir; do
+  [ \-x "$dir/netwatch" ] && echo "$dir/netwatch" && break
+done)
+bin=$(readlink \-f "${bin:\-/usr/local/bin/netwatch}")
+case $bin in
+  /usr/bin/netwatch | /usr/local/bin/netwatch) ;;
+  *)
+    sudo install \-o root \-g netwatch \-m 0750 "$bin" /usr/local/bin/netwatch
+    bin=/usr/local/bin/netwatch
+    ;;
+esac
 sudo chown root:netwatch "$bin"
 sudo chmod 0750 "$bin"
 sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$bin"
 .fi
 .RE
 .PP
-A package's
+The recipe grants the first netwatch on PATH outside
+.IR /usr/local/bin ,
+with symlinks followed. A package's
 .I /usr/bin/netwatch
-is changed in place. A binary you own, such as one from cargo install, is
-copied to
+is changed in place. Any other binary, such as one from cargo install,
+Homebrew or a Nix profile, is copied to
 .I /usr/local/bin
-first; run that copy. Capabilities attach to a specific file, so they must be
-re-applied after every install or upgrade. Never grant them to a binary every
+first; run that copy. Because the search skips
+.IR /usr/local/bin ,
+a re-run after an upgrade copies the new binary over the old copy.
+Capabilities attach to a specific file, so they must be re-applied after every
+install or upgrade. Never grant them to a binary every
 account can run. Running as root works, but containment is then limited. On
 Windows, install Npcap first.
 .SH FILES

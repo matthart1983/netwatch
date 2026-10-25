@@ -404,4 +404,156 @@ mod capture_fix_tests {
             assert!(text.contains(caps), "{file} grants other capabilities");
         }
     }
+
+    /// The group-restricted recipe in REFERENCE.md and the man page, run by
+    /// `sh` in a scratch tree standing in for /usr/bin, /usr/local/bin, a
+    /// cargo bin directory and a Nix store and profile. `sudo` records which
+    /// file each command would change, and `stat` names the owner a real
+    /// system would: root for package, store and profile files and for the
+    /// copy `sudo install` makes, the user for a cargo build.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_setcap_recipe_grants_the_file_it_describes() {
+        use std::path::Path;
+        let reference = include_str!("../../docs/REFERENCE.md")
+            .split_once("### Running without sudo")
+            .and_then(|(_, rest)| rest.split_once("```bash\n"))
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .unwrap()
+            .0;
+        let man = include_str!("../../docs/netwatch.1")
+            .split_once(".SH PERMISSIONS")
+            .and_then(|(_, rest)| rest.split_once(".nf\n"))
+            .and_then(|(_, rest)| rest.split_once(".fi"))
+            .unwrap()
+            .0
+            .replace("\\-", "-")
+            .replace("\\e", "\\");
+        // The man page leaves out the comments and the closing echo.
+        let commands = |recipe: &str| {
+            recipe
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#') && !l.starts_with("echo "))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(commands(reference), commands(&man), "the recipes differ");
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("netwatch-recipe-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&scratch.0).unwrap();
+        let root = std::fs::canonicalize(&scratch.0).unwrap();
+        // Only the tools the recipe needs, so a netwatch installed on this
+        // machine cannot be found.
+        let tools = root.join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        for tool in ["tr", "grep", "readlink", "cp"] {
+            let found = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|dir| Path::new(dir).join(tool))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| panic!("no {tool}"));
+            std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
+        }
+        const SHIMS: &str = r#"
+sudo() {
+  case $1 in
+    install) shift $(($# - 2)); cp "$1" "$2"; echo "install $2" ;;
+    chown | chmod | setcap) echo "$1 $3" ;;
+  esac
+}
+stat() { case ${3#"$PWD"/} in usr/* | local/* | store/* | profile/*) echo root ;; *) echo user ;; esac; }
+"#;
+        for dir in ["usr", "local", "cargo", "store", "profile"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        // A new file each time, as an upgrade writes.
+        let put = |path: &str, text: &str| {
+            let path = root.join(path);
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, text).unwrap();
+            let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+            std::fs::set_permissions(&path, mode).unwrap();
+        };
+        // What the recipe changes, as "<command> <path under root>" lines,
+        // and what the copy in /usr/local/bin then holds.
+        let run = |recipe: &str, path: &[&str]| {
+            let script = recipe
+                .replace("/usr/local/bin", &root.join("local").display().to_string())
+                .replace(
+                    "/usr/bin/netwatch",
+                    &root.join("usr/netwatch").display().to_string(),
+                );
+            let path = path
+                .iter()
+                .map(|dir| root.join(dir))
+                .chain([tools.clone()])
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":");
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{SHIMS}{script}"))
+                .env_clear()
+                .env("PATH", path)
+                .env("USER", "user")
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            let prefix = format!("{}/", root.display());
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let changed = stdout
+                .lines()
+                .filter(|l| !l.starts_with("After"))
+                .chain(stderr.lines())
+                .map(|l| l.replace(&prefix, ""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let copy = std::fs::read_to_string(root.join("local/netwatch")).ok();
+            (changed, copy)
+        };
+        let in_place = |file: &str| format!("chown {file}, chmod {file}, setcap {file}");
+        let copied = format!("install local/netwatch, {}", in_place("local/netwatch"));
+
+        for recipe in [reference, man.as_str()] {
+            // A package: changed in place, so an upgrade resets it.
+            put("usr/netwatch", "v1");
+            assert_eq!(
+                run(recipe, &["local", "usr"]),
+                (in_place("usr/netwatch"), None)
+            );
+            std::fs::remove_file(root.join("usr/netwatch")).unwrap();
+
+            // A cargo build, with /usr/local/bin ahead of the cargo bin
+            // directory in PATH: copied, and after an upgrade the re-run
+            // copies the new build, not the old copy onto itself.
+            put("cargo/netwatch", "v1");
+            let path = ["local", "usr", "cargo"];
+            assert_eq!(run(recipe, &path), (copied.clone(), Some("v1".into())));
+            put("cargo/netwatch", "v2");
+            assert_eq!(run(recipe, &path), (copied.clone(), Some("v2".into())));
+            std::fs::remove_file(root.join("cargo/netwatch")).unwrap();
+            std::fs::remove_file(root.join("local/netwatch")).unwrap();
+
+            // A Nix profile's symlink into the store: the store file is
+            // copied, never changed.
+            put("store/netwatch", "v1");
+            std::os::unix::fs::symlink(root.join("store/netwatch"), root.join("profile/netwatch"))
+                .unwrap();
+            assert_eq!(
+                run(recipe, &["profile", "local"]),
+                (copied.clone(), Some("v1".into()))
+            );
+            std::fs::remove_file(root.join("profile/netwatch")).unwrap();
+            std::fs::remove_file(root.join("store/netwatch")).unwrap();
+            std::fs::remove_file(root.join("local/netwatch")).unwrap();
+        }
+    }
 }

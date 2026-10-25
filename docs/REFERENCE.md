@@ -686,14 +686,23 @@ again for membership to take effect. Apply capabilities last, after ownership:
 ```bash
 sudo groupadd -f netwatch
 sudo usermod -aG netwatch "$USER"
-bin=$(command -v netwatch)
-# A package's root-owned /usr/bin/netwatch is changed in place. A binary you
-# own, such as one from cargo install or a tarball, is copied to a root-owned
-# path first: its owner could otherwise make it executable by everyone.
-if [ "$(stat -c %U "$bin")" != root ]; then
-  sudo install -o root -g netwatch -m 0750 "$bin" /usr/local/bin/netwatch
-  bin=/usr/local/bin/netwatch
-fi
+# The first netwatch on PATH outside /usr/local/bin, where this recipe puts
+# its copy, so a re-run after an upgrade finds the new binary. A symlink, such
+# as a Nix profile's, is followed to its file.
+bin=$(echo "$PATH" | tr : '\n' | grep -vx '/usr/local/bin/*' | while read -r dir; do
+  [ -x "$dir/netwatch" ] && echo "$dir/netwatch" && break
+done)
+bin=$(readlink -f "${bin:-/usr/local/bin/netwatch}")
+# A package's /usr/bin/netwatch is changed in place, so an upgrade resets it.
+# Anything else is copied to a root-owned path first: a binary you own could
+# otherwise be made executable by everyone, and a Nix store file is shared.
+case $bin in
+  /usr/bin/netwatch | /usr/local/bin/netwatch) ;;
+  *)
+    sudo install -o root -g netwatch -m 0750 "$bin" /usr/local/bin/netwatch
+    bin=/usr/local/bin/netwatch
+    ;;
+esac
 sudo chown root:netwatch "$bin"
 sudo chmod 0750 "$bin"
 sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$bin"
@@ -702,14 +711,15 @@ echo "After logging in again, run $bin"
 
 > **Re-run after every install.** `setcap` attaches to a specific binary on disk. A package
 > upgrade replaces `/usr/bin/netwatch` with a root-owned, world-executable file without
-> capabilities, so capture fails until the recipe runs again. `cargo install netwatch-tui`
-> and the Release tarballs replace only their own file: the copy in `/usr/local/bin` keeps
-> the old version and its capabilities until the recipe copies the new binary over it. If
-> `command -v netwatch` still finds that old copy, set `bin` to the new binary's path. If you
-> see `pcap open failed: socket: Operation not permitted` or `BPF load failed:
-> PermissionDenied` in `~/.cache/netwatch/netwatch.log.*` after an upgrade, the binary needs
-> the root ownership, group execution restriction and `setcap` re-applied. Never grant
-> capture capabilities to a world-executable copy.
+> capabilities, so capture fails until the recipe runs again. `cargo install netwatch-tui`,
+> the Release tarballs, Homebrew and Nix replace only their own file: the copy in
+> `/usr/local/bin` keeps the old version and its capabilities until the recipe copies the
+> new binary over it. The recipe skips `/usr/local/bin` when it looks for netwatch, so the
+> re-run finds the new binary wherever `/usr/local/bin` sits in `PATH`. If you see `pcap
+> open failed: socket: Operation not permitted` or `BPF load failed: PermissionDenied` in
+> `~/.cache/netwatch/netwatch.log.*` after an upgrade, the binary needs the root ownership,
+> group execution restriction and `setcap` re-applied. Never grant capture capabilities to
+> a world-executable copy.
 
 | Capability | What it unlocks |
 |------------|-----------------|
