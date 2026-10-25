@@ -124,14 +124,18 @@ All notable changes to NetWatch will be documented in this file.
   one GSO frame can be 64 KiB, each recorded frame held about 380 KB with
   its hex and text, so 20,000 could reach 7 GB. A host with 10,000
   connections reached 3 million rows, about 3.3 GB. The recorder now also
-  stops at 64 MiB of packets, dropping the oldest first, and at 50,000
-  connection rows across its snapshots. Past that it leaves out whole older
-  snapshots and keeps the rest evenly spread across the window, so the
-  bundle still covers five minutes at a longer interval. The newest snapshot
-  is always whole. A new manifest key, `connection_rows_dropped`, and a line
-  in `summary.md` give the number of rows left out, and `connections.json`
-  keeps its shape. The bundle's JSON files are also written through a buffer
-  now; 50,000 rows took about 12 million write calls before.
+  stops at 64 MiB of packets, dropping the oldest first. That counts the
+  text decoded from them as well as their bytes, including the SNI or
+  request path that every packet of a flow carries, which a peer can make
+  kilobytes long. Connection snapshots stop at 50,000 rows in all, and past
+  that the recorder leaves out whole older snapshots. Up to 16,666
+  connections the rest stay spread across the window at a longer interval.
+  From there to 25,000 only one older snapshot fits beside the newest, and
+  past 25,000 the recorder keeps only the newest. That one is always
+  whole. A new manifest key, `connection_rows_dropped`, and a line in
+  `summary.md` give the number of rows left out, and `connections.json`
+  keeps its shape. The bundle's JSON files are also written through a
+  buffer now; 50,000 rows took about 12 million write calls before.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
