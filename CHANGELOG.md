@@ -240,13 +240,17 @@ All notable changes to NetWatch will be documented in this file.
   something under sudo on a kernel where Landlock does not enforce (older
   than 5.13, or Landlock missing from `lsm=`): confined threads can no
   longer read `/proc/<pid>/exe` or the socket links in `/proc/<pid>/fd` of
-  a process root does not own, yours included, or of one that is not
-  dumpable. Such a process is named by the kernel's 15-character `comm`
-  rather than its executable, and its connections have no owner before the
-  process-attribution thread's first scan or when its latest scan is more
-  than 5 seconds old. Where Landlock enforces, it already refused those
-  reads. Runs without elevation, with the documented `setcap` line or under
-  the systemd unit drop what they did before.
+  almost any process but netwatch itself. Without CAP_SYS_PTRACE the kernel
+  allows those reads of another process only if it runs as root, is dumpable
+  and holds no capability the reading thread lacks. That rules out your
+  processes and other users', and also most root daemons, systemd among
+  them, because they hold capabilities a confined thread has dropped. Such a
+  process is named by the kernel's 15-character `comm` rather than its
+  executable, and its connections have no owner on a poll that finds the
+  latest process-attribution scan more than 5 seconds old. Where Landlock
+  enforces, it already refused those reads. Runs without elevation, with the
+  documented `setcap` line or under the systemd unit drop what they did
+  before.
 - **The process-attribution thread no longer keeps every capability
   netwatch started with.** It reads other processes' socket fds in `/proc`
   to name each connection's owner, so it runs outside the sandbox, and it
