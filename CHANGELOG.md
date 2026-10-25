@@ -220,8 +220,8 @@ All notable changes to NetWatch will be documented in this file.
 - **Worker threads carry their names.** They were started unnamed, so the
   log recorded a panic in any of them as `thread="unnamed"`, and `top -H`
   or `ps -L` listed every worker as `netwatch`. Each now has its worker's
-  name (`connections`, `health`, `reverse-dns` and so on), which the kernel
-  shortens to 15 characters.
+  name (`capture`, `connections`, `health`, `reverse-dns` and so on), which
+  the kernel shortens to 15 characters.
 
 ### Security
 - **Run as root, the sandbox now takes the capabilities netwatch never
