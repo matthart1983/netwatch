@@ -686,23 +686,30 @@ again for membership to take effect. Apply capabilities last, after ownership:
 ```bash
 sudo groupadd -f netwatch
 sudo usermod -aG netwatch "$USER"
-# Use a root-owned installation path, not a user-writable cargo bin directory.
-if [ "$(command -v netwatch)" != /usr/local/bin/netwatch ]; then
-  sudo install -o root -g netwatch -m 0750 "$(command -v netwatch)" /usr/local/bin/netwatch
+bin=$(command -v netwatch)
+# A package's root-owned /usr/bin/netwatch is changed in place. A binary you
+# own, such as one from cargo install or a tarball, is copied to a root-owned
+# path first: its owner could otherwise make it executable by everyone.
+if [ "$(stat -c %U "$bin")" != root ]; then
+  sudo install -o root -g netwatch -m 0750 "$bin" /usr/local/bin/netwatch
+  bin=/usr/local/bin/netwatch
 fi
-sudo chown root:netwatch /usr/local/bin/netwatch
-sudo chmod 0750 /usr/local/bin/netwatch
-sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' /usr/local/bin/netwatch
-# After logging in again:
-/usr/local/bin/netwatch
+sudo chown root:netwatch "$bin"
+sudo chmod 0750 "$bin"
+sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$bin"
+echo "After logging in again, run $bin"
 ```
 
-> **Re-run after every install.** `setcap` attaches to a specific binary on disk; `cargo
-> install netwatch-tui` and the Release tarballs overwrite that file, so the capabilities
-> don't carry over. If you see `pcap open failed: socket: Operation not permitted` or `BPF
-> load failed: PermissionDenied` in `~/.cache/netwatch/netwatch.log.*` after an upgrade, the
-> new binary needs the root ownership, group execution restriction and `setcap`
-> re-applied. Never grant capture capabilities to a world-executable copy.
+> **Re-run after every install.** `setcap` attaches to a specific binary on disk. A package
+> upgrade replaces `/usr/bin/netwatch` with a root-owned, world-executable file without
+> capabilities, so capture fails until the recipe runs again. `cargo install netwatch-tui`
+> and the Release tarballs replace only their own file: the copy in `/usr/local/bin` keeps
+> the old version and its capabilities until the recipe copies the new binary over it. If
+> `command -v netwatch` still finds that old copy, set `bin` to the new binary's path. If you
+> see `pcap open failed: socket: Operation not permitted` or `BPF load failed:
+> PermissionDenied` in `~/.cache/netwatch/netwatch.log.*` after an upgrade, the binary needs
+> the root ownership, group execution restriction and `setcap` re-applied. Never grant
+> capture capabilities to a world-executable copy.
 
 | Capability | What it unlocks |
 |------------|-----------------|
