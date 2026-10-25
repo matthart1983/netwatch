@@ -32,6 +32,13 @@ All notable changes to NetWatch will be documented in this file.
   host with five open sockets was counted five times. The sparkline
   overstated whichever hosts had the most sockets, and its newest point
   disagreed with DOWN. Each host is now counted once.
+- **With `x` on, the Packets detail pane stops showing a packet the list
+  hides.** Turning `x` on with a packet selected that is not an expert
+  finding left that packet decoded in the detail pane, while the list showed
+  only the findings and the stream pane beside it asked for a selection. The
+  detail pane now asks for a selection too, as it already did when the
+  display filter hid the packet, and `W` does nothing until a row in the list
+  is selected. Turning `x` off shows the packet again.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -48,9 +55,7 @@ All notable changes to NetWatch will be documented in this file.
   hiding.** Since 0.24.0, when the display filter hides the selected packet,
   the detail pane stops showing it and asks for a selection. `W` still found
   that packet in the whole capture and sent its source and destination to
-  rdap.org. Turning `x` on with a packet selected that is not an expert
-  finding did the same. `W` now looks up a packet only while its row is in
-  the list.
+  rdap.org. `W` now looks up a packet only while its row is in the list.
 
 ## [0.38.0] - 2026-10-25
 
