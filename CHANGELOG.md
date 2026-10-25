@@ -4,6 +4,72 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Dense view's connection and process sparklines now use their full width,
+  including on wide terminals. Their time labels reflect the retained history
+  and refresh interval instead of always saying `60s`.
+- **Dense view's interface sparklines fill their whole row.** The `60s` plot
+  gave each sample half a cell, so when the row had more room than the last
+  minute had samples, its left side stayed empty. At the default 1-second
+  refresh that happened on terminals wider than about 160 columns and in the
+  zoomed `ifaces` box. At a 5-second refresh it happened on every terminal.
+  In the first minute after start, the samples so far were also stretched
+  across the plot as if they covered all 60 seconds. The plot now spreads
+  the last 60 seconds across the row at every width and refresh rate, and a
+  short history fills in from the right.
+- **The Connections and Processes detail graphs fill their width, and their
+  labels name the window they draw.** The Connections detail graph drew its
+  30 samples at the right edge, one or two to a column, so in a wider pane
+  the rest stayed empty, and its label said `RX 30s` at every refresh rate.
+  The Processes RX chart did the same with its 60 samples under a fixed
+  `RX 60s`, and a bar chart narrower than 60 columns dropped the oldest
+  samples it claimed to show. Both graphs now spread their whole history
+  across the chart, and the label follows the refresh interval: at 500 ms
+  they read `RX 15s` and `RX 30s`, and at 5000 ms `RX 150s` and `RX 5m`.
+- **Dense view's process header rows draw the traffic their DOWN column
+  reports.** A process with several sockets summed its sockets' sparklines,
+  but every socket to the same host carries that host's whole history, so a
+  host with five open sockets was counted five times. The sparkline
+  overstated whichever hosts had the most sockets, and its newest point
+  disagreed with DOWN. Each host is now counted once.
+- **Chart window labels between two and ten minutes give the exact number
+  of seconds.** A window of two minutes or more was rounded to the nearest
+  minute, so 148 seconds read `2m` and 150 seconds `3m`. At the default
+  1-second refresh, Dense's throughput axis was off at nearly every terminal
+  size (80 columns plot 148 seconds), and so was Lite's axis on terminals
+  wider than about 120 columns. Lite's connection sparkline label was off at
+  refresh intervals above 4 seconds. Those windows now read
+  `148s` and `150s`. A whole number of minutes still reads `2m` or `5m`, and
+  a window of ten minutes or more is given to the nearest minute.
+- **With `x` on, the Packets detail pane stops showing a packet the list
+  hides.** Turning `x` on with a packet selected that is not an expert
+  finding left that packet decoded in the detail pane, while the list showed
+  only the findings and the stream pane beside it asked for a selection. The
+  detail pane now asks for a selection too, as it already did when the
+  display filter hid the packet. `W` (WHOIS), `s` (stream), `m` (bookmark)
+  and `y` (copy) now act only on a packet the list shows, where they used to
+  act on the hidden one whether `x` or the display filter hid it. Turning `x`
+  off shows the packet again.
+
+### Security
+- **Selecting a packet or a connection no longer sends its addresses to
+  rdap.org. Only `W` does.** Since 0.8.0 the Packets detail pane, and since
+  0.16.1 the Connections detail strip, started a WHOIS lookup themselves the
+  first time they drew an address. Stepping through a capture sent the
+  source and destination of each packet you landed on to rdap.org over
+  HTTPS, and on to the regional registry it redirects to. Moving down the
+  Connections table, or leaving the cursor on a row while the live table
+  changed under it, did the same with each remote address. Addresses in the
+  private ranges WHOIS skips were not sent. The panes now show only what a
+  `W` press has already fetched.
+- **`W` in Packets no longer sends the addresses of a packet the list is
+  hiding.** Since 0.24.0, when the display filter hides the selected packet,
+  the detail pane stops showing it and asks for a selection. `W` still found
+  that packet in the whole capture and sent its source and destination to
+  rdap.org. `W` now looks up a packet only while its row is in the list.
+
+## [0.38.0] - 2026-10-25
+
 ### Added
 - **`netwatch uptime`**: outage history for an ISP ticket. One row per
   outage with start, end, duration and the hop that failed (gateway,
@@ -338,6 +404,14 @@ All notable changes to NetWatch will be documented in this file.
   unmaintained crate ratatui 0.27 built with, is gone from the tree.
 
 ### CI
+- **The Nix flake is built in CI.** A new workflow runs `nix build`, test
+  suite included, on every change and once a week, evaluates the flake for
+  every system it declares, and checks that the built binary reports the
+  Cargo.toml version. The flake had stopped building without anyone
+  noticing until #105, from @kashw2, fixed it and made it read its version
+  from Cargo.toml. The flake now lists x86_64-linux, aarch64-linux and
+  aarch64-darwin only: nixpkgs dropped Intel Macs in 26.11, and listing
+  them made the flake fail to evaluate.
 - **CI fails when Windows code compares English command output.** A test
   reads the source as a Windows build compiles it and fails on any
   comparison with English that ping, tracert, ipconfig, netstat, netsh or

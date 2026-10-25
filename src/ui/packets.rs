@@ -851,18 +851,11 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
 }
 
 fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
-    // Only render the selected packet if it's within the active filter —
-    // otherwise a stale selection (or a scroll position the filter excludes)
-    // would render details for a packet not shown in the list.
-    let filter = effective_packet_filter(app);
-    let selected_pkt = app
-        .ui
-        .scroll
-        .packet_selected
-        .and_then(|id| packets.iter().find(|p| p.id == id))
-        .filter(|p| filter.as_ref().is_none_or(|e| matches_packet(e, p)));
-
-    match selected_pkt {
+    // Only render the selected packet while the list shows it. The display
+    // filter and `x` both leave the selection set, and a packet either of
+    // them hides must not be decoded here, beside a stream pane and a `W`
+    // that already ignore it.
+    match selected_packet(app, packets) {
         Some(pkt) => {
             let has_payload = !pkt.payload_text.is_empty() || pkt.decrypted_plaintext.is_some();
 
@@ -2634,5 +2627,56 @@ mod tests {
             .collect();
         assert!(screen.contains("TCP: 12345 -> 443"), "detail not drawn");
         assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+    }
+
+    /// A selection the list hides, by the display filter or by `x`, is not
+    /// decoded in the detail pane, which then agrees with the stream pane
+    /// beside it and with `W`. The pane applied only the display filter, so
+    /// with `x` on it kept decoding a packet that was no longer in the list.
+    #[test]
+    fn the_detail_pane_drops_a_selection_the_list_hides() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector.seed_demo_capture();
+        // Packet 3 is the SYN to 93.184.216.34: not dns, and not a finding.
+        app.packet_collector
+            .packets
+            .write()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p.id == 3)
+            .unwrap()
+            .expert = ExpertSeverity::Chat;
+        app.ui.scroll.packet_selected = Some(3);
+        let screen = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+            terminal.draw(|f| render(f, app, f.area())).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        let decode = "TCP: 10.88.0.2:52344 -> 93.184.216.34:443";
+        assert!(screen(&app).contains(decode), "packet 3 not decoded");
+
+        for hide in ["display filter", "x"] {
+            match hide {
+                "x" => app.ui.packet_expert_only = true,
+                _ => app.ui.packet_filter_active = Some("dns".into()),
+            }
+            let s = screen(&app);
+            assert!(!s.contains(decode), "{hide}: hidden packet still decoded");
+            assert!(
+                s.contains(" Select a packet with ↑↓ to inspect"),
+                "{hide}: no selection hint"
+            );
+            app.ui.packet_expert_only = false;
+            app.ui.packet_filter_active = None;
+            assert!(screen(&app).contains(decode), "{hide}: selection lost");
+        }
     }
 }
