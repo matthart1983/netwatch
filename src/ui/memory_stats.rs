@@ -18,6 +18,8 @@ struct Gauge {
     name: &'static str,
     current: usize,
     cap: usize,
+    /// `current` and `cap` are bytes rather than entries.
+    bytes: bool,
     /// One-line explanation of what fills this structure.
     note: &'static str,
 }
@@ -30,12 +32,24 @@ impl Gauge {
             (self.current as f32 / self.cap as f32) * 100.0
         }
     }
+
+    /// `current/cap`, with bytes in MiB to fit the column.
+    fn amount(&self) -> String {
+        if self.bytes {
+            let mib = |n: usize| n as f64 / (1024.0 * 1024.0);
+            format!("{:.1}/{:.0} MiB", mib(self.current), mib(self.cap))
+        } else {
+            format!("{}/{}", self.current, self.cap)
+        }
+    }
 }
 
 fn gather(app: &App) -> Vec<Gauge> {
     use crate::collectors::egress::MAX_PROCESSES;
     use crate::collectors::network_intel::{MAX_TRACKED_BEACONS, MAX_TRACKED_IPS};
-    use crate::collectors::packets::{MAX_STREAMS, STREAM_EVICT_BATCH};
+    use crate::collectors::packets::{
+        MAX_STREAMS, RING_BYTE_BUDGET, RING_CAPACITY, STREAM_EVICT_BATCH,
+    };
 
     let mut out: Vec<Gauge> = Vec::new();
 
@@ -45,7 +59,15 @@ fn gather(app: &App) -> Vec<Gauge> {
             name: "stream tracker — flows",
             current: tracker.all_streams.len(),
             cap: MAX_STREAMS + STREAM_EVICT_BATCH,
+            bytes: false,
             note: "LRU evicted on oldest last_seen_ns",
+        });
+        out.push(Gauge {
+            name: "stream tracker — held bytes",
+            current: tracker.held_bytes(),
+            cap: tracker.byte_budget(),
+            bytes: true,
+            note: "LRU evicted to 7/8 when over budget",
         });
     }
 
@@ -54,6 +76,7 @@ fn gather(app: &App) -> Vec<Gauge> {
         name: "rtt history — IP keys",
         current: app.caches.rtt_history.len(),
         cap: 256, // MAX_RTT_HISTORY_IPS — private const in app module
+        bytes: false,
         note: "FIFO eviction on first-insert order",
     });
 
@@ -62,6 +85,7 @@ fn gather(app: &App) -> Vec<Gauge> {
         name: "connection timeline",
         current: app.connection_timeline.tracked_len(),
         cap: app.connection_timeline.tracked_cap(),
+        bytes: false,
         note: "hard cap with O(n) index rebuild",
     });
 
@@ -70,18 +94,21 @@ fn gather(app: &App) -> Vec<Gauge> {
         name: "network-intel — scan states",
         current: app.network_intel.scan_states_len(),
         cap: MAX_TRACKED_IPS,
+        bytes: false,
         note: "LRU evicted on oldest last_seen",
     });
     out.push(Gauge {
         name: "network-intel — beacon states",
         current: app.network_intel.beacon_states_len(),
         cap: MAX_TRACKED_BEACONS,
+        bytes: false,
         note: "LRU evicted on oldest last_seen",
     });
     out.push(Gauge {
         name: "network-intel — alert history",
         current: app.network_intel.alert_history_len(),
         cap: 100,
+        bytes: false,
         note: "ring buffer; oldest dropped",
     });
 
@@ -90,6 +117,7 @@ fn gather(app: &App) -> Vec<Gauge> {
         name: "egress profiler — processes",
         current: app.egress_profiler.process_count(),
         cap: MAX_PROCESSES,
+        bytes: false,
         note: "LRU evicted on oldest last_seen",
     });
 
@@ -97,8 +125,16 @@ fn gather(app: &App) -> Vec<Gauge> {
     out.push(Gauge {
         name: "packet ring",
         current: app.packet_collector.packet_count_hint(),
-        cap: 5000, // MAX_PACKETS in packets.rs
+        cap: RING_CAPACITY,
+        bytes: false,
         note: "ring buffer; oldest dropped",
+    });
+    out.push(Gauge {
+        name: "packet ring — bytes",
+        current: app.packet_collector.ring_bytes(),
+        cap: RING_BYTE_BUDGET,
+        bytes: true,
+        note: "oldest dropped when over budget",
     });
 
     out
@@ -175,11 +211,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(app.theme.text_primary),
             ),
             Span::styled(
-                format!(
-                    "{:<count_w$}",
-                    format!("{}/{}", g.current, g.cap),
-                    count_w = count_w
-                ),
+                format!("{:<count_w$}", g.amount(), count_w = count_w),
                 Style::default().fg(app.theme.text_primary),
             ),
             Span::styled(bar, Style::default().fg(bar_color)),

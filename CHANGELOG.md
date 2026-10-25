@@ -21,6 +21,23 @@ All notable changes to NetWatch will be documented in this file.
   pointer, and reads only the speed field rather than borrowing the whole
   `if_data` record. Nothing netwatch shows changes, and no new crate is
   compiled.
+- **The stream tracker's budget is an eighth of the host's memory, up to
+  256 MiB.** It was 256 MiB on every host, half the memory of a 512 MiB
+  board. On Linux netwatch reads `MemTotal` once at start, so a 512 MiB host
+  gets 64 MiB, a 1 GiB host 128 MiB, and a host with 2 GiB or more keeps
+  256 MiB. macOS, Windows and FreeBSD keep 256 MiB. Past the budget the
+  tracker drops the least recently seen streams, as before, so a small host
+  keeps payloads for fewer flows under heavy traffic. One decrypted HTTP/3
+  flow can still hold up to 64 MiB on its own, so with an SSLKEYLOGFILE on a
+  host under 2 GiB the tracker can pass its budget by that much.
+- **The `M` overlay shows the bytes the packet list and the stream tracker
+  hold, in MiB, against their budgets.** It also took the packet list's
+  count cap from a copy of 5000, and now reads the constant the list uses.
+- **`CapturedPacket` no longer has `raw_hex` and `raw_ascii`.** Library
+  callers can build the same text from `raw_bytes` with
+  `collectors::packets::hex_dump` and `ascii_dump`. `PacketCollector::ring_bytes`
+  and the hidden `StreamTracker::held_bytes`, `byte_budget` and
+  `at_capacity` are new. The 1.0 contract does not cover the library.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
@@ -118,6 +135,35 @@ All notable changes to NetWatch will be documented in this file.
   past the 20 that raise the alert, and each window starts with an empty
   set. Domain counts are cut to the 500 most queried as soon as a new name
   would take them past 1,000.
+- **A bulk transfer no longer fills memory through the packet list.** Every
+  captured packet carried a hex and an ASCII dump of its frame, built with a
+  `format!` per byte. The dumps took about five times the frame's size and
+  most of the capture thread's decode time, and the list of the last 5,000
+  packets had no byte limit. A local bulk transfer, whose segmentation
+  offload hands libpcap 64 KB frames, left the list holding 1.8 GB, and
+  5,000 full-size Ethernet frames held 53 MB. Only the selected packet's dump
+  is ever drawn, so the Packets tab now builds it from the frame as it
+  draws, and only as many lines as the pane has rows. The list keeps 5,000
+  packets or 32 MiB of them, whichever is fewer. That is about 500 of those
+  64 KB frames, or 5,000 full-size ones in 18 MB. Decoding full-size frames
+  went from about 13,000 to about 150,000 a second on the development
+  machine.
+- **The stream tracker's byte budget counts everything the streams hold.**
+  The tracker charged each stored segment its payload and its own size, but
+  not the `Arc` it lives in or its slot in the stream's list, 24 bytes a
+  segment on a 64-bit host. It did not charge a QUIC flow's CRYPTO
+  reassembly buffer at all, up to 16 KiB. Small UDP payloads over a
+  thousand flows filled 300 MiB against the 256 MiB budget. The tracker
+  charges both now and stays under its budget, and it takes the CRYPTO
+  buffer's charge back when it frees the buffer.
+- **A text filter on the Packets tab no longer slows every frame.** A bare
+  word or a `contains` filter lowercased a copy of each packet's info,
+  addresses, host names and payload text to search them. It did that for
+  every packet in the list on every frame, while holding the list's lock.
+  With 5,000 text packets and the filter `zzz`, a Packets frame took 11 ms,
+  17.6 ms at the 99th percentile, against 0.4 ms unfiltered. It now takes
+  4 ms, or 6.3 ms at the 99th percentile. The search compares in place and
+  finds the same packets.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to

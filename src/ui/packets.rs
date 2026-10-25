@@ -1,7 +1,7 @@
 use crate::app::{App, StreamDirectionFilter};
 use crate::collectors::packets::{
-    format_endpoint, matches_packet_in, parse_filter, port_label, CapturedPacket, ExpertSeverity,
-    FilterExpr, StreamDirection,
+    ascii_dump, format_endpoint, hex_dump, matches_packet_in, parse_filter, port_label,
+    CapturedPacket, ExpertSeverity, FilterExpr, StreamDirection,
 };
 use crate::ui::stream_context;
 use crate::ui::widgets;
@@ -1252,7 +1252,22 @@ fn render_hex_ascii(
     chunks: std::rc::Rc<[Rect]>,
     theme: &crate::theme::Theme,
 ) {
-    let hex = Paragraph::new(pkt.raw_hex.clone())
+    // Dump only the lines the panes have rows for. Each line takes at least
+    // one row, and a 64 KB frame dumps to 4096 lines.
+    let rows = usize::from(chunks[0].height.max(chunks[1].height));
+    let shown = &pkt.raw_bytes[..pkt.raw_bytes.len().min(rows * 16)];
+    render_dumps(f, hex_dump(shown), ascii_dump(shown), chunks, theme);
+}
+
+/// The hex and ASCII dump panes, side by side.
+fn render_dumps(
+    f: &mut Frame,
+    hex: String,
+    ascii: String,
+    chunks: std::rc::Rc<[Rect]>,
+    theme: &crate::theme::Theme,
+) {
+    let hex = Paragraph::new(hex)
         .style(Style::default().fg(theme.status_good))
         .block(
             widgets::panel_block(theme)
@@ -1265,7 +1280,7 @@ fn render_hex_ascii(
         .wrap(Wrap { trim: false });
     f.render_widget(hex, chunks[0]);
 
-    let ascii = Paragraph::new(pkt.raw_ascii.clone())
+    let ascii = Paragraph::new(ascii)
         .style(Style::default().fg(theme.status_warn))
         .block(
             widgets::panel_block(theme)
@@ -2201,8 +2216,6 @@ mod tests {
             info: String::new(),
             details: vec!["TCP: 12345 -> 443".into()],
             payload_text: String::new(),
-            raw_hex: String::new(),
-            raw_ascii: String::new(),
             raw_bytes: vec![],
             stream_index: Some(0),
             tcp_flags: None,
@@ -2530,8 +2543,6 @@ mod tests {
             info: qname.into(),
             details: Vec::new(),
             payload_text: String::new(),
-            raw_hex: String::new(),
-            raw_ascii: String::new(),
             raw_bytes: Vec::new(),
             stream_index: Some(1),
             tcp_flags: None,
@@ -2630,6 +2641,86 @@ mod tests {
         ] {
             p.expert = sev;
             assert_eq!(is_expert(&p), expected, "{sev:?}");
+        }
+    }
+
+    /// The dumps as every packet used to carry them, built with a `format!`
+    /// per byte.
+    fn old_hex_dump(raw: &[u8]) -> String {
+        raw.chunks(16)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+                format!("{:04x}  {}", i * 16, hex.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn old_ascii_dump(raw: &[u8]) -> String {
+        raw.chunks(16)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let ascii: String = chunk
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                format!("{:04x}  {}", i * 16, ascii)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The hex pane, now drawn from the frame for the selected packet only
+    /// and only as far as it has rows, shows what the full dump the packet
+    /// used to carry showed.
+    #[test]
+    fn hex_pane_matches_previous_hex_dump() {
+        use ratatui::{backend::TestBackend, Terminal};
+        // Every byte value, then a short last line.
+        let raw: Vec<u8> = (0..=255).chain(0..=40).collect();
+        for len in [0, 1, 15, 16, 17, raw.len()] {
+            assert_eq!(hex_dump(&raw[..len]), old_hex_dump(&raw[..len]), "{len}");
+            assert_eq!(
+                ascii_dump(&raw[..len]),
+                old_ascii_dump(&raw[..len]),
+                "{len}"
+            );
+        }
+
+        let mut pkt = pkt_with_decrypted(None);
+        pkt.raw_bytes = raw;
+        let theme = crate::theme::by_name("default");
+        // The dump has 19 lines. The panes have fewer rows, and at 80 columns
+        // the hex lines wrap.
+        for (width, height) in [(120, 12), (80, 12), (120, 30)] {
+            let draw = |old: bool| {
+                let area = Rect::new(0, 0, width, height);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| {
+                        let chunks = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                            .split(area);
+                        if old {
+                            let (hex, ascii) =
+                                (old_hex_dump(&pkt.raw_bytes), old_ascii_dump(&pkt.raw_bytes));
+                            render_dumps(f, hex, ascii, chunks, &theme);
+                        } else {
+                            render_hex_ascii(f, &pkt, chunks, &theme);
+                        }
+                    })
+                    .unwrap();
+                terminal.backend().buffer().clone()
+            };
+            assert_eq!(draw(false), draw(true), "{width}x{height}");
         }
     }
 
