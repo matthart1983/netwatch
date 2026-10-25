@@ -8,6 +8,15 @@ All notable changes to NetWatch will be documented in this file.
 - Dense view's connection and process sparklines now use their full width,
   including on wide terminals. Their time labels reflect the retained history
   and refresh interval instead of always saying `60s`.
+- **Dense view's interface sparklines fill their whole row.** The `60s` plot
+  gave each sample half a cell, so when the row had more room than the last
+  minute had samples, its left side stayed empty. At the default 1-second
+  refresh that happened on terminals wider than about 160 columns and in the
+  zoomed `ifaces` box. At a 5-second refresh it happened on every terminal.
+  In the first minute after start, the samples so far were also stretched
+  across the plot as if they covered all 60 seconds. The plot now spreads
+  the last 60 seconds across the row at every width and refresh rate, and a
+  short history fills in from the right.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
