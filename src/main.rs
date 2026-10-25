@@ -1,13 +1,10 @@
 use anyhow::Result;
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use netwatch::app;
 use netwatch::config::NetwatchConfig;
+use netwatch::ui::tty;
 use ratatui::prelude::*;
 use std::io;
+use std::mem::ManuallyDrop;
 
 // Replace glibc's `ptmalloc` (Linux) and the system allocator on other
 // platforms with mimalloc. Long-running TUI daemons that spawn short
@@ -150,11 +147,14 @@ fn main() -> Result<()> {
         ));
     }
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // `_tty` is declared after `_worker_session` and `runtime`, so during an
+    // unwind it drops first and the shell is back before the workers' wait.
+    tty::install_panic_hook();
+    let _tty = tty::enter()?;
+    // Never dropped: `Terminal`'s drop shows the cursor again, as
+    // `tty::restore` already has, and panics in `eprintln!` if that write
+    // fails, as every write does once the terminal has hung up.
+    let mut terminal = ManuallyDrop::new(Terminal::new(CrosstermBackend::new(io::stdout()))?);
 
     let result = runtime.block_on(app::run(
         &mut terminal,
@@ -164,13 +164,17 @@ fn main() -> Result<()> {
         demo,
     ));
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    tty::restore();
 
-    result
+    // A background thread that dies can end the session with no more than
+    // "Event channel closed"; the panic is what the user needs to see.
+    match (result, tty::background_panic()) {
+        (Err(error), Some(panic)) => {
+            let log = netwatch::logging::log_dir()
+                .map(|dir| format!("; log in {}", dir.display()))
+                .unwrap_or_default();
+            Err(error.context(format!("{panic}{log}")))
+        }
+        (result, _) => result,
+    }
 }

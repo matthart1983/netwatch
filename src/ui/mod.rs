@@ -19,6 +19,7 @@ pub mod stream_context;
 pub mod timeline;
 pub mod topology;
 pub mod tree;
+pub mod tty;
 pub mod widgets;
 
 pub mod capture_export;

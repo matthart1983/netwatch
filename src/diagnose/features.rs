@@ -26,6 +26,7 @@ use super::detectors::{
 };
 use super::issue::{Issue, Severity};
 use super::{causes, rules};
+use crate::ui::sanitize::{display, display_owned};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -674,11 +675,15 @@ pub fn decisions(episode: &super::episode::Episode) -> Vec<DecisionRow> {
     rows
 }
 
+/// One CSV field. The strings in a row come from the episode file, which
+/// can be someone else's, and with no `--out` the CSV goes to the terminal,
+/// so each goes through [`display`] first.
 fn csv_field(s: &str) -> String {
+    let s = display(s);
     if s.contains([',', '"', '\n']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_string()
+        s.into_owned()
     }
 }
 
@@ -775,8 +780,9 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
             vec![target.clone()]
         };
         for file in files {
-            let ep = super::episode::load(Path::new(&file))
-                .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+            let ep = super::episode::load(Path::new(&file)).map_err(|e| {
+                anyhow::anyhow!("{}: {e}", display_owned(file.display().to_string()))
+            })?;
             episodes += 1;
             for row in decisions(&ep) {
                 writeln!(sink, "{}", csv_row(&row))?;
@@ -1040,6 +1046,36 @@ mod decision_tests {
             "no addresses in training rows: {csv}"
         );
         assert_eq!(csv_header().split(',').count(), csv.split(',').count());
+    }
+
+    /// With no `--out` the CSV goes to the terminal, and the strings in a row
+    /// come from the episode file.
+    #[test]
+    fn a_row_prints_a_shared_episode_as_text() {
+        use crate::ui::sanitize::is_unsafe;
+        const OSC52: &str = "\x1b]52;c;aGk=\x07";
+        let mut ep = recorded();
+        ep.id = format!("id{OSC52}");
+        ep.env.os = format!("os\u{202e}{OSC52}");
+        ep.source = episode::EpisodeSource::Lab {
+            scenario: OSC52.into(),
+            seed: 1,
+        };
+        let key = ep.issue_keys().remove(0);
+        ep.labels.push(Label {
+            issue: key,
+            cause: OSC52.into(),
+            source: LabelSource::Lab,
+            ts: ep.ended.clone(),
+            note: None,
+        });
+        let rows = decisions(&ep);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            let csv = csv_row(row);
+            assert!(csv.starts_with("id·]52;c;aGk=·,lab:·]52"), "{csv:?}");
+            assert!(!csv.chars().any(is_unsafe), "{csv:?}");
+        }
     }
 
     #[test]
