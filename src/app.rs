@@ -3567,12 +3567,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.export_status_tick = 0;
         }
         KeyCode::Char('W') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
-            if let Some(sel_id) = app.ui.scroll.packet_selected {
-                let packets = app.packet_collector.get_packets();
-                if let Some(pkt) = packets.iter().find(|p| p.id == sel_id) {
-                    app.whois_cache.request(&pkt.src_ip);
-                    app.whois_cache.request(&pkt.dst_ip);
-                }
+            // Only a packet the list shows. A selection the display filter or
+            // `x` hides stays set, and must not send its addresses anywhere.
+            let packets = app.packet_collector.get_packets();
+            if let Some(pkt) = ui::packets::selected_packet(app, &packets) {
+                app.whois_cache.request(&pkt.src_ip);
+                app.whois_cache.request(&pkt.dst_ip);
             }
         }
         KeyCode::Char('W') if app.ui.current_tab == Tab::Connections => {
@@ -4052,6 +4052,39 @@ mod quit_key_tests {
             let summary = app.capture_export.take().unwrap().summary();
             assert_eq!(summary.packets + summary.omitted, shown, "{expert_only}");
         }
+    }
+
+    /// `W` looks up the packet the list shows. It searched the whole capture,
+    /// so a selection the display filter had hidden, which the detail pane no
+    /// longer showed, still sent its addresses to rdap.org.
+    #[test]
+    fn shift_w_skips_a_packet_the_list_hides() {
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        app.packet_collector.seed_demo_capture();
+        // Packet 3 is the SYN to 93.184.216.34, which `dns` hides.
+        app.ui.scroll.packet_selected = Some(3);
+        for k in "/dns".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            handle_key(&mut app, key(k));
+        }
+        assert_eq!(app.ui.packet_filter_active.as_deref(), Some("dns"));
+        handle_key(&mut app, key(KeyCode::Char('W')));
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+
+        // `x` hides it the same way.
+        app.ui.packet_filter_active = None;
+        app.ui.packet_expert_only = true;
+        let mut packets = app.packet_collector.packets.write().unwrap();
+        packets.iter_mut().find(|p| p.id == 3).unwrap().expert =
+            crate::collectors::packets::ExpertSeverity::Chat;
+        drop(packets);
+        handle_key(&mut app, key(KeyCode::Char('W')));
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+
+        app.ui.packet_expert_only = false;
+        handle_key(&mut app, key(KeyCode::Char('W')));
+        assert_eq!(app.whois_cache.queued_for_test(), ["93.184.216.34"]);
     }
 
     #[test]

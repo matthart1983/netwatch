@@ -20,6 +20,13 @@ All notable changes to NetWatch will be documented in this file.
   changed under it, did the same with each remote address. Addresses in the
   private ranges WHOIS skips were not sent. The panes now show only what a
   `W` press has already fetched.
+- **`W` in Packets no longer sends the addresses of a packet the list is
+  hiding.** Since 0.24.0, when the display filter hides the selected packet,
+  the detail pane stops showing it and asks for a selection. `W` still found
+  that packet in the whole capture and sent its source and destination to
+  rdap.org. Turning `x` on with a packet selected that is not an expert
+  finding did the same. `W` now looks up a packet only while its row is in
+  the list.
 
 ## [0.38.0] - 2026-10-25
 
