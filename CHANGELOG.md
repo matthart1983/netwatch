@@ -234,15 +234,18 @@ All notable changes to NetWatch will be documented in this file.
   character across its eighth byte. Replay no longer panics when the first
   frame's time does not parse, as happened to any recording that began in
   the hour a clock goes back.
-- **An episode stops loading at 450 MiB.** `diagnose episodes`, `replay`,
-  `features` and `export` inflated a gzipped episode in full before parsing
-  it, so a 1 MiB file of compressed zeros took a gigabyte of memory, and a
-  larger one could take all of it. Loading now stops past 450 MiB
-  uncompressed, far more than any recording netwatch makes, with an error
-  that says so. `netwatch uptime` likewise skips a log line longer than
-  64 KiB and warns how many it skipped, where it used to read a line of any
-  length. A line that is not valid UTF-8 now costs that line only; it used
-  to end the rest of that day's file.
+- **An episode stops loading past 84,000 frames or 820 MiB uncompressed.**
+  `diagnose episodes`, `replay`, `features` and `export` inflated a gzipped
+  episode in full before parsing it, so a gzip of zeros a few megabytes long
+  could take all the memory there was, and a 100 KB file of a million empty
+  frames took 2.6 GB. Loading now stops at either limit with an error that
+  says which. A recording holds at most 72,000 frames, one per 100 ms tick
+  for two hours, which inflate to about 650 MB on a busy host. The limits
+  bound the input, not the memory: a crafted episode under both can still
+  take gigabytes to parse. `netwatch uptime` likewise skips a log line
+  longer than 64 KiB and warns how many it skipped, where it used to read a
+  line of any length. A line that is not valid UTF-8 now costs that line
+  only; it used to end the rest of that day's file.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**

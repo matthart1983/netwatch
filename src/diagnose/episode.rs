@@ -48,11 +48,20 @@ pub const TOP_SOCKETS: usize = 20;
 
 pub const RETAIN_SECS: u64 = 90 * 24 * 3_600;
 pub const RETAIN_BYTES: u64 = 300 * 1024 * 1024;
-/// Most [`load`] reads from one recording, after gunzip: the whole store's
-/// budget with half again as headroom. A day of recordings gzips to under
-/// 5 MiB, so only a damaged or hostile file gets near it, and a gzip bomb
-/// stops here rather than filling memory.
-pub const MAX_LOAD_BYTES: u64 = RETAIN_BYTES + RETAIN_BYTES / 2;
+/// Most frames [`load`] accepts from one recording. netwatch ticks at most
+/// every 100 ms, its fastest refresh, and starts a new episode once one
+/// spans [`MAX_EPISODE_SECS`], so a recording holds at most 72,000 frames;
+/// the two rolls on top are headroom. A frame with every field empty is
+/// 35 bytes of JSON and 1.7 KB in memory, so a 100 KB gzip of a million of
+/// them took 2.6 GB.
+pub const MAX_LOAD_FRAMES: usize =
+    ((MAX_EPISODE_SECS + PRE_ROLL_SECS + POST_ROLL_SECS) * 10.0) as usize;
+/// Most [`load`] inflates from one recording: [`MAX_LOAD_FRAMES`] frames of
+/// 10 KiB. A busy host's frames average 9 KB, so two hours of them at the
+/// fastest refresh inflate to 650 MB. This bounds the input, not the memory
+/// parsing it takes: a list of empty strings takes eight times its JSON, so
+/// a crafted file under both limits can still need gigabytes.
+pub const MAX_LOAD_BYTES: u64 = MAX_LOAD_FRAMES as u64 * 10 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -303,11 +312,42 @@ pub struct Episode {
     /// [`MAX_EPISODE_SECS`].
     #[serde(default)]
     pub continues: Option<String>,
+    #[serde(deserialize_with = "at_most_max_frames")]
     pub frames: Vec<Frame>,
     #[serde(default)]
     pub issues: Vec<IssueSnapshot>,
     #[serde(default)]
     pub labels: Vec<Label>,
+}
+
+/// `frames`, failing at the first past [`MAX_LOAD_FRAMES`] instead of
+/// growing until memory runs out.
+fn at_most_max_frames<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<Frame>, D::Error> {
+    struct Frames;
+    impl<'de> serde::de::Visitor<'de> for Frames {
+        type Value = Vec<Frame>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a list of frames")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Vec<Frame>, A::Error> {
+            let mut frames = Vec::new();
+            while let Some(frame) = seq.next_element()? {
+                if frames.len() == MAX_LOAD_FRAMES {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "more than {MAX_LOAD_FRAMES} frames, more than any recording"
+                    )));
+                }
+                frames.push(frame);
+            }
+            Ok(frames)
+        }
+    }
+    de.deserialize_seq(Frames)
 }
 
 impl Episode {
@@ -2524,6 +2564,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(err.contains("unknown variant"), "{err}");
         assert!(!err.chars().any(crate::ui::sanitize::is_unsafe), "{err:?}");
+    }
+
+    /// A gzip of `frames` frames with every field empty, in an episode that
+    /// is otherwise real.
+    fn empty_frames(frames: usize) -> Vec<u8> {
+        let mut ep = incident().finished.remove(0);
+        ep.frames.clear();
+        let empty = r#"{"at":0,"ts":"","obs":{},"ages":{}}"#;
+        let json = serde_json::to_string(&ep).unwrap().replacen(
+            r#""frames":[]"#,
+            &format!(r#""frames":[{}]"#, vec![empty; frames].join(",")),
+            1,
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(json.as_bytes()).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A few kilobytes of gzip, nowhere near the byte limit. Before the frame
+    /// limit, a million of these frames took 2.6 GB.
+    #[test]
+    fn load_rejects_more_frames_than_a_recording_holds() {
+        let dir = std::env::temp_dir().join(format!("nw-frames-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frames.json.gz");
+        std::fs::write(&path, empty_frames(MAX_LOAD_FRAMES)).unwrap();
+        let most = load(&path).map(|ep| ep.frames.len());
+        let gz = empty_frames(MAX_LOAD_FRAMES + 1);
+        assert!(gz.len() < 64 << 10, "{} bytes", gz.len());
+        std::fs::write(&path, gz).unwrap();
+        let over = load(&path).map(|ep| ep.frames.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(most.unwrap(), MAX_LOAD_FRAMES);
+        let err = over.unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("more than {MAX_LOAD_FRAMES} frames")),
+            "{err}"
+        );
     }
 
     #[test]
