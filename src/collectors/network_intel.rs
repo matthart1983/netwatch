@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 
 const PORT_SCAN_WINDOW_SECS: u64 = 30;
 const PORT_SCAN_THRESHOLD: usize = 20;
+/// Distinct ports kept per source per window. Past the alert threshold the
+/// count only feeds the alert text, and an uncapped set let each of
+/// MAX_TRACKED_IPS sources hold all 65,536 ports, about 400 MB between them.
+const MAX_SCAN_PORTS: usize = 256;
 const BEACON_MIN_SAMPLES: usize = 5;
 const BEACON_MAX_SAMPLES: usize = 8;
 const BEACON_JITTER_THRESHOLD: f64 = 0.15;
@@ -345,8 +349,18 @@ impl NetworkIntelCollector {
         let now = Instant::now();
         self.dns_total_queries += 1;
 
-        // Track domain counts
+        // Track domain counts, trimmed to the top N when a new name would
+        // take them past twice that. Trimming in prune_stale instead let a
+        // flood of unique names add an entry per query for 30 s.
         let base_domain = extract_base_domain(&event.qname);
+        if self.domain_counts.len() >= MAX_TRACKED_DOMAINS * 2
+            && !self.domain_counts.contains_key(&base_domain)
+        {
+            let mut entries: Vec<(String, u32)> = self.domain_counts.drain().collect();
+            entries.sort_by_key(|b| std::cmp::Reverse(b.1));
+            entries.truncate(MAX_TRACKED_DOMAINS);
+            self.domain_counts = entries.into_iter().collect();
+        }
         *self.domain_counts.entry(base_domain.clone()).or_insert(0) += 1;
 
         // Bound domain_tunnel_stats: a DNS flood with endlessly unique base
@@ -512,15 +526,18 @@ impl NetworkIntelCollector {
                 alerted: false,
             });
 
-        // Reset window if expired
+        // Reset window if expired. A new set rather than clear(), which
+        // would keep the capacity the last window grew.
         if now.duration_since(state.window_start) > Duration::from_secs(PORT_SCAN_WINDOW_SECS) {
             state.window_start = now;
-            state.ports.clear();
+            state.ports = HashSet::new();
             state.alerted = false;
         }
 
         state.last_seen = now;
-        state.ports.insert(event.dst_port);
+        if state.ports.len() < MAX_SCAN_PORTS {
+            state.ports.insert(event.dst_port);
+        }
 
         if state.ports.len() >= PORT_SCAN_THRESHOLD && !state.alerted {
             state.alerted = true;
@@ -720,14 +737,6 @@ impl NetworkIntelCollector {
             .retain(|_, v| now.duration_since(v.last_seen) < stale);
         self.domain_tunnel_stats
             .retain(|_, v| now.duration_since(v.window_start) < stale);
-
-        // Prune domain counts to top N
-        if self.domain_counts.len() > MAX_TRACKED_DOMAINS * 2 {
-            let mut entries: Vec<(String, u32)> = self.domain_counts.drain().collect();
-            entries.sort_by_key(|b| std::cmp::Reverse(b.1));
-            entries.truncate(MAX_TRACKED_DOMAINS);
-            self.domain_counts = entries.into_iter().collect();
-        }
     }
 }
 
@@ -1127,5 +1136,59 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn scan_ports_set_is_capped_and_shrinks_on_window_reset() {
+        fn probe(intel: &mut NetworkIntelCollector, port: u16, at: Instant) {
+            let event = ConnAttemptEvent {
+                src_ip: "203.0.113.9".into(),
+                dst_ip: "192.0.2.1".into(),
+                dst_port: port,
+            };
+            intel.detect_port_scan(&event, at);
+        }
+        let mut intel = NetworkIntelCollector::new();
+        let start = Instant::now();
+        for port in 0..=u16::MAX {
+            probe(&mut intel, port, start);
+        }
+        let ports = &intel.scan_states["203.0.113.9"].ports;
+        assert_eq!(ports.len(), MAX_SCAN_PORTS);
+        assert_eq!(intel.active_alerts.len(), 1, "the sweep still alerts once");
+
+        // The next window starts from an empty set, not the old one cleared.
+        let later = start + Duration::from_secs(PORT_SCAN_WINDOW_SECS + 1);
+        probe(&mut intel, 1, later);
+        let ports = &intel.scan_states["203.0.113.9"].ports;
+        assert_eq!(ports.len(), 1);
+        assert!(ports.capacity() < MAX_SCAN_PORTS, "{}", ports.capacity());
+    }
+
+    #[test]
+    fn domain_counts_capped_between_prunes() {
+        fn query(intel: &mut NetworkIntelCollector, qname: String) {
+            intel.on_dns_query(DnsQueryEvent {
+                txid: 1,
+                client_ip: "192.0.2.10".into(),
+                server_ip: "192.0.2.53".into(),
+                qname,
+            });
+        }
+        let mut intel = NetworkIntelCollector::new();
+        for _ in 0..50 {
+            query(&mut intel, "www.busy.example".into());
+        }
+        // A flood of unique names with no tick, so no prune, in between.
+        for i in 0..MAX_TRACKED_DOMAINS * 10 {
+            query(&mut intel, format!("q.d{i}.example"));
+            assert!(
+                intel.domain_counts.len() <= MAX_TRACKED_DOMAINS * 2,
+                "{} domains after {i} names",
+                intel.domain_counts.len()
+            );
+        }
+        let top = &intel.dns_analytics().top_domains[0];
+        assert_eq!((top.0.as_str(), top.1), ("busy.example", 50));
     }
 }

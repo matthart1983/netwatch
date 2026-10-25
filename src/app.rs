@@ -1209,7 +1209,7 @@ impl App {
         }
 
         self.incident_recorder.record_capture_status(
-            self.packet_collector.capture_session.clone(),
+            self.packet_collector.capture_session(),
             self.packet_collector.stats.observed_drops(),
         );
         let connections = self.connection_collector.connections();
@@ -3474,25 +3474,32 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             if let Some(sel_id) = app.ui.scroll.packet_selected {
                 // Only a packet the list shows, as for `W`.
                 let idx = ui::packets::selected_packet(app, &app.packet_collector.get_packets())
-                    .and_then(|p| p.stream_index);
-                if let Some(idx) = idx {
+                    .and_then(|p| {
+                        p.stream_index
+                            .map(|i| (i, p.capture.as_ref().map(|m| m.session.to_string())))
+                    });
+                if let Some((idx, session)) = idx {
                     app.ui.stream_view_open = true;
                     app.ui.stream_view_index = Some(idx);
+                    app.ui.stream_view_session = session;
                     app.ui.stream_direction_filter = StreamDirectionFilter::Both;
                     app.ui.stream_hex_mode = false;
                     // Remember which packet was selected so the stream view
                     // highlights it, and scroll so its bytes are on screen.
                     app.ui.stream_view_focus_packet = Some(sel_id);
-                    let focus_line = app.packet_collector.get_stream(idx).and_then(|s| {
-                        crate::ui::packets::build_stream_lines(
-                            &s,
-                            false,
-                            StreamDirectionFilter::Both,
-                            Some(sel_id),
-                            &app.theme,
-                        )
-                        .1
-                    });
+                    let focus_line = app
+                        .packet_collector
+                        .get_stream_in_session(idx, app.ui.stream_view_session.as_deref())
+                        .and_then(|s| {
+                            crate::ui::packets::build_stream_lines(
+                                &s,
+                                false,
+                                StreamDirectionFilter::Both,
+                                Some(sel_id),
+                                &app.theme,
+                            )
+                            .1
+                        });
                     app.ui.scroll.stream_scroll = focus_line.map_or(0, |l| l.saturating_sub(2));
                 }
             }
@@ -3939,10 +3946,7 @@ fn yank_selected_packet(app: &mut App) {
         app.ui.export_status_tick = 0;
         return;
     };
-    let h3_bodies = pkt
-        .stream_index
-        .map(|i| app.packet_collector.quic_h3_bodies(i))
-        .unwrap_or_default();
+    let h3_bodies = app.packet_collector.quic_h3_bodies_for_packet(pkt);
     let text = crate::ui::packets::format_packet_for_clipboard(pkt, &h3_bodies);
     match crate::clipboard::copy(&text) {
         Ok(tool) => {

@@ -91,7 +91,8 @@ fn link_type_for(name: Option<&str>, dlt: i32) -> Option<u16> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureMetadata {
     /// Identifies one capture start; a restart on the same interface is a
-    /// new session and gets its own PCAPNG interface block.
+    /// new session and gets its own PCAPNG interface block. So is a capture
+    /// that runs out of stream indexes, which then restart from 0.
     pub session: Arc<str>,
     pub interface: Arc<str>,
     /// PCAPNG / pcap-savefile LINKTYPE of the bytes in `raw_bytes`.

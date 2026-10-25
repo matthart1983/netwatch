@@ -3,7 +3,7 @@
 //! Packets tab (list, detail pane, and scroll/selection).
 
 use super::format::{canonical_ip, parse_ip};
-use super::CapturedPacket;
+use super::{CapturedPacket, IndexSpace};
 
 // ── Display filters ─────────────────────────────────────────
 
@@ -288,14 +288,35 @@ fn address_matches(addr: &str, wanted: &str) -> bool {
     }
 }
 
+/// Whether `pkt` passes `expr`, judged on the packet alone: `stream N`
+/// compares the index and nothing else. The Packets tab uses
+/// [`matches_packet_in`].
 pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
+    matches(expr, pkt, None)
+}
+
+/// [`matches_packet`] as the Packets tab applies it, where `stream N` is the
+/// flow the tracker numbers N now. Once the indices have run out, the list
+/// can still hold older packets numbered N for a different flow, and those
+/// are outside `index_space`.
+pub fn matches_packet_in(
+    expr: &FilterExpr,
+    pkt: &CapturedPacket,
+    index_space: &IndexSpace,
+) -> bool {
+    matches(expr, pkt, Some(index_space))
+}
+
+fn matches(expr: &FilterExpr, pkt: &CapturedPacket, index_space: Option<&IndexSpace>) -> bool {
     match expr {
         FilterExpr::Protocol(p) => pkt.protocol.eq_ignore_ascii_case(p),
         FilterExpr::SrcIp(ip) => address_matches(&pkt.src_ip, ip),
         FilterExpr::DstIp(ip) => address_matches(&pkt.dst_ip, ip),
         FilterExpr::Ip(ip) => address_matches(&pkt.src_ip, ip) || address_matches(&pkt.dst_ip, ip),
         FilterExpr::Port(p) => pkt.src_port == Some(*p) || pkt.dst_port == Some(*p),
-        FilterExpr::Stream(n) => pkt.stream_index == Some(*n),
+        FilterExpr::Stream(n) => {
+            pkt.stream_index == Some(*n) && index_space.is_none_or(|s| s.holds(pkt))
+        }
         FilterExpr::Contains(s) => {
             pkt.info.to_lowercase().contains(s)
                 || pkt.src_ip.to_lowercase().contains(s)
@@ -364,8 +385,8 @@ pub fn matches_packet(expr: &FilterExpr, pkt: &CapturedPacket) -> bool {
             _ => false,
         },
         FilterExpr::Decrypted(want) => pkt.decrypted_plaintext.is_some() == *want,
-        FilterExpr::Not(inner) => !matches_packet(inner, pkt),
-        FilterExpr::And(a, b) => matches_packet(a, pkt) && matches_packet(b, pkt),
-        FilterExpr::Or(a, b) => matches_packet(a, pkt) || matches_packet(b, pkt),
+        FilterExpr::Not(inner) => !matches(inner, pkt, index_space),
+        FilterExpr::And(a, b) => matches(a, pkt, index_space) && matches(b, pkt, index_space),
+        FilterExpr::Or(a, b) => matches(a, pkt, index_space) || matches(b, pkt, index_space),
     }
 }
