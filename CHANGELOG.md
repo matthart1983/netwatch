@@ -50,6 +50,38 @@ All notable changes to NetWatch will be documented in this file.
   and `y` (copy) now act only on a packet the list shows, where they used to
   act on the hidden one whether `x` or the display filter hid it. Turning `x`
   off shows the packet again.
+- **A packet from before the stream indices ran out no longer shows a newer
+  flow's stream.** Once a capture had numbered 2^32 flows the numbers began
+  again, and a packet still in the list from before could show the stream
+  details, handshake time, HTTP/3 bodies, conversation ladder and stream
+  view of the newer flow that took its number; a `stream N` filter listed
+  both flows. Such a packet now shows no stream, and `stream N` matches only
+  the flow numbered N now. Packets from before a capture restart or an
+  interface switch still show theirs, as numbering carries on across those.
+- **The drop count and packet rate stay right past four billion packets.**
+  libpcap counts received and dropped packets in 32 bits, which wrap within
+  the hour at 1.2 million packets a second. netwatch showed libpcap's count
+  as it stood, so after a wrap the drops in the Packets header and in an
+  incident bundle's `last_capture_status` fell back towards zero, and the
+  rate read 0 pkt/s for a second. Each poll now adds the change since the
+  last one to 64-bit totals.
+- **A stream index names one flow per capture session, even after four
+  billion flows.** Capture numbers each flow with a 32-bit index. After
+  2^32 flows, about seven hours of new connections at full decode speed, the
+  numbering wrapped to 0, and one index in one `capture_session` could name
+  two flows, so two flows' packets could carry the same `capture_generation`
+  in a PCAPNG export. netwatch now forgets every stream, numbers from 0
+  again and starts a new `capture_session`. The drops in an incident
+  bundle's `last_capture_status` still count from the capture start.
+- **A port scan or a flood of DNS names no longer swells the detectors'
+  memory.** The port-scan detector kept every port each source touched in
+  its 30-second window, up to all 65,536 for each of 1,000 sources, about
+  400 MB, and kept that memory after the window ended. Query counts per
+  domain were trimmed every 30 seconds, so a flood of unique names added an
+  entry per query until then. Each source now keeps at most 256 ports, well
+  past the 20 that raise the alert, and each window starts with an empty
+  set. Domain counts are cut to the 500 most queried as soon as a new name
+  would take them past 1,000.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -158,14 +190,6 @@ All notable changes to NetWatch will be documented in this file.
   must be on a filesystem with hard links.
 
 ### Fixed
-- **A packet from before the stream indices ran out no longer shows a newer
-  flow's stream.** Once a capture had numbered 2^32 flows the numbers began
-  again, and a packet still in the list from before could show the stream
-  details, handshake time, HTTP/3 bodies, conversation ladder and stream
-  view of the newer flow that took its number; a `stream N` filter listed
-  both flows. Such a packet now shows no stream, and `stream N` matches only
-  the flow numbered N now. Packets from before a capture restart or an
-  interface switch still show theirs, as numbering carries on across those.
 - **Exported captures carry the real capture time and wire length.** PCAP
   export rebuilt each timestamp from the time of day shown in the packet
   list, so every packet was dated 1 January 1970 and a capture across
@@ -291,30 +315,6 @@ All notable changes to NetWatch will be documented in this file.
   can change after upgrading: an `allow_sni` list stops flagging allowed
   IPv6 traffic that had no name before, and a `deny_sni` list now catches
   IPv6 traffic it used to miss.
-- **The drop count and packet rate stay right past four billion packets.**
-  libpcap counts received and dropped packets in 32 bits, which wrap within
-  the hour at 1.2 million packets a second. netwatch showed libpcap's count
-  as it stood, so after a wrap the drops in the Packets header and in an
-  incident bundle's `last_capture_status` fell back towards zero, and the
-  rate read 0 pkt/s for a second. Each poll now adds the change since the
-  last one to 64-bit totals.
-- **A stream index names one flow per capture session, even after four
-  billion flows.** Capture numbers each flow with a 32-bit index. After
-  2^32 flows, about seven hours of new connections at full decode speed, the
-  numbering wrapped to 0, and one index in one `capture_session` could name
-  two flows, so two flows' packets could carry the same `capture_generation`
-  in a PCAPNG export. netwatch now forgets every stream, numbers from 0
-  again and starts a new `capture_session`. The drops in an incident
-  bundle's `last_capture_status` still count from the capture start.
-- **A port scan or a flood of DNS names no longer swells the detectors'
-  memory.** The port-scan detector kept every port each source touched in
-  its 30-second window, up to all 65,536 for each of 1,000 sources, about
-  400 MB, and kept that memory after the window ended. Query counts per
-  domain were trimmed every 30 seconds, so a flood of unique names added an
-  entry per query until then. Each source now keeps at most 256 ports, well
-  past the 20 that raise the alert, and each window starts with an empty
-  set. Domain counts are cut to the 500 most queried as soon as a new name
-  would take them past 1,000.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
