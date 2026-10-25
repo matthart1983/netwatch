@@ -28,9 +28,12 @@ pub mod socket_table;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-/// The `setcap` line the README, REFERENCE.md and the man page give for
+/// The `setcap` line the capture error and the Dashboard banner give for
 /// capture without root on Linux. CAP_BPF and CAP_PERFMON are for eBPF
-/// attribution (`sandbox/mod.rs`).
+/// attribution (`sandbox/mod.rs`). It grants the binary in place, for every
+/// account that can run it. The README, REFERENCE.md and the man page first
+/// restrict the binary to a group; E3 in docs/THREAT-MODEL.md is the work
+/// that makes this line and the package messages match them.
 pub const LINUX_CAPTURE_FIX: &str =
     r#"sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)""#;
 
@@ -40,8 +43,8 @@ pub const WINDOWS_CAPTURE_FIX: &str =
     "install Npcap from https://npcap.com/#download, without \"restrict to administrators\"";
 
 /// What lets netwatch capture on this OS when opening a capture was refused.
-/// The one place it is written, so the error, the Dashboard banner and the
-/// docs cannot drift apart.
+/// The one place it is written, so the error and the Dashboard banner cannot
+/// drift apart.
 pub const fn capture_fix() -> &'static str {
     if cfg!(target_os = "linux") {
         LINUX_CAPTURE_FIX
@@ -361,8 +364,11 @@ mod interface_name_tests {
 mod capture_fix_tests {
     use super::LINUX_CAPTURE_FIX;
 
-    /// The line the banner prints is the line the docs give, and the
-    /// packages grant the same capabilities.
+    /// The banner, the docs and the packages grant the same capabilities.
+    /// The docs also restrict the binary to a group first, which the
+    /// banner's one line cannot; E3 in docs/THREAT-MODEL.md brings the
+    /// banner and the packages in line, and this goes back to checking
+    /// the docs give the banner's exact line.
     #[test]
     fn the_fix_line_matches_the_docs_and_packages() {
         for (doc, text) in [
@@ -373,6 +379,10 @@ mod capture_fix_tests {
             assert!(
                 text.contains("cap_net_raw,cap_bpf,cap_perfmon+eip"),
                 "{doc} gives another capability set"
+            );
+            assert!(
+                !text.contains(LINUX_CAPTURE_FIX),
+                "{doc} grants capabilities to a world-executable binary"
             );
         }
         let caps = LINUX_CAPTURE_FIX.split_whitespace().nth(2).unwrap();
