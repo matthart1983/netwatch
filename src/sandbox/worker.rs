@@ -255,6 +255,45 @@ pub fn drop_load_caps(name: &str) {
     let _ = name;
 }
 
+/// What [`relinquish`] left each unconfined thread holding, by name.
+static RELINQUISHED: Mutex<BTreeMap<String, Report>> = Mutex::new(BTreeMap::new());
+
+/// Give up, on the calling thread, every capability except CAP_SYS_PTRACE and
+/// CAP_DAC_READ_SEARCH, without confining it.
+///
+/// For the ProcBroker, which stays outside Landlock to read other processes'
+/// socket fds and so never enters. Under sudo it would otherwise keep every
+/// capability the process started with, CAP_NET_RAW and the BPF set included,
+/// for the whole session and in every mode. Needs no policy, because the
+/// broker can start before [`ensure`] installs one; the outcome is recorded
+/// for [`relinquished`] either way.
+pub fn relinquish(name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut report = Report::default();
+        super::linux::relinquish_caps(&mut report);
+        for warning in &report.mode.warnings {
+            tracing::warn!(target: "netwatch::sandbox", thread = name, "{warning}");
+        }
+        let mut records = crate::app::safe_lock(&RELINQUISHED, "worker::relinquish");
+        // Never overwrite evidence that an earlier thread of the same name
+        // kept more than it should have.
+        if records
+            .get(name)
+            .is_none_or(|earlier| earlier.mode.warnings.is_empty())
+        {
+            records.insert(name.into(), report);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = name;
+}
+
+/// The capabilities each [`relinquish`] caller dropped and kept.
+pub fn relinquished() -> BTreeMap<String, Report> {
+    crate::app::safe_lock(&RELINQUISHED, "worker::relinquished").clone()
+}
+
 pub fn spawn(name: &'static str, run: impl FnOnce() + Send + 'static) -> WorkerHandle {
     spawn_retaining(name, super::Retain::Nothing, run)
 }
@@ -268,13 +307,18 @@ pub fn spawn_retaining(
     begin(name);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-    let handle = std::thread::spawn(move || {
-        let allowed = enter_retaining(name, retain);
-        let _ = ready_tx.send(allowed);
-        if allowed && release_rx.recv().unwrap_or(false) && !stopping() {
-            run();
-        }
-    });
+    // Named so the panic hook, the log and `/proc/<pid>/task/*/comm` can tell
+    // workers apart; the kernel keeps the first 15 bytes.
+    let handle = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let allowed = enter_retaining(name, retain);
+            let _ = ready_tx.send(allowed);
+            if allowed && release_rx.recv().unwrap_or(false) && !stopping() {
+                run();
+            }
+        })
+        .expect("failed to spawn thread");
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(true) => {
             let _ = release_tx.send(true);
@@ -499,6 +543,21 @@ mod tests {
         assert_eq!(shutdown(Duration::from_secs(2)), 0);
         // Parent thread remains unrestricted: tests changed the real workers only.
         assert_eq!(std::fs::read(root.join("secret")).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn worker_threads_are_named() {
+        // An unnamed worker carries its parent's name, so every worker in a
+        // panic message or a task listing used to read "netwatch".
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn("policy-preflight", move || {
+            let comm = std::fs::read_to_string("/proc/thread-self/comm").unwrap();
+            tx.send(comm).unwrap();
+        })
+        .join()
+        .unwrap();
+        let comm = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(comm.trim_end(), "policy-prefligh");
     }
 
     /// The capture thread records its state in the component map and the UI
