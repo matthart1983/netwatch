@@ -71,8 +71,9 @@ legacy journal is not crash-durable.
 ## Security boundary
 
 The [sandbox reference](REFERENCE.md#landlock-sandbox-linux) documents current
-worker entry enforcement and exact file/dedicated-directory grants. The SDK eBPF
-source stays disabled under enabled policy until a reader hook is available.
+worker entry enforcement and exact file/dedicated-directory grants. eBPF loads
+inside the policy; the SDK reader inherits it but keeps the load capabilities
+until it has an entry hook of its own.
 Network access remains unrestricted. Linux tests cover actual lookup, Insights and
 keylog entries, keylog restart, export access, symlink replacement and strict entry
 rejection. Privileged capture/restart and cross-platform acceptance remain pending.

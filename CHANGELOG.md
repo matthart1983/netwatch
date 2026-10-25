@@ -228,8 +228,11 @@ All notable changes to NetWatch will be documented in this file.
   notes overstated protection by saying a compromised parser cannot read SSH
   keys. Threads share memory and descriptors, the proc broker is outside
   Landlock, and outbound networking remains unrestricted. Root operation has
-  limited containment. The preferred Linux setup restricts a capability-enabled
-  binary to a dedicated group; policy and endpoint tables are checked in tests.
+  limited containment. The preferred Linux setup restricts a
+  capability-enabled binary to a dedicated group; policy and endpoint tables
+  are checked in tests. `netwatch doctor` said eBPF was disabled by the
+  sandbox policy, untrue since 0.32.2; it now says eBPF loads under the policy
+  and its reader keeps the load capabilities.
 - **Run as root, the sandbox now takes the capabilities netwatch never
   uses from every confined thread.** It removes capabilities by a
   deny-list, and the list held only CAP_BPF, CAP_PERFMON and CAP_SYS_ADMIN.

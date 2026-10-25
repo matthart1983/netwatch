@@ -127,7 +127,7 @@ impl CapabilitySnapshot {
         );
         let ebpf = cfg!(all(target_os = "linux", feature = "ebpf"));
         let attribution = if ebpf && !matches!(Mode::from_config(&config.sandbox), Mode::Disabled) {
-            "eBPF disabled by sandbox policy; socket polling fallback not checked"
+            "eBPF loads under sandbox policy and its reader keeps load capabilities; initialization and socket fallback not checked"
         } else if ebpf {
             "eBPF compiled in; initialization and socket fallback not checked"
         } else {
@@ -1087,6 +1087,16 @@ mod tests {
         let snapshot = CapabilitySnapshot::configured(&config);
         assert_eq!(snapshot.get("online_geo").state, State::NotChecked);
         assert!(snapshot.get("online_geo").detail.contains("cleartext"));
+    }
+    /// Since 0.32.2 eBPF loads inside the sandbox policy, so the default
+    /// configuration must not report it switched off by that policy.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[test]
+    fn static_doctor_says_ebpf_loads_under_the_sandbox() {
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let detail = &snapshot.get("attribution").detail;
+        assert!(!detail.contains("disabled"), "{detail}");
+        assert!(detail.contains("keeps load capabilities"), "{detail}");
     }
     #[cfg(target_os = "linux")]
     #[test]

@@ -702,8 +702,9 @@ impl App {
     }
 
     /// Start persistent workers through their policy entry boundaries.
-    /// Capture opens its resource before entering; the SDK source stays disabled
-    /// under sandbox policy because its internal reader has no entry hook.
+    /// Capture opens its resource before entering. eBPF loads inside the policy;
+    /// the SDK's reader inherits it but keeps the load capabilities, because it
+    /// has no entry hook of its own.
     pub(crate) fn start_workers(&mut self) {
         if self.workers_started {
             return;
