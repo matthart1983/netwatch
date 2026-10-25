@@ -443,26 +443,35 @@ pub(super) fn prepare_ruleset(paths: &SandboxPaths) -> Result<landlock::RulesetC
                     }
                 }
             }
-            let mut access = if write {
-                AccessFs::from_all(TARGET_ABI)
-            } else {
-                AccessFs::from_read(TARGET_ABI)
-            };
-            if !meta.is_dir() {
-                access &= AccessFs::ReadFile
-                    | AccessFs::WriteFile
-                    | AccessFs::Execute
-                    | AccessFs::Truncate;
-            }
-            if configured_file {
-                access = AccessFs::ReadFile.into();
-            }
+            let access = rule_access(write, meta.is_dir(), configured_file);
             ruleset = ruleset
                 .add_rule(PathBeneath::new(file, access))
                 .map_err(|e| e.to_string())?;
         }
     }
     Ok(ruleset)
+}
+
+/// What one grant allows: every handled right for a write grant, reading
+/// for a read grant, and only reading the file itself for a configured
+/// GeoIP or keylog file. A non-directory takes only the file rights.
+pub(super) fn rule_access(
+    write: bool,
+    is_dir: bool,
+    configured_file: bool,
+) -> landlock::BitFlags<AccessFs> {
+    if configured_file {
+        return AccessFs::ReadFile.into();
+    }
+    let mut access = if write {
+        AccessFs::from_all(TARGET_ABI)
+    } else {
+        AccessFs::from_read(TARGET_ABI)
+    };
+    if !is_dir {
+        access &= AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Execute | AccessFs::Truncate;
+    }
+    access
 }
 
 fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<(), String> {

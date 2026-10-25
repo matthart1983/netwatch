@@ -48,6 +48,21 @@ fn threat_model_policy_tables_match_code() {
         rows.extend(entries.iter().map(|p| format!("{kind}: {}", p.display())));
     }
     assert_eq!(block("policy:grants"), rows.join("\n"));
+    // And the labels mean what the document says they grant.
+    use landlock::{Access, AccessFs, BitFlags};
+    let abi = linux::TARGET_ABI;
+    assert_eq!(
+        linux::rule_access(false, true, false),
+        AccessFs::from_read(abi)
+    );
+    assert_eq!(
+        linux::rule_access(false, false, true),
+        BitFlags::from(AccessFs::ReadFile)
+    );
+    assert_eq!(
+        linux::rule_access(true, true, false),
+        AccessFs::from_all(abi)
+    );
 }
 
 #[test]
