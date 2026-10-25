@@ -1,6 +1,6 @@
 use crate::app::{App, StreamDirectionFilter};
 use crate::collectors::packets::{
-    format_endpoint, matches_packet, parse_filter, port_label, CapturedPacket, ExpertSeverity,
+    format_endpoint, matches_packet_in, parse_filter, port_label, CapturedPacket, ExpertSeverity,
     FilterExpr, StreamDirection,
 };
 use crate::ui::stream_context;
@@ -473,9 +473,13 @@ pub fn effective_packet_filter(app: &App) -> Option<FilterExpr> {
 /// passed slice; callers hold the packet-store guard for its lifetime.
 pub fn visible_packets<'a>(app: &App, packets: &'a [CapturedPacket]) -> Vec<&'a CapturedPacket> {
     let expr = effective_packet_filter(app);
+    let index_space = app.packet_collector.index_space();
     packets
         .iter()
-        .filter(|p| expr.as_ref().is_none_or(|e| matches_packet(e, p)))
+        .filter(|p| {
+            expr.as_ref()
+                .is_none_or(|e| matches_packet_in(e, p, &index_space))
+        })
         .filter(|p| !app.ui.packet_expert_only || is_expert(p))
         .collect()
 }
@@ -855,12 +859,17 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
     // otherwise a stale selection (or a scroll position the filter excludes)
     // would render details for a packet not shown in the list.
     let filter = effective_packet_filter(app);
+    let index_space = app.packet_collector.index_space();
     let selected_pkt = app
         .ui
         .scroll
         .packet_selected
         .and_then(|id| packets.iter().find(|p| p.id == id))
-        .filter(|p| filter.as_ref().is_none_or(|e| matches_packet(e, p)));
+        .filter(|p| {
+            filter
+                .as_ref()
+                .is_none_or(|e| matches_packet_in(e, p, &index_space))
+        });
 
     match selected_pkt {
         Some(pkt) => {

@@ -3342,7 +3342,7 @@ pub mod export;
 
 // ── Display filters (extracted to filter.rs) ──
 mod filter;
-pub use filter::{matches_packet, parse_filter, FilterExpr};
+pub use filter::{matches_packet, matches_packet_in, parse_filter, FilterExpr};
 
 /// The device name pcap opens for a user-facing interface name.
 ///
@@ -4359,6 +4359,53 @@ mod tests {
             .is_none());
         let current = collector.capture_session().unwrap();
         assert!(collector.get_stream_in_session(0, Some(&current)).is_some());
+    }
+
+    /// `stream N` means the flow numbered N now. Once the indices have run
+    /// out, the list can still hold packets numbered N for an older flow.
+    #[test]
+    fn the_stream_filter_leaves_out_a_flow_from_before_the_indices_ran_out() {
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        let collector = &app.packet_collector;
+        let first: Arc<str> = "capture-a".into();
+        collector
+            .stream_tracker
+            .lock()
+            .unwrap()
+            .start_session(Arc::clone(&first));
+        let udp_from = |port: u16| {
+            let mut frame = UDP_FRAME;
+            frame[34..36].copy_from_slice(&port.to_be_bytes());
+            let mut meta = metadata(1);
+            meta.session = Arc::clone(&first);
+            let frame = Frame {
+                data: &frame,
+                ethernet: true,
+                capture: Some(meta),
+            };
+            let pkt = decode_and_track(
+                frame,
+                &collector.counter,
+                &collector.dns_cache,
+                &collector.stream_tracker,
+            )
+            .unwrap();
+            collector.packets.write().unwrap().push(pkt.clone());
+            pkt
+        };
+        let old = udp_from(1000);
+        collector.stream_tracker.lock().unwrap().next_index = u32::MAX;
+        let new = udp_from(2000);
+        assert_eq!((old.stream_index, new.stream_index), (Some(0), Some(0)));
+
+        app.ui.packet_filter_active = Some("stream 0".into());
+        let packets = app.packet_collector.get_packets();
+        let shown: Vec<u64> = crate::ui::packets::visible_packets(&app, &packets)
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(shown, [new.id]);
     }
 
     #[test]

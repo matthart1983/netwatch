@@ -96,9 +96,10 @@ All notable changes to NetWatch will be documented in this file.
   flow's stream.** Once a capture had numbered 2^32 flows the numbers began
   again, and a packet still in the list from before could show the stream
   details, handshake time, HTTP/3 bodies, conversation ladder and stream
-  view of the newer flow that took its number. Such a packet now shows no
-  stream. Packets from before a capture restart or an interface switch still
-  show theirs, as numbering carries on across those.
+  view of the newer flow that took its number; a `stream N` filter listed
+  both flows. Such a packet now shows no stream, and `stream N` matches only
+  the flow numbered N now. Packets from before a capture restart or an
+  interface switch still show theirs, as numbering carries on across those.
 - **Exported captures carry the real capture time and wire length.** PCAP
   export rebuilt each timestamp from the time of day shown in the packet
   list, so every packet was dated 1 January 1970 and a capture across
