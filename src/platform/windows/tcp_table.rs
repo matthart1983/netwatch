@@ -186,8 +186,9 @@ fn read_table<T: OwnerPidTable>(
 
 /// Copy the rows out of a buffer a successful call filled. `filled` is the
 /// byte count the call left in its size argument, never trusted past the
-/// buffer's own length. A buffer too short to hold the table header has no
-/// rows: `read_table` never passes one, but this is a safe fn and checks.
+/// buffer's own length. A buffer too short to hold the whole table struct,
+/// its header and one row, has no rows: `read_table` never passes one, but
+/// this is a safe fn and checks.
 fn rows<T: OwnerPidTable>(buf: &[u32], filled: usize) -> Vec<T::Row> {
     // The tables' fields are all u32 and byte arrays, so u32 elements align
     // the buffer for them. Checked here rather than taken on trust.
@@ -329,12 +330,17 @@ mod tests {
         );
     }
 
-    /// `rows` is safe to call with any slice. One shorter than the table
-    /// struct would have the header read past its end.
+    /// `rows` is safe to call with any slice, so one shorter than the table
+    /// struct must not have the struct borrowed past its end. Without the
+    /// check, the empty slice reads its row count through a dangling pointer.
+    /// A slice one u32 short of the struct holds a header but no row, so it
+    /// reads none either way, but under Miri it fails a check that stops at
+    /// the header.
     #[test]
-    fn a_buffer_shorter_than_the_table_header_reads_no_rows() {
+    fn a_buffer_shorter_than_the_table_struct_reads_no_rows() {
         assert!(rows::<MIB_TCPTABLE_OWNER_PID>(&[], 0).is_empty());
-        assert!(rows::<MIB_TCP6TABLE_OWNER_PID>(&[1], 4).is_empty());
+        let short = vec![1u32; size_of::<MIB_TCP6TABLE_OWNER_PID>() / 4 - 1];
+        assert!(rows::<MIB_TCP6TABLE_OWNER_PID>(&short, short.len() * 4).is_empty());
     }
 
     #[test]
