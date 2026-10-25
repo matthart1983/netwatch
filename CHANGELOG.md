@@ -118,6 +118,17 @@ All notable changes to NetWatch will be documented in this file.
   past the 20 that raise the alert, and each window starts with an empty
   set. Domain counts are cut to the 500 most queried as soon as a new name
   would take them past 1,000.
+- **With a GeoIP database configured, the GeoIP cache stops growing at
+  4,096 addresses.** Each address the database answered for got a cache
+  entry that was never removed, so a TUI or daemon left running kept one
+  for every public address it had looked up. On a public server that is
+  every client. Every GeoIP lookup now goes through one cache of 4,096
+  entries that drops the least recently used quarter when it fills, as
+  reverse DNS already did. The WHOIS cache of 2,048 entries and the online
+  GeoIP cache dropped whichever quarter their map listed first, which could
+  include the address on screen. They now drop the least recently used
+  too. A v4-mapped address such as `::ffff:8.8.8.8` and its IPv4 form share
+  one entry and are looked up as the IPv4 address.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -214,6 +225,18 @@ All notable changes to NetWatch will be documented in this file.
   300 MiB, so a link there could keep that cleanup running for good or
   offer it files from outside. They now list a linked file but do not
   descend into a linked directory.
+- **WHOIS and online GeoIP look up global unicast addresses only.** Their
+  private-address check compared the start of the text against a short
+  list, so it let through local addresses written another way or in ranges
+  the list left out. Among them were a LAN peer in the `::ffff:192.168.1.5`
+  form Linux gives a dual-stack socket's peer, the 100.64.0.0/10 range that
+  carrier-grade NAT and Tailscale use, the documentation and benchmarking
+  ranges, link-local addresses outside `fe80::/16`, multicast groups
+  outside 224/8 and 239/8, and 255.255.255.255. `W` sent such an address
+  to rdap.org, and with `geoip_online` on netwatch sent it to ip-api.com in
+  cleartext. Both now skip any address that is not global unicast. A NAT64
+  address in `64:ff9b::/96` or a 6to4 address in `2002::/16` counts as
+  global only if the IPv4 address inside it does.
 
 ## [0.38.0] - 2026-10-25
 

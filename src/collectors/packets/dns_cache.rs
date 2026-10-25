@@ -7,12 +7,13 @@
 //! up every source let a flood of spoofed sources fill the queue and the
 //! cache.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 
 use super::format::parse_ip;
+use crate::collectors::lru::BoundedLru;
 
 const DNS_CACHE_MAX: usize = 4096; // max entries kept in memory, pending ones included
 
@@ -33,62 +34,22 @@ pub struct DnsCache {
 }
 
 /// The cache's entries, evicted least recently used first.
-#[derive(Default)]
-struct Entries {
-    map: HashMap<String, Slot>,
-    /// Advanced on every read and write; a slot keeps the value from its
-    /// last one.
-    clock: u64,
-}
-
-struct Slot {
-    entry: DnsEntry,
-    used: u64,
-}
+type Entries = BoundedLru<String, DnsEntry>;
 
 impl Entries {
     /// The resolver thread taking `ip` off the queue: `Queued` becomes
     /// `Pending`. False when there is nothing to look up, because the entry
     /// was answered or evicted while it waited.
     fn take(&mut self, ip: &str) -> bool {
-        match self.map.get_mut(ip) {
-            Some(slot) if matches!(slot.entry, DnsEntry::Queued) => {
-                slot.entry = DnsEntry::Pending {
+        match self.peek_mut(ip) {
+            Some(entry) if matches!(entry, DnsEntry::Queued) => {
+                *entry = DnsEntry::Pending {
                     started: std::time::Instant::now(),
                 };
                 true
             }
             _ => false,
         }
-    }
-
-    fn get(&mut self, ip: &str) -> Option<&DnsEntry> {
-        self.clock += 1;
-        let clock = self.clock;
-        self.map.get_mut(ip).map(|slot| {
-            slot.used = clock;
-            &slot.entry
-        })
-    }
-
-    /// Insert or replace. A new address in a full cache first evicts the
-    /// least recently used quarter, so the sort is paid once per
-    /// `DNS_CACHE_MAX / 4` insertions.
-    fn put(&mut self, ip: String, entry: DnsEntry) {
-        if self.map.len() >= DNS_CACHE_MAX && !self.map.contains_key(&ip) {
-            let mut by_use: Vec<(u64, String)> = self
-                .map
-                .iter()
-                .map(|(ip, slot)| (slot.used, ip.clone()))
-                .collect();
-            by_use.sort_unstable();
-            for (_, ip) in by_use.into_iter().take(DNS_CACHE_MAX / 4) {
-                self.map.remove(&ip);
-            }
-        }
-        self.clock += 1;
-        let used = self.clock;
-        self.map.insert(ip, Slot { entry, used });
     }
 }
 
@@ -123,7 +84,7 @@ const DNS_PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 impl DnsCache {
     pub(crate) fn new() -> Self {
         let (tx, rx) = std_mpsc::sync_channel::<String>(DNS_QUEUE_MAX);
-        let cache = Arc::new(Mutex::new(Entries::default()));
+        let cache = Arc::new(Mutex::new(Entries::new(DNS_CACHE_MAX)));
         Self {
             cache,
             tx,
@@ -319,7 +280,7 @@ mod lifecycle_tests {
         assert_eq!(cache.lookup("203.0.113.9"), None);
         assert_eq!(cache.lookup("0.0.0.0"), None);
         assert!(queued(&cache).is_empty());
-        assert!(cache.cache.lock().unwrap().map.is_empty());
+        assert_eq!(cache.cache.lock().unwrap().len(), 0);
 
         cache.lookup("192.0.2.10");
         cache.lookup("198.51.100.7");
@@ -334,7 +295,7 @@ mod lifecycle_tests {
         // The next refresh replaces the set: a closed connection's peer is
         // no longer looked up once its pending entry is gone.
         cache.set_peers(["192.0.2.1:80"]);
-        cache.cache.lock().unwrap().map.clear();
+        cache.cache.lock().unwrap().clear();
         cache.lookup("198.51.100.7");
         assert!(queued(&cache).is_empty());
     }
@@ -349,7 +310,7 @@ mod lifecycle_tests {
         for peer in &peers {
             cache.lookup(peer.trim_end_matches(":443"));
         }
-        assert_eq!(cache.cache.lock().unwrap().map.len(), DNS_QUEUE_MAX);
+        assert_eq!(cache.cache.lock().unwrap().len(), DNS_QUEUE_MAX);
         assert_eq!(queued(&cache).len(), DNS_QUEUE_MAX);
         // With room again, a dropped request is asked for on its next lookup.
         let dropped = peers.last().unwrap().trim_end_matches(":443");
@@ -366,8 +327,8 @@ mod lifecycle_tests {
         // However long it waits behind other lookups, it is not asked for
         // again, so it holds one slot and `host` runs once.
         assert!(matches!(
-            cache.cache.lock().unwrap().map[ip].entry,
-            DnsEntry::Queued
+            cache.cache.lock().unwrap().get(ip),
+            Some(DnsEntry::Queued)
         ));
         cache.lookup(ip);
         assert_eq!(queued(&cache), [ip]);
@@ -396,28 +357,8 @@ mod lifecycle_tests {
             .put(ip.into(), DnsEntry::Resolved("peer.example".into()));
         assert!(!cache.cache.lock().unwrap().take(ip));
         // As it does one evicted while it waited.
-        cache.cache.lock().unwrap().map.clear();
+        cache.cache.lock().unwrap().clear();
         assert!(!cache.cache.lock().unwrap().take(ip));
-    }
-
-    #[test]
-    fn the_cache_is_capped_and_evicts_the_least_recently_used() {
-        let mut entries = Entries::default();
-        let failed = |i: usize| format!("10.0.{}.{}", i / 256, i % 256);
-        for i in 0..DNS_CACHE_MAX {
-            entries.put(failed(i), DnsEntry::Failed);
-        }
-        // Read the oldest entry, so it is no longer the least recently used.
-        assert!(entries.get(&failed(0)).is_some());
-        entries.put("192.0.2.1".into(), DnsEntry::Failed);
-        assert_eq!(entries.map.len(), DNS_CACHE_MAX - DNS_CACHE_MAX / 4 + 1);
-        assert!(entries.map.contains_key(&failed(0)));
-        assert!(!entries.map.contains_key(&failed(1)));
-        assert!(entries.map.contains_key(&failed(DNS_CACHE_MAX / 4 + 1)));
-        for i in 0..DNS_CACHE_MAX * 2 {
-            entries.put(format!("10.1.{}.{}", i / 256, i % 256), DnsEntry::Failed);
-            assert!(entries.map.len() <= DNS_CACHE_MAX);
-        }
     }
 
     #[test]
