@@ -37,8 +37,8 @@ All notable changes to NetWatch will be documented in this file.
   minute, so 148 seconds read `2m` and 150 seconds `3m`. At the default
   1-second refresh, Dense's throughput axis was off at nearly every terminal
   size (80 columns plot 148 seconds), and so was Lite's axis on terminals
-  wider than about 120 columns. The connection sparkline labels in Dense and
-  Lite were off at refresh intervals above 4 seconds. Those windows now read
+  wider than about 120 columns. Lite's connection sparkline label was off at
+  refresh intervals above 4 seconds. Those windows now read
   `148s` and `150s`. A whole number of minutes still reads `2m` or `5m`, and
   a window of ten minutes or more is given to the nearest minute.
 - **With `x` on, the Packets detail pane stops showing a packet the list
@@ -46,8 +46,10 @@ All notable changes to NetWatch will be documented in this file.
   finding left that packet decoded in the detail pane, while the list showed
   only the findings and the stream pane beside it asked for a selection. The
   detail pane now asks for a selection too, as it already did when the
-  display filter hid the packet, and `W` does nothing until a row in the list
-  is selected. Turning `x` off shows the packet again.
+  display filter hid the packet. `W` (WHOIS), `s` (stream), `m` (bookmark)
+  and `y` (copy) now act only on a packet the list shows, where they used to
+  act on the hidden one whether `x` or the display filter hid it. Turning `x`
+  off shows the packet again.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
