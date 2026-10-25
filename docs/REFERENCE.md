@@ -275,7 +275,7 @@ incident JSON names processes and endpoints whether or not packet comments are o
 | `packet_artifacts` | The packet files actually in the bundle: none, `["packets.pcapng"]`, or both |
 | `packet_export` | `packets` written, `omitted` (no capture metadata), and `annotated` (with a socket owner) |
 | `packet_annotations` | Whether packet comments were on |
-| `last_capture_status` | The capture's `session`, `sampled_at_utc_ms` and `drops` (packets libpcap dropped, null when it had not reported recently), last sampled while recording. Not a loss total for the incident window |
+| `last_capture_status` | The capture's `session`, `sampled_at_utc_ms` and `drops` (packets libpcap dropped, null when it had not reported recently), last sampled while recording. `drops` counts from the last capture start, so it also covers any earlier `session` that ended when the stream indexes ran out. Not a loss total for the incident window |
 | `capture_limitations` | What the packet files cannot show, in prose |
 
 Version 1 bundles, from netwatch 0.37 and earlier, have `packets.pcap` only, with times

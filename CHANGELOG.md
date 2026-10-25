@@ -238,7 +238,8 @@ All notable changes to NetWatch will be documented in this file.
   numbering wrapped to 0, and one index in one `capture_session` could name
   two flows, so two flows' packets could carry the same `capture_generation`
   in a PCAPNG export. netwatch now forgets every stream, numbers from 0
-  again and starts a new `capture_session`.
+  again and starts a new `capture_session`. The drops in an incident
+  bundle's `last_capture_status` still count from the capture start.
 - **A port scan or a flood of DNS names no longer swells the detectors'
   memory.** The port-scan detector kept every port each source touched in
   its 30-second window, up to all 65,536 for each of 1,000 sources, about
