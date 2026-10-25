@@ -36,7 +36,7 @@ impl Directory {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         let meta = file.metadata()?;
-        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        if meta.uid() != nix::unistd::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "recovery directory must be owned by this user and private",
@@ -60,7 +60,7 @@ impl Directory {
         let file = unsafe { File::from_raw_fd(fd) };
         let meta = file.metadata()?;
         if !meta.is_file()
-            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.uid() != nix::unistd::geteuid().as_raw()
             || meta.mode() & 0o077 != 0
             || meta.nlink() != 1
         {
