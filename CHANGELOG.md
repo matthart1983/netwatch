@@ -283,6 +283,14 @@ All notable changes to NetWatch will be documented in this file.
   sockets is Landlock ABI 9, which earlier releases of the crate do not
   know. Cargo.lock already had 0.4.7, so nothing new is compiled.
 
+### CI
+- **The sandbox tests catch a worker whose role changes by accident.** They
+  read the name every worker spawn site in `src` uses and fail on one the
+  role table does not list, so renaming a network worker can no longer turn
+  it into a parser unnoticed. A child test hides Landlock behind a seccomp
+  filter and checks that strict mode refuses a parser thread because it
+  cannot deny TCP.
+
 ## [0.38.0] - 2026-10-25
 
 ### Added

@@ -595,6 +595,16 @@ mod tests {
                 "actual {name} worker could read sentinel"
             );
         }
+        // The exporter starts metrics-client on the listener's thread, where
+        // it inherits the listener's layer whatever its own role, so the
+        // scrape below shows the listener's deny only. Entered from this
+        // unconfined thread, it has to deny TCP by its own role.
+        spawn("metrics-client", || {}).join().unwrap();
+        assert_eq!(
+            NET_PROBES.lock().unwrap().get("metrics-client"),
+            Some(&Some(nix::libc::EACCES)),
+            "metrics-client's own role keeps the network"
+        );
         // An exporter serving from parser threads still answers a scrape
         // from this unconfined thread: accepting and answering is neither a
         // bind nor a connect, and the listener was bound before entry.
@@ -651,6 +661,93 @@ mod tests {
         .unwrap();
         let comm = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(comm.trim_end(), "policy-prefligh");
+    }
+
+    /// Make Landlock look absent to the calling thread and every thread it
+    /// starts afterwards: landlock_create_ruleset, which every Landlock call
+    /// starts with, fails with ENOSYS. Syscalls added since Linux 5.1 have the
+    /// same number on every architecture netwatch builds for, so the filter
+    /// does not check which.
+    fn hide_landlock() {
+        use nix::libc;
+        let statement = |code: u32, k: u32| libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let mut filter = [
+            statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0),
+            libc::sock_filter {
+                jf: 1,
+                ..statement(
+                    libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                    libc::SYS_landlock_create_ruleset as u32,
+                )
+            },
+            statement(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+            ),
+            statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        let (zero, one): (libc::c_ulong, libc::c_ulong) = (0, 1);
+        let mode = libc::SECCOMP_MODE_FILTER as libc::c_ulong;
+        // SAFETY: prctl reads four arguments after the option, each passed
+        // as the unsigned long the kernel takes, and PR_SET_NO_NEW_PRIVS
+        // fails unless the last three are zero. PR_SET_SECCOMP reads
+        // `program` and the `filter` it points to, both alive until it
+        // returns.
+        let installed = unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero) == 0
+                && libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    mode,
+                    &program as *const libc::sock_fprog,
+                    zero,
+                    zero,
+                ) == 0
+        };
+        assert!(installed, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Strict refuses a parser entry on a kernel that cannot deny TCP
+    /// (OD3). The filesystem layer fails too when Landlock is hidden, so the
+    /// error has to name the TCP deny; any strict failure would not do.
+    #[test]
+    fn strict_refuses_parser_entry_without_the_tcp_deny() {
+        const CHILD: &str = "NETWATCH_WORKER_NO_LANDLOCK_TEST";
+        // The filter cannot be removed, so it goes on a child.
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::worker::tests::strict_refuses_parser_entry_without_the_tcp_deny",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        hide_landlock();
+        install(Mode::Strict, SandboxPaths::default()).unwrap();
+        let error = preflight().unwrap_err();
+        assert!(
+            error.contains("cannot deny TCP") || error.contains("parser network deny unavailable"),
+            "{error}"
+        );
+        assert!(!snapshot()["policy-preflight"].ready);
     }
 
     /// The capture thread records its state in the component map and the UI
