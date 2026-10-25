@@ -1605,9 +1605,13 @@ fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) 
         width: area.width,
         height: 1,
     };
+    let window = crate::ui::lite::window_label(
+        crate::app::TOP_CONN_HISTORY_LEN,
+        app.user_config.refresh_rate_ms,
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "RX 30s",
+            format!("RX {window}"),
             Style::default().fg(t.text_muted),
         ))),
         hdr_area,
@@ -1622,11 +1626,17 @@ fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) 
                 width: area.width,
                 height: area.height.saturating_sub(2),
             };
-            let padded = pad_hist(&data, spark_area.width as usize);
+            // The cache's whole window across the pane. One sample per column
+            // left everything left of the newest 30 columns empty.
+            let fitted = crate::ui::dense::fit_window(
+                &data,
+                crate::app::TOP_CONN_HISTORY_LEN,
+                spark_area.width as usize * crate::graph::samples_per_column(app.graph_style),
+            );
             crate::graph::render(
                 f,
                 spark_area,
-                &padded,
+                &fitted,
                 app.graph_style,
                 t.rx_rate,
                 t.status_warn,
@@ -1634,18 +1644,6 @@ fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) 
             );
         }
     }
-}
-
-fn pad_hist(data: &[u64], target_width: usize) -> Vec<u64> {
-    if target_width == 0 {
-        return Vec::new();
-    }
-    if data.len() >= target_width {
-        return data[data.len() - target_width..].to_vec();
-    }
-    let mut padded = vec![0u64; target_width - data.len()];
-    padded.extend_from_slice(data);
-    padded
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -2227,5 +2225,89 @@ mod tests {
         let h: VecDeque<f64> = (0..20).map(|i| i as f64 * 5.0).collect();
         let s = rtt_sparkline(&h);
         assert_eq!(s.chars().count(), 20);
+    }
+
+    /// The detail strip shows WHOIS for the selected row only after W. It
+    /// used to queue the lookup itself, so moving the cursor down the table
+    /// sent each remote address to rdap.org. So did a parked cursor: the
+    /// selection is a row index, and the live table changes under it.
+    #[test]
+    fn drawing_the_selected_connection_queues_no_whois_lookup() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.connection_collector
+            .publish_for_test(vec![conn("curl", "ESTABLISHED", "8.8.8.8:443")]);
+        app.ui.connection_group = ConnectionGroup::None;
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("127.0.0.1:1234  →  8.8.8.8:443"),
+            "detail not drawn"
+        );
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+
+        // A new connection takes row 0 with no key pressed.
+        app.connection_collector
+            .publish_for_test(vec![conn("curl", "ESTABLISHED", "9.9.9.9:443")]);
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        assert_eq!(app.ui.scroll.connection_scroll, 0);
+        assert_eq!(app.whois_cache.queued_for_test(), Vec::<String>::new());
+    }
+
+    /// The detail graph spreads the cache's whole window across the pane, in
+    /// either graph style, and its header names that window. It padded the
+    /// 30 samples to one per column, so a pane wider than 30 columns drew
+    /// only its right edge (15 columns in the dots style), under a header
+    /// that said `RX 30s` at every refresh rate.
+    #[test]
+    fn the_detail_graph_fills_the_pane_with_the_window_it_names() {
+        use crate::graph::GraphStyle;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        let c = conn("curl", "ESTABLISHED", "8.8.8.8:443");
+        app.caches.top_conn_history.insert(
+            ("curl".into(), "8.8.8.8".into()),
+            vec![1000; crate::app::TOP_CONN_HISTORY_LEN].into(),
+        );
+        let area = Rect::new(0, 0, 80, 6);
+        for style in [GraphStyle::Bars, GraphStyle::Dots] {
+            app.graph_style = style;
+            // 30 samples at each rate. 150 seconds is not `3m`.
+            for (refresh_rate_ms, label) in [
+                (1000, "RX 30s"),
+                (500, "RX 15s"),
+                (4000, "RX 2m"),
+                (4500, "RX 135s"),
+                (5000, "RX 150s"),
+            ] {
+                app.user_config.refresh_rate_ms = refresh_rate_ms;
+                let mut terminal =
+                    Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+                terminal
+                    .draw(|f| render_detail_right(f, &app, area, &c))
+                    .unwrap();
+                let buf = terminal.backend().buffer();
+                let header: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+                assert_eq!(header.trim_end(), label);
+                // A full-scale sample reaches the plot's top row.
+                for x in 0..area.width {
+                    assert_ne!(
+                        buf[(x, 1)].symbol(),
+                        " ",
+                        "column {x} empty, {style:?} at {refresh_rate_ms} ms"
+                    );
+                }
+            }
+        }
     }
 }
