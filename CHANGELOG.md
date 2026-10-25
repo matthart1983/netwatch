@@ -252,6 +252,15 @@ All notable changes to NetWatch will be documented in this file.
   longer than 64 KiB and warns how many it skipped, where it used to read a
   line of any length. A line that is not valid UTF-8 now costs that line
   only; it used to end the rest of that day's file.
+- **`netwatch diagnose` no longer follows a link into another directory.**
+  Given a directory, `episodes`, `replay`, `features` and `export` walked
+  every link in it, so two links back up the tree, as an archive someone
+  sends you can hold, kept them walking until killed, and a link out of it
+  listed episodes from elsewhere. netwatch cleans its own episode directory
+  the same way after each recording, deleting what is past 90 days or
+  300 MiB, so a link there could keep that cleanup running for good or
+  offer it files from outside. They now list a linked file but do not
+  descend into a linked directory.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**

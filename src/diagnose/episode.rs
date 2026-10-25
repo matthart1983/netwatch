@@ -999,7 +999,9 @@ pub fn list(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // Not `path.is_dir()`, which follows a link: one back up the tree
+            // is a loop, and one out of it hands `prune` other files.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push(path);
             } else if path.to_string_lossy().ends_with(".json.gz") {
                 // Only what `save` writes. `prune` deletes from this list, so
@@ -2854,5 +2856,27 @@ mod tests {
             .collect();
         assert_eq!(left, vec!["1.json.gz", "2.json.gz"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Path::is_dir` follows a link, so a link back up the tree was walked
+    /// until the path held more links than the kernel resolves, listing each
+    /// episode once a lap, and two such links did not finish. A link out of
+    /// the tree handed `prune` files that are not netwatch's.
+    #[cfg(unix)]
+    #[test]
+    fn list_does_not_follow_links_to_directories() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("nw-links-{}", uuid::Uuid::new_v4()));
+        let (root, outside) = (dir.join("episodes"), dir.join("elsewhere"));
+        std::fs::create_dir_all(root.join("2026-09")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let ep = root.join("2026-09").join("ep.json.gz");
+        std::fs::write(&ep, b"").unwrap();
+        std::fs::write(outside.join("theirs.json.gz"), b"").unwrap();
+        symlink(".", root.join("loop")).unwrap();
+        symlink(&outside, root.join("out")).unwrap();
+        let listed = list(&root);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(listed, vec![ep]);
     }
 }
