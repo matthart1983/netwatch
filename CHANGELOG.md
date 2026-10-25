@@ -21,6 +21,12 @@ All notable changes to NetWatch will be documented in this file.
   pointer, and reads only the speed field rather than borrowing the whole
   `if_data` record. Nothing netwatch shows changes, and no new crate is
   compiled.
+- **`--sandbox-strict` and `sandbox = "strict"` need Linux 6.7 or newer.**
+  Strict mode now requires the parser threads' TCP deny described under
+  Security, which needs Landlock ABI 4. On Linux 6.2 to 6.6, which passed strict
+  before, netwatch now refuses to start in strict mode and says the kernel
+  cannot deny TCP. Older kernels already failed strict. Best-effort runs on
+  any kernel as before and logs one line when the deny is unavailable.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
@@ -230,6 +236,45 @@ All notable changes to NetWatch will be documented in this file.
   at startup. `netwatch doctor` said eBPF was disabled by the sandbox
   policy, untrue since 0.32.2; it now says eBPF loads under the policy and
   its reader keeps the load capabilities.
+- **Parser threads can no longer open TCP connections or listen on a
+  port.** On Linux 6.7 or newer, the workers that read packets, files,
+  kernel tables or subprocess output now stack a second Landlock layer that
+  denies TCP bind and connect. Capture, the TLS keylog reader, the metrics
+  endpoint, eBPF and connections are among them. Before, a parser bug that
+  ran code could connect anywhere or listen on any port, as every confined
+  thread could. The metrics endpoint still answers scrapes, because
+  accepting a connection is neither. Where the kernel supports it, the same
+  layer also stops these threads connecting to abstract Unix sockets from
+  Linux 6.12 and to pathname Unix sockets such as D-Bus or nscd from 7.1.
+  From 6.12, on a kernel with the fix for Landlock erratum 2, it stops them
+  signalling processes outside their domain. Main keeps the network, and so
+  do the workers whose job is a connection: reverse DNS, WHOIS, GeoIP,
+  health, traceroute, Insights, remote publishing and the Diagnose probes.
+  A worker missing from the role table counts as a parser. UDP, ICMP and
+  MPTCP stay open to parser threads, and MPTCP falls back to TCP, so this
+  makes sending data out after code execution harder without preventing
+  it. On older kernels best-effort logs `parser network deny unavailable`
+  once and runs as before.
+- **Parser and capture threads drop CAP_NET_RAW in best-effort mode too.**
+  Under the `setcap` line or sudo, every confined thread kept CAP_NET_RAW
+  unless `--sandbox-strict` was given, so a compromised parser could open
+  raw and packet sockets and inject frames. Those threads now drop it in
+  every mode. Capture opens its device before it drops the capability, and
+  `c`, `i` and `Shift+R` reopen capture on a new thread, so they keep
+  working. Main and the network workers keep CAP_NET_RAW in best-effort.
+  The capture thread still holds the device it opened, which can capture
+  and inject on its interface.
+- **The capture thread can no longer write files.** It had every write
+  grant the other confined threads have, so a parser bug in it could
+  rewrite `config.toml`, for example to turn the sandbox off for the next
+  start. Its Landlock layer now allows reading only. Nothing in the capture
+  loop writes a file; exports and incident bundles are written by other
+  threads. The other confined threads can still write the configuration.
+
+### Dependencies
+- **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
+  sockets is Landlock ABI 9, which earlier releases of the crate do not
+  know. Cargo.lock already had 0.4.7, so nothing new is compiled.
 
 ## [0.38.0] - 2026-10-25
 

@@ -19,6 +19,12 @@ struct Policy {
     components: Mutex<BTreeMap<String, Component>>,
     #[cfg(target_os = "linux")]
     prepared: Result<landlock::RulesetCreated, String>,
+    /// Stacked on `prepared` by parser threads; see [`super::Role`].
+    #[cfg(target_os = "linux")]
+    prepared_parser: Result<landlock::RulesetCreated, String>,
+    /// Stacked on `prepared` by the capture thread.
+    #[cfg(target_os = "linux")]
+    prepared_capture: Result<landlock::RulesetCreated, String>,
 }
 type SharedJoin = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
 static HANDLES: Mutex<Vec<SharedJoin>> = Mutex::new(Vec::new());
@@ -94,6 +100,10 @@ pub fn install(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
             mode,
             #[cfg(target_os = "linux")]
             prepared: super::linux::prepare_ruleset(&paths),
+            #[cfg(target_os = "linux")]
+            prepared_parser: super::linux::prepare_parser_layer(mode),
+            #[cfg(target_os = "linux")]
+            prepared_capture: super::linux::prepare_capture_layer(mode, &paths),
             paths,
             components: Mutex::new(BTreeMap::new()),
         })
@@ -102,6 +112,16 @@ pub fn install(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 pub(super) fn prepared_ruleset() -> Option<&'static Result<landlock::RulesetCreated, String>> {
     POLICY.get().map(|p| &p.prepared)
+}
+/// The layer `role` stacks on the shared ruleset. Each thread clones its own.
+#[cfg(target_os = "linux")]
+pub(super) fn prepared_layer(
+    role: super::Role,
+) -> Option<&'static Result<landlock::RulesetCreated, String>> {
+    POLICY.get().map(|p| match role {
+        super::Role::Capture => &p.prepared_capture,
+        _ => &p.prepared_parser,
+    })
 }
 pub fn ensure(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
     if let Some(policy) = POLICY.get() {
@@ -183,7 +203,9 @@ pub fn fail(name: &str, error: impl Into<String>) {
         );
     }
 }
-/// Enforce on the actual worker. Strict failures return false before processing.
+/// Enforce on the actual worker, with the policy of its role
+/// ([`super::roles::role_for`]). Strict failures return false before
+/// processing.
 pub fn enter(name: &str) -> bool {
     enter_retaining(name, super::Retain::Nothing)
 }
@@ -198,7 +220,8 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
     let Some(p) = POLICY.get() else {
         return true;
     };
-    let report = super::apply_retaining(p.mode, &p.paths, retain);
+    let role = super::roles::role_for(name);
+    let report = super::apply_retaining(p.mode, &p.paths, retain, role);
     #[cfg(test)]
     let report = {
         let mut report = report;
@@ -215,6 +238,18 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
         let denied =
             std::fs::read(path).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
         PROBES.lock().unwrap().insert(name.into(), denied);
+    }
+    #[cfg(test)]
+    if let Some(port) = std::env::var("NETWATCH_WORKER_NET_PROBE")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        // The errno of a TCP connect to a loopback listener, or `None` when
+        // it connected.
+        let errno = std::net::TcpStream::connect(("127.0.0.1", port))
+            .err()
+            .map(|e| e.raw_os_error().unwrap_or(-1));
+        NET_PROBES.lock().unwrap().insert(name.into(), errno);
     }
     let allowed = !matches!(p.mode, Mode::Strict) || report.mode.warnings.is_empty();
     let mut components = crate::app::safe_lock(&p.components, "worker::enter");
@@ -378,6 +413,8 @@ pub fn summary() -> String {
 
 #[cfg(test)]
 static PROBES: Mutex<BTreeMap<String, bool>> = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+static NET_PROBES: Mutex<BTreeMap<String, Option<i32>>> = Mutex::new(BTreeMap::new());
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -407,6 +444,10 @@ mod tests {
                 ),
             )
             .unwrap();
+            // Workers connect to this on entry; the kernel completes the
+            // handshake without an accept.
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let probe_port = probe.local_addr().unwrap().port().to_string();
             for injected in ["", "blocked"] {
                 let result = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -417,6 +458,7 @@ mod tests {
                     .env(CHILD, temp.0.as_path())
                     .env("NETWATCH_WORKER_FORCE_FAILURE", injected)
                     .env("NETWATCH_WORKER_PROBE", temp.0.as_path().join("secret"))
+                    .env("NETWATCH_WORKER_NET_PROBE", &probe_port)
                     .output()
                     .unwrap();
                 assert!(
@@ -551,6 +593,43 @@ mod tests {
                 PROBES.lock().unwrap().get(name),
                 Some(&true),
                 "actual {name} worker could read sentinel"
+            );
+        }
+        // An exporter serving from parser threads still answers a scrape
+        // from this unconfined thread: accepting and answering is neither a
+        // bind nor a connect, and the listener was bound before entry.
+        let metrics_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let exporter = crate::metrics::MetricsExporter::new(format!("127.0.0.1:{metrics_port}"));
+        exporter.start();
+        let mut scrape = std::net::TcpStream::connect(("127.0.0.1", metrics_port)).unwrap();
+        std::io::Write::write_all(&mut scrape, b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut scrape, &mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let net = NET_PROBES.lock().unwrap().clone();
+        for name in [
+            "keylog",
+            "metrics-listener",
+            "metrics-client",
+            "boundary-check",
+        ] {
+            assert_eq!(
+                net.get(name),
+                Some(&Some(nix::libc::EACCES)),
+                "actual {name} worker could connect: {net:?}"
+            );
+        }
+        // The online GeoIP worker is on its way out, so it is not held to
+        // connecting here.
+        for name in ["whois", "reverse-dns", "insights"] {
+            assert_eq!(
+                net.get(name),
+                Some(&None),
+                "actual {name} worker could not connect: {net:?}"
             );
         }
         assert!(wait_ready(Duration::from_secs(1)).is_ok());

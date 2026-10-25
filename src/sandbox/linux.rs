@@ -1,26 +1,46 @@
-//! Linux sandbox backend — capability drop + Landlock filesystem
-//! restrictions.
+//! Linux sandbox backend — capability drop plus Landlock layers.
 //!
-//! Phase 1 does *not* enable Landlock's network-block (ABI V4) rule. The
-//! TUI makes legitimate outbound calls for the ip-api.com GeoIP fallback
-//! (cleartext HTTP), `--remote` metric streaming, and inline WHOIS lookups; a
-//! blanket TCP-block would silently break working features. A later
-//! phase can add port-allow-listing once those endpoints are known at
-//! startup.
+//! Every confined thread takes the filesystem layer. Parser and capture
+//! threads (see [`Role`]) stack a second layer on it, with no rules, that
+//! denies TCP bind and connect, connecting to Unix sockets outside the
+//! thread's domain and, with erratum 2 fixed, signalling outside it.
+//! Capture's layer also handles every filesystem right and grants back only
+//! the read grants. Main and the network workers keep the network: main starts
+//! network workers after its own entry, and a thread keeps every layer it
+//! inherits. A TCP rule names a port, not a host, so allowing 443 to a
+//! network worker would still let it reach any host on 443; they get no TCP
+//! rules at all.
 
 use super::paths::SandboxPaths;
-use super::{Mode, Report};
+use super::{Mode, Report, Role};
 
 use caps::{CapSet, Capability, CapsHashSet};
 use landlock::{
-    Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Erratum, PathBeneath,
+    RestrictionStatus, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 use std::path::{Path, PathBuf};
 
-/// Highest requested ABI. Only filesystem access types are handled here;
-/// compatibility is best-effort on kernels supporting fewer access types.
+/// Highest requested ABI for the filesystem layer. Only filesystem access
+/// types are handled there; compatibility is best-effort on kernels
+/// supporting fewer access types.
 pub(crate) const TARGET_ABI: ABI = ABI::V4;
+
+/// The parser and capture layers handle `AccessNet::from_all` of this ABI,
+/// TCP bind and connect (Linux 6.7), with no rule, so both are denied.
+/// Strict mode requires them.
+pub(crate) const PARSER_NET_ABI: ABI = ABI::V4;
+
+/// Those layers take `Scope::from_all` of this ABI where the kernel has it:
+/// abstract Unix sockets and signals outside the thread's domain (Linux
+/// 6.12). Signals only once erratum 2 is fixed; see [`scoped_signals`].
+pub(crate) const PARSER_SCOPE_ABI: ABI = ABI::V6;
+
+/// The filesystem right those layers handle where the kernel has it (ABI 9,
+/// Linux 7.1), with no rule granting it back: connecting to a pathname Unix
+/// socket, which is how a parser would reach D-Bus, nscd or any other local
+/// service.
+pub(crate) const PARSER_FS: AccessFs = AccessFs::ResolveUnix;
 
 /// Capabilities dropped in every mode that runs `drop_caps`.
 ///
@@ -34,8 +54,9 @@ pub(crate) const TARGET_ABI: ABI = ABI::V4;
 /// access in the user's directories (CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH,
 /// CAP_FOWNER, CAP_CHOWN, CAP_FSETID), limits and scheduling
 /// (CAP_SYS_RESOURCE, CAP_SYS_NICE, CAP_IPC_LOCK), CAP_NET_BIND_SERVICE for a
-/// metrics port below 1024, CAP_NET_RAW to reopen capture (see
-/// `CAPS_TO_DROP_STRICT`), and for now CAP_NET_ADMIN.
+/// metrics port below 1024, CAP_NET_RAW on main and the network workers so
+/// capture can reopen (see `CAPS_TO_DROP_STRICT` and `CAPS_TO_DROP_PARSER`),
+/// and for now CAP_NET_ADMIN.
 pub(crate) const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
     // Once the kprobe is attached and the ringbuffer is open, we don't need
     // to load new BPF programs at runtime.
@@ -106,6 +127,14 @@ pub(crate) const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
 /// there.
 pub(crate) const CAPS_TO_DROP_STRICT: &[Capability] = &[Capability::CAP_NET_RAW];
 
+/// Additional caps parser and capture threads drop in every mode. Landlock
+/// does not mediate raw or packet sockets, so this is what stops a parser
+/// opening one. Capture opens its device before entry, and every reopen
+/// (`c`, `i`, `Shift+R`) runs on a new thread main starts, which keeps
+/// CAP_NET_RAW in best-effort. The open device is not revoked: whoever
+/// holds its descriptor can still capture and inject on it.
+pub(crate) const CAPS_TO_DROP_PARSER: &[Capability] = &[Capability::CAP_NET_RAW];
+
 /// What loading and attaching a BPF program needs. CAP_SYS_ADMIN is the
 /// pre-5.8 fallback and is listed for the same kernels the drop list names.
 pub(crate) const CAPS_FOR_BPF_LOAD: &[Capability] = &[
@@ -167,10 +196,20 @@ fn broker_drop_set(held: &CapsHashSet) -> Vec<Capability> {
     drop
 }
 
-pub fn apply(mode: Mode, paths: &SandboxPaths, retain: super::Retain, report: &mut Report) {
+/// Drop capabilities, then stack the filesystem layer and the role's layer,
+/// in that order. A worker started from main carries main's layer too, and
+/// the metrics client its listener's two, so no thread holds more than four
+/// of the kernel's sixteen.
+pub fn apply(
+    mode: Mode,
+    paths: &SandboxPaths,
+    retain: super::Retain,
+    role: Role,
+    report: &mut Report,
+) {
     report.mode.effective = Some(mode.label());
 
-    drop_caps(mode, retain, report);
+    drop_caps(mode, retain, role, report);
     record_retained(report);
 
     let result = if let Some(prepared) = super::worker::prepared_ruleset() {
@@ -184,12 +223,16 @@ pub fn apply(mode: Mode, paths: &SandboxPaths, retain: super::Retain, report: &m
     } else {
         prepare_ruleset(paths).and_then(|r| enforce(r, report))
     };
-    if let Err(error) = result {
-        report
-            .mode
-            .warnings
-            .push(format!("Landlock not applied: {error}"));
-    }
+    let kernel = match result {
+        Ok(abi) => Some(abi),
+        Err(error) => {
+            report
+                .mode
+                .warnings
+                .push(format!("Landlock not applied: {error}"));
+            None
+        }
+    };
 
     if matches!(mode, Mode::Strict) && report.platform.landlock_abi == 0 {
         report
@@ -197,16 +240,40 @@ pub fn apply(mode: Mode, paths: &SandboxPaths, retain: super::Retain, report: &m
             .warnings
             .push("strict sandbox requested but Landlock did not enforce".into());
     }
+
+    if role.layer().is_some() {
+        enforce_layer(mode, paths, role, report);
+    } else if role == Role::Main {
+        // Parser workers share main's kernel and enter before logging
+        // starts, so main says it once for all of them.
+        if let Some(abi) = kernel.filter(|abi| AccessNet::from_all(*abi).is_empty()) {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!(target: "netwatch::sandbox", "{}", deny_unavailable(abi));
+            });
+        }
+    }
 }
 
-fn drop_caps(mode: Mode, retain: super::Retain, report: &mut Report) {
-    let extra: &[Capability] = if matches!(mode, Mode::Strict) {
+fn drop_caps(mode: Mode, retain: super::Retain, role: Role, report: &mut Report) {
+    let mut drop = CAPS_TO_DROP_DEFAULT.to_vec();
+    let strict: &[Capability] = if matches!(mode, Mode::Strict) {
         CAPS_TO_DROP_STRICT
     } else {
         &[]
     };
+    let parser: &[Capability] = if role.layer().is_some() {
+        CAPS_TO_DROP_PARSER
+    } else {
+        &[]
+    };
+    for cap in strict.iter().chain(parser) {
+        if !drop.contains(cap) {
+            drop.push(*cap);
+        }
+    }
     let held = held_caps(report);
-    for cap in CAPS_TO_DROP_DEFAULT.iter().chain(extra.iter()) {
+    for cap in &drop {
         // Held deliberately and briefly — see `Retain`. The worker drops
         // them itself once the load is done, and the report says which
         // worker held what until it did.
@@ -399,14 +466,78 @@ pub(super) fn collect_read_write(paths: &SandboxPaths) -> Vec<PathBuf> {
 /// Build once before workers start; kernel rules pin the opened filesystem
 /// objects, so later symlink replacement cannot widen a worker's grants.
 pub(super) fn prepare_ruleset(paths: &SandboxPaths) -> Result<landlock::RulesetCreated, String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let mut ruleset = Ruleset::default()
+    let ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(TARGET_ABI))
         .map_err(|e| e.to_string())?
         .create()
         .map_err(|e| e.to_string())?;
-    for grant in grants(paths) {
+    add_grants(ruleset, grants(paths))
+}
+
+/// The parser layer, built once before workers start like
+/// [`prepare_ruleset`]. In strict mode a kernel that cannot deny TCP fails
+/// it here, and every parser entry with it.
+pub(super) fn prepare_parser_layer(mode: Mode) -> Result<landlock::RulesetCreated, String> {
+    layer_ruleset(mode, PARSER_FS.into())?
+        .create()
+        .map_err(|e| e.to_string())
+}
+
+/// The capture layer: the parser layer's rights plus every filesystem
+/// right, with the read grants and none of the write grants. Nothing the
+/// capture loop runs writes a file; exports and incident bundles are written
+/// by other threads.
+pub(super) fn prepare_capture_layer(
+    mode: Mode,
+    paths: &SandboxPaths,
+) -> Result<landlock::RulesetCreated, String> {
+    let ruleset = layer_ruleset(mode, AccessFs::from_all(TARGET_ABI) | PARSER_FS)?
+        .create()
+        .map_err(|e| e.to_string())?;
+    add_grants(ruleset, grants(paths).into_iter().filter(|g| !g.write))
+}
+
+/// What the parser and capture layers handle. The TCP part is a hard
+/// requirement in strict mode; the scopes and `fs` are taken where the
+/// kernel has them.
+fn layer_ruleset(mode: Mode, fs: BitFlags<AccessFs>) -> Result<Ruleset, String> {
+    let tcp = if matches!(mode, Mode::Strict) {
+        CompatLevel::HardRequirement
+    } else {
+        CompatLevel::BestEffort
+    };
+    let mut scopes = Scope::from_all(PARSER_SCOPE_ABI);
+    if !scoped_signals() {
+        scopes.remove(Scope::Signal);
+    }
+    Ruleset::default()
+        .set_compatibility(tcp)
+        .handle_access(AccessNet::from_all(PARSER_NET_ABI))
+        .map_err(|_| "kernel Landlock below ABI 4 cannot deny TCP (needs Linux 6.7)".to_string())?
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(fs)
+        .map_err(|e| e.to_string())?
+        .scope(scopes)
+        .map_err(|e| e.to_string())
+}
+
+/// Whether the kernel has the fix for Landlock erratum 2. Without it, a
+/// signal scope also stops a thread signalling its own process's threads in
+/// other domains, so the scope is added only once the fix is reported, as
+/// the crate's errata guidance says.
+fn scoped_signals() -> bool {
+    static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIXED.get_or_init(|| Erratum::current().contains(Erratum::ScopedSignalHandling))
+}
+
+/// Add each grant's rule, opening its path first.
+fn add_grants(
+    mut ruleset: landlock::RulesetCreated,
+    grants: impl IntoIterator<Item = Grant>,
+) -> Result<landlock::RulesetCreated, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    for grant in grants {
         let (path, write) = (&grant.path, grant.write);
         let mut options = std::fs::OpenOptions::new();
         options
@@ -504,19 +635,16 @@ impl Grant {
     }
 }
 
-fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<(), String> {
+/// Restrict the calling thread with the filesystem layer. Returns the ABI
+/// the kernel reported.
+fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<ABI, String> {
     let status = ruleset.restrict_self().map_err(|e| e.to_string())?;
 
     // Record the effective ABI for the Settings overlay. `landlock`
     // exposes the effective ABI inside `LandlockStatus::Available`.
-    match status.landlock {
-        landlock::LandlockStatus::Available { effective_abi, .. } => {
-            report.platform.landlock_abi = effective_abi as u32;
-        }
-        landlock::LandlockStatus::NotEnabled | landlock::LandlockStatus::NotImplemented => {
-            // Ruleset wasn't enforced — keep landlock_abi at 0.
-        }
-    }
+    // Without Landlock this is `Unsupported`, which keeps landlock_abi at 0.
+    let abi = kernel_abi(&status);
+    report.platform.landlock_abi = abi as u32;
 
     if status.ruleset == RulesetStatus::NotEnforced {
         report
@@ -530,7 +658,104 @@ fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<(),
             .push("Landlock ruleset partially enforced (older kernel)".into());
     }
 
-    Ok(())
+    Ok(abi)
+}
+
+/// The ABI the kernel reported to a restriction, `Unsupported` without
+/// Landlock.
+fn kernel_abi(status: &RestrictionStatus) -> ABI {
+    match status.landlock {
+        landlock::LandlockStatus::Available { effective_abi, .. } => effective_abi,
+        landlock::LandlockStatus::NotEnabled | landlock::LandlockStatus::NotImplemented => {
+            ABI::Unsupported
+        }
+    }
+}
+
+fn deny_unavailable(abi: ABI) -> String {
+    format!(
+        "parser network deny unavailable: kernel Landlock ABI {} (needs 4, Linux 6.7)",
+        abi as u32
+    )
+}
+
+/// Stack the role's parser or capture layer on the calling thread and record
+/// what the kernel enforced.
+///
+/// A kernel below ABI 4 cannot deny TCP. Best-effort carries on without a
+/// per-worker warning, and main's entry logs it once for the process; strict
+/// refuses the entry. The scopes and pathname sockets are taken silently
+/// where the kernel has them, so ABI 4 to 8 report a partly enforced layer
+/// as normal.
+fn enforce_layer(mode: Mode, paths: &SandboxPaths, role: Role, report: &mut Report) {
+    let Some(layer) = role.layer() else {
+        return;
+    };
+    report.platform.landlock_layer = Some(layer);
+    let capture = role == Role::Capture;
+    let status = match super::worker::prepared_layer(role) {
+        Some(Ok(ruleset)) => ruleset
+            .try_clone()
+            .map_err(|e| e.to_string())
+            .and_then(restrict),
+        Some(Err(error)) => Err(error.clone()),
+        None if capture => prepare_capture_layer(mode, paths).and_then(restrict),
+        None => prepare_parser_layer(mode).and_then(restrict),
+    };
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            report
+                .mode
+                .warnings
+                .push(format!("{layer} layer not applied: {error}"));
+            return;
+        }
+    };
+    let abi = kernel_abi(&status);
+    let enforced = status.ruleset != RulesetStatus::NotEnforced;
+    let restrictions = layer_restrictions(abi, enforced, capture, scoped_signals());
+    report.platform.landlock_network_blocked =
+        restrictions.contains(&"tcp_bind") && restrictions.contains(&"tcp_connect");
+    report.platform.landlock_restrictions = restrictions;
+    if !report.platform.landlock_network_blocked && matches!(mode, Mode::Strict) {
+        report.mode.warnings.push(deny_unavailable(abi));
+    }
+}
+
+fn restrict(ruleset: landlock::RulesetCreated) -> Result<RestrictionStatus, String> {
+    ruleset.restrict_self().map_err(|e| e.to_string())
+}
+
+/// What a parser or capture layer enforced, from the ABI the kernel reported
+/// and whether the layer took effect. Best-effort drops exactly the rights
+/// the kernel lacks, so a right is in force once the kernel has its ABI.
+fn layer_restrictions(abi: ABI, enforced: bool, capture: bool, signals: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if !enforced {
+        return out;
+    }
+    if capture {
+        out.push("filesystem_write");
+    }
+    let net = AccessNet::from_all(abi);
+    if net.contains(AccessNet::BindTcp) {
+        out.push("tcp_bind");
+    }
+    if net.contains(AccessNet::ConnectTcp) {
+        out.push("tcp_connect");
+    }
+    let scopes = Scope::from_all(abi);
+    if scopes.contains(Scope::AbstractUnixSocket) {
+        out.push("abstract_unix_socket");
+    }
+    if signals && scopes.contains(Scope::Signal) {
+        out.push("signal");
+    }
+    if AccessFs::from_all(abi).contains(PARSER_FS) {
+        out.push("pathname_unix_socket");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -557,7 +782,12 @@ mod tests {
     #[test]
     fn only_the_load_policy_keeps_capabilities_back() {
         let mut report = Report::default();
-        drop_caps(Mode::BestEffort, super::super::Retain::Nothing, &mut report);
+        drop_caps(
+            Mode::BestEffort,
+            super::super::Retain::Nothing,
+            Role::Network,
+            &mut report,
+        );
         assert!(
             report.platform.caps_retained_for_load.is_empty(),
             "an ordinary worker keeps nothing back: {:?}",
@@ -565,7 +795,12 @@ mod tests {
         );
 
         let mut report = Report::default();
-        drop_caps(Mode::BestEffort, super::super::Retain::BpfLoad, &mut report);
+        drop_caps(
+            Mode::BestEffort,
+            super::super::Retain::BpfLoad,
+            Role::Parser,
+            &mut report,
+        );
         // Reported whether or not the process had them: the field says what
         // the policy held back, not what the thread happened to own.
         assert_eq!(
@@ -733,7 +968,12 @@ mod tests {
                 return;
             }
             let mut report = Report::default();
-            drop_caps(Mode::Strict, super::super::Retain::Nothing, &mut report);
+            drop_caps(
+                Mode::Strict,
+                super::super::Retain::Nothing,
+                Role::Parser,
+                &mut report,
+            );
             relinquish_caps(&mut report);
             assert!(
                 report.mode.warnings.is_empty(),
@@ -761,6 +1001,371 @@ mod tests {
                 CAPS_TO_DROP_DEFAULT.contains(&cap),
                 "{cap:?} should be dropped in BestEffort"
             );
+        }
+    }
+
+    /// Apply `role`'s best-effort policy on the calling thread.
+    fn enter_as(role: Role, paths: &SandboxPaths) -> Report {
+        let mut report = Report::default();
+        apply(
+            Mode::BestEffort,
+            paths,
+            super::super::Retain::Nothing,
+            role,
+            &mut report,
+        );
+        report
+    }
+
+    /// Whether the kernel can deny TCP, asked apart from the layer under test.
+    fn kernel_denies_tcp() -> bool {
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessNet::from_all(PARSER_NET_ABI))
+            .is_ok()
+    }
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("netwatch-roles-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn layer_restrictions_follow_the_kernel_abi() {
+        let parser = |abi| layer_restrictions(abi, true, false, true);
+        assert!(parser(ABI::Unsupported).is_empty());
+        assert!(parser(ABI::V3).is_empty());
+        assert_eq!(parser(ABI::V4), ["tcp_bind", "tcp_connect"]);
+        assert_eq!(parser(ABI::V5), ["tcp_bind", "tcp_connect"]);
+        assert_eq!(
+            parser(ABI::V6),
+            ["tcp_bind", "tcp_connect", "abstract_unix_socket", "signal"]
+        );
+        // Without erratum 2's fix the signal scope is never requested.
+        assert_eq!(
+            layer_restrictions(ABI::V8, true, false, false),
+            ["tcp_bind", "tcp_connect", "abstract_unix_socket"]
+        );
+        assert_eq!(
+            parser(ABI::V9),
+            [
+                "tcp_bind",
+                "tcp_connect",
+                "abstract_unix_socket",
+                "signal",
+                "pathname_unix_socket"
+            ]
+        );
+        assert_eq!(
+            layer_restrictions(ABI::V3, true, true, true),
+            ["filesystem_write"]
+        );
+        assert!(layer_restrictions(ABI::V9, false, true, true).is_empty());
+    }
+
+    #[test]
+    fn strict_parser_layer_requires_tcp() {
+        // Strict fails the layer, and with it every parser entry, on a kernel
+        // that cannot deny TCP; best-effort builds it anyway.
+        assert_eq!(
+            prepare_parser_layer(Mode::Strict).is_ok(),
+            kernel_denies_tcp()
+        );
+        assert!(prepare_parser_layer(Mode::BestEffort).is_ok());
+    }
+
+    #[test]
+    fn parser_layer_denies_tcp_bind_and_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let denies = kernel_denies_tcp();
+        std::thread::spawn(move || {
+            let report = enter_as(Role::Parser, &SandboxPaths::default());
+            let connect = std::net::TcpStream::connect(addr).map(|_| ());
+            let bind = std::net::TcpListener::bind("127.0.0.1:0").map(|_| ());
+            assert_eq!(report.platform.landlock_layer, Some("parser"));
+            if denies {
+                assert!(report.platform.landlock_network_blocked, "{report:?}");
+                assert_eq!(connect.unwrap_err().raw_os_error(), Some(nix::libc::EACCES));
+                assert_eq!(bind.unwrap_err().raw_os_error(), Some(nix::libc::EACCES));
+                // A kernel without the scopes or pathname sockets is no
+                // reason to warn.
+                assert!(
+                    report.mode.warnings.is_empty(),
+                    "{:?}",
+                    report.mode.warnings
+                );
+            } else {
+                assert!(!report.platform.landlock_network_blocked, "{report:?}");
+                assert!(!report
+                    .platform
+                    .landlock_restrictions
+                    .contains(&"tcp_connect"));
+                connect.unwrap();
+                bind.unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn parser_layer_leaves_udp_open() {
+        // Landlock mediates TCP only. The threat model says so; this fails if
+        // that changes under it.
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = peer.local_addr().unwrap();
+        std::thread::spawn(move || {
+            enter_as(Role::Parser, &SandboxPaths::default());
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.send_to(b"udp", addr).unwrap();
+        })
+        .join()
+        .unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0; 8];
+        let (n, _) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"udp");
+    }
+
+    #[test]
+    fn parser_layer_scopes_abstract_sockets_and_signals() {
+        use std::os::linux::net::SocketAddrExt;
+        let name = format!("netwatch-roles-{}", uuid::Uuid::new_v4());
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind_addr(&address).unwrap();
+        // A process outside the thread's domain, and this process.
+        let mut outside = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let outside_pid = nix::unistd::Pid::from_raw(outside.id() as i32);
+        // Each check holds the report to what the kernel did, both ways.
+        let checked = std::thread::spawn(move || {
+            let report = enter_as(Role::Parser, &SandboxPaths::default());
+            let restrictions = report.platform.landlock_restrictions;
+            let connect = std::os::unix::net::UnixStream::connect_addr(&address);
+            if restrictions.contains(&"abstract_unix_socket") {
+                assert_eq!(connect.unwrap_err().raw_os_error(), Some(nix::libc::EPERM));
+            } else {
+                connect.unwrap();
+            }
+            let signal = nix::sys::signal::kill(outside_pid, None);
+            if restrictions.contains(&"signal") {
+                assert_eq!(signal, Err(nix::errno::Errno::EPERM));
+            } else {
+                signal.unwrap();
+            }
+            // Signalling its own process stays allowed: the scope is only
+            // added on kernels with that fixed.
+            nix::sys::signal::kill(nix::unistd::getpid(), None).unwrap();
+        })
+        .join();
+        let _ = outside.kill();
+        let _ = outside.wait();
+        checked.unwrap();
+    }
+
+    #[test]
+    fn network_role_gets_no_parser_layer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        for role in [Role::Network, Role::Main] {
+            std::thread::spawn(move || {
+                let report = enter_as(role, &SandboxPaths::default());
+                assert_eq!(report.platform.landlock_layer, None);
+                assert!(report.platform.landlock_restrictions.is_empty());
+                assert!(!report.platform.landlock_network_blocked);
+                std::net::TcpStream::connect(addr).unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn denied_thread_drops_cap_net_raw_only_on_itself() {
+        const CHILD: &str = "NETWATCH_NET_RAW_DROP_TEST";
+        let net_raw = |set| caps::has_cap(None, set, Capability::CAP_NET_RAW).unwrap();
+        if !net_raw(CapSet::Effective) {
+            assert!(
+                std::env::var_os(CHILD).is_none(),
+                "the user namespace gave no CAP_NET_RAW"
+            );
+            // Root in a new user namespace holds every capability in it.
+            let unshare = || {
+                let mut command = std::process::Command::new("unshare");
+                command.args(["--user", "--map-root-user"]);
+                command
+            };
+            let status = unshare()
+                .args(["cat", "/proc/self/status"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let effective = status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapEff:"))
+                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+                .unwrap_or(0);
+            if effective & (1 << Capability::CAP_NET_RAW.index()) == 0 {
+                eprintln!("skipped: no user namespace with CAP_NET_RAW here");
+                return;
+            }
+            let result = unshare()
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::linux::tests::denied_thread_drops_cap_net_raw_only_on_itself",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        for (role, keeps) in [
+            (Role::Parser, false),
+            (Role::Capture, false),
+            (Role::Network, true),
+            (Role::Main, true),
+        ] {
+            let (report, effective, permitted) = std::thread::spawn(move || {
+                let report = enter_as(role, &SandboxPaths::default());
+                (
+                    report,
+                    net_raw(CapSet::Effective),
+                    net_raw(CapSet::Permitted),
+                )
+            })
+            .join()
+            .unwrap();
+            assert_eq!(
+                (effective, permitted),
+                (keeps, keeps),
+                "{role:?}: {report:?}"
+            );
+            assert_eq!(
+                report
+                    .platform
+                    .caps_dropped
+                    .contains(&Capability::CAP_NET_RAW.to_string()),
+                !keeps,
+                "{role:?}: {report:?}"
+            );
+            assert!(
+                report.mode.warnings.is_empty(),
+                "{role:?}: {:?}",
+                report.mode.warnings
+            );
+        }
+        // The thread that started them keeps it.
+        assert!(net_raw(CapSet::Effective) && net_raw(CapSet::Permitted));
+    }
+
+    #[test]
+    fn capture_role_cannot_write_config() {
+        let landlock = Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .is_ok();
+        if !landlock {
+            eprintln!("skipped: Landlock is not enabled on this kernel");
+            return;
+        }
+        let root = TestDir::new();
+        let paths = SandboxPaths {
+            config_dir: Some(root.0.join("config")),
+            cache_dir: Some(root.0.join("cache")),
+            ..Default::default()
+        };
+        paths.prepare().unwrap();
+        // A parser may save the config, as the Settings overlay does from
+        // the UI thread; the capture thread may not.
+        for (role, writes) in [(Role::Parser, true), (Role::Capture, false)] {
+            let paths = paths.clone();
+            let config = root.0.join("config").join("config.toml");
+            std::thread::spawn(move || {
+                let report = enter_as(role, &paths);
+                let wrote = std::fs::write(&config, b"sandbox = \"off\"\n");
+                if writes {
+                    wrote.unwrap();
+                } else {
+                    assert_eq!(
+                        wrote.unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                    assert!(
+                        report
+                            .platform
+                            .landlock_restrictions
+                            .contains(&"filesystem_write"),
+                        "{report:?}"
+                    );
+                }
+                // The read grants still hold.
+                std::fs::read_to_string("/proc/self/status").unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_role_cannot_connect_pathname_unix() {
+        let resolves = Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(PARSER_FS)
+            .is_ok();
+        if !resolves {
+            eprintln!("skipped: kernel Landlock ABI below 9");
+            return;
+        }
+        let root = TestDir::new();
+        let socket = root.0.join("service.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        for (role, connects) in [
+            (Role::Capture, false),
+            (Role::Parser, false),
+            (Role::Network, true),
+        ] {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                let report = enter_as(role, &SandboxPaths::default());
+                let connect = std::os::unix::net::UnixStream::connect(&socket);
+                if connects {
+                    connect.unwrap();
+                } else {
+                    assert!(
+                        report
+                            .platform
+                            .landlock_restrictions
+                            .contains(&"pathname_unix_socket"),
+                        "{report:?}"
+                    );
+                    assert_eq!(connect.unwrap_err().raw_os_error(), Some(nix::libc::EACCES));
+                }
+            })
+            .join()
+            .unwrap();
         }
     }
 }
