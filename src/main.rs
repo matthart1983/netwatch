@@ -4,6 +4,7 @@ use netwatch::config::NetwatchConfig;
 use netwatch::ui::tty;
 use ratatui::prelude::*;
 use std::io;
+use std::mem::ManuallyDrop;
 
 // Replace glibc's `ptmalloc` (Linux) and the system allocator on other
 // platforms with mimalloc. Long-running TUI daemons that spawn short
@@ -150,7 +151,10 @@ fn main() -> Result<()> {
     // unwind it drops first and the shell is back before the workers' wait.
     tty::install_panic_hook();
     let _tty = tty::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    // Never dropped: `Terminal`'s drop shows the cursor again, as
+    // `tty::restore` already has, and panics in `eprintln!` if that write
+    // fails, as every write does once the terminal has hung up.
+    let mut terminal = ManuallyDrop::new(Terminal::new(CrosstermBackend::new(io::stdout()))?);
 
     let result = runtime.block_on(app::run(
         &mut terminal,
@@ -160,7 +164,6 @@ fn main() -> Result<()> {
         demo,
     ));
 
-    drop(terminal);
     tty::restore();
 
     // A background thread that dies can end the session with no more than

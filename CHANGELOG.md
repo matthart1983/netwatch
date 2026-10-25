@@ -100,8 +100,9 @@ All notable changes to NetWatch will be documented in this file.
   microsecond. `--demo` packets, which were never captured, are left out
   and counted instead of written with an invented time.
 - **The terminal is restored on a TUI panic or shutdown signal.** SIGTERM,
-  SIGINT and SIGHUP exit cleanly on Unix; Windows handles Ctrl+C and console
-  close notifications. Raw mode, mouse capture and the alternate screen are
+  SIGINT and SIGHUP exit cleanly on Unix, the hangup from closing the
+  terminal window or losing the SSH connection included; Windows handles
+  Ctrl+C and console close notifications. Raw mode, mouse capture and the alternate screen are
   undone before a fatal panic report, whose terminal control characters are
   replaced. Background panics stay in the log. Bare mouse motion no longer
   redraws the screen, and queued input is processed in bounded batches.

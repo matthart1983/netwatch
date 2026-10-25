@@ -114,7 +114,10 @@ pub fn install_panic_hook() {
                 return;
             }
             restore();
-            eprintln!(
+            // Not `eprintln!`, which panics if the terminal has hung up, and
+            // a panic in the hook aborts.
+            let _ = writeln!(
+                io::stderr(),
                 "\nthread '{}' {}",
                 sanitize::display(name),
                 sanitize::display_multiline(&report)

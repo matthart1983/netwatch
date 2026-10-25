@@ -156,6 +156,13 @@ impl Drop for Pty {
     }
 }
 
+/// The first frame ends by hiding the cursor. By then the TUI is in its
+/// event loop, and its signal listeners are registered.
+fn first_frame(out: &str) -> bool {
+    out.find(ENTER)
+        .is_some_and(|at| out[at..].contains("\x1b[?25l"))
+}
+
 /// Start `netwatch --demo`, wait for its first frame, stop it with `stop`,
 /// and check that it exits 0 and puts the terminal back.
 fn stops_cleanly(stop: impl FnOnce(&mut Pty)) {
@@ -163,12 +170,7 @@ fn stops_cleanly(stop: impl FnOnce(&mut Pty)) {
     let mut cmd = fixture.command();
     cmd.arg("--demo");
     let mut pty = Pty::spawn(cmd);
-    // The first frame ends by hiding the cursor. By then the TUI is in its
-    // event loop, and its signal listeners are registered.
-    let started = pty.read_until(Duration::from_secs(10), |out| {
-        out.find(ENTER)
-            .is_some_and(|at| out[at..].contains("\x1b[?25l"))
-    });
+    let started = pty.read_until(Duration::from_secs(10), first_frame);
     assert!(started, "no first frame: {:?}", pty.output);
     stop(&mut pty);
     let status = pty.wait(Duration::from_secs(10));
@@ -212,4 +214,80 @@ fn sighup_restores_the_terminal_and_exits_0() {
 #[test]
 fn ctrl_c_typed_restores_the_terminal_and_exits_0() {
     stops_cleanly(|pty| pty.master.write_all(b"\x03").unwrap());
+}
+
+/// Closing the terminal window or losing the SSH connection hangs the pty up:
+/// netwatch gets SIGHUP and every write fails. A failed write on the way out
+/// panicked, the panic report's own write panicked again, and the process
+/// aborted with a core dump. `kill -HUP` above leaves the pty working, so it
+/// never saw this.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hangup_ends_without_a_panic() {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::AsFd;
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = Fixture::new();
+    let mut cmd = fixture.command();
+    cmd.arg("--demo");
+    let size = Winsize {
+        ws_row: 40,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(&size, None).unwrap();
+    let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
+    cmd.stdin(stdio()).stdout(stdio()).stderr(stdio());
+    // The pty is netwatch's controlling terminal, so closing its master
+    // hangs it up the way a terminal emulator closing does.
+    // SAFETY: setsid and ioctl are async-signal-safe, which is all that may
+    // run between fork and exec, and touch only the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setsid()?;
+            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    // openpty's descriptors survive exec, and a child holding the master
+    // would keep the pty from hanging up. A clone is close-on-exec.
+    let mut master = fs::File::from(pty.master.try_clone().unwrap());
+    drop(pty.master);
+    let mut child = cmd.spawn().unwrap();
+    drop(cmd);
+    drop(pty.slave);
+    // Read here rather than on a thread, which would hold the master open.
+    let mut output = String::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !first_frame(&output) {
+        assert!(Instant::now() < deadline, "no first frame: {output:?}");
+        let mut fds = [PollFd::new(master.as_fd(), PollFlags::POLLIN)];
+        if poll(&mut fds, PollTimeout::from(100u16)).unwrap() > 0 {
+            let mut buf = [0; 16384];
+            let n = master.read(&mut buf).unwrap();
+            output.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+    drop(master);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("netwatch did not exit after the hangup");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    // 101 is a panic that unwound out of `main`.
+    assert!(
+        status.signal().is_none() && status.code() != Some(101),
+        "{status}"
+    );
 }
