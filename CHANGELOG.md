@@ -23,15 +23,17 @@ All notable changes to NetWatch will be documented in this file.
   compiled.
 - **The stream tracker's budget is an eighth of the host's memory, up to
   256 MiB.** It was 256 MiB on every host, half the memory of a 512 MiB
-  board. On Linux netwatch reads `MemTotal` once at start, so a 512 MiB host
-  gets 64 MiB, a 1 GiB host 128 MiB, and a host with 2 GiB or more keeps
-  256 MiB. macOS, Windows and FreeBSD keep 256 MiB. Past the budget the
-  tracker drops the least recently seen streams, as before, so a small host
-  keeps payloads for fewer flows under heavy traffic. One decrypted HTTP/3
-  flow can hold about 69 MiB on its own, and the tracker does not drop a flow
-  while that flow is the one growing. With an SSLKEYLOGFILE on a host under
-  about 550 MiB, the tracker can pass its budget by the difference, about
-  5 MiB on a 512 MiB host, until another flow's traffic drops that one.
+  board. netwatch reads the host's memory once at start, `MemTotal` on Linux
+  and the physical memory the system reports on macOS, Windows and FreeBSD,
+  so a 512 MiB host gets 64 MiB, a 1 GiB host 128 MiB, and a host with 2 GiB
+  or more keeps 256 MiB. In a Linux container the budget follows the host's
+  memory, not the container's limit. Past the budget the tracker drops the
+  least recently seen streams, as before, so a small host keeps payloads for
+  fewer flows under heavy traffic. One decrypted HTTP/3 flow can hold about
+  69 MiB on its own, and the tracker does not drop a flow while that flow is
+  the one growing. With an SSLKEYLOGFILE on a host under about 550 MiB, the
+  tracker can pass its budget by the difference, about 5 MiB on a 512 MiB
+  host, until another flow's traffic drops that one.
 - **The `M` overlay shows the bytes the packet list and the stream tracker
   hold, in MiB, against their budgets.** It also took the packet list's
   count cap from a copy of 5000, and now reads the constant the list uses.
@@ -153,7 +155,10 @@ All notable changes to NetWatch will be documented in this file.
   later datagram on the flow then carries. The capture strip said
   `ring 5000` whatever the list held. It now measures the list against the
   cap it is nearer, `ring 3120/5000`, or `ring 494 · 31.9/32 MiB` under
-  large frames. Decoding full-size frames went from about 13,000 to about
+  large frames. The drop count moves to the front of those figures, since
+  the strip is cut off at the terminal's edge: at 80 columns, with a long
+  interface name or filter, the end of the line was lost, and the drop
+  count with it. Decoding full-size frames went from about 13,000 to about
   150,000 a second on the development machine.
 - **The stream tracker charges each segment its full cost, and charges the
   QUIC CRYPTO buffer and each flow's DPI label.** The tracker charged each

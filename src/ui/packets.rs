@@ -161,12 +161,10 @@ fn render_capture_strip(f: &mut Frame, app: &App, packets: &[CapturedPacket], ar
         }
     };
     let mut meta = vec![
-        Span::styled(
-            format!("{ring} · {shown} shown · "),
-            Style::default().fg(t.text_muted),
-        ),
         // Drops are the one number here that changes what the list means, so
-        // they are the one number that takes a colour.
+        // they are the one number that takes a colour, and they come first:
+        // the strip clips at the right edge, and at 80 columns the ring
+        // figures can reach it.
         Span::styled(
             format!("drops {dropped}"),
             Style::default().fg(if dropped > 0 {
@@ -174,6 +172,10 @@ fn render_capture_strip(f: &mut Frame, app: &App, packets: &[CapturedPacket], ar
             } else {
                 t.text_muted
             }),
+        ),
+        Span::styled(
+            format!(" · {ring} · {shown} shown"),
+            Style::default().fg(t.text_muted),
         ),
     ];
     if capturing {
@@ -2739,12 +2741,30 @@ mod tests {
         }
     }
 
+    /// Fills the ring with Ethernet, IPv4 and TCP frames carrying 64,000
+    /// bytes of text each, as a bulk transfer with segmentation offload hands
+    /// them to libpcap, until the byte budget holds it.
+    fn fill_ring_with_64k_frames(app: &App) {
+        use crate::collectors::packets::RING_BYTE_BUDGET;
+        let payload = b"HTTP/1.1 200 OK\r\n".repeat(64_000 / 17);
+        let mut frame = vec![0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0x01, 0x08, 0x00];
+        frame.extend_from_slice(&[0x45, 0]);
+        frame.extend_from_slice(&(40 + payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0, 192, 0, 2, 20, 192, 0, 2, 10]);
+        frame.extend_from_slice(&[0, 80, 0xc3, 0x50, 0, 0, 0, 1, 0, 0, 0, 1, 0x50, 0x10]);
+        frame.extend_from_slice(&[0xfa, 0xf0, 0, 0, 0, 0]);
+        frame.extend_from_slice(&payload);
+        for _ in 0..RING_BYTE_BUDGET / payload.len() + 50 {
+            app.packet_collector.ingest_frame_for_test(&frame).unwrap();
+        }
+    }
+
     /// The ring stops at 5,000 packets or 32 MiB of them, and the strip
     /// measures it against the cap it is nearer. It said `ring 5000` while
     /// 64 KB frames held the ring to a few hundred.
     #[test]
     fn the_capture_strip_measures_the_ring_against_its_nearer_cap() {
-        use crate::collectors::packets::{RING_BYTE_BUDGET, RING_CAPACITY};
+        use crate::collectors::packets::RING_CAPACITY;
         use ratatui::{backend::TestBackend, Terminal};
         let screen = |app: &App| {
             let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
@@ -2767,19 +2787,7 @@ mod tests {
         assert!(s.contains(&ring), "no {ring:?} in {s}");
 
         let app = crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
-        // Ethernet, IPv4 and TCP carrying 64,000 bytes of text, as a bulk
-        // transfer with segmentation offload hands them to libpcap.
-        let payload = b"HTTP/1.1 200 OK\r\n".repeat(64_000 / 17);
-        let mut frame = vec![0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0x01, 0x08, 0x00];
-        frame.extend_from_slice(&[0x45, 0]);
-        frame.extend_from_slice(&(40 + payload.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0, 192, 0, 2, 20, 192, 0, 2, 10]);
-        frame.extend_from_slice(&[0, 80, 0xc3, 0x50, 0, 0, 0, 1, 0, 0, 0, 1, 0x50, 0x10]);
-        frame.extend_from_slice(&[0xfa, 0xf0, 0, 0, 0, 0]);
-        frame.extend_from_slice(&payload);
-        for _ in 0..RING_BYTE_BUDGET / payload.len() + 50 {
-            app.packet_collector.ingest_frame_for_test(&frame).unwrap();
-        }
+        fill_ring_with_64k_frames(&app);
         let held = app.packet_collector.get_packets().len();
         assert!(held < RING_CAPACITY / 5, "{held} packets");
         let mib = app.packet_collector.ring_bytes() as f64 / (1024.0 * 1024.0);
@@ -2787,6 +2795,39 @@ mod tests {
         let ring = format!("ring {held} · {mib:.1}/32 MiB · {held} shown");
         let s = screen(&app);
         assert!(s.contains(&ring), "no {ring:?} in {s}");
+    }
+
+    /// The strip is one unwrapped line that clips at the right edge, and the
+    /// drop counter is the one figure on it the list cannot be read without.
+    /// It came last, after the ring figures, so at 80 columns with a
+    /// nine-character interface name the ring's longer `494 · 31.9/32 MiB`
+    /// and `11/5000` forms pushed it off the screen.
+    #[test]
+    fn the_capture_strip_keeps_drops_in_80_columns() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for bulk in [false, true] {
+            let mut app =
+                crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+            app.capture_interface = "enp0s31f6".to_string();
+            if bulk {
+                fill_ring_with_64k_frames(&app);
+            } else {
+                app.packet_collector.seed_demo_capture();
+            }
+            let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+            terminal.draw(|f| render(f, &app, f.area())).unwrap();
+            let buf = terminal.backend().buffer();
+            let strip = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .find(|row| row.contains("enp0s31f6 stopped"))
+                .expect("no capture strip");
+            assert!(strip.contains("drops 0"), "bulk={bulk}: {strip:?}");
+            assert!(strip.contains("ring "), "bulk={bulk}: {strip:?}");
+        }
     }
 
     /// Selecting a packet sends neither of its addresses to rdap.org; only W

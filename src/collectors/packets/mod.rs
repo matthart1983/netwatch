@@ -486,19 +486,56 @@ fn stream_budget(mem_total: Option<u64>) -> usize {
     }
 }
 
-/// [`stream_budget`] for this host, read once. Linux reads `MemTotal` from
-/// /proc/meminfo; elsewhere memory is not read and the budget is the ceiling.
+/// [`stream_budget`] for this host, read once.
 fn host_stream_budget() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        #[cfg(target_os = "linux")]
-        let mem_total = std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|m| meminfo_total(&m));
-        #[cfg(not(target_os = "linux"))]
-        let mem_total = None;
-        stream_budget(mem_total)
-    })
+    *BUDGET.get_or_init(|| stream_budget(host_mem_total()))
+}
+
+/// This host's memory in bytes, from `MemTotal` in /proc/meminfo.
+#[cfg(target_os = "linux")]
+fn host_mem_total() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| meminfo_total(&m))
+}
+
+/// This host's memory in bytes: its physical pages times the page size, as
+/// sysconf reports them.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn host_mem_total() -> Option<u64> {
+    // SAFETY: sysconf takes an integer name and reads no memory of ours.
+    let pages = unsafe { nix::libc::sysconf(nix::libc::_SC_PHYS_PAGES) };
+    // SAFETY: as above.
+    let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) };
+    u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page_size).ok()?)
+}
+
+/// This host's memory in bytes, from `GlobalMemoryStatusEx`.
+#[cfg(windows)]
+fn host_mem_total() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `status` is a live MEMORYSTATUSEX, and its `dwLength` gives
+    // the size the call checks before it writes the struct.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.ullTotalPhys)
+}
+
+/// Memory is not read here, and the budget is the ceiling.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+)))]
+fn host_mem_total() -> Option<u64> {
+    None
 }
 
 /// `MemTotal` from the text of /proc/meminfo, in bytes.
@@ -5038,15 +5075,21 @@ mod tests {
         assert_eq!(stream_budget(Some(0)), 256 * MIB);
     }
 
-    /// The tracker takes this host's budget, read from its own
-    /// /proc/meminfo. On a host with 2 GiB or more that is the ceiling, so
-    /// only a smaller one can tell the two apart.
-    #[cfg(target_os = "linux")]
+    /// The tracker takes this host's budget, from the memory the system
+    /// reports. On a host with 2 GiB or more that is the ceiling, so only a
+    /// smaller one can tell the two apart. Off Linux the tracker took the
+    /// ceiling without reading memory.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
     #[test]
-    fn the_tracker_takes_the_budget_from_this_hosts_meminfo() {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
-        let total = meminfo_total(&meminfo);
-        assert!(total.is_some_and(|t| t > 0), "{meminfo}");
+    fn the_tracker_takes_the_budget_from_this_hosts_memory() {
+        let total = host_mem_total();
+        // No host these tests run on has 64 MiB or less.
+        assert!(total.is_some_and(|t| t > 64 << 20), "{total:?}");
         assert_eq!(host_stream_budget(), stream_budget(total));
         assert_eq!(StreamTracker::new().byte_budget(), host_stream_budget());
     }
