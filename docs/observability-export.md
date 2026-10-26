@@ -58,9 +58,7 @@ trusted network boundary.
 | `netwatch_policy_violations_total{process}` | counter | Egress-policy violations per process (post-cooldown; only processes declared in `egress-policy.toml` can appear, so cardinality stays bounded) |
 
 Names and units follow Prometheus base-unit conventions (`_bytes`, `_seconds`,
-`_ratio`, `_total`). The 1.0 compatibility promise covers the names, types and
-labels in this table. A 1.x release can add metrics but does not rename or
-remove these.
+`_ratio`, `_total`).
 
 The three capture counters count from when the capture opened, and netwatch
 updates them once a second, when it polls libpcap. They have no sample while no capture is
