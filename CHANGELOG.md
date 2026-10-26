@@ -139,6 +139,31 @@ All notable changes to NetWatch will be documented in this file.
   past the 20 that raise the alert, and each window starts with an empty
   set. Domain counts are cut to the 500 most queried as soon as a new name
   would take them past 1,000.
+- **With a GeoIP database configured, the GeoIP cache stops growing at
+  16,384 addresses.** Each address the database answered for got a cache
+  entry that was never removed, so a TUI or daemon left running kept one
+  for every public address it had looked up. On a public server that is
+  every client. Every GeoIP lookup now goes through one cache of 16,384
+  entries, room for the 10,000 connections netwatch is sized for, that
+  drops the least recently used quarter when it fills, as reverse DNS
+  already did. The WHOIS cache of 2,048 entries and the online GeoIP cache
+  dropped whichever quarter their map listed first, which could include the
+  address on screen. They now drop the least recently used too. A
+  v4-mapped address such as `::ffff:8.8.8.8` and its IPv4 form share one
+  entry and are looked up as the IPv4 address. With `geoip_online` on, the
+  queue of addresses waiting for ip-api.com, which is asked about one every
+  1.4 seconds, had no limit, and with more peers than the cache held it
+  grew by hundreds a second. It now holds 256, and an address that finds
+  it full is asked for again on a later lookup.
+- **The Connections GEO column shows a location for IPv6 peers.** The
+  column looked up the address with its brackets on, as in
+  `[2606:4700:4700::1111]`, which the lookup could not parse, so every IPv6
+  row showed a dash. So did an IPv4 peer of a dual-stack socket, which
+  Linux shows as `[::ffff:8.8.8.8]`. The lookup now drops the brackets.
+- **Dense shows the org and city of a peer that sent a server name.** The
+  line under the selected connection looked up the TLS or QUIC server name
+  instead of the address, and a GeoIP database knows only addresses, so
+  those rows never showed one. It now looks up the address.
 - **A bulk transfer no longer fills memory through the packet list.** Every
   captured packet carried a hex and an ASCII dump of its frame, built with a
   `format!` per byte. The dumps took about five times the frame's size and
@@ -274,6 +299,25 @@ All notable changes to NetWatch will be documented in this file.
   300 MiB, so a link there could keep that cleanup running for good or
   offer it files from outside. They now list a linked file but do not
   descend into a linked directory.
+- **WHOIS and online GeoIP look up global unicast addresses only.** Their
+  private-address check compared the start of the text against a short
+  list, so it let through local addresses written another way or in ranges
+  the list left out. Among them were a LAN peer in the `::ffff:192.168.1.5`
+  form Linux gives a dual-stack socket's peer, the 100.64.0.0/10 range that
+  carrier-grade NAT and Tailscale use, the documentation and benchmarking
+  ranges, link-local addresses outside `fe80::/16`, multicast groups
+  outside 224/8 and 239/8, 255.255.255.255, local-use NAT64 addresses in
+  `64:ff9b:1::/48` and SRv6 addresses in `5f00::/16`. `W` sent such an
+  address to rdap.org, and with `geoip_online` on, netwatch sent it to
+  ip-api.com in cleartext. Both now skip any address that is not global
+  unicast: multicast, and every address the IANA special-purpose
+  registries mark as not globally reachable. A NAT64 address in
+  `64:ff9b::/96` or a 6to4 address in `2002::/16` counts as global only if
+  the IPv4 address inside it does.
+- **Dense no longer sends server names to ip-api.com.** With
+  `geoip_online` on, the line under the selected connection sent
+  ip-api.com, in cleartext, the server name a TLS or QUIC connection had
+  sent instead of its address. It now sends the address.
 
 ### CI
 - **A Diagnose load test unit test no longer fails on a slow runner.**

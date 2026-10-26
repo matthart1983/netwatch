@@ -1,11 +1,20 @@
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const GEO_CACHE_MAX: usize = 4096;
+use super::lru::BoundedLru;
+
+/// More than the 10,000 connections netwatch is sized for. The egress view
+/// looks up every public peer on every tick, and an LRU smaller than the set
+/// it cycles through evicts each entry before it is asked for again.
+const GEO_CACHE_MAX: usize = 16_384;
+
+/// Online lookups queued for the worker at most. A lookup that finds the
+/// queue full is dropped and asked again on a later lookup. The worker
+/// answers one every 1.4 s, so a full queue is six minutes of work.
+const GEO_QUEUE_MAX: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct GeoInfo {
@@ -62,9 +71,7 @@ impl MaxMindReader {
         }
     }
 
-    fn lookup(&self, ip: &str) -> Option<GeoInfo> {
-        let addr: IpAddr = ip.parse().ok()?;
-
+    fn lookup(&self, addr: IpAddr) -> Option<GeoInfo> {
         // Try the City/Country DB first
         // `?` rather than `if let ... else { return None }`: no City/Country
         // database configured means no lookup is possible, which is the same
@@ -120,10 +127,11 @@ impl MaxMindReader {
 
 #[derive(Clone)]
 pub struct GeoCache {
-    cache: Arc<Mutex<HashMap<String, GeoEntry>>>,
+    /// Keyed by [`lookup_addr`]'s canonical address.
+    cache: Arc<Mutex<BoundedLru<IpAddr, GeoEntry>>>,
     mmdb: Arc<Option<MaxMindReader>>,
-    online_tx: std_mpsc::Sender<String>,
-    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<String>>>>,
+    online_tx: std_mpsc::SyncSender<IpAddr>,
+    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<IpAddr>>>>,
     /// Opt-in: without it, an IP with no offline DB hit simply has no geo
     /// info rather than being sent to ip-api.com. See `geoip_online` in
     /// `NetwatchConfig` for why this defaults to off.
@@ -150,12 +158,15 @@ impl GeoCache {
     }
 
     pub fn with_mmdb_and_online(city_path: &str, asn_path: &str, online_enabled: bool) -> Self {
-        let reader = MaxMindReader::open(city_path, asn_path);
+        Self::with_reader(MaxMindReader::open(city_path, asn_path), online_enabled)
+    }
+
+    fn with_reader(reader: MaxMindReader, online_enabled: bool) -> Self {
         let has_db = reader.city_reader.is_some();
         let mmdb = Arc::new(if has_db { Some(reader) } else { None });
 
-        let (tx, rx) = std_mpsc::channel::<String>();
-        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = std_mpsc::sync_channel::<IpAddr>(GEO_QUEUE_MAX);
+        let cache = Arc::new(Mutex::new(BoundedLru::new(GEO_CACHE_MAX)));
 
         Self {
             online_enabled,
@@ -195,21 +206,11 @@ impl GeoCache {
                 if crate::sandbox::worker::stopping() {
                     break;
                 }
-                let result = lookup_geo_online(&ip);
+                let result = lookup_geo_online(ip);
                 let mut c = resolver_cache.lock().unwrap();
                 match result {
-                    Some(info) => {
-                        c.insert(ip, GeoEntry::Resolved(info));
-                    }
-                    None => {
-                        c.insert(ip, GeoEntry::Failed);
-                    }
-                }
-                if c.len() > GEO_CACHE_MAX {
-                    let keys: Vec<String> = c.keys().take(GEO_CACHE_MAX / 4).cloned().collect();
-                    for k in keys {
-                        c.remove(&k);
-                    }
+                    Some(info) => c.put(ip, GeoEntry::Resolved(info)),
+                    None => c.put(ip, GeoEntry::Failed),
                 }
             }
         });
@@ -222,14 +223,12 @@ impl GeoCache {
     }
 
     pub fn lookup(&self, ip: &str) -> Option<GeoInfo> {
-        if ip == "—" || ip.is_empty() || is_private_ip(ip) {
-            return None;
-        }
+        let addr = lookup_addr(ip)?;
 
         // Fast path: check cache first
         {
-            let cache = self.cache.lock().unwrap();
-            match cache.get(ip) {
+            let mut cache = self.cache.lock().unwrap();
+            match cache.get(&addr) {
                 Some(GeoEntry::Resolved(info)) => return Some(info.clone()),
                 Some(GeoEntry::Failed) => return None,
                 Some(GeoEntry::Pending) => return None,
@@ -239,15 +238,15 @@ impl GeoCache {
 
         // Try offline MaxMind DB (instant, no rate limit)
         if let Some(ref reader) = *self.mmdb {
-            let result = reader.lookup(ip);
+            let result = reader.lookup(addr);
             let mut cache = self.cache.lock().unwrap();
             match result {
                 Some(info) => {
-                    cache.insert(ip.to_string(), GeoEntry::Resolved(info.clone()));
+                    cache.put(addr, GeoEntry::Resolved(info.clone()));
                     return Some(info);
                 }
                 None => {
-                    cache.insert(ip.to_string(), GeoEntry::Failed);
+                    cache.put(addr, GeoEntry::Failed);
                     return None;
                 }
             }
@@ -260,12 +259,140 @@ impl GeoCache {
             return None;
         }
         let mut cache = self.cache.lock().unwrap();
-        cache.insert(ip.to_string(), GeoEntry::Pending);
-        if let Err(e) = self.online_tx.send(ip.to_string()) {
-            tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
+        match self.online_tx.try_send(addr) {
+            Ok(()) => cache.put(addr, GeoEntry::Pending),
+            // Queue full: record nothing, so the next lookup asks again.
+            Err(std_mpsc::TrySendError::Full(_)) => {}
+            // Worker gone: nothing will answer, so record the address as
+            // failed and log it once rather than on every later lookup.
+            Err(e @ std_mpsc::TrySendError::Disconnected(_)) => {
+                cache.put(addr, GeoEntry::Failed);
+                tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
+            }
         }
         None
     }
+}
+
+/// The address a GeoIP or WHOIS lookup is made for, or None when `ip` should
+/// not be looked up at all. Brackets and a `%zone` are dropped and a
+/// v4-mapped address becomes the IPv4 one it carries, so `[::ffff:8.8.8.8]`,
+/// `::ffff:8.8.8.8` and `8.8.8.8` share a cache entry. Anything that is not
+/// global unicast is None: a multicast address, or one the IANA
+/// special-purpose registries mark not globally reachable, such as a
+/// private, shared, documentation or benchmarking address. It has no
+/// location or owner worth showing, and asking a remote service about one
+/// tells it about the local network.
+///
+/// Stricter than [`is_private_ip`], which stays as it is: topology, egress,
+/// beacon detection and diagnose use it to decide what counts as local, and
+/// widening it would change what they report.
+pub(crate) fn lookup_addr(ip: &str) -> Option<IpAddr> {
+    let ip = ip
+        .strip_prefix('[')
+        .and_then(|ip| ip.strip_suffix(']'))
+        .unwrap_or(ip);
+    let ip = ip.split_once('%').map_or(ip, |(addr, _zone)| addr);
+    let addr = ip.parse::<IpAddr>().ok()?.to_canonical();
+    let global = match addr {
+        IpAddr::V4(v4) => is_global_v4(v4),
+        IpAddr::V6(v6) => is_global_v6(v6),
+    };
+    global.then_some(addr)
+}
+
+/// IPv4 networks that are not global unicast: those the IANA special-purpose
+/// registry (RFC 6890 and its updates) marks not globally reachable, as
+/// std's unstable `Ipv4Addr::is_global` does, and multicast.
+const NON_GLOBAL_V4: [(Ipv4Addr, u32); 15] = [
+    (Ipv4Addr::new(0, 0, 0, 0), 8),       // "this network"
+    (Ipv4Addr::new(10, 0, 0, 0), 8),      // private
+    (Ipv4Addr::new(100, 64, 0, 0), 10),   // shared: carrier-grade NAT, Tailscale
+    (Ipv4Addr::new(127, 0, 0, 0), 8),     // loopback
+    (Ipv4Addr::new(169, 254, 0, 0), 16),  // link-local
+    (Ipv4Addr::new(172, 16, 0, 0), 12),   // private
+    (Ipv4Addr::new(192, 0, 0, 0), 24),    // IETF protocol assignments, but see GLOBAL_V4
+    (Ipv4Addr::new(192, 0, 2, 0), 24),    // documentation
+    (Ipv4Addr::new(192, 88, 99, 2), 32),  // 6a44 relay anycast
+    (Ipv4Addr::new(192, 168, 0, 0), 16),  // private
+    (Ipv4Addr::new(198, 18, 0, 0), 15),   // benchmarking
+    (Ipv4Addr::new(198, 51, 100, 0), 24), // documentation
+    (Ipv4Addr::new(203, 0, 113, 0), 24),  // documentation
+    (Ipv4Addr::new(224, 0, 0, 0), 4),     // multicast
+    (Ipv4Addr::new(240, 0, 0, 0), 4),     // reserved, and 255.255.255.255
+];
+
+/// Addresses inside [`NON_GLOBAL_V4`] that the registry marks globally
+/// reachable.
+const GLOBAL_V4: [(Ipv4Addr, u32); 2] = [
+    (Ipv4Addr::new(192, 0, 0, 9), 32),  // PCP anycast
+    (Ipv4Addr::new(192, 0, 0, 10), 32), // TURN anycast
+];
+
+/// IPv6 networks that are not global unicast: those the IANA special-purpose
+/// registry marks not globally reachable, as std's unstable
+/// `Ipv6Addr::is_global` does, multicast and deprecated site-local. NAT64
+/// and 6to4 addresses are left to [`is_global_v6`], which judges them by the
+/// IPv4 address inside.
+const NON_GLOBAL_V6: [(Ipv6Addr, u32); 12] = [
+    (Ipv6Addr::UNSPECIFIED, 127),                         // :: and ::1
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),      // unique local
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),     // link-local
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),     // site-local, deprecated
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),      // multicast
+    (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32), // documentation
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),     // documentation
+    (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),      // discard-only
+    (Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64),      // dummy prefix
+    // Local-use NAT64. Its prefix can be any length from /48 to /96, so the
+    // IPv4 address inside is not always in the last 32 bits.
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    // IETF protocol assignments, Teredo and benchmarking among them, but
+    // see GLOBAL_V6.
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16), // SRv6 segment IDs
+];
+
+/// Blocks inside [`NON_GLOBAL_V6`] that the registry marks globally
+/// reachable.
+const GLOBAL_V6: [(Ipv6Addr, u32); 7] = [
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1), 128), // PCP anycast
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2), 128), // TURN anycast
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3), 128), // DNS-SD SRP anycast
+    (Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32),  // AMT
+    (Ipv6Addr::new(0x2001, 4, 0x112, 0, 0, 0, 0, 0), 48), // AS112
+    (Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28), // ORCHIDv2
+    (Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28), // drone remote ID tags
+];
+
+fn in_v4(ip: Ipv4Addr, nets: &[(Ipv4Addr, u32)]) -> bool {
+    let bits = u32::from(ip);
+    nets.iter()
+        .any(|&(net, len)| bits >> (32 - len) == u32::from(net) >> (32 - len))
+}
+
+fn in_v6(ip: Ipv6Addr, nets: &[(Ipv6Addr, u32)]) -> bool {
+    let bits = u128::from(ip);
+    nets.iter()
+        .any(|&(net, len)| bits >> (128 - len) == u128::from(net) >> (128 - len))
+}
+
+fn is_global_v4(ip: Ipv4Addr) -> bool {
+    in_v4(ip, &GLOBAL_V4) || !in_v4(ip, &NON_GLOBAL_V4)
+}
+
+fn is_global_v6(ip: Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    let embedded = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+    // A NAT64 address (64:ff9b::/96) ends in the IPv4 peer, and a 6to4 one
+    // (2002::/16) carries the site's IPv4 address after the prefix.
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return is_global_v4(embedded(seg[6], seg[7]));
+    }
+    if seg[0] == 0x2002 {
+        return is_global_v4(embedded(seg[1], seg[2]));
+    }
+    in_v6(ip, &GLOBAL_V6) || !in_v6(ip, &NON_GLOBAL_V6)
 }
 
 pub fn is_private_ip(ip: &str) -> bool {
@@ -304,7 +431,7 @@ pub fn is_private_ip(ip: &str) -> bool {
 /// tier. Anyone on the path sees which peers are looked up and can rewrite
 /// the answer. That is why `geoip_online` is off by default, and why doctor,
 /// Settings and the config reference call it cleartext.
-fn lookup_geo_online(ip: &str) -> Option<GeoInfo> {
+fn lookup_geo_online(ip: IpAddr) -> Option<GeoInfo> {
     let url = format!(
         "http://ip-api.com/json/{}?fields=status,country,countryCode,city,org,as",
         ip
@@ -330,6 +457,15 @@ fn parse_ip_api(body: &str) -> Option<GeoInfo> {
             .unwrap_or("")
             .to_string(),
     ))
+}
+
+#[cfg(test)]
+impl GeoCache {
+    /// A cache whose database puts every address in Ashburn, United States,
+    /// for tests outside this module.
+    pub(crate) fn every_address_us_for_test() -> Self {
+        Self::with_reader(tests::every_address_us(), false)
+    }
 }
 
 #[cfg(test)]
@@ -480,7 +616,7 @@ mod tests {
                 .unwrap()
                 .try_recv()
                 .unwrap(),
-            "8.8.8.8"
+            IpAddr::from([8, 8, 8, 8])
         );
     }
 
@@ -520,6 +656,270 @@ mod tests {
         assert_eq!(info.city, "Syd·]52;c;AAAA·");
         assert_eq!(info.org, "Evil·Net");
     }
+
+    /// A MaxMind DB that puts every address, v4 or v6, in Ashburn, United
+    /// States: one search-tree node whose two records both point at the only
+    /// data record. Enough to drive the offline path without a database file.
+    pub(super) fn every_address_us() -> MaxMindReader {
+        // A UTF-8 string shorter than 29 bytes: type 2 in the top three
+        // bits, length in the low five.
+        fn text(s: &str) -> Vec<u8> {
+            assert!(s.len() < 29);
+            let mut out = vec![0x40 | s.len() as u8];
+            out.extend_from_slice(s.as_bytes());
+            out
+        }
+        // One node, 24-bit records. A record past the node count points
+        // into the data section, which starts 16 bytes after the tree:
+        // 1 + 16 + offset 0.
+        let mut db = vec![0, 0, 17, 0, 0, 17];
+        db.extend_from_slice(&[0; 16]);
+        // {city: {names: {en: "Ashburn"}},
+        //  country: {iso_code: "US", names: {en: "United States"}}}
+        db.push(0xE2);
+        db.extend(text("city"));
+        db.push(0xE1);
+        db.extend(text("names"));
+        db.push(0xE1);
+        db.extend(text("en"));
+        db.extend(text("Ashburn"));
+        db.extend(text("country"));
+        db.push(0xE2);
+        db.extend(text("iso_code"));
+        db.extend(text("US"));
+        db.extend(text("names"));
+        db.push(0xE1);
+        db.extend(text("en"));
+        db.extend(text("United States"));
+        db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
+        let metadata: [(&str, &[u8]); 9] = [
+            ("binary_format_major_version", &[0xA1, 2]), // uint16
+            ("binary_format_minor_version", &[0xA0]),
+            ("build_epoch", &[0x04, 0x02, 0x68, 0xE7, 0xB7, 0x00]), // uint64
+            ("database_type", b"\x49Test-City"),
+            ("description", &[0xE0]), // empty map
+            ("ip_version", &[0xA1, 6]),
+            ("languages", b"\x01\x04\x42en"), // array of one string
+            ("node_count", &[0xC1, 1]),       // uint32
+            ("record_size", &[0xA1, 24]),
+        ];
+        db.push(0xE0 | metadata.len() as u8);
+        for (key, value) in metadata {
+            db.extend(text(key));
+            db.extend_from_slice(value);
+        }
+        MaxMindReader {
+            city_reader: Some(maxminddb::Reader::from_source(db).unwrap()),
+            asn_reader: None,
+        }
+    }
+
+    /// What the online worker would be handed next, drained.
+    fn queued(cache: &GeoCache) -> Vec<String> {
+        let rx = cache.pending_rx.lock().unwrap();
+        rx.as_ref()
+            .unwrap()
+            .try_iter()
+            .map(|ip| ip.to_string())
+            .collect()
+    }
+
+    /// The offline path inserted with no eviction at all, so a long-running
+    /// host with a database kept every distinct peer it ever saw.
+    #[test]
+    fn offline_cache_stays_bounded() {
+        let cache = GeoCache::with_reader(every_address_us(), false);
+        assert!(cache.has_offline_db());
+        for i in 0..100_000u32 {
+            let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
+            assert_eq!(cache.lookup(&ip).unwrap().country_code, "US");
+            assert!(cache.cache.lock().unwrap().len() <= GEO_CACHE_MAX);
+        }
+    }
+
+    /// netwatch is sized for 10,000 connections, and the egress view looks
+    /// up every public peer on every tick. With fewer entries than peers,
+    /// each tick evicted the ones the next would ask for, so every lookup
+    /// went back to the database.
+    #[test]
+    fn ten_thousand_peers_stay_cached() {
+        let cache = GeoCache::with_reader(every_address_us(), false);
+        let peers: Vec<IpAddr> = (0..10_000u32)
+            .map(|i| IpAddr::from(Ipv4Addr::from(0x0800_0000 + i)))
+            .collect();
+        for peer in &peers {
+            assert!(cache.lookup(&peer.to_string()).is_some());
+        }
+        let c = cache.cache.lock().unwrap();
+        assert!(peers.iter().all(|peer| c.contains_key(peer)));
+    }
+
+    /// The online queue had no limit, and a pending entry the cache evicted
+    /// was queued again on the next tick's lookup, so with more peers than
+    /// cache entries every tick queued every peer behind a worker that
+    /// answers one every 1.4 s.
+    #[test]
+    fn a_full_online_queue_drops_the_request_and_records_nothing() {
+        let cache = GeoCache::with_mmdb_and_online("", "", true);
+        let peers: Vec<String> = (0..10_000u32)
+            .map(|i| Ipv4Addr::from(0x0800_0000 + i).to_string())
+            .collect();
+        // Two ticks: the second queues nothing new.
+        for _ in 0..2 {
+            for peer in &peers {
+                assert!(cache.lookup(peer).is_none());
+            }
+        }
+        assert_eq!(cache.cache.lock().unwrap().len(), GEO_QUEUE_MAX);
+        assert_eq!(queued(&cache).len(), GEO_QUEUE_MAX);
+        // With room again, a dropped request is asked for on its next lookup.
+        let dropped = peers.last().unwrap();
+        cache.lookup(dropped);
+        assert_eq!(queued(&cache), [dropped.as_str()]);
+    }
+
+    /// Once the worker has gone, after a panic or at shutdown while the UI
+    /// still ticks, a lookup that records nothing tries the send again next
+    /// time. The egress view looks up every public peer on every tick, so
+    /// that was an error in the log per peer per tick.
+    #[test]
+    fn a_gone_worker_is_logged_once_per_address() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&events)));
+        let cache = GeoCache::with_mmdb_and_online("", "", true);
+        drop(cache.pending_rx.lock().unwrap().take());
+        tracing::subscriber::with_default(subscriber, || {
+            for _tick in 0..10 {
+                for i in 0..100u32 {
+                    let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
+                    assert!(cache.lookup(&ip).is_none());
+                }
+            }
+        });
+        assert_eq!(events.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn v4_mapped_and_plain_share_one_entry() {
+        let cache = GeoCache::with_reader(every_address_us(), false);
+        assert!(cache.lookup("8.8.8.8").is_some());
+        assert!(cache.lookup("::ffff:8.8.8.8").is_some());
+        assert!(cache.lookup("[::ffff:8.8.8.8]").is_some());
+        assert_eq!(cache.cache.lock().unwrap().len(), 1);
+
+        // Online, the mapped form is asked for once, as the IPv4 address.
+        let online = GeoCache::with_mmdb_and_online("", "", true);
+        online.lookup("::ffff:8.8.8.8");
+        online.lookup("8.8.8.8");
+        assert_eq!(queued(&online), ["8.8.8.8"]);
+    }
+
+    #[test]
+    fn non_global_addresses_are_never_looked_up() {
+        // Every address is in the fake database, so None means skipped.
+        let offline = GeoCache::with_reader(every_address_us(), false);
+        let online = GeoCache::with_mmdb_and_online("", "", true);
+        for ip in [
+            "::ffff:192.168.1.5",
+            "::ffff:10.0.0.1",
+            "100.64.0.1",
+            "100.100.100.100",
+            "192.0.2.1",
+            "198.18.0.1",
+            "2001:db8::1",
+            "fe90::1",
+            "64:ff9b::a00:1",
+            "255.255.255.255",
+            // The edges of the same networks, and the rest of the tables.
+            "0.0.0.0",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.31.255.255",
+            "192.0.0.8",
+            "192.0.0.170",
+            "192.88.99.2",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::",
+            "::1",
+            "fd00::1",
+            "fe80::1%eth0",
+            "fec0::1",
+            "ff02::1",
+            "3fff::1",
+            "100::1",
+            // 6to4 for 192.168.1.1.
+            "2002:c0a8:101::1",
+            // The rest of the registry: local-use NAT64, whatever the
+            // prefix length, the dummy prefix, SRv6, and the IETF block
+            // with Teredo and benchmarking in it.
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1:c0a8:1:500::",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+            "100:0:0:1::1",
+            "5f00::1",
+            "2001::1",
+            "2001:1::5",
+            "2001:2::1",
+            "2001:5::1",
+            "2001:10::1",
+            "2001:1ff:ffff::1",
+            // A connection row's host, as Linux prints a dual-stack peer.
+            "[::ffff:192.168.1.5]",
+            "[fe80::1%eth0]",
+            "",
+            "—",
+            "not-an-ip",
+        ] {
+            assert!(offline.lookup(ip).is_none(), "{ip}");
+            online.lookup(ip);
+        }
+        assert_eq!(offline.cache.lock().unwrap().len(), 0);
+        assert!(queued(&online).is_empty());
+
+        for ip in [
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1111%eth0",
+            "100.63.255.255",
+            "100.128.0.0",
+            "172.32.0.1",
+            "198.17.255.255",
+            "198.20.0.0",
+            "223.255.255.255",
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            "[::ffff:8.8.8.8]",
+            "[2606:4700:4700::1111]",
+            // Blocks inside the ones above that IANA marks global.
+            "192.0.0.9",
+            "192.0.0.10",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:3f::1",
+            "2001:200::1",
+        ] {
+            assert!(offline.lookup(ip).is_some(), "{ip}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -531,7 +931,7 @@ mod lifecycle_tests {
         // Online lookups must be opted into for this to exercise the
         // worker-sharing path at all (see geo.rs's `online_enabled` gate).
         let cache = GeoCache::with_mmdb_and_online("", "", true);
-        cache.lookup("192.0.2.1");
+        cache.lookup("8.8.8.8");
         assert_eq!(
             cache
                 .pending_rx
@@ -541,7 +941,7 @@ mod lifecycle_tests {
                 .unwrap()
                 .try_recv()
                 .unwrap(),
-            "192.0.2.1"
+            IpAddr::from([8, 8, 8, 8])
         );
         let clone = cache.clone();
         assert!(clone.start());
