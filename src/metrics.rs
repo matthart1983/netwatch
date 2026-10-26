@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use crate::app::safe_lock;
 use crate::collectors::connections::ConnectionCollector;
 use crate::collectors::health::HealthProber;
+use crate::collectors::packets::PacketCollector;
 use crate::collectors::traffic::InterfaceTraffic;
 
 /// Default bind address — loopback only (never expose metrics to the network by
@@ -61,6 +62,29 @@ pub struct InterfaceMetrics {
     pub tx_drops: u64,
 }
 
+/// The packet capture's counts since it opened, as of libpcap's last poll
+/// (once a second). u64 totals built from libpcap's wrapping u32 counters,
+/// so they keep climbing past four billion packets.
+#[derive(Clone, Copy, Default)]
+pub struct CaptureMetrics {
+    pub received: u64,
+    /// Kernel-buffer drops plus interface/driver drops.
+    pub dropped: u64,
+    /// Packets that reached the packet list.
+    pub decoded: u64,
+}
+
+impl CaptureMetrics {
+    fn of(packets: &PacketCollector) -> Self {
+        let (received, dropped, decoded) = packets.capture_totals();
+        Self {
+            received,
+            dropped,
+            decoded,
+        }
+    }
+}
+
 /// A point-in-time snapshot of the aggregate metrics, refreshed each tick and
 /// rendered to Prometheus text on scrape.
 #[derive(Clone, Default)]
@@ -73,6 +97,9 @@ pub struct MetricsSnapshot {
     pub connection_count: u64,
     pub tcp_time_wait: u64,
     pub tcp_close_wait: u64,
+    /// `None` while no capture is running, as when the daemon could not open
+    /// one. Zeros would read as a capture that sees no traffic.
+    pub capture: Option<CaptureMetrics>,
     /// Cumulative egress-policy violations per process (post-cooldown, so it
     /// tracks the alert stream). Low-cardinality by construction: only
     /// processes with a declared rule in `egress-policy.toml` can appear.
@@ -104,6 +131,7 @@ impl MetricsExporter {
         interfaces: &[InterfaceTraffic],
         health: &HealthProber,
         connections: &ConnectionCollector,
+        packets: &PacketCollector,
         policy_violations: Vec<(String, u64)>,
     ) {
         let ifaces = interfaces
@@ -143,6 +171,7 @@ impl MetricsExporter {
             connection_count: conns.len() as u64,
             tcp_time_wait: time_wait,
             tcp_close_wait: close_wait,
+            capture: packets.is_capturing().then(|| CaptureMetrics::of(packets)),
             policy_violations,
         };
 
@@ -529,6 +558,33 @@ pub fn render_prometheus(snap: Option<&MetricsSnapshot>, collectors_ok: bool) ->
         s.tcp_close_wait
     );
 
+    // --- Packet capture ---------------------------------------------------
+    // HELP and TYPE always, a sample only while a capture runs.
+    let capture = s.capture.as_ref();
+    for (name, help, value) in [
+        (
+            "netwatch_capture_packets_received_total",
+            "Packets libpcap received since the capture opened.",
+            capture.map(|c| c.received),
+        ),
+        (
+            "netwatch_capture_packets_dropped_total",
+            "Packets libpcap dropped since the capture opened, in its kernel buffer or by the interface or driver.",
+            capture.map(|c| c.dropped),
+        ),
+        (
+            "netwatch_capture_packets_decoded_total",
+            "Captured packets netwatch decoded into its packet list since the capture opened.",
+            capture.map(|c| c.decoded),
+        ),
+    ] {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} counter");
+        if let Some(v) = value {
+            let _ = writeln!(o, "{name} {v}");
+        }
+    }
+
     // --- Egress policy linter --------------------------------------------
     if !s.policy_violations.is_empty() {
         o.push_str(
@@ -574,8 +630,135 @@ mod tests {
             connection_count: 7,
             tcp_time_wait: 3,
             tcp_close_wait: 1,
+            capture: Some(CaptureMetrics {
+                received: 9000,
+                dropped: 12,
+                decoded: 8800,
+            }),
             policy_violations: vec![("curl".into(), 2)],
         }
+    }
+
+    const CAPTURE_COUNTERS: [&str; 3] = [
+        "netwatch_capture_packets_received_total",
+        "netwatch_capture_packets_dropped_total",
+        "netwatch_capture_packets_decoded_total",
+    ];
+
+    /// The value of the unlabelled series `name`, if it has a sample.
+    fn sample_value(out: &str, name: &str) -> Option<u64> {
+        out.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+            .map(|v| v.parse().unwrap())
+    }
+
+    #[test]
+    fn renders_capture_counters() {
+        let out = render_prometheus(Some(&sample()), true);
+        for (name, value) in CAPTURE_COUNTERS.into_iter().zip([9000, 12, 8800]) {
+            assert!(out.contains(&format!("# HELP {name} ")), "{name}");
+            assert!(out.contains(&format!("# TYPE {name} counter\n")), "{name}");
+            assert_eq!(sample_value(&out, name), Some(value), "{name}");
+        }
+    }
+
+    /// With no capture running, as when the daemon lacks permission to open
+    /// one, the counters have no sample. A zero would read as a quiet
+    /// network.
+    #[test]
+    fn capture_counters_have_no_sample_without_a_capture() {
+        let snap = MetricsSnapshot {
+            capture: None,
+            ..sample()
+        };
+        let out = render_prometheus(Some(&snap), true);
+        for name in CAPTURE_COUNTERS {
+            assert!(out.contains(&format!("# TYPE {name} counter\n")), "{name}");
+            assert_eq!(sample_value(&out, name), None, "{name}");
+        }
+
+        let exporter = MetricsExporter::new("127.0.0.1:0");
+        let packets = PacketCollector::new();
+        let connections = ConnectionCollector::new(Arc::clone(&packets.stream_tracker));
+        exporter.update(
+            &[],
+            &HealthProber::new(),
+            &connections,
+            &packets,
+            Vec::new(),
+        );
+        let snap = safe_lock(&exporter.snapshot, "metrics::test")
+            .clone()
+            .unwrap();
+        assert!(snap.capture.is_none(), "a collector that is not capturing");
+    }
+
+    /// libpcap counts in u32, which wraps within the hour at 1.2M packets a
+    /// second. The counters carry the collector's u64 totals past the wrap.
+    #[test]
+    fn capture_counters_climb_across_a_libpcap_wrap() {
+        let packets = PacketCollector::new();
+        let reading = |received, dropped| pcap::Stat {
+            received,
+            dropped,
+            if_dropped: 0,
+        };
+        let scrape = |packets: &PacketCollector| {
+            let snap = MetricsSnapshot {
+                capture: Some(CaptureMetrics::of(packets)),
+                ..sample()
+            };
+            let out = render_prometheus(Some(&snap), true);
+            CAPTURE_COUNTERS.map(|name| sample_value(&out, name).unwrap())
+        };
+        let mut last = reading(0, 0);
+        // Two polls to near the top of the range: one that moved 2^31 or
+        // more would read as the counter going back.
+        let stats = &packets.stats;
+        stats.record_poll_for_test(&mut last, reading(u32::MAX / 2, u32::MAX / 2), 100);
+        stats.record_poll_for_test(&mut last, reading(u32::MAX - 999, u32::MAX - 9), 200);
+        let before = scrape(&packets);
+        assert_eq!(
+            before,
+            [u64::from(u32::MAX) - 999, u64::from(u32::MAX) - 9, 200]
+        );
+
+        stats.record_poll_for_test(&mut last, reading(1000, 10), 300);
+        let after = scrape(&packets);
+        assert_eq!(
+            after,
+            [u64::from(u32::MAX) + 1001, u64::from(u32::MAX) + 11, 300]
+        );
+        assert!(before.iter().zip(after).all(|(b, a)| a > *b));
+    }
+
+    /// observability-export.md's table is the list of metric names and
+    /// types that 1.0 keeps, so a metric added, renamed or retyped without
+    /// the doc fails here.
+    #[test]
+    fn the_documented_metrics_are_the_ones_served() {
+        let doc = include_str!("../docs/observability-export.md");
+        let mut documented: Vec<(&str, &str)> = doc
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.strip_prefix("| `")?.split('|');
+                let name = cells.next()?.split(['`', '{']).next()?;
+                let kind = cells.next()?.trim();
+                name.starts_with("netwatch_").then_some((name, kind))
+            })
+            .collect();
+        // Every family the exporter can serve has a series in the sample.
+        let out = render_prometheus(Some(&sample()), true);
+        let mut served: Vec<(&str, &str)> = out
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.strip_prefix("# TYPE ")?.split(' ');
+                Some((words.next()?, words.next()?))
+            })
+            .collect();
+        documented.sort_unstable();
+        served.sort_unstable();
+        assert_eq!(documented, served);
     }
 
     #[test]

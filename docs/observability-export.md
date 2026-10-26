@@ -52,10 +52,25 @@ trusted network boundary.
 | `netwatch_dns_loss_ratio` | gauge | DNS packet loss (0–1) |
 | `netwatch_connections` | gauge | Tracked connections |
 | `netwatch_tcp_connections{state}` | gauge | TCP connections by state (`time_wait`, `close_wait`) |
+| `netwatch_capture_packets_received_total` | counter | Packets libpcap received |
+| `netwatch_capture_packets_dropped_total` | counter | Packets libpcap dropped because its kernel buffer was full, plus drops by the interface or driver |
+| `netwatch_capture_packets_decoded_total` | counter | Captured packets netwatch decoded into its packet list |
 | `netwatch_policy_violations_total{process}` | counter | Egress-policy violations per process (post-cooldown; only processes declared in `egress-policy.toml` can appear, so cardinality stays bounded) |
 
 Names and units follow Prometheus base-unit conventions (`_bytes`, `_seconds`,
-`_ratio`, `_total`).
+`_ratio`, `_total`). The 1.0 compatibility promise covers the names, types and
+labels in this table. A 1.x release can add metrics but does not rename or
+remove these.
+
+The three capture counters count from when the capture opened, and netwatch
+reads them from libpcap once a second. They have no sample while no capture is
+running, for example when the daemon lacks permission to capture, so alert on
+`absent(netwatch_capture_packets_received_total)` as well as on a rising
+`rate(netwatch_capture_packets_dropped_total[5m])`. libpcap's own counters are
+32-bit and wrap after about four billion packets; these are 64-bit and keep
+counting. On Linux loopback (`lo`) libpcap counts each packet twice, once
+sent and once received, but hands netwatch one copy, so there the received
+count is twice the decoded count.
 
 ## Prometheus scrape config
 

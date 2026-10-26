@@ -1624,6 +1624,18 @@ impl CaptureStats {
         );
     }
 
+    /// [`Self::record_poll`] for tests outside this module, a second after
+    /// the last poll.
+    #[cfg(test)]
+    pub(crate) fn record_poll_for_test(
+        &self,
+        last: &mut pcap::Stat,
+        reading: pcap::Stat,
+        decoded: u64,
+    ) {
+        self.record_poll(last, reading, decoded, 1.0);
+    }
+
     /// Zeroed when a capture starts, so the numbers describe this run rather
     /// than accumulating across interface switches.
     fn reset(&self) {
