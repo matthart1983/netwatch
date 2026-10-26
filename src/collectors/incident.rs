@@ -14,7 +14,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_WINDOW_SECS: i64 = 300;
 const MAX_RECORDED_PACKETS: usize = 20_000;
+/// What the recorded packets may hold, as [`TimedPacket::held_bytes`]
+/// counts it. Under bulk traffic, where one GSO frame can be 64 KiB, this
+/// rather than the count is what limits the recorder.
+const MAX_RECORDED_PACKET_BYTES: usize = 64 << 20;
 const MAX_SNAPSHOTS: usize = 600;
+/// Connection rows all the snapshots may hold together, about 55 MB at the
+/// usual 1.1 KB a row. A host with 10,000 connections fills it in five
+/// snapshots. `summary.md` and REFERENCE write the number out.
+const MAX_CONNECTION_ROWS: usize = 50_000;
+/// What the snapshots may hold together, as [`connection_held_bytes`]
+/// counts it. Rows of the usual size reach [`MAX_CONNECTION_ROWS`] first.
+/// A row carries its flow's classification, and the peer picks the SNI or
+/// request path in it, so 1,024 rows, as many flows as the stream tracker
+/// classifies, can hold 8 MB.
+const MAX_CONNECTION_BYTES: usize = 64 << 20;
 const MAX_ALERT_EVENTS: usize = 200;
 const TOP_PROCESS_COUNT: usize = 10;
 
@@ -95,6 +109,7 @@ struct IncidentManifest {
     freeze_reason: Option<String>,
     packet_count: usize,
     connection_snapshots: usize,
+    connection_rows_dropped: usize,
     health_snapshots: usize,
     bandwidth_snapshots: usize,
     dns_snapshots: usize,
@@ -113,6 +128,66 @@ pub struct CaptureStatus {
 struct TimedPacket {
     observed_at: DateTime<Utc>,
     packet: CapturedPacket,
+}
+
+impl TimedPacket {
+    /// What this copy costs against [`MAX_RECORDED_PACKET_BYTES`]: the
+    /// captured bytes and the text decoded from them, the flow's
+    /// classification included. The fixed part counts too, or a flood of
+    /// tiny frames would look free.
+    fn held_bytes(&self) -> usize {
+        let p = &self.packet;
+        let host = |name: &Option<String>| name.as_ref().map_or(0, String::len);
+        std::mem::size_of::<Self>()
+            + p.timestamp.len()
+            + p.src_ip.len()
+            + p.dst_ip.len()
+            + host(&p.src_host)
+            + host(&p.dst_host)
+            + p.protocol.len()
+            + p.info.len()
+            + p.details
+                .iter()
+                .map(|line| std::mem::size_of::<String>() + line.len())
+                .sum::<usize>()
+            + p.payload_text.len()
+            + p.raw_bytes.len()
+            + p.decrypted_plaintext.as_ref().map_or(0, Vec::len)
+            + p.app_protocol
+                .as_ref()
+                .map_or(0, super::packets::label_bytes)
+            + p.annotation
+                .as_ref()
+                .map_or(0, |_| std::mem::size_of::<export::PacketAnnotation>())
+    }
+}
+
+/// What a connection row costs against [`MAX_CONNECTION_BYTES`]: the struct,
+/// its text and its flow's classification.
+fn connection_held_bytes(conn: &Connection) -> usize {
+    let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    let evidence = &conn.evidence;
+    std::mem::size_of::<Connection>()
+        + conn.protocol.len()
+        + conn.local_addr.len()
+        + conn.remote_addr.len()
+        + conn.state.len()
+        + text(&conn.process_name)
+        + evidence.process.as_ref().map_or(0, |p| {
+            p.session.len() + p.start_token.len() + text(&p.executable) + text(&p.network_namespace)
+        })
+        + text(&evidence.corroborated_by)
+        + evidence.flow.as_ref().map_or(0, |f| {
+            f.session.len()
+                + f.protocol.len()
+                + f.local.len()
+                + f.remote.len()
+                + text(&f.network_namespace)
+        })
+        + conn
+            .app_protocol
+            .as_ref()
+            .map_or(0, super::packets::label_bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +213,9 @@ pub struct IncidentRecorder {
     last_recorded_alert_at: Option<std::time::Instant>,
     packets: VecDeque<TimedPacket>,
     connection_snapshots: VecDeque<TimedSnapshot<ConnectionSnapshot>>,
+    /// When each snapshot the row budget dropped was taken, and its rows.
+    /// They leave with the window, like the snapshots they stood for.
+    dropped_connection_rows: Vec<(DateTime<Utc>, usize)>,
     health_snapshots: VecDeque<TimedSnapshot<HealthSnapshot>>,
     bandwidth_snapshots: VecDeque<TimedSnapshot<BandwidthSnapshot>>,
     dns_snapshots: VecDeque<TimedSnapshot<DnsSnapshot>>,
@@ -163,6 +241,7 @@ impl IncidentRecorder {
             last_recorded_alert_at: None,
             packets: VecDeque::new(),
             connection_snapshots: VecDeque::new(),
+            dropped_connection_rows: Vec::new(),
             health_snapshots: VecDeque::new(),
             bandwidth_snapshots: VecDeque::new(),
             dns_snapshots: VecDeque::new(),
@@ -365,6 +444,7 @@ impl IncidentRecorder {
             freeze_reason: self.freeze_reason.clone(),
             packet_count: self.packets.len(),
             connection_snapshots: self.connection_snapshots.len(),
+            connection_rows_dropped: self.connection_rows_dropped(),
             health_snapshots: self.health_snapshots.len(),
             bandwidth_snapshots: self.bandwidth_snapshots.len(),
             dns_snapshots: self.dns_snapshots.len(),
@@ -459,6 +539,7 @@ impl IncidentRecorder {
             },
         );
         self.prune(now);
+        self.thin_connection_snapshots(now);
     }
 
     fn record_new_packets(&mut self, now: DateTime<Utc>, packets: &[CapturedPacket]) {
@@ -495,9 +576,72 @@ impl IncidentRecorder {
             });
         }
         self.last_packet_id = last_packet_id;
-        while self.packets.len() > MAX_RECORDED_PACKETS {
-            self.packets.pop_front();
+        // Oldest first, until both the count and the bytes fit.
+        let mut held: usize = self.packets.iter().map(TimedPacket::held_bytes).sum();
+        while self.packets.len() > MAX_RECORDED_PACKETS || held > MAX_RECORDED_PACKET_BYTES {
+            let Some(oldest) = self.packets.pop_front() else {
+                break;
+            };
+            held -= oldest.held_bytes();
         }
+    }
+
+    /// Keep the connection snapshots within [`MAX_CONNECTION_ROWS`] and
+    /// [`MAX_CONNECTION_BYTES`]. Every snapshot kept is whole, since a
+    /// snapshot missing rows would read as connections that had closed, and
+    /// the newest is always kept, even alone over the budget. Older ones go
+    /// one at a time, each time the one whose loss leaves the shortest gap,
+    /// with the window's start standing in for the snapshot before the
+    /// oldest. While three or more fit, up to 16,666 rows each at the usual
+    /// row size, those left stay spread across the window. With two, the
+    /// older one's age cycles from a second to the whole window, and past
+    /// 25,000 rows only the newest is left. The choice goes by time, not
+    /// size, so a snapshot from a short burst of connections is usually
+    /// dropped as soon as a newer one is taken.
+    fn thin_connection_snapshots(&mut self, now: DateTime<Utc>) {
+        let start = now - self.window;
+        let held = |rows: &[Connection]| rows.iter().map(connection_held_bytes).sum::<usize>();
+        let mut rows: usize = self
+            .connection_snapshots
+            .iter()
+            .map(|s| s.value.connections.len())
+            .sum();
+        let mut bytes: usize = self
+            .connection_snapshots
+            .iter()
+            .map(|s| held(&s.value.connections))
+            .sum();
+        while (rows > MAX_CONNECTION_ROWS || bytes > MAX_CONNECTION_BYTES)
+            && self.connection_snapshots.len() > 1
+        {
+            let snapshots = &self.connection_snapshots;
+            let gap_without = |i: usize| {
+                let before = if i == 0 {
+                    start
+                } else {
+                    snapshots[i - 1].observed_at
+                };
+                snapshots[i + 1].observed_at - before
+            };
+            let Some(dropped) = (0..snapshots.len() - 1)
+                .min_by_key(|&i| gap_without(i))
+                .and_then(|i| self.connection_snapshots.remove(i))
+            else {
+                break;
+            };
+            rows -= dropped.value.connections.len();
+            bytes -= held(&dropped.value.connections);
+            self.dropped_connection_rows
+                .push((dropped.observed_at, dropped.value.connections.len()));
+        }
+    }
+
+    /// Rows the row budget dropped from snapshots still in the window.
+    fn connection_rows_dropped(&self) -> usize {
+        self.dropped_connection_rows
+            .iter()
+            .map(|(_, rows)| rows)
+            .sum()
     }
 
     fn record_alerts(&mut self, now: DateTime<Utc>, alert_history: &[Alert]) {
@@ -538,6 +682,8 @@ impl IncidentRecorder {
         prune_queue(&mut self.connection_snapshots, cutoff, |item| {
             item.observed_at
         });
+        self.dropped_connection_rows
+            .retain(|(observed_at, _)| *observed_at >= cutoff);
         prune_queue(&mut self.health_snapshots, cutoff, |item| item.observed_at);
         prune_queue(&mut self.bandwidth_snapshots, cutoff, |item| {
             item.observed_at
@@ -586,11 +732,21 @@ impl IncidentRecorder {
         }
         out.push_str(&format!("- Packets retained: `{}`\n", total_packets));
         out.push_str(&format!(
-            "- Connection snapshots: `{}`  Health snapshots: `{}`  Alert events: `{}`\n\n",
+            "- Connection snapshots: `{}`  Health snapshots: `{}`  Alert events: `{}`\n",
             self.connection_snapshots.len(),
             self.health_snapshots.len(),
             self.alert_events.len()
         ));
+        let rows_dropped = self.connection_rows_dropped();
+        if rows_dropped > 0 {
+            // The newest snapshot is kept whole even over the budget, so
+            // this says what the rows went for, not that the bundle fits.
+            out.push_str(&format!(
+                "- Connection rows dropped: `{}` (whole older snapshots, for the budget of 50,000 rows and 64 MiB)\n",
+                rows_dropped
+            ));
+        }
+        out.push('\n');
 
         out.push_str("## Traffic Signals\n\n");
         out.push_str(&format!("- Expert errors: `{}`\n", error_count));
@@ -719,6 +875,7 @@ impl IncidentRecorder {
         self.last_recorded_alert_at = None;
         self.packets.clear();
         self.connection_snapshots.clear();
+        self.dropped_connection_rows.clear();
         self.health_snapshots.clear();
         self.bandwidth_snapshots.clear();
         self.dns_snapshots.clear();
@@ -791,7 +948,11 @@ fn alert_severity_label(alert: &Alert) -> String {
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let file = create_new(path).map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
-    serde_json::to_writer_pretty(file, value)
+    // Unbuffered, serde writes each token on its own: 50,000 connection
+    // rows took about 12 million write calls.
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)
+        .and_then(|()| writer.flush().map_err(serde_json::Error::io))
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
@@ -807,6 +968,7 @@ fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dpi::AppProtocol;
     use std::collections::VecDeque;
     use std::fs;
 
@@ -1147,6 +1309,7 @@ mod tests {
             serde_json::from_slice(&fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["version"], 2);
         assert_eq!(manifest["packet_export"]["packets"], 1);
+        assert_eq!(manifest["connection_rows_dropped"], 0);
         assert!(manifest["last_capture_status"].is_null());
         let second = recorder.export_bundle(&root).unwrap();
         assert_ne!(bundle, second);
@@ -1174,5 +1337,304 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Bulk traffic with GSO captures 64 KiB frames, and 20,000 of them
+    /// would be over a gigabyte. The byte budget stops the recorder well
+    /// before the count does, dropping the oldest first, while small frames
+    /// still stop at the count.
+    #[test]
+    fn recorder_evicts_packets_by_bytes() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let held = |recorder: &IncidentRecorder| -> usize {
+            recorder.packets.iter().map(TimedPacket::held_bytes).sum()
+        };
+        let mut id = 0;
+        for _ in 0..20 {
+            let batch: Vec<_> = (0..100)
+                .map(|_| {
+                    id += 1;
+                    let mut packet = make_packet(id, "TCP", ExpertSeverity::Chat);
+                    packet.raw_bytes = vec![0xab; 65_000];
+                    packet
+                })
+                .collect();
+            record_packets(&mut recorder, &batch);
+            assert!(held(&recorder) <= MAX_RECORDED_PACKET_BYTES);
+        }
+        let kept = recorder.packets.len() as u64;
+        let frame = recorder.packets[0].held_bytes();
+        assert!(kept < 2_000, "{kept} of 2,000 frames kept");
+        assert!(held(&recorder) + frame > MAX_RECORDED_PACKET_BYTES);
+        let ids: Vec<u64> = recorder.packets.iter().map(|p| p.packet.id).collect();
+        assert_eq!(ids, (2_001 - kept..=2_000).collect::<Vec<_>>());
+
+        recorder.arm();
+        let small: Vec<_> = (1..=25_000)
+            .map(|id| make_packet(id, "DNS", ExpertSeverity::Chat))
+            .collect();
+        record_packets(&mut recorder, &small);
+        assert_eq!(recorder.packets.len(), MAX_RECORDED_PACKETS);
+        assert_eq!(recorder.packets[0].packet.id, 5_001);
+        assert!(held(&recorder) < MAX_RECORDED_PACKET_BYTES);
+    }
+
+    /// Every packet of a flow carries the flow's classification, empty ACKs
+    /// included, so one long SNI or request path from a peer is held once
+    /// per packet. The byte budget counts it.
+    #[test]
+    fn recorder_counts_app_protocol_against_the_byte_budget() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let long = || Some("a".repeat(8_192));
+        let classified: Vec<_> = (1..=20_000u64)
+            .map(|id| {
+                let mut packet = make_packet(id, "TCP", ExpertSeverity::Chat);
+                packet.app_protocol = Some(match id % 3 {
+                    0 => AppProtocol::Tls {
+                        sni: long(),
+                        alpn: None,
+                        ech: false,
+                        ja4: None,
+                    },
+                    1 => AppProtocol::Quic {
+                        sni: long(),
+                        ech: false,
+                        ja4: None,
+                    },
+                    _ => AppProtocol::Http {
+                        method: "GET".into(),
+                        host: None,
+                        path: long(),
+                        status: None,
+                    },
+                });
+                packet
+            })
+            .collect();
+        record_packets(&mut recorder, &classified);
+        let held: usize = recorder.packets.iter().map(TimedPacket::held_bytes).sum();
+        let kept = recorder.packets.len() as u64;
+        assert!(held <= MAX_RECORDED_PACKET_BYTES, "{} MiB held", held >> 20);
+        assert!(kept < 10_000, "{kept} of 20,000 packets kept");
+        let ids: Vec<u64> = recorder.packets.iter().map(|p| p.packet.id).collect();
+        assert_eq!(ids, (20_001 - kept..=20_000).collect::<Vec<_>>());
+    }
+
+    /// A host with 10,000 connections, recorded for the whole window,
+    /// would hold 3 million rows. The snapshots stay within the row budget:
+    /// the newest whole every tick, older ones dropped whole and the rest
+    /// spread across the window, and the bundle says how many rows went.
+    /// Run for twice the window, so dropped rows also age out with it.
+    #[test]
+    fn armed_recorder_with_10k_rows_stays_within_row_budget() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let table: Vec<Connection> = (0..10_000u32)
+            .map(|i| Connection {
+                local_addr: format!("10.0.{}.{}:{}", i >> 8, i & 0xff, 40_000 + i % 20_000),
+                ..make_connection()
+            })
+            .collect();
+        let start = Utc::now();
+        let ticks = 600;
+        let mut dropped = 0;
+        for tick in 0..ticks {
+            let now = start + Duration::seconds(tick);
+            recorder.record_at(
+                now,
+                &[],
+                &table,
+                &make_health(),
+                &[],
+                &[],
+                &DnsAnalytics::default(),
+                &[],
+            );
+            let rows: usize = recorder
+                .connection_snapshots
+                .iter()
+                .map(|s| s.value.connections.len())
+                .sum();
+            assert!(rows <= MAX_CONNECTION_ROWS, "tick {tick}: {rows} rows");
+            let newest = recorder.connection_snapshots.back().unwrap();
+            assert_eq!(newest.observed_at, now);
+            assert_eq!(newest.value.connections.len(), table.len());
+            // One snapshot a second, so the window holds those from the
+            // last 300 seconds and the one on its edge.
+            let taken = (tick.min(recorder.window.num_seconds()) + 1) as usize;
+            dropped = (taken - recorder.connection_snapshots.len()) * table.len();
+            assert_eq!(recorder.connection_rows_dropped(), dropped, "tick {tick}");
+        }
+
+        let kept = &recorder.connection_snapshots;
+        assert_eq!(kept.len(), MAX_CONNECTION_ROWS / table.len());
+        let whole = |rows: &[Connection]| {
+            rows.iter()
+                .map(|c| &c.local_addr)
+                .eq(table.iter().map(|c| &c.local_addr))
+        };
+        assert!(kept.iter().all(|s| whole(&s.value.connections)));
+        // No stretch of the window, its start included, goes without a
+        // snapshot for more than twice the even spacing.
+        let even = recorder.window / kept.len() as i32;
+        let mut before = start + Duration::seconds(ticks - 1) - recorder.window;
+        for snapshot in kept {
+            let gap = snapshot.observed_at - before;
+            assert!(gap <= even * 2, "{}s gap", gap.num_seconds());
+            before = snapshot.observed_at;
+        }
+        assert_eq!(dropped, 296 * table.len());
+
+        recorder.freeze("busy host").unwrap();
+        let root = scratch("rows");
+        let bundle = recorder
+            .export_bundle_options(&root, false, &AtomicBool::new(false))
+            .unwrap();
+        let manifest = manifest(&bundle);
+        assert_eq!(manifest["connection_snapshots"], 5);
+        assert_eq!(manifest["connection_rows_dropped"], dropped);
+        let summary = fs::read_to_string(bundle.join("summary.md")).unwrap();
+        assert!(
+            summary.contains(&format!("Connection rows dropped: `{dropped}`")),
+            "{summary}"
+        );
+        let snapshots: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(bundle.join("connections.json")).unwrap()).unwrap();
+        assert_eq!(snapshots.len(), 5);
+        for snapshot in &snapshots {
+            assert!(snapshot["timestamp"].is_string());
+            assert_eq!(snapshot["connections"].as_array().unwrap().len(), 10_000);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every row of a classified flow carries the flow's SNI or request
+    /// path, which the peer picks. 1,024 rows, as many flows as the stream
+    /// tracker classifies, are far inside the row budget, but at 8 KB of
+    /// text each the window would hold 2.7 GB. The byte budget counts it,
+    /// and the snapshots it leaves stay whole and spread across the window.
+    #[test]
+    fn recorder_counts_row_classification_against_the_byte_budget() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let long = || Some("a".repeat(8_192));
+        let table: Vec<Connection> = (0..1_024u32)
+            .map(|i| Connection {
+                remote_addr: format!("203.0.113.7:{}", 40_000 + i),
+                app_protocol: Some(if i % 2 == 0 {
+                    AppProtocol::Tls {
+                        sni: long(),
+                        alpn: None,
+                        ech: false,
+                        ja4: None,
+                    }
+                } else {
+                    AppProtocol::Http {
+                        method: "GET".into(),
+                        host: None,
+                        path: long(),
+                        status: None,
+                    }
+                }),
+                ..make_connection()
+            })
+            .collect();
+        let snapshot_bytes: usize = table.iter().map(connection_held_bytes).sum();
+        let held = |recorder: &IncidentRecorder| -> usize {
+            recorder
+                .connection_snapshots
+                .iter()
+                .flat_map(|s| s.value.connections.iter())
+                .map(connection_held_bytes)
+                .sum()
+        };
+        let start = Utc::now();
+        let ticks = 600;
+        for tick in 0..ticks {
+            let now = start + Duration::seconds(tick);
+            recorder.record_at(
+                now,
+                &[],
+                &table,
+                &make_health(),
+                &[],
+                &[],
+                &DnsAnalytics::default(),
+                &[],
+            );
+            assert!(
+                held(&recorder) <= MAX_CONNECTION_BYTES,
+                "tick {tick}: {} MiB held",
+                held(&recorder) >> 20
+            );
+            let newest = recorder.connection_snapshots.back().unwrap();
+            assert_eq!(newest.observed_at, now);
+            assert_eq!(newest.value.connections.len(), table.len());
+            let taken = (tick.min(recorder.window.num_seconds()) + 1) as usize;
+            assert_eq!(
+                recorder.connection_rows_dropped(),
+                (taken - recorder.connection_snapshots.len()) * table.len(),
+                "tick {tick}"
+            );
+        }
+
+        // The bytes, not the rows, are what stopped it.
+        let kept = &recorder.connection_snapshots;
+        assert_eq!(kept.len(), MAX_CONNECTION_BYTES / snapshot_bytes);
+        assert!(kept.len() * table.len() < MAX_CONNECTION_ROWS / 4);
+        assert!(kept
+            .iter()
+            .all(|s| s.value.connections.len() == table.len()));
+        let even = recorder.window / kept.len() as i32;
+        let mut before = start + Duration::seconds(ticks - 1) - recorder.window;
+        for snapshot in kept {
+            let gap = snapshot.observed_at - before;
+            assert!(gap <= even * 2, "{}s gap", gap.num_seconds());
+            before = snapshot.observed_at;
+        }
+    }
+
+    /// The newest snapshot stays whole even when it alone is over the row
+    /// budget, and the summary does not then say the bundle is within it.
+    /// Arming again starts the count of dropped rows afresh.
+    #[test]
+    fn newest_snapshot_over_the_row_budget_stays_whole() {
+        let mut recorder = IncidentRecorder::new();
+        recorder.arm();
+        let table = vec![make_connection(); 60_000];
+        let start = Utc::now();
+        for tick in 0..2 {
+            recorder.record_at(
+                start + Duration::seconds(tick),
+                &[],
+                &table,
+                &make_health(),
+                &[],
+                &[],
+                &DnsAnalytics::default(),
+                &[],
+            );
+        }
+        assert_eq!(recorder.connection_snapshots.len(), 1);
+        assert_eq!(
+            recorder.connection_snapshots[0].observed_at,
+            start + Duration::seconds(1)
+        );
+        assert_eq!(
+            recorder.connection_snapshots[0].value.connections.len(),
+            60_000
+        );
+        assert_eq!(recorder.connection_rows_dropped(), 60_000);
+        let summary = recorder.build_summary();
+        assert!(
+            summary.contains(
+                "- Connection rows dropped: `60000` (whole older snapshots, for the budget of 50,000 rows and 64 MiB)\n"
+            ),
+            "{summary}"
+        );
+        recorder.arm();
+        assert_eq!(recorder.connection_rows_dropped(), 0);
     }
 }

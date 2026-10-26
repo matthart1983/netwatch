@@ -1730,27 +1730,47 @@ fn run_capture_step(
 }
 
 /// The bytes behind a flow's DPI label. Every packet on the flow carries a
-/// copy, and a peer chooses how long some of it is: a QUIC ClientHello can
-/// name a 15,000-byte SNI over MTU-sized Initials.
-fn label_bytes(p: &crate::dpi::AppProtocol) -> usize {
-    use crate::dpi::AppProtocol as P;
-    let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);
-    match p {
-        P::Tls { sni, alpn, ja4, .. } => opt(sni) + opt(alpn) + opt(ja4),
-        P::Http {
-            method, host, path, ..
-        } => method.len() + opt(host) + opt(path),
-        P::Dns { qname, .. } | P::Llmnr { qname, .. } => qname.len(),
-        P::Ssh { version } => version.len(),
-        P::Quic { sni, ja4, .. } => opt(sni) + opt(ja4),
-        P::Mqtt { client_id } => opt(client_id),
-        P::Stun { message_type } => message_type.len(),
-        P::BitTorrent { info_hash } => opt(info_hash),
-        P::NetBios { service } => service.len(),
-        P::Snmp { version, community } => version.len() + opt(community),
-        P::Ssdp { method, target } => method.len() + opt(target),
-        P::Ftp { command } => command.len(),
-        P::Dhcp { .. } | P::Ntp { .. } => 0,
+/// copy, empty ACKs included, and the flow's row in every connection
+/// snapshot the incident recorder keeps holds another. A peer chooses how
+/// long some of it is: a QUIC ClientHello can name a 15,000-byte SNI over
+/// MTU-sized Initials. Every field is named, so a new variant or field has
+/// to be counted here before this compiles.
+pub(crate) fn label_bytes(app: &crate::dpi::AppProtocol) -> usize {
+    use crate::dpi::AppProtocol;
+    let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    match app {
+        AppProtocol::Tls {
+            sni,
+            alpn,
+            ech: _,
+            ja4,
+        } => text(sni) + text(alpn) + text(ja4),
+        AppProtocol::Http {
+            method,
+            host,
+            path,
+            status: _,
+        } => method.len() + text(host) + text(path),
+        AppProtocol::Dns {
+            qname,
+            qtype: _,
+            rcode: _,
+        } => qname.len(),
+        AppProtocol::Ssh { version } => version.len(),
+        AppProtocol::Quic { sni, ech: _, ja4 } => text(sni) + text(ja4),
+        AppProtocol::Mqtt { client_id } => text(client_id),
+        AppProtocol::Stun { message_type } => message_type.len(),
+        AppProtocol::BitTorrent { info_hash } => text(info_hash),
+        AppProtocol::NetBios { service } => service.len(),
+        AppProtocol::Snmp { version, community } => version.len() + text(community),
+        AppProtocol::Ssdp { method, target } => method.len() + text(target),
+        AppProtocol::Ftp { command } => command.len(),
+        AppProtocol::Llmnr { qname, qtype: _ } => qname.len(),
+        AppProtocol::Dhcp { op: _ } => 0,
+        AppProtocol::Ntp {
+            version: _,
+            mode: _,
+        } => 0,
     }
 }
 
