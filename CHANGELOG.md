@@ -51,7 +51,7 @@ All notable changes to NetWatch will be documented in this file.
   counts closed connections alone and drops the ones that closed longest
   ago. Open connections are never dropped. It drops at least 256 at a time,
   so the Timeline is not reindexed on every tick that something closes, and
-  right after a drop it can hold as few as 1,744 closed connections. The
+  right after a drop it can hold as few as 1,745 closed connections. The
   `M` overlay shows the closed count against 2,000.
 
 ### Fixed
