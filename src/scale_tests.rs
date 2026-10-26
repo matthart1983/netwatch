@@ -2,13 +2,15 @@
 //!
 //! Two tests run with the rest of the suite: a 10,000-row table renders its
 //! true count and every row can be scrolled to, and the timeline keeps every
-//! active entry when 10,000 are active and some close.
+//! active entry when 10,000 are active and some close. Two more check the
+//! timings below: each timed frame follows a tick, and `NW_PERF_STRICT`
+//! fails a missed `Pending` budget.
 //!
 //! The rest are timings, `#[ignore]`d and named `scale_*`, for a release
 //! build:
 //!
 //! ```text
-//! cargo nextest run --release --run-ignored only -E 'test(/scale_/)' --no-capture
+//! cargo nextest run --release --run-ignored only --no-fail-fast -E 'test(/scale_/)' --no-capture
 //! ```
 //!
 //! They time frames on a 200x50 terminal, the scroll key, the UI tick's
@@ -22,18 +24,21 @@
 //! (1 on the reference machine, 3 in CI). The 2,000 and 50,000 rows are
 //! printed but not judged; 50,000 has to work, not to be fast. A budget
 //! today's code misses is `Pending` on the branch expected to meet it: it is
-//! measured and printed and never fails the test, and that branch makes it
-//! `Enforced`.
+//! measured and printed and does not fail the test, and that branch makes it
+//! `Enforced`. `NW_PERF_STRICT=1` fails a missed `Pending` budget as well,
+//! for a release candidate, which has to meet every one.
 
 use crate::app::{draw_frame, handle_key, App, ConnectionGroup, Tab, ViewMode};
+use crate::collectors::attribution::MAX_MATCH_AGE;
 use crate::collectors::connections::{Connection, ConnectionTimeline};
 use crate::collectors::tcp_info::{normalize_endpoint, FlowMap, TcpInfo};
 use crate::config::NetwatchConfig;
+use crate::sort::TabSortState;
 use crate::testutil::connections::synthetic_connections;
-use crate::ui::connections::{build_view, selected_connection, ConnRow};
+use crate::ui::connections::{build_view, selected_connection, ConnRow, COLUMNS};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// The size the budgets are for.
@@ -52,7 +57,8 @@ enum Stat {
 #[derive(Clone, Copy)]
 enum Gate {
     Enforced,
-    /// Measured and printed, never failed, until the named branch meets it.
+    /// Measured and printed, and failed only under `NW_PERF_STRICT=1`, until
+    /// the named branch meets it.
     Pending(&'static str),
 }
 
@@ -75,7 +81,7 @@ const DENSE_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Pending(VIEW_CACHE
 const TOPOLOGY_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const TIMELINE_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const SCROLL_KEY: Budget = budget(Stat::P99, 5.0, Gate::Pending(VIEW_CACHE));
-const TICK_CONSUMERS: Budget = budget(Stat::P50, 15.0, Gate::Pending(POLL_10K));
+const TICK_CONSUMERS: Budget = budget(Stat::P50, 15.0, Gate::Pending(VIEW_CACHE));
 const DIAGNOSE_JOIN: Budget = budget(Stat::P50, 2.0, Gate::Pending(POLL_10K));
 #[cfg(target_os = "linux")]
 const POLL: Budget = budget(Stat::P50, 150.0, Gate::Pending(POLL_10K));
@@ -104,6 +110,18 @@ fn slack() -> f64 {
     }
 }
 
+/// Whether a missed `Pending` budget fails, from `NW_PERF_STRICT`.
+fn strict() -> bool {
+    match std::env::var("NW_PERF_STRICT") {
+        Ok(v) => match v.trim() {
+            "1" => true,
+            "0" => false,
+            _ => panic!("NW_PERF_STRICT={v}: not 0 or 1"),
+        },
+        Err(_) => false,
+    }
+}
+
 /// Samples per case: enough for a p99 that is not the single worst sample,
 /// except at 50,000 rows, where frames take most of a second.
 fn iterations(n: usize) -> usize {
@@ -116,12 +134,22 @@ fn iterations(n: usize) -> usize {
 
 /// Collects the cases, and fails at the end if an enforced budget was
 /// missed, so one slow case does not hide the numbers after it.
-#[derive(Default)]
 struct Report {
     over: Vec<String>,
+    slack: f64,
+    /// Whether a missed `Pending` budget fails too.
+    strict: bool,
 }
 
 impl Report {
+    fn from_env() -> Self {
+        Self {
+            over: Vec::new(),
+            slack: slack(),
+            strict: strict(),
+        }
+    }
+
     fn record(&mut self, case: &str, n: usize, mut samples: Vec<Duration>, budget: Budget) {
         samples.sort();
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
@@ -135,19 +163,25 @@ impl Report {
             Stat::P50 => ("p50", p50),
             Stat::P99 => ("p99", p99),
         };
-        let limit = budget.ms * slack();
+        let limit = budget.ms * self.slack;
         let within = measured <= limit;
         let status = match (n == BUDGET_ROWS, budget.gate, within) {
             (false, ..) => "unjudged".to_string(),
             (true, Gate::Enforced, true) => "ok".to_string(),
-            (true, Gate::Enforced, false) => {
-                self.over.push(format!(
-                    "{case}: {stat} {measured:.2} ms, budget {limit:.1} ms"
-                ));
-                "over".to_string()
-            }
             (true, Gate::Pending(owner), true) => format!("pending-met owner={owner}"),
-            (true, Gate::Pending(owner), false) => format!("pending owner={owner}"),
+            (true, Gate::Pending(owner), false) if !self.strict => {
+                format!("pending owner={owner}")
+            }
+            (true, gate, false) => {
+                let owner = match gate {
+                    Gate::Enforced => String::new(),
+                    Gate::Pending(owner) => format!(" owner={owner}"),
+                };
+                self.over.push(format!(
+                    "{case}: {stat} {measured:.2} ms, budget {limit:.1} ms{owner}"
+                ));
+                format!("over{owner}")
+            }
         };
         println!(
             "SCALE case={case} rows={n} p50_ms={p50:.2} p99_ms={p99:.2} max_ms={:.2} iters={} budget={stat}<={limit:.1}ms status={status}",
@@ -159,8 +193,9 @@ impl Report {
     fn finish(self) {
         assert!(
             self.over.is_empty(),
-            "over budget at {BUDGET_ROWS} rows (NW_PERF_SLACK={}):\n{}",
-            slack(),
+            "over budget at {BUDGET_ROWS} rows (NW_PERF_SLACK={}, NW_PERF_STRICT={}):\n{}",
+            self.slack,
+            u8::from(self.strict),
             self.over.join("\n")
         );
     }
@@ -193,8 +228,7 @@ impl Host {
             kernel: false,
             published: Instant::now(),
         };
-        host.publish();
-        host.app.observe_connections();
+        host.tick();
         host
     }
 
@@ -225,6 +259,24 @@ impl Host {
         self.published = Instant::now();
     }
 
+    /// One tick's connection work: the poll the last tick started has
+    /// published the table, and the tick's consumers take it in.
+    fn tick(&mut self) {
+        self.publish();
+        self.app.observe_connections();
+    }
+
+    /// Publish the table as a poll more than `MAX_MATCH_AGE` ago left it.
+    fn publish_stale(&mut self) {
+        let mut rows = self.rows.clone();
+        for row in &mut rows {
+            // `None` on a host up for less than that, which is stale too.
+            row.evidence.observed_at =
+                Instant::now().checked_sub(MAX_MATCH_AGE + Duration::from_secs(1));
+        }
+        self.app.connection_collector.publish_for_test(rows);
+    }
+
     /// Time `iters` runs of `f`, after one untimed run. Republishes between
     /// runs, untimed, before the rows go stale.
     fn time(&mut self, iters: usize, mut f: impl FnMut(&mut App)) -> Vec<Duration> {
@@ -241,11 +293,25 @@ impl Host {
             .collect()
     }
 
+    /// Time `iters` frames as an idle TUI draws them, after one untimed
+    /// frame. Its loop draws once per event, and an idle TUI's only event is
+    /// the tick, so every frame follows a new table: each timed frame here
+    /// comes after an untimed tick, and pays for whatever is rebuilt per
+    /// table.
     fn frames(&mut self, iters: usize) -> Vec<Duration> {
         let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
-        self.time(iters, |app| {
+        let mut draw = |app: &mut App| {
             terminal.draw(|f| draw_frame(f, app)).unwrap();
-        })
+        };
+        draw(&mut self.app);
+        (0..iters)
+            .map(|_| {
+                self.tick();
+                let started = Instant::now();
+                draw(&mut self.app);
+                started.elapsed()
+            })
+            .collect()
     }
 }
 
@@ -309,6 +375,19 @@ fn ten_thousand_rows_render_true_count() {
     let app = &mut host.app;
     app.ui.current_tab = Tab::Connections;
     app.ui.connection_group = ConnectionGroup::None;
+    // By local address, which no two rows share and an owner going stale
+    // does not change. The default, by process, reorders the table then.
+    let column = COLUMNS
+        .iter()
+        .position(|c| c.name == "Local Address")
+        .unwrap();
+    app.ui.sort_states.insert(
+        Tab::Connections,
+        TabSortState {
+            column,
+            ascending: true,
+        },
+    );
 
     let lines = screen(app);
     assert!(
@@ -318,10 +397,11 @@ fn ten_thousand_rows_render_true_count() {
     );
 
     // Every row can be scrolled to: the table holds each connection once,
-    // the cursor stops on the last row and not before, and the frame there
-    // draws that row. Stepping there a key at a time rebuilds the view per
-    // key, which a debug build cannot afford at this size; the clamp is what
-    // decides whether the end is reachable.
+    // the cursor stops on the last row and not before, and the table there
+    // draws the last page with the cursor on its bottom row. Stepping there
+    // a key at a time rebuilds the view per key, which a debug build cannot
+    // afford at this size; the clamp is what decides whether the end is
+    // reachable.
     let view = build_view(app);
     let rows = view.rows(&app.ui.connection_collapsed);
     let listed: Vec<RowKey> = rows
@@ -335,8 +415,11 @@ fn ten_thousand_rows_render_true_count() {
     let published: HashSet<RowKey> = host.rows.iter().map(row_key).collect();
     assert_eq!(listed.iter().copied().collect::<HashSet<_>>(), published);
     let last = listed[BUDGET_ROWS - 1];
-    let last = (last.0.to_string(), last.1.to_string(), last.2.to_string());
-    drop(view);
+
+    // A slow machine gets here after the rows' evidence has aged past
+    // `MAX_MATCH_AGE`, and from then on they show without owners. Age them
+    // now, so what follows holds on any machine.
+    host.publish_stale();
 
     let app = &mut host.app;
     press(app, KeyCode::PageDown);
@@ -347,15 +430,73 @@ fn ten_thousand_rows_render_true_count() {
     press(app, KeyCode::Down);
     assert_eq!(app.ui.scroll.connection_scroll, BUDGET_ROWS - 1);
     let selected = selected_connection(app).expect("no connection under the cursor");
-    assert_eq!(
-        (selected.protocol, selected.local_addr, selected.remote_addr),
-        last
-    );
+    assert_eq!(row_key(&selected), last);
     let lines = screen(app);
+    let header = lines
+        .iter()
+        .position(|l| l.contains("proto  remote"))
+        .expect("no connection table on screen");
+    let drawn: Vec<&String> = lines[header + 1..]
+        .iter()
+        .take_while(|l| l.starts_with('│'))
+        .collect();
+    assert!(drawn.len() > 1, "the table draws {} rows", drawn.len());
+    for (line, (proto, _, remote)) in drawn.iter().zip(&listed[BUDGET_ROWS - drawn.len()..]) {
+        assert!(
+            line.contains(&format!("{proto:<5} {remote:<32}")),
+            "the table does not end on the last {} rows: {proto} {remote} is not on\n{line}",
+            drawn.len()
+        );
+    }
     assert!(
-        lines.iter().any(|l| l.contains(&last.1)),
-        "the last row, {}, is not on screen",
-        last.1
+        drawn.last().is_some_and(|l| l.contains('▸')),
+        "the cursor is not on the table's bottom row"
+    );
+}
+
+#[test]
+fn every_timed_frame_follows_a_tick() {
+    // The tick's consumers add one sample to each row's history per tick.
+    fn ticks(host: &Host) -> usize {
+        host.app
+            .caches
+            .top_conn_history
+            .values()
+            .map(VecDeque::len)
+            .max()
+            .unwrap_or(0)
+    }
+    let mut host = Host::new(200);
+    let before = ticks(&host);
+    host.frames(5);
+    assert_eq!(ticks(&host), before + 5);
+}
+
+#[test]
+fn strict_fails_a_missed_pending_budget() {
+    let pending = budget(Stat::P50, 10.0, Gate::Pending(VIEW_CACHE));
+    let samples = || vec![Duration::from_millis(20); 10];
+    let mut report = Report {
+        over: Vec::new(),
+        slack: 1.0,
+        strict: false,
+    };
+    report.record("missed", BUDGET_ROWS, samples(), pending);
+    assert!(report.over.is_empty(), "{:?}", report.over);
+
+    report.strict = true;
+    report.record("unjudged", 2_000, samples(), pending);
+    report.record(
+        "met",
+        BUDGET_ROWS,
+        vec![Duration::from_millis(5); 10],
+        pending,
+    );
+    assert!(report.over.is_empty(), "{:?}", report.over);
+    report.record("missed", BUDGET_ROWS, samples(), pending);
+    assert_eq!(
+        report.over,
+        ["missed: p50 20.00 ms, budget 10.0 ms owner=perf/conn-view-cache"]
     );
 }
 
@@ -390,7 +531,7 @@ fn timeline_churn_with_10k_active() {
 #[test]
 #[ignore = "release-build timing; see the module docs"]
 fn scale_connections_frames() {
-    let mut report = Report::default();
+    let mut report = Report::from_env();
     for n in sizes() {
         let mut host = Host::new(n);
         host.app.ui.current_tab = Tab::Connections;
@@ -424,6 +565,8 @@ fn scale_connections_frames() {
                 false,
                 FILTERED_CONNECTIONS_FRAME,
             ),
+            // No GeoIP database is loaded, so each drawn row's lookup finds
+            // nothing: this is the GEO column without one.
             (
                 "geo",
                 ConnectionGroup::Process,
@@ -445,7 +588,7 @@ fn scale_connections_frames() {
 #[test]
 #[ignore = "release-build timing; see the module docs"]
 fn scale_view_frames() {
-    let mut report = Report::default();
+    let mut report = Report::from_env();
     for n in sizes() {
         let mut host = Host::new(n);
         for (case, tab, budget) in [
@@ -469,7 +612,7 @@ fn scale_view_frames() {
 #[test]
 #[ignore = "release-build timing; see the module docs"]
 fn scale_scroll_key() {
-    let mut report = Report::default();
+    let mut report = Report::from_env();
     for n in sizes() {
         let mut host = Host::new(n);
         host.app.ui.current_tab = Tab::Connections;
@@ -489,7 +632,7 @@ fn scale_scroll_key() {
 #[test]
 #[ignore = "release-build timing; see the module docs"]
 fn scale_tick_consumers() {
-    let mut report = Report::default();
+    let mut report = Report::from_env();
     for n in sizes() {
         // The same table every tick.
         let mut host = Host::new(n);
@@ -517,7 +660,7 @@ fn scale_tick_consumers() {
 #[test]
 #[ignore = "release-build timing; see the module docs"]
 fn scale_diagnose_join() {
-    let mut report = Report::default();
+    let mut report = Report::from_env();
     for n in sizes() {
         let mut host = Host::new(n).with_kernel_flows();
         let flows = host.app.tcp_info.snapshot().len();
@@ -543,7 +686,7 @@ fn scale_poll_real_sockets() {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
-    let mut report = Report::default();
+    let mut report = Report::from_env();
     for n in sizes() {
         let pairs = n / 2;
         let need = n as u64 + 1_024;
@@ -574,7 +717,9 @@ fn scale_poll_real_sockets() {
         let iters = if n > BUDGET_ROWS { 5 } else { 10 };
         let poll = || {
             collector.update();
+            let deadline = Instant::now() + Duration::from_secs(60);
             while collector.poll_in_flight() {
+                assert!(Instant::now() < deadline, "the poll never finished");
                 std::thread::sleep(Duration::from_millis(1));
             }
         };

@@ -6,12 +6,15 @@
 #
 # Runs the scale_ tests in src/scale_tests.rs from a release build, one at a
 # time. Budgets apply at 10,000 rows and are multiplied by NW_PERF_SLACK:
-# 1 (the default) on the reference machine, 3 in CI. The table is printed
-# even when a test fails, and the script then exits nonzero. The real-socket
-# poll opens up to 50,000 loopback sockets, so the open-file limit is raised
-# to the hard limit first, and it lists every socket on the host, so run it
-# on a quiet one. With table.md given, the table is also written there and
-# the test output to table.log.
+# 1 (the default) on the reference machine, 3 in CI. A budget still Pending
+# on the branch that should meet it is printed but fails nothing unless
+# NW_PERF_STRICT=1, which a release candidate's run sets, since it has to
+# meet them all. Every test runs and the table is printed even when one
+# fails, and the script then exits nonzero. The real-socket poll opens up to
+# 50,000 loopback sockets, so the open-file limit is raised to the hard limit
+# first, and it lists every socket on the host, so run it on a quiet one.
+# With table.md given, the table is also written there and the test output
+# to table.log.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -27,10 +30,10 @@ ulimit -n "$(ulimit -Hn)" 2>/dev/null || ulimit -n 65536 2>/dev/null || true
 export NW_PERF_SLACK="${NW_PERF_SLACK:-1}"
 
 status=0
-cargo nextest run --release --run-ignored only -E 'test(/scale_/)' --no-capture 2>&1 |
+cargo nextest run --release --run-ignored only --no-fail-fast -E 'test(/scale_/)' --no-capture 2>&1 |
     tee "${log}" || status=$?
 
-cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -n 1)
+cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -n 1 || true)
 mem=$(awk '/^MemTotal:/ { printf "%.0f GB", $2 / 1048576 }' /proc/meminfo 2>/dev/null || true)
 
 table() {
@@ -56,7 +59,7 @@ table() {
             if (f["status"] != "unjudged") {
                 b = f["budget"]; sub(/<=/, " ≤ ", b); sub(/ms$/, " ms", b)
                 s = f["status"]
-                if (s == "pending" || s == "pending-met") s = s " (" f["owner"] ")"
+                if ("owner" in f) s = s " (" f["owner"] ")"
                 judged[c] = b ", " s
             }
         }

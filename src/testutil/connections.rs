@@ -41,9 +41,10 @@ impl Lcg {
 /// have a wildcard peer.
 ///
 /// Peers are in 198.18.0.0/15 (RFC 2544) and 2001:db8::/32 (RFC 3849), which
-/// nothing routes but `geo::is_private_ip` treats as public, so geo, egress
-/// and Topology do their full work on them. Each row has its own local
-/// endpoint, so no two rows share a key.
+/// nothing routes but `geo::is_private_ip` treats as public, so egress and
+/// Topology handle them as internet peers. A geo lookup still needs a GeoIP
+/// database to find anything. Each row has its own local endpoint, so no two
+/// rows share a key.
 pub(crate) fn synthetic_connections(n: usize, seed: u64) -> Vec<Connection> {
     let mut rng = Lcg(0x5eed ^ seed);
     let hosts = (n as u64 / 3).max(1);
