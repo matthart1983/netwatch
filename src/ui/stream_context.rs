@@ -447,8 +447,6 @@ mod tests {
             info: String::new(),
             details: vec![],
             payload_text: String::new(),
-            raw_hex: String::new(),
-            raw_ascii: String::new(),
             raw_bytes: vec![],
             stream_index: Some(0),
             tcp_flags: None,

@@ -1,7 +1,8 @@
 //! Display-formatting helpers: MAC / IPv6 rendering, TCP flag strings,
-//! IP-protocol and ICMP type names, port labels, and the ARP summary, plus
-//! the one canonical spelling addresses are compared in.
+//! IP-protocol and ICMP type names, port labels, the ARP summary and the hex
+//! and ASCII dumps, plus the one canonical spelling addresses are compared in.
 
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv6Addr};
 
 use super::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FLAG_URG};
@@ -76,6 +77,52 @@ pub(crate) fn format_endpoint(host: &str, port: impl std::fmt::Display) -> Strin
     } else {
         format!("{host}:{port}")
     }
+}
+
+/// Offset-prefixed hex, sixteen bytes to the line.
+///
+/// Written into one buffer. Every captured packet used to carry this dump
+/// and [`ascii_dump`], built with a `format!` per byte, which was most of the
+/// capture thread's decode time and about five times the frame's size in memory.
+/// Only the selected packet's dump is ever drawn, so the Packets tab builds
+/// it from the frame when it draws one.
+pub fn hex_dump(raw: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // Six characters of offset and gap, three per byte.
+    let mut out = String::with_capacity(raw.len().div_ceil(16) * (6 + 16 * 3));
+    for (i, chunk) in raw.chunks(16).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(out, "{:04x}  ", i * 16);
+        for (j, &b) in chunk.iter().enumerate() {
+            if j > 0 {
+                out.push(' ');
+            }
+            out.push(char::from(DIGITS[usize::from(b >> 4)]));
+            out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+        }
+    }
+    out
+}
+
+/// The same bytes as printable characters, aligned with [`hex_dump`].
+pub fn ascii_dump(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len().div_ceil(16) * (6 + 16 + 1));
+    for (i, chunk) in raw.chunks(16).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(out, "{:04x}  ", i * 16);
+        out.extend(chunk.iter().map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                char::from(b)
+            } else {
+                '.'
+            }
+        }));
+    }
+    out
 }
 
 pub(crate) fn tcp_flags(flags: u8) -> String {

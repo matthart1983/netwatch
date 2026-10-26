@@ -833,8 +833,6 @@ mod tests {
             info: "test packet".into(),
             details: Vec::new(),
             payload_text: String::new(),
-            raw_hex: String::new(),
-            raw_ascii: String::new(),
             raw_bytes: vec![0, 1, 2, 3],
             stream_index: Some(1),
             tcp_flags: Some(0x02),
