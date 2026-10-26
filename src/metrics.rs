@@ -70,7 +70,8 @@ pub struct CaptureMetrics {
     pub received: u64,
     /// Kernel-buffer drops plus interface/driver drops.
     pub dropped: u64,
-    /// Packets that reached the packet list.
+    /// Packets the dissectors decoded. A frame in a framing they do not read
+    /// is listed as `Raw` but not counted.
     pub decoded: u64,
 }
 
@@ -574,7 +575,7 @@ pub fn render_prometheus(snap: Option<&MetricsSnapshot>, collectors_ok: bool) ->
         ),
         (
             "netwatch_capture_packets_decoded_total",
-            "Captured packets netwatch decoded into its packet list since the capture opened.",
+            "Packets netwatch decoded since the capture opened. Frames in a framing it does not decode, listed as Raw, are not counted.",
             capture.map(|c| c.decoded),
         ),
     ] {
@@ -652,6 +653,16 @@ mod tests {
             .map(|v| v.parse().unwrap())
     }
 
+    /// Feed `packets` to an exporter as `run_headless` does, and render what
+    /// a scrape would get.
+    fn update_and_scrape(packets: &PacketCollector) -> String {
+        let exporter = MetricsExporter::new("127.0.0.1:0");
+        let connections = ConnectionCollector::new(Arc::clone(&packets.stream_tracker));
+        exporter.update(&[], &HealthProber::new(), &connections, packets, Vec::new());
+        let snap = safe_lock(&exporter.snapshot, "metrics::test").clone();
+        render_prometheus(Some(&snap.unwrap()), true)
+    }
+
     #[test]
     fn renders_capture_counters() {
         let out = render_prometheus(Some(&sample()), true);
@@ -677,20 +688,34 @@ mod tests {
             assert_eq!(sample_value(&out, name), None, "{name}");
         }
 
-        let exporter = MetricsExporter::new("127.0.0.1:0");
+        let out = update_and_scrape(&PacketCollector::new());
+        for name in CAPTURE_COUNTERS {
+            assert_eq!(sample_value(&out, name), None, "not capturing: {name}");
+        }
+    }
+
+    /// What `run_headless` does each tick: a running capture's totals reach
+    /// the scrape through `update()`.
+    #[test]
+    fn update_exports_a_running_capture_s_totals() {
         let packets = PacketCollector::new();
-        let connections = ConnectionCollector::new(Arc::clone(&packets.stream_tracker));
-        exporter.update(
-            &[],
-            &HealthProber::new(),
-            &connections,
-            &packets,
-            Vec::new(),
+        packets.mark_capturing_for_test();
+        let mut last = pcap::Stat {
+            received: 0,
+            dropped: 0,
+            if_dropped: 0,
+        };
+        let reading = pcap::Stat {
+            received: 9000,
+            dropped: 10,
+            if_dropped: 2,
+        };
+        packets.stats.record_poll_for_test(&mut last, reading, 8800);
+        let out = update_and_scrape(&packets);
+        assert_eq!(
+            CAPTURE_COUNTERS.map(|name| sample_value(&out, name)),
+            [Some(9000), Some(12), Some(8800)]
         );
-        let snap = safe_lock(&exporter.snapshot, "metrics::test")
-            .clone()
-            .unwrap();
-        assert!(snap.capture.is_none(), "a collector that is not capturing");
     }
 
     /// libpcap counts in u32, which wraps within the hour at 1.2M packets a

@@ -9,14 +9,16 @@ All notable changes to NetWatch will be documented in this file.
   `netwatch_capture_packets_received_total` and
   `netwatch_capture_packets_dropped_total` count the packets libpcap
   received and dropped since the capture opened, and
-  `netwatch_capture_packets_decoded_total` the ones netwatch decoded. Until
-  now only the TUI's Packets header showed drops, so on a dashboard a daemon
-  losing packets to a full kernel buffer looked the same as one that saw
-  every packet. The counters are 64-bit and keep counting past libpcap's
-  32-bit wrap. While no capture is running, for example when the daemon
-  lacks permission to capture, they have no sample rather than a zero.
-  docs/observability-export.md lists them, and puts its table of metric
-  names, types and labels under the 1.0 compatibility promise.
+  `netwatch_capture_packets_decoded_total` the ones netwatch decoded. Frames
+  in a framing netwatch does not decode, the `Raw` rows in Packets, are not
+  counted as decoded, so on a Linux `any` capture or a tunnel that counter
+  stays at 0. Until now only the TUI showed capture drops, so on a dashboard
+  a daemon losing packets to a full kernel buffer looked the same as one
+  that saw every packet. The counters are 64-bit and keep counting past
+  libpcap's 32-bit wrap. While no capture is running, for example when the
+  daemon lacks permission to capture, they have no sample rather than a
+  zero. docs/observability-export.md lists them, and puts its table of
+  metric names, types and labels under the 1.0 compatibility promise.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
