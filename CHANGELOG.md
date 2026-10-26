@@ -231,16 +231,21 @@ All notable changes to NetWatch will be documented in this file.
   named with eight `ﾊﾟ` filled its 15-column field and the gap after it,
   with no ellipsis. An emoji with its presentation selector, such as `❤️`
   or `#️⃣`, counted as one column and drew two, so eight hearts were cut one
-  heart late and the ellipsis fell in the host column. A skin-tone or joined
-  emoji, such as `👍🏽` or a family, counted as four to six columns and drew
-  two, so the name was cut short. In a Dense box border, a right-hand label
-  holding sound marks lost its end under the closing `├`. Text is now
-  measured and cut between the graphemes ratatui lays out, by the columns
-  it gives each one. That covers Lite, Dense, the full view's tables and
-  labels, which counted characters, and the check that drops a box's
-  right-hand text when it would cover the title. Plain ASCII text is cut
-  as before. A CJK or emoji name that a full-view table used to clip at its
-  column edge now ends in `…`. ratatui itself still places right-aligned
+  heart late and the ellipsis fell in the host column. A skin-tone emoji
+  such as `👍🏽` counted as four columns and drew two, so the name was cut
+  short, and the last hand could lose its skin tone. In the top border of
+  Dense's net box, an interface name with sound marks lost its end under
+  the `├` that closes it. Text is now measured and cut between the
+  graphemes ratatui lays out, by the columns it gives each one. That covers
+  Lite, Dense, the cuts in the full view's tables and labels and in the
+  footer's status message, which counted characters, and the check that
+  drops a box's right-hand text when it would cover the title. Plain ASCII
+  text is cut as before. A CJK or emoji name that a full-view table used to
+  clip at its column edge now ends in `…`, and a status message naming a
+  CJK process no longer runs off the right of the footer. Full-view tables
+  that pad their columns with spaces, such as Connections and Processes,
+  still count characters for the padding, so a CJK name there still pushes
+  the columns after it right. ratatui itself still places right-aligned
   text one column too far right for each sound mark, and cuts off what
   passes the edge.
 - **An emoji sequence that reached the screen unreplaced no longer hides
