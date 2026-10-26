@@ -812,12 +812,14 @@ fn idle_vs_loaded(ctx: &Context) -> Result3 {
         }
     });
     let loaded = sample_under_load(
-        &sending,
+        || sending.load(Ordering::Acquire),
         || upload.is_finished(),
         stop_sending,
         LOAD_RAMP,
         5,
         || connect_time(dest, Duration::from_secs(3)),
+        Instant::now,
+        std::thread::sleep,
     );
     let uploaded = upload.join().unwrap_or(false);
     let Some(loaded) = loaded else {
@@ -870,28 +872,31 @@ const LOAD_RAMP: Duration = Duration::from_secs(2);
 /// and RTT sampled before then is idle RTT. So this waits for `sending`,
 /// then `ramp` for the load to build, and starts no sample once the body is
 /// cut short at `stop_sending`. None if the body had not started by then, or
-/// the upload ended without starting it.
+/// the upload ended without starting it. `now` and `sleep` are its clock,
+/// `Instant::now` and `thread::sleep` outside the tests.
 fn sample_under_load(
-    sending: &AtomicBool,
+    sending: impl Fn() -> bool,
     upload_done: impl Fn() -> bool,
     stop_sending: Instant,
     ramp: Duration,
     n: usize,
     mut sample: impl FnMut() -> Option<f64>,
+    now: impl Fn() -> Instant,
+    sleep: impl Fn(Duration),
 ) -> Option<Vec<f64>> {
-    while !sending.load(Ordering::Acquire) {
-        if cancelled() || upload_done() || Instant::now() >= stop_sending {
+    while !sending() {
+        if cancelled() || upload_done() || now() >= stop_sending {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(50));
     }
-    let ramp_end = Instant::now() + ramp;
-    while !cancelled() && Instant::now() < ramp_end {
-        std::thread::sleep(Duration::from_millis(50));
+    let ramp_end = now() + ramp;
+    while !cancelled() && now() < ramp_end {
+        sleep(Duration::from_millis(50));
     }
     let mut times = Vec::new();
     for _ in 0..n {
-        if cancelled() || Instant::now() >= stop_sending {
+        if cancelled() || now() >= stop_sending {
             break;
         }
         times.extend(sample());
@@ -1818,62 +1823,111 @@ mod tests {
         assert_eq!(server.join().unwrap()[..2], [0x16, 0x03]);
     }
 
+    /// A clock that moves only when it is slept on. On the real one, a runner
+    /// short of CPU can oversleep past a deadline the test depends on.
+    struct FakeTime {
+        start: Instant,
+        elapsed: std::cell::Cell<Duration>,
+        /// Reads since the clock last moved.
+        still: std::cell::Cell<u32>,
+    }
+
+    impl FakeTime {
+        fn new() -> Self {
+            Self {
+                start: Instant::now(),
+                elapsed: Default::default(),
+                still: Default::default(),
+            }
+        }
+        fn at(&self, ms: u64) -> Instant {
+            self.start + Duration::from_millis(ms)
+        }
+        fn now(&self) -> Instant {
+            // A loop that sleeps on the real clock would read this one
+            // forever and hang the test instead of failing it.
+            let still = self.still.get() + 1;
+            assert!(still < 100, "the clock stood still: a real sleep?");
+            self.still.set(still);
+            self.start + self.elapsed.get()
+        }
+        fn sleep(&self, d: Duration) {
+            self.still.set(0);
+            let elapsed = self.elapsed.get() + d;
+            self.elapsed.set(elapsed);
+            // A loop that misses its way out would sleep on this one forever.
+            // The test's whole timeline is under 2 s.
+            assert!(elapsed < Duration::from_secs(60), "the clock ran on");
+        }
+    }
+
     /// The body starts late, as when the first resolved addresses do not
     /// answer. No sample is taken before it has had its ramp, or after it is
     /// cut short.
     #[test]
     fn loaded_samples_are_taken_only_while_the_body_goes_out() {
-        let started = Instant::now();
-        let stop_sending = started + Duration::from_millis(900);
-        let sending = AtomicBool::new(false);
+        let time = FakeTime::new();
+        let (body_starts, stop_sending) = (time.at(300), time.at(900));
         let mut taken = Vec::new();
-        let samples = std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(Duration::from_millis(300));
-                sending.store(true, Ordering::Release);
-            });
-            sample_under_load(
-                &sending,
-                || false,
-                stop_sending,
-                Duration::from_millis(200),
-                100,
-                || {
-                    taken.push(Instant::now());
-                    std::thread::sleep(Duration::from_millis(50));
-                    Some(1.0)
-                },
-            )
-        });
+        let samples = sample_under_load(
+            || time.now() >= body_starts,
+            || false,
+            stop_sending,
+            Duration::from_millis(200),
+            100,
+            || {
+                taken.push(time.now());
+                time.sleep(Duration::from_millis(50));
+                Some(1.0)
+            },
+            || time.now(),
+            |d| time.sleep(d),
+        );
         assert_eq!(samples.map(|t| t.len()), Some(taken.len()));
         assert!(!taken.is_empty());
         for at in &taken {
-            assert!(
-                *at >= started + Duration::from_millis(500),
-                "before the ramp"
-            );
+            assert!(*at >= time.at(500), "before the ramp");
             assert!(*at < stop_sending, "after the body was cut short");
         }
 
         // The body starts too late for its ramp to end in time.
-        let soon = Instant::now() + Duration::from_millis(100);
+        let soon = time.now() + Duration::from_millis(100);
         let ramp = Duration::from_millis(200);
         let samples = sample_under_load(
-            &AtomicBool::new(true),
+            || true,
             || false,
             soon,
             ramp,
             5,
             || panic!("sampled after the body was cut short"),
+            || time.now(),
+            |d| time.sleep(d),
         );
         assert_eq!(samples, Some(Vec::new()));
 
         // The body never starts: the upload fails first, or runs out of time.
-        let idle = AtomicBool::new(false);
-        let failed = sample_under_load(&idle, || true, far(), ramp, 5, || panic!("no upload"));
+        let failed = sample_under_load(
+            || false,
+            || true,
+            far(),
+            ramp,
+            5,
+            || panic!("no upload"),
+            || time.now(),
+            |_| panic!("waited although the upload had failed"),
+        );
         assert_eq!(failed, None);
-        let soon = Instant::now() + Duration::from_millis(100);
-        let late = sample_under_load(&idle, || false, soon, ramp, 5, || panic!("no upload"));
+        let soon = time.now() + Duration::from_millis(100);
+        let late = sample_under_load(
+            || false,
+            || false,
+            soon,
+            ramp,
+            5,
+            || panic!("no upload"),
+            || time.now(),
+            |d| time.sleep(d),
+        );
         assert_eq!(late, None);
     }
 
