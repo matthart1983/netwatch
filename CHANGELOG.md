@@ -271,10 +271,11 @@ All notable changes to NetWatch will be documented in this file.
   it in one buffer for the whole process. The four tests in
   `tests/tui_signals.rs` allocate their ptys at the same moment on parallel
   threads, so a test could open another test's slave. Its netwatch then drew
-  where nothing was reading, and the test failed with `no first frame: ""`
-  in 23 of 120 runs on a FreeBSD 15.1 VM. The pty tests in `src/ui/tty.rs`
-  had the same race. Both now allocate one pty at a time, and 200 runs in a
-  row pass.
+  where nothing was reading, and the test failed, mostly with `no first
+  frame: ""`: 23 of 120 runs on a FreeBSD 15.1 VM. The pty tests in
+  `src/ui/tty.rs` had the same race and failed 3 of 100. Both now allocate
+  one pty at a time. The signal tests then passed 200 runs in a row, and the
+  tty tests 100.
 
 ## [0.38.0] - 2026-10-25
 
