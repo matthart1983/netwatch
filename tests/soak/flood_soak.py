@@ -455,7 +455,7 @@ def summarise(records, calibration=None, ceiling_mib=None):
     for s in dict.fromkeys(p['scenario'] for p in phases if p['cycle']):
         cycles = [p for p in stats if p['cycle'] and p['scenario'] == s and p.get('decoded_pps') is not None]
         if cycles:
-            scenarios[s] = {key: statistics.median(p[key] for p in cycles if p.get(key) is not None)
+            scenarios[s] = {key: round(statistics.median(p[key] for p in cycles if p.get(key) is not None), 2)
                             for key in ('decoded_pps', 'drop_pct', 'cpu_pct')
                             if any(p.get(key) is not None for p in cycles)}
     daemon_rows = [r for r in records if r['kind'] == 'daemon']
@@ -519,7 +519,7 @@ def gates(run, phases, by_phase, in_phases, rows, daemon_rows, daemon, scenarios
     gate('panic', not panicked, f'a thread panicked by t={panicked[0]}' if panicked else 'no panic')
     planned = sum(p['seconds'] for p in run['phases'])
     seen = len({r['t'] for r in in_phases})
-    gate('sampled', seen >= SAMPLED * planned, f'{seen} of {planned} seconds sampled, {SAMPLED:.0%} needed')
+    gate('sampled', seen >= SAMPLED * planned, f'{seen} lines in {planned} planned seconds, {SAMPLED:.0%} needed')
     bulk = [r for p in phases if p['scenario'] == 'bulk' for r in by_phase[p['name']]]
     if any(p['scenario'] == 'bulk' for p in run['phases']):
         gate('super_frames', worst('max_frame', bulk) > SUPER_FRAME,
