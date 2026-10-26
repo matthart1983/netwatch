@@ -617,7 +617,7 @@ impl LiveSampler {
 /// has it, as a search of `conns` in order finds. Built once per sample:
 /// searching the table for each kernel flow instead cost about 50 ms a sample
 /// at 10,000 connections.
-fn rows_by_endpoints(conns: &[Connection]) -> HashMap<(&str, &str), &Connection> {
+pub(crate) fn rows_by_endpoints(conns: &[Connection]) -> HashMap<(&str, &str), &Connection> {
     let mut by_endpoints = HashMap::with_capacity(conns.len());
     for conn in conns {
         by_endpoints

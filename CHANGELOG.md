@@ -397,11 +397,14 @@ All notable changes to NetWatch will be documented in this file.
   a table and fails on any budget not met. The workflow sets
   `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
   printed there and do not fail the run.
-- **The 10,000-socket poll is held to its budget.**
-  `scale_poll_real_sockets` fails past 150 ms at the median, times
-  `NW_PERF_SLACK`, instead of printing it as pending. The Timeline churn
-  test now expects the last 2,000 closed connections to stay. Diagnose's
-  socket pass, at about 11 ms against its 2 ms budget, stays pending.
+- **The 10,000-socket poll and Diagnose's socket join are held to their
+  budgets.** `scale_poll_real_sockets` fails past 150 ms at the median,
+  times `NW_PERF_SLACK`, instead of printing it as pending.
+  `scale_diagnose_join` times the join of kernel flows to connection rows on
+  its own against the 2 ms budget, about 0.6 ms at 10,000 rows. It timed
+  Diagnose's whole socket pass against that budget before, which no change
+  to the join could meet; the pass is still printed, with no budget. The
+  Timeline churn test now expects the last 2,000 closed connections to stay.
 
 ## [0.38.0] - 2026-10-25
 
