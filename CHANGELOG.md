@@ -236,6 +236,14 @@ All notable changes to NetWatch will be documented in this file.
   offer it files from outside. They now list a linked file but do not
   descend into a linked directory.
 
+### CI
+- **A Diagnose load test unit test no longer fails on a slow runner.**
+  `loaded_samples_are_taken_only_while_the_body_goes_out` slept on the real
+  clock and needed its first sample before a 900 ms cut-off, which a busy
+  macOS runner sometimes missed, failing the run and cancelling the Linux
+  and Windows jobs with it. The sampler now takes its clock as an argument,
+  and the test gives it one that moves only when it is slept on.
+
 ## [0.38.0] - 2026-10-25
 
 ### Added
