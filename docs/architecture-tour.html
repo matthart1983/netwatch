@@ -389,9 +389,9 @@ pub enum AttributionSource {
         <div class="node g">StreamTracker — reassembly · ≤1024 flows (LRU)</div><div class="down">↓</div>
         <div class="node b">classify_once() — DPI, cached per stream</div><div class="down">↓</div>
         <div class="node p">try_decrypt_tls_record / _quic_1rtt</div><div class="down">↓</div>
-        <div class="node y">ring buffer — newest 5000 · Packets tab + PCAP</div>
+        <div class="node y">ring buffer — newest 5000 or 32&nbsp;MiB · Packets tab + PCAP</div>
       </div>
-      <p class="cap">Bounded everywhere — 5000 packets, ≤1024 streams, ≤2&nbsp;MB/stream. A diagnostics tool must never OOM the box.</p>
+      <p class="cap">Bounded everywhere — 5000 packets or 32&nbsp;MiB, ≤1024 streams, ≤2&nbsp;MB/stream. A diagnostics tool must never OOM the box.</p>
     </div>
   </section>
 

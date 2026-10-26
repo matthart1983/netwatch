@@ -601,8 +601,6 @@ mod tests {
             info: info.into(),
             details: vec![],
             payload_text: String::new(),
-            raw_hex: String::new(),
-            raw_ascii: String::new(),
             raw_bytes: vec![],
             stream_index: None,
             tcp_flags: None,
