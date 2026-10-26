@@ -42,6 +42,17 @@ All notable changes to NetWatch will be documented in this file.
   `collectors::packets::hex_dump` and `ascii_dump`. `PacketCollector::ring_bytes`
   and the hidden `StreamTracker::held_bytes`, `byte_budget` and
   `dropped_flows` are new. The library is not a stable interface.
+- **The Timeline keeps every open connection and the last 2,000 that
+  closed.** Its limit of 2,000 counted open connections too, but dropped only
+  closed ones. On a host with 2,000 or more open connections, each one left
+  the Timeline on the tick it closed, so the tab showed no closed
+  connections at all. With fewer open, the closed ones to go first were the
+  ones that opened first, however recently they had closed. The limit now
+  counts closed connections alone and drops the ones that closed longest
+  ago. Open connections are never dropped. It drops at least 256 at a time,
+  so the Timeline is not reindexed on every tick that something closes, and
+  right after a drop it can hold as few as 1,744 closed connections. The
+  `M` overlay shows the closed count against 2,000.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
@@ -224,6 +235,34 @@ All notable changes to NetWatch will be documented in this file.
   in `summary.md` give the number of rows left out, and `connections.json`
   keeps its shape. The bundle's JSON files are also written through a
   buffer now; 50,000 rows took about 12 million write calls before.
+- **A connection poll on a busy Linux host takes about a quarter of the
+  time.** Each poll ran `ss -tunap`. The `-p` walks every process's open
+  files to name each socket's owner, and netwatch threw that name away for
+  the owner its own `/proc` scan found. Naming owners then read each
+  process's identity from `/proc` twice per socket, so a process holding
+  10,000 sockets was read 20,000 times a poll. With 10,000 loopback sockets
+  a poll took about 300 ms at the median on a 24-thread host, and now takes
+  about 80 ms. netwatch runs `ss -tuna`, and `netwatch doctor` names that
+  command. Each poll reads a process's identity once before looking up its
+  name and once after, and a socket recorded for an earlier process with
+  the same PID still loses its owner. A UDP socket with no peer is matched to
+  its captured stream through an index built once per poll, where each one
+  searched every stream before.
+- **Diagnose's socket check no longer takes 100 ms a tick on a busy host.**
+  In the Dense view and during `netwatch diagnose run`, Diagnose matches
+  each kernel TCP flow to its connection once a tick. It searched the whole
+  connection table for each flow, then checked every socket it remembered
+  against a list of the live ones, so its cost grew with the square of the
+  connection count. At 10,000 connections a pass took about 100 ms, and now
+  takes about 11 ms.
+- **The tick does less work per connection.** Every read of the connection
+  table checked each row's age, and once any row was more than five seconds
+  old, it copied the whole table to blank the stale owners. A tick
+  and a frame each read the table several times. Now the table is checked
+  once per poll and copied at most once each time another row goes stale.
+  The Timeline also stopped building a set of every connection's key on
+  each tick. At 10,000 connections the tick's connection work fell from
+  about 50 ms to about 35 ms at the median.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -358,6 +397,11 @@ All notable changes to NetWatch will be documented in this file.
   a table and fails on any budget not met. The workflow sets
   `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
   printed there and do not fail the run.
+- **The 10,000-socket poll is held to its budget.**
+  `scale_poll_real_sockets` fails past 150 ms at the median, times
+  `NW_PERF_SLACK`, instead of printing it as pending. The Timeline churn
+  test now expects the last 2,000 closed connections to stay. Diagnose's
+  socket pass, at about 11 ms against its 2 ms budget, stays pending.
 
 ## [0.38.0] - 2026-10-25
 

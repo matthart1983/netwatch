@@ -2,9 +2,9 @@
 //!
 //! Two tests run with the rest of the suite: a 10,000-row table renders its
 //! true count and every row can be scrolled to, and the timeline keeps every
-//! active entry when 10,000 are active and some close. Two more check the
-//! timings below: each timed frame follows a tick, and a missed `Pending`
-//! budget fails unless `NW_PERF_STRICT=0`.
+//! active entry, and the last 2,000 that closed, when 10,000 are active and
+//! some close. Two more check the timings below: each timed frame follows a
+//! tick, and a missed `Pending` budget fails unless `NW_PERF_STRICT=0`.
 //!
 //! The rest are timings, `#[ignore]`d and named `scale_*`, for a release
 //! build:
@@ -31,7 +31,7 @@
 
 use crate::app::{draw_frame, handle_key, App, ConnectionGroup, Tab, ViewMode};
 use crate::collectors::attribution::MAX_MATCH_AGE;
-use crate::collectors::connections::{Connection, ConnectionTimeline};
+use crate::collectors::connections::{Connection, ConnectionTimeline, MAX_CLOSED_HISTORY};
 use crate::collectors::tcp_info::{normalize_endpoint, FlowMap, TcpInfo};
 use crate::config::NetwatchConfig;
 use crate::sort::TabSortState;
@@ -85,7 +85,7 @@ const SCROLL_KEY: Budget = budget(Stat::P99, 5.0, Gate::Pending(VIEW_CACHE));
 const TICK_CONSUMERS: Budget = budget(Stat::P50, 15.0, Gate::Pending(VIEW_CACHE));
 const DIAGNOSE_JOIN: Budget = budget(Stat::P50, 2.0, Gate::Pending(POLL_10K));
 #[cfg(target_os = "linux")]
-const POLL: Budget = budget(Stat::P50, 150.0, Gate::Pending(POLL_10K));
+const POLL: Budget = budget(Stat::P50, 150.0, Gate::Enforced);
 
 fn sizes() -> Vec<usize> {
     match std::env::var("NW_SCALE_ROWS") {
@@ -527,12 +527,12 @@ fn timeline_churn_with_10k_active() {
         .collect();
     assert_eq!(active, open, "an active connection was evicted");
 
-    // The 2,000 cap counts active entries, so with 10,000 active every
-    // closed one is evicted on the tick it closes and the Timeline shows no
-    // closed history at all. perf/conn-poll-10k keeps the last 2,000 closed
-    // and changes this to `3_000.min(2_000)`.
+    // The bound is on closed history alone: however many are active, the
+    // last 2,000 that closed stay.
     let closed = timeline.tracked.iter().filter(|t| !t.is_active).count();
-    assert_eq!(closed, 0);
+    assert_eq!(closed, 3_000.min(MAX_CLOSED_HISTORY));
+    assert_eq!(timeline.closed_len(), closed);
+    assert!(timeline.closed_trimmed());
 }
 
 #[test]

@@ -12,7 +12,7 @@
 //! deliberately without: how long a socket has held its verdict, what the
 //! interface counters were last tick, and the previous trace to each target.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use super::baseline::{BaselineStore, NetworkFingerprint};
@@ -21,6 +21,7 @@ use super::detectors::{
     ObservedConfig, PathObs, SocketObs, SocketVerdict, Thresholds,
 };
 use crate::app::App;
+use crate::collectors::connections::Connection;
 use crate::collectors::traceroute::{TracerouteResult, TracerouteStatus};
 use crate::collectors::traffic::InterfaceTraffic;
 use crate::platform::InterfaceInfo;
@@ -558,14 +559,17 @@ impl LiveSampler {
             return vec![];
         }
         let conns = app.connection_collector.connections();
+        let by_endpoints = rows_by_endpoints(&conns);
         let now = Instant::now();
         let mut out = Vec::new();
-        let mut live_keys: Vec<String> = Vec::new();
+        // A set: the retains below look up every key in it, and as a list it
+        // made a sample quadratic in its flows, about 30 ms at 10,000.
+        let mut live_keys: HashSet<String> = HashSet::new();
 
         for ((local, remote), info) in flows.iter() {
-            let conn = conns
-                .iter()
-                .find(|c| &c.local_addr == local && &c.remote_addr == remote);
+            let conn = by_endpoints
+                .get(&(local.as_str(), remote.as_str()))
+                .copied();
 
             let mut s = SocketObs {
                 local: local.clone(),
@@ -589,7 +593,7 @@ impl LiveSampler {
             };
 
             let key = s.key();
-            live_keys.push(key.clone());
+            live_keys.insert(key.clone());
             let verdict = classify_socket(&s, thresholds);
             let since = match self.verdict_since.get(&key) {
                 // Same verdict as last tick: keep the original start time.
@@ -607,6 +611,20 @@ impl LiveSampler {
         self.retrans_history.retain(|k, _| live_keys.contains(k));
         out
     }
+}
+
+/// The connection-table row for each (local, remote) pair: the first that
+/// has it, as a search of `conns` in order finds. Built once per sample:
+/// searching the table for each kernel flow instead cost about 50 ms a sample
+/// at 10,000 connections.
+fn rows_by_endpoints(conns: &[Connection]) -> HashMap<(&str, &str), &Connection> {
+    let mut by_endpoints = HashMap::with_capacity(conns.len());
+    for conn in conns {
+        by_endpoints
+            .entry((conn.local_addr.as_str(), conn.remote_addr.as_str()))
+            .or_insert(conn);
+    }
+    by_endpoints
 }
 
 fn gateway(app: &App) -> Option<GatewayObs> {
@@ -1171,6 +1189,38 @@ mod tests {
             _ => Instant::now(),
         };
         assert_ne!(restarted, t0);
+    }
+
+    /// The index finds the row a search of the table in order would, the
+    /// first of two that share endpoints included, and nothing for a flow
+    /// the table does not list.
+    #[test]
+    fn diagnose_join_hashmap_matches_linear() {
+        let mut conns = crate::testutil::connections::synthetic_connections(2_000, 3);
+        let mut twin = conns[10].clone();
+        twin.protocol = "UDP".into();
+        twin.process_name = Some("twin".into());
+        conns.push(twin);
+        let by_endpoints = rows_by_endpoints(&conns);
+
+        let mut flows: Vec<(&str, &str)> = conns
+            .iter()
+            .map(|c| (c.local_addr.as_str(), c.remote_addr.as_str()))
+            .collect();
+        flows.push(("192.0.2.1:1", "192.0.2.2:2"));
+        for (local, remote) in flows {
+            let linear = conns
+                .iter()
+                .find(|c| c.local_addr == local && c.remote_addr == remote);
+            let joined = by_endpoints.get(&(local, remote)).copied();
+            assert!(
+                match (linear, joined) {
+                    (Some(a), Some(b)) => std::ptr::eq(a, b),
+                    (a, b) => a.is_none() && b.is_none(),
+                },
+                "{local} → {remote}"
+            );
+        }
     }
 
     /// Every baselined metric must be consumed by an *active* rule whose

@@ -632,7 +632,7 @@ fn static_connection_table(ss: Option<&std::path::Path>, proc_net_readable: bool
             State::Ready,
             "ss_found",
             format!(
-                "{} found; live sessions read the connection table from ss -tunap (not run here)",
+                "{} found; live sessions read the connection table from ss -tuna (not run here)",
                 path.display()
             ),
             None,
@@ -668,7 +668,7 @@ fn live_connection_table(coverage: &crate::collectors::attribution::Coverage) ->
     let next = if note.starts_with("ss not found") {
         "Install iproute2 for ss"
     } else {
-        "Check that ss -tunap runs for this user and sandbox"
+        "Check that ss -tuna runs for this user and sandbox"
     };
     if coverage.completed_at.is_none() {
         return (
@@ -682,7 +682,7 @@ fn live_connection_table(coverage: &crate::collectors::attribution::Coverage) ->
         Some(TableSource::Ss) => (
             State::Ready,
             "ss",
-            "Connection table from ss -tunap".into(),
+            "Connection table from ss -tuna".into(),
             None,
         ),
         Some(TableSource::ProcNet) => (
@@ -1150,7 +1150,7 @@ mod tests {
         ));
         assert_eq!(
             next,
-            Some("Check that ss -tunap runs for this user and sandbox")
+            Some("Check that ss -tuna runs for this user and sandbox")
         );
 
         let (state, reason, detail, _) = live_connection_table(&polled(
