@@ -859,6 +859,99 @@ mod tests {
         assert_eq!(capture_authority(), tui);
     }
 
+    /// Whether a `health` worker still holds CAP_NET_RAW once it has entered
+    /// on a thread of its own.
+    fn health_keeps_net_raw() -> bool {
+        std::thread::spawn(|| {
+            assert!(enter("health"));
+            caps::has_cap(None, caps::CapSet::Permitted, caps::Capability::CAP_NET_RAW).unwrap()
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// The session's capture authority reaches each worker's entry: a
+    /// network worker drops CAP_NET_RAW until a TUI's `ensure` says capture
+    /// reopens, and keeps it from then on.
+    #[test]
+    fn network_worker_keeps_cap_net_raw_once_a_tui_starts() {
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::network_worker_keeps_cap_net_raw_once_a_tui_starts",
+        ) {
+            return;
+        }
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        assert!(!health_keeps_net_raw(), "entered before the session");
+        let tui = CaptureAuthority::RetainForReopen;
+        ensure(Mode::BestEffort, SandboxPaths::default(), tui).unwrap();
+        assert!(health_keeps_net_raw(), "entered in a TUI");
+    }
+
+    /// The daemon and the Diagnose CLI never reopen capture, so their
+    /// network workers drop CAP_NET_RAW.
+    #[test]
+    fn network_worker_drops_cap_net_raw_where_capture_never_reopens() {
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::network_worker_drops_cap_net_raw_where_capture_never_reopens",
+        ) {
+            return;
+        }
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        let daemon = CaptureAuthority::DropAfterOpen;
+        ensure(Mode::BestEffort, SandboxPaths::default(), daemon).unwrap();
+        assert!(!health_keeps_net_raw());
+    }
+
+    /// A thread that never enters keeps only what its name's role needs
+    /// unconfined: the proc broker its scan's two capabilities, the TUI's
+    /// shutdown deadline and a capture thread whose device failed to open
+    /// nothing.
+    #[test]
+    fn relinquish_keeps_only_what_the_role_needs() {
+        use caps::{CapSet, Capability};
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::relinquish_keeps_only_what_the_role_needs",
+        ) {
+            return;
+        }
+        let broker = [Capability::CAP_SYS_PTRACE, Capability::CAP_DAC_READ_SEARCH];
+        for (name, keeps) in [
+            ("proc-broker", &broker[..]),
+            ("shutdown-deadline", &[]),
+            ("capture", &[]),
+        ] {
+            let held = std::thread::spawn(move || {
+                // Root in a user namespace holds nothing Inheritable or
+                // Ambient, so grant CAP_NET_RAW there first, as the systemd
+                // unit's AmbientCapabilities does.
+                for set in [CapSet::Inheritable, CapSet::Ambient] {
+                    caps::raise(None, set, Capability::CAP_NET_RAW).unwrap();
+                }
+                relinquish(name);
+                [
+                    CapSet::Effective,
+                    CapSet::Permitted,
+                    CapSet::Inheritable,
+                    CapSet::Ambient,
+                ]
+                .map(|set| (set, caps::read(None, set).unwrap()))
+            })
+            .join()
+            .unwrap();
+            for (set, held) in held {
+                let expected: caps::CapsHashSet =
+                    if matches!(set, CapSet::Effective | CapSet::Permitted) {
+                        keeps.iter().copied().collect()
+                    } else {
+                        Default::default()
+                    };
+                assert_eq!(held, expected, "{name} {set:?}");
+            }
+            let report = &relinquished()[name];
+            assert!(report.mode.warnings.is_empty(), "{name}: {report:?}");
+        }
+    }
+
     /// The capture thread records its state in the component map and the UI
     /// reads it for Settings and the capability report. Once poisoned, the
     /// map used to panic the next capture start and every screen that read it.

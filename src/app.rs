@@ -4398,6 +4398,53 @@ mod tests {
         assert!(app.pktap_handle.is_none());
     }
 
+    /// The shutdown-deadline thread starts before main drops anything and
+    /// never enters, so it gives up every capability itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_deadline_thread_holds_no_capability() {
+        if !crate::sandbox::audit::as_root_in_user_namespace(
+            "app::tests::shutdown_deadline_thread_holds_no_capability",
+        ) {
+            return;
+        }
+        super::shutdown_deadline();
+        // Its four sets as procfs shows them. It drops once it is running, so
+        // they are read until they are empty or 3 seconds pass. The kernel
+        // keeps the first 15 bytes of its name.
+        let sets = || {
+            std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .flatten()
+                .find(|task| {
+                    std::fs::read_to_string(task.path().join("comm"))
+                        .is_ok_and(|comm| comm.trim_end() == "shutdown-deadli")
+                })
+                .and_then(|task| std::fs::read_to_string(task.path().join("status")).ok())
+                .map(|status| {
+                    status
+                        .lines()
+                        .filter(|line| {
+                            ["CapPrm:", "CapEff:", "CapInh:", "CapAmb:"]
+                                .iter()
+                                .any(|set| line.starts_with(set))
+                        })
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+        };
+        let empty = |sets: &[String]| {
+            sets.len() == 4 && sets.iter().all(|line| line.ends_with("\t0000000000000000"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut seen = sets();
+        while !seen.as_deref().is_some_and(empty) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            seen = sets();
+        }
+        assert!(seen.as_deref().is_some_and(empty), "{seen:?}");
+    }
+
     use super::*;
     use crate::collectors::process_bandwidth::ProcessBandwidth;
     use crate::collectors::traffic::InterfaceTraffic;

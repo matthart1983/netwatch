@@ -52,16 +52,7 @@ pub fn start(app: &mut App, kind: SessionKind, mode: sandbox::Mode) -> anyhow::R
         tracing::warn!(%error, "worker readiness incomplete");
     }
     let paths = sandbox::SandboxPaths::from_config(&app.user_config);
-    let mut report = sandbox::apply(mode, &paths);
-    // Main has dropped and the workers have entered, so no thread should
-    // hold more than `authority` allows.
-    sandbox::audit::check_threads(mode, authority, &mut report);
-    if matches!(mode, sandbox::Mode::Strict) && !report.mode.warnings.is_empty() {
-        anyhow::bail!(
-            "sandbox: strict mode could not be enforced: {}",
-            report.mode.warnings.join("; ")
-        );
-    }
+    let report = confine_main(mode, authority, &paths)?;
     for warning in &report.mode.warnings {
         tracing::warn!(target: "netwatch::sandbox", "{warning}");
     }
@@ -76,6 +67,27 @@ pub fn start(app: &mut App, kind: SessionKind, mode: sandbox::Mode) -> anyhow::R
             .set_status(crate::runtime::capabilities::CapabilitySnapshot::live(app).compact());
     }
     Ok(())
+}
+
+/// Apply main's policy on the calling thread, then audit every thread of the
+/// process against `authority`. Strict refuses on any warning, the audit's
+/// included.
+fn confine_main(
+    mode: sandbox::Mode,
+    authority: sandbox::CaptureAuthority,
+    paths: &sandbox::SandboxPaths,
+) -> anyhow::Result<sandbox::Report> {
+    let mut report = sandbox::apply(mode, paths);
+    // Main has dropped and the workers have entered, so no thread should
+    // hold more than `authority` allows.
+    sandbox::audit::check_threads(mode, authority, &mut report);
+    if matches!(mode, sandbox::Mode::Strict) && !report.mode.warnings.is_empty() {
+        anyhow::bail!(
+            "sandbox: strict mode could not be enforced: {}",
+            report.mode.warnings.join("; ")
+        );
+    }
+    Ok(report)
 }
 
 /// Both live loops begin with the same initial observations.
@@ -112,5 +124,51 @@ mod tests {
         ] {
             assert_eq!(kind.capture_authority(mode), authority, "{kind:?} {mode:?}");
         }
+    }
+
+    /// Main's entry audits every thread: one still holding CAP_NET_RAW in a
+    /// session that drops it is a warning in best-effort and refuses a
+    /// strict start.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn main_entry_names_a_thread_that_still_holds_net_raw() {
+        if !sandbox::audit::as_root_in_user_namespace(
+            "runtime::bootstrap::tests::main_entry_names_a_thread_that_still_holds_net_raw",
+        ) {
+            return;
+        }
+        // Never confined, so it keeps every capability root holds here.
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::Builder::new()
+            .name("audit-holder".into())
+            .spawn(move || {
+                tid_tx.send(nix::unistd::gettid().as_raw()).unwrap();
+                let _ = done_rx.recv();
+            })
+            .unwrap();
+        let named = format!("audit-holder ({})", tid_rx.recv().unwrap());
+        // Entry confines the thread that makes it, so each runs on its own.
+        let enter = |mode| {
+            std::thread::spawn(move || {
+                confine_main(
+                    mode,
+                    CaptureAuthority::DropAfterOpen,
+                    &sandbox::SandboxPaths::default(),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .join()
+            .unwrap()
+        };
+        let warnings = enter(Mode::BestEffort).unwrap().mode.warnings;
+        assert!(
+            warnings.iter().any(|w| w.contains(&named)),
+            "{named}: {warnings:?}"
+        );
+        let error = enter(Mode::Strict).unwrap_err();
+        assert!(error.contains(&named), "{named}: {error}");
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 }
