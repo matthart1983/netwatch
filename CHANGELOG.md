@@ -224,6 +224,34 @@ All notable changes to NetWatch will be documented in this file.
   in `summary.md` give the number of rows left out, and `connections.json`
   keeps its shape. The bundle's JSON files are also written through a
   buffer now; 50,000 rows took about 12 million write calls before.
+- **Names with emoji or halfwidth katakana stay inside their column.** Lite
+  and Dense measured a name with unicode-width and cut it one character at
+  a time, and both disagree with what ratatui draws. A halfwidth sound mark
+  (ﾞ or ﾟ) takes a column on screen but counted as none: in Lite, a process
+  named with eight `ﾊﾟ` filled its 15-column field and the gap after it,
+  with no ellipsis. An emoji with its presentation selector, such as `❤️`
+  or `#️⃣`, counted as one column and drew two, so eight hearts were cut one
+  heart late and the ellipsis fell in the host column. A skin-tone or joined
+  emoji, such as `👍🏽` or a family, counted as four to six columns and drew
+  two, so the name was cut short. In a Dense box border, a right-hand label
+  holding sound marks lost its end under the closing `├`. Text is now
+  measured and cut between the graphemes ratatui lays out, by the columns
+  it gives each one. That covers Lite, Dense, the full view's tables and
+  labels, which counted characters, and the check that drops a box's
+  right-hand text when it would cover the title. Plain ASCII text is cut
+  as before. A CJK or emoji name that a full-view table used to clip at its
+  column edge now ends in `…`. ratatui itself still places right-aligned
+  text one column too far right for each sound mark, and cuts off what
+  passes the edge.
+- **An emoji sequence that reached the screen unreplaced no longer hides
+  the text after it.** The last pass over each frame drops the characters
+  that could control the terminal or disguise text, the zero-width joiner
+  among them. A family emoji is three emoji joined into one 2-column cell.
+  With the joiners gone that cell held three emoji, 6 columns wide, and the
+  four cells after it were never sent to the terminal. The cell now keeps
+  the first emoji and its width. Names from packets, peers and other
+  processes have their joiners replaced with `·` before layout, so this
+  only hit text that missed that step.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to

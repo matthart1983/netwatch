@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::app::App;
 use crate::collectors::process_bandwidth::ProcessBandwidth;
 use crate::sort::{apply_direction, cmp_case_insensitive, cmp_f64, SortColumn, TabSortState};
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{prelude::*, widgets::Paragraph};
 
@@ -671,15 +672,6 @@ fn host_only(addr: &str) -> String {
     } else {
         addr.to_string()
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

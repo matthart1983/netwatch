@@ -22,10 +22,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::theme::Theme;
+use crate::ui::text;
 
 // ── The grid ────────────────────────────────────────────────────────────────
 
@@ -483,25 +483,7 @@ pub fn fmt_rate(bytes_per_sec: f64) -> String {
 /// Width-aware rather than byte- or char-aware so CJK process names don't
 /// shear the columns to the right of them.
 pub fn truncate_end(s: &str, w: u16) -> String {
-    let w = w as usize;
-    if s.width() <= w {
-        return s.to_string();
-    }
-    if w <= 1 {
-        return "…".into();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let cw = ch.to_string().width();
-        if used + cw > w - 1 {
-            break;
-        }
-        out.push(ch);
-        used += cw;
-    }
-    out.push('…');
-    out
+    text::truncate_end(s, w as usize)
 }
 
 /// Middle-truncate a hostname, keeping the start and the TLD.
@@ -511,7 +493,7 @@ pub fn truncate_end(s: &str, w: u16) -> String {
 /// the domain recognisable.
 pub fn truncate_host(s: &str, w: u16) -> String {
     let wu = w as usize;
-    if s.width() <= wu {
+    if text::width(s) <= wu {
         return s.to_string();
     }
     if wu <= 3 {
@@ -531,20 +513,12 @@ pub fn truncate_host(s: &str, w: u16) -> String {
     // Keep the tail only if it still leaves a head worth reading — otherwise
     // `…amazonaws.com` tells you less than `ec2-52-1-2-3.com…`.
     const MIN_HEAD: usize = 3;
-    if tail.is_empty() || tail.width() + 1 + MIN_HEAD > wu {
+    let tail_w = text::width(tail);
+    if tail.is_empty() || tail_w + 1 + MIN_HEAD > wu {
         return truncate_end(s, w);
     }
-    let head_w = wu - tail.width() - 1; // room for the ellipsis
-    let mut head = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let cw = ch.to_string().width();
-        if used + cw > head_w {
-            break;
-        }
-        head.push(ch);
-        used += cw;
-    }
+    let head_w = wu - tail_w - 1; // room for the ellipsis
+    let head = text::prefix(s, head_w);
     format!("{head}…{tail}")
 }
 
@@ -560,7 +534,7 @@ fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style, clip_x_end: u16) {
 
 /// Draw right-aligned so the string *ends* on `x_end`.
 fn put_right(f: &mut Frame, x_end: u16, y: u16, s: &str, style: Style) {
-    let w = s.width() as u16;
+    let w = text::width(s) as u16;
     let x = x_end.saturating_sub(w.saturating_sub(1));
     put(f, x, y, s, style, x_end);
 }
@@ -694,7 +668,7 @@ fn render_header(
     x += 10;
     let iface = &app.capture_interface;
     put(f, x, y, iface, Style::default().fg(t.tx_rate), end);
-    x += iface.width() as u16;
+    x += text::width(iface) as u16;
 
     if let Some(ip) = app
         .interface_info
@@ -740,13 +714,13 @@ fn render_header(
         t.status_good
     });
 
-    let total = 2 + rtt.width() as u16 + 2 + loss.width() as u16;
+    let total = 2 + text::width(&rtt) as u16 + 2 + text::width(&loss) as u16;
     let sx = end + 1 - total;
     put(f, sx, y, dot, dot_style, end);
     put(f, sx + 2, y, &rtt, Style::default().fg(t.text_primary), end);
     put(
         f,
-        sx + 2 + rtt.width() as u16 + 2,
+        sx + 2 + text::width(&rtt) as u16 + 2,
         y,
         &loss,
         Style::default().fg(if unhealthy {
@@ -816,7 +790,7 @@ fn render_throughput(f: &mut Frame, app: &App, l: &Layout, paused: bool) {
         );
         put(
             f,
-            l.content_x + 3 + val.width() as u16,
+            l.content_x + 3 + text::width(&val) as u16,
             y_label,
             unit,
             Style::default().fg(t.text_secondary),
@@ -924,7 +898,7 @@ fn render_health_line(
             Style::default().fg(t.text_secondary),
             end,
         );
-        x += label.width() as u16 + 1;
+        x += text::width(label) as u16 + 1;
         put(
             f,
             x,
@@ -933,7 +907,7 @@ fn render_health_line(
             Style::default().fg(if bad { t.status_error } else { t.text_primary }),
             end,
         );
-        x += val.width() as u16 + 3;
+        x += text::width(&val) as u16 + 3;
     }
 
     let (verdict_text, style) = if health.gateway_loss.degrades(health.gateway_rtt_ms) {
@@ -1181,7 +1155,7 @@ fn render_prompt(f: &mut Frame, app: &App, l: &Layout, matched: usize, _sel: usi
         if lite.filter_input {
             put(
                 f,
-                l.content_x + 2 + q.width() as u16,
+                l.content_x + 2 + text::width(q) as u16,
                 l.row_prompt,
                 "█",
                 Style::default().fg(t.text_primary),
@@ -1233,7 +1207,7 @@ fn render_footer(f: &mut Frame, t: &Theme, l: &Layout, app: &App) {
             Style::default().fg(t.key_hint).add_modifier(Modifier::BOLD),
             end,
         );
-        x += k.width() as u16;
+        x += text::width(k) as u16;
         put(
             f,
             x,
@@ -1242,7 +1216,7 @@ fn render_footer(f: &mut Frame, t: &Theme, l: &Layout, app: &App) {
             Style::default().fg(t.text_secondary),
             end,
         );
-        x += 1 + label.width() as u16 + FOOTER_GAP;
+        x += 1 + text::width(label) as u16 + FOOTER_GAP;
     }
     let _ = app;
     put_right(
@@ -1403,20 +1377,72 @@ mod tests {
         assert_eq!(truncate_end("firefox", 15), "firefox");
         // Fills the field: 14 chars + the ellipsis == the full 15 columns.
         assert_eq!(truncate_end("mDNSResponder-extra", 15), "mDNSResponder-…");
-        assert_eq!(truncate_end("mDNSResponder-extra", 15).width(), 15);
+        assert_eq!(text::width(&truncate_end("mDNSResponder-extra", 15)), 15);
 
         // CJK: two columns per char, so 8 chars would overflow a 10-col field
         // if measured by char count.
         let cjk = "网络监视器网络监视器";
-        assert!(truncate_end(cjk, 10).width() <= 10);
+        assert!(text::width(&truncate_end(cjk, 10)) <= 10);
 
         // Hosts keep their TLD so the domain stays recognisable.
         let long = "ec2-52-1-2-3.compute-1.amazonaws.com";
         let out = truncate_host(long, 22);
-        assert!(out.width() <= 22, "{out:?} exceeds 22 columns");
+        assert!(text::width(&out) <= 22, "{out:?} exceeds 22 columns");
         assert!(out.ends_with("amazonaws.com"), "{out:?} lost its TLD");
         assert!(out.contains('…'), "{out:?} has no elision marker");
         assert_eq!(truncate_host("github.com", 22), "github.com");
+    }
+
+    /// Counted the unicode-width way, eight `ﾊﾟ` (16 cells as drawn) fitted
+    /// the 15-column process field untouched, and eight `❤️` were cut one
+    /// heart late, so the ellipsis landed in the host column.
+    #[test]
+    fn a_wide_name_does_not_push_the_host_column() {
+        use crate::collectors::connections::Connection;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let host = "203.0.113.7";
+        for name in ["ﾊﾟ".repeat(8), "❤\u{FE0F}".repeat(8)] {
+            let app =
+                crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+            let mut conn = Connection {
+                protocol: "TCP".into(),
+                local_addr: "192.0.2.10:50000".into(),
+                remote_addr: format!("{host}:443"),
+                state: "ESTABLISHED".into(),
+                pid: Some(4242),
+                process_name: Some(name.clone()),
+                handshake_rtt_us: None,
+                rx_rate: Some(1000.0),
+                tx_rate: Some(100.0),
+                attribution: Default::default(),
+                evidence: Default::default(),
+                app_protocol: None,
+                retransmits: 0,
+                out_of_order: 0,
+            };
+            // A stale row loses its process name before the view sees it.
+            conn.evidence.observe();
+            app.connection_collector.publish_for_test(vec![conn]);
+            let mut terminal = Terminal::new(TestBackend::new(GRID_W, GRID_H)).unwrap();
+            terminal.draw(|f| render(f, &app, f.area())).unwrap();
+            let buf = terminal.backend().buffer();
+            let l = Layout::new(Rect::new(0, 0, GRID_W, GRID_H));
+            let y = l.row_talkers;
+            let cells =
+                |xs: std::ops::Range<u16>| -> String { xs.map(|x| buf[(x, y)].symbol()).collect() };
+            assert_eq!(
+                cells(l.x_host..l.x_host + host.len() as u16),
+                host,
+                "{name}"
+            );
+            let process = cells(l.x_process..l.x_host);
+            assert!(
+                process.trim_end().ends_with('…'),
+                "{name}: the process field read {process:?}"
+            );
+        }
     }
 
     #[test]

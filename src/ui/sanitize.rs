@@ -22,7 +22,7 @@
 
 use std::borrow::Cow;
 
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellWidth};
 
 /// Stands in for a character that must never reach the terminal. The packet
 /// ASCII pane already uses it for non-printable bytes.
@@ -89,12 +89,32 @@ pub fn display_multiline(s: &str) -> Cow<'_, str> {
 /// directly arrives in a cell of its own and becomes [`REPLACEMENT`]; a
 /// zero-width one arrives appended to its neighbour's symbol and is dropped,
 /// which leaves the neighbour and the cell's width as they were.
+///
+/// A cell never gets wider. The diff skips the columns a wide cell covers, so
+/// a family emoji, three emoji joined by U+200D into 2 columns, would cover 6
+/// once its joiners went and hide the 4 cells after it. What is kept stops
+/// before the first character that would pass the cell's width, which leaves
+/// the first emoji of the three.
 pub fn scrub_buffer(buf: &mut Buffer) {
     for cell in &mut buf.content {
         if !cell.symbol().chars().any(is_unsafe) {
             continue;
         }
-        let kept: String = cell.symbol().chars().filter(|&c| !is_unsafe(c)).collect();
+        // Asking ratatui for the width of a lone control byte trips a debug
+        // assertion. It took one column.
+        let before = if cell.symbol().len() == 1 {
+            1
+        } else {
+            cell.cell_width().max(1)
+        };
+        let mut kept = String::new();
+        for c in cell.symbol().chars().filter(|&c| !is_unsafe(c)) {
+            kept.push(c);
+            if kept.cell_width() > before {
+                kept.pop();
+                break;
+            }
+        }
         if kept.is_empty() {
             cell.set_symbol(REPLACEMENT.encode_utf8(&mut [0; 4]));
         } else {
@@ -218,5 +238,24 @@ mod tests {
         assert!(!has_unsafe(buf));
         let row: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert_eq!(row.trim_end(), "]52;c;AAAA xy   ·");
+    }
+
+    /// A ZWJ sequence is one 2-column grapheme. Dropping its joiners left
+    /// three emoji in one cell, 6 columns wide, and the diff then skipped
+    /// the 4 cells after it, so "abcd" never reached the terminal.
+    #[test]
+    fn scrub_buffer_never_widens_a_cell() {
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(Line::from("👨\u{200D}👩\u{200D}👧abcdef"), f.area());
+                scrub_buffer(f.buffer_mut());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(!has_unsafe(buf));
+        assert_eq!(buf[(0, 0)].cell_width(), 2, "{:?}", buf[(0, 0)].symbol());
+        let row: String = (2..8).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(row, "abcdef");
     }
 }

@@ -126,12 +126,12 @@ impl Panel {
         let text: usize = self
             .title
             .iter()
-            .map(|s| s.content.chars().count())
+            .map(|s| crate::ui::text::width(&s.content))
             .sum::<usize>();
         let badge = self
             .badge
             .as_ref()
-            .map(|n| n.chars().count() + 3)
+            .map(|n| crate::ui::text::width(n) + 3)
             .unwrap_or(0);
         // A leading space, the badge chip, then the title, then a space.
         if text == 0 && badge == 0 {
@@ -146,7 +146,7 @@ impl Panel {
         let text: usize = self
             .meta
             .iter()
-            .map(|s| s.content.chars().count())
+            .map(|s| crate::ui::text::width(&s.content))
             .sum::<usize>();
         if text == 0 {
             0
@@ -1220,6 +1220,30 @@ mod tests {
         let wide = row(80);
         assert!(wide.contains("watching for"), "{wide:?}");
         assert!(wide.contains("21 active"), "{wide:?}");
+    }
+
+    /// A CJK title takes two columns a char. Counted in chars, this one left
+    /// room for metadata that then covered its last character.
+    #[test]
+    fn a_wide_title_is_measured_in_columns() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let t = crate::theme::by_name("dark");
+        let mut terminal = Terminal::new(TestBackend::new(28, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                Panel::new("接続一覧接続一覧").meta("12 active").render(
+                    f,
+                    &t,
+                    Rect::new(0, 0, 28, 3),
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let top: String = (0..28).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(buf[(16, 0)].symbol(), "覧", "{top:?}");
+        assert!(!top.contains("active"), "{top:?}");
     }
 
     /// Verdict chips take the colour of the verdict's *severity*, not a

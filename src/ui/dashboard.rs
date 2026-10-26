@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::collectors::traffic::InterfaceTraffic;
 use crate::sort::{SortColumn, TabSortState};
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
@@ -1931,15 +1932,6 @@ fn remote_host_only(addr: &str) -> String {
     } else {
         addr.to_string()
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
