@@ -5,7 +5,6 @@ use super::packets::export::{self, ExportSummary, Format};
 use super::packets::{CapturedPacket, ExpertSeverity};
 use super::process_bandwidth::ProcessBandwidth;
 use super::traffic::InterfaceTraffic;
-use crate::dpi::AppProtocol;
 use chrono::{DateTime, Duration, Local, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -152,57 +151,14 @@ impl TimedPacket {
                 .map(|line| std::mem::size_of::<String>() + line.len())
                 .sum::<usize>()
             + p.payload_text.len()
-            + p.raw_hex.len()
-            + p.raw_ascii.len()
             + p.raw_bytes.len()
             + p.decrypted_plaintext.as_ref().map_or(0, Vec::len)
-            + p.app_protocol.as_ref().map_or(0, app_protocol_bytes)
+            + p.app_protocol
+                .as_ref()
+                .map_or(0, super::packets::label_bytes)
             + p.annotation
                 .as_ref()
                 .map_or(0, |_| std::mem::size_of::<export::PacketAnnotation>())
-    }
-}
-
-/// The text a flow's classification holds. Every packet of the flow carries
-/// its own copy, empty ACKs included, and the peer picks the SNI or request
-/// path, so one long name is held once per packet, and again in the flow's
-/// row of every connection snapshot. Every field is named, so a new
-/// variant or field has to be counted here before this compiles.
-fn app_protocol_bytes(app: &AppProtocol) -> usize {
-    let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
-    match app {
-        AppProtocol::Tls {
-            sni,
-            alpn,
-            ech: _,
-            ja4,
-        } => text(sni) + text(alpn) + text(ja4),
-        AppProtocol::Http {
-            method,
-            host,
-            path,
-            status: _,
-        } => method.len() + text(host) + text(path),
-        AppProtocol::Dns {
-            qname,
-            qtype: _,
-            rcode: _,
-        } => qname.len(),
-        AppProtocol::Ssh { version } => version.len(),
-        AppProtocol::Quic { sni, ech: _, ja4 } => text(sni) + text(ja4),
-        AppProtocol::Mqtt { client_id } => text(client_id),
-        AppProtocol::Stun { message_type } => message_type.len(),
-        AppProtocol::BitTorrent { info_hash } => text(info_hash),
-        AppProtocol::NetBios { service } => service.len(),
-        AppProtocol::Snmp { version, community } => version.len() + text(community),
-        AppProtocol::Ssdp { method, target } => method.len() + text(target),
-        AppProtocol::Ftp { command } => command.len(),
-        AppProtocol::Llmnr { qname, qtype: _ } => qname.len(),
-        AppProtocol::Dhcp { op: _ } => 0,
-        AppProtocol::Ntp {
-            version: _,
-            mode: _,
-        } => 0,
     }
 }
 
@@ -228,7 +184,10 @@ fn connection_held_bytes(conn: &Connection) -> usize {
                 + f.remote.len()
                 + text(&f.network_namespace)
         })
-        + conn.app_protocol.as_ref().map_or(0, app_protocol_bytes)
+        + conn
+            .app_protocol
+            .as_ref()
+            .map_or(0, super::packets::label_bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -1009,6 +968,7 @@ fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dpi::AppProtocol;
     use std::collections::VecDeque;
     use std::fs;
 
