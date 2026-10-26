@@ -1302,39 +1302,10 @@ impl App {
         if self.conn_tick >= 1 {
             self.conn_tick = 0;
             self.connection_collector.update();
-            let conns = self.connection_collector.connections();
-            // Reverse DNS resolves only the addresses in these connections,
-            // this host's and its peers', not every address a packet claims
-            // to come from.
-            self.packet_collector.dns_cache.set_peers(
-                conns
-                    .iter()
-                    .flat_map(|c| [c.local_addr.as_str(), c.remote_addr.as_str()]),
-            );
-            self.packet_collector.observe_attribution(&conns);
-            self.connection_timeline.update(&conns);
-            // Observe-mode egress profiling (Horizon 3): learn per-process
-            // {SNI, ASN, port} baselines from the live connection table, and
-            // — when a policy is loaded — warn on flows that drift from it.
-            self.egress_profiler.observe(&conns, &self.geo_cache);
-            for v in self.egress_profiler.take_violations() {
-                self.network_intel.raise_policy_violation(
-                    format!(
-                        "Egress {}: {} → {}",
-                        if v.blocked { "blocked" } else { "drift" },
-                        v.process,
-                        v.dest
-                    ),
-                    format!("{} (port {})", v.reason, v.port),
-                );
-            }
+            self.observe_connections();
             // Persist the learned baseline (rate-limited internally) so it
             // survives restarts — a 20-minute session isn't a baseline.
             self.egress_profiler.maybe_persist();
-            let interfaces = self.traffic.interfaces();
-            self.process_bandwidth.update(&conns, &interfaces);
-            update_top_conn_history(&mut self.caches.top_conn_history, &conns);
-            update_top_proc_rx_history(&mut self.caches.top_proc_rx_history, &conns);
         }
 
         // The eBPF event source (when present) drains its own ring buffer
@@ -1407,6 +1378,42 @@ impl App {
             );
             collector.submit_snapshot(snapshot);
         }
+    }
+
+    /// Feed the latest connection snapshot to everything the UI thread
+    /// derives from it. The scale tests time this, which is why the egress
+    /// baseline save, a file write, stays in `tick`.
+    pub(crate) fn observe_connections(&mut self) {
+        let conns = self.connection_collector.connections();
+        // Reverse DNS resolves only the addresses in these connections,
+        // this host's and its peers', not every address a packet claims
+        // to come from.
+        self.packet_collector.dns_cache.set_peers(
+            conns
+                .iter()
+                .flat_map(|c| [c.local_addr.as_str(), c.remote_addr.as_str()]),
+        );
+        self.packet_collector.observe_attribution(&conns);
+        self.connection_timeline.update(&conns);
+        // Observe-mode egress profiling (Horizon 3): learn per-process
+        // {SNI, ASN, port} baselines from the live connection table, and
+        // — when a policy is loaded — warn on flows that drift from it.
+        self.egress_profiler.observe(&conns, &self.geo_cache);
+        for v in self.egress_profiler.take_violations() {
+            self.network_intel.raise_policy_violation(
+                format!(
+                    "Egress {}: {} → {}",
+                    if v.blocked { "blocked" } else { "drift" },
+                    v.process,
+                    v.dest
+                ),
+                format!("{} (port {})", v.reason, v.port),
+            );
+        }
+        let interfaces = self.traffic.interfaces();
+        self.process_bandwidth.update(&conns, &interfaces);
+        update_top_conn_history(&mut self.caches.top_conn_history, &conns);
+        update_top_proc_rx_history(&mut self.caches.top_proc_rx_history, &conns);
     }
 
     fn sample_rtt_from_streams(&mut self) {
@@ -1566,7 +1573,8 @@ fn build_connection_filter(conn: &Connection) -> String {
 }
 
 /// Draw one frame of the TUI: the current view, then any open overlays.
-fn draw_frame(f: &mut Frame, app: &mut App) {
+#[doc(hidden)]
+pub fn draw_frame(f: &mut Frame, app: &mut App) {
     let area = f.area();
     app.ui.last_area = area;
     // Paint the theme's panel background AND default foreground
@@ -2656,7 +2664,7 @@ fn scroll_tab(app: &mut App, delta: isize) {
 /// Routes the key, then decides whether a quit stands. With `confirm_quit`
 /// on, `q` raises a prompt and the next key answers it; Ctrl+C always quits
 /// at once, since a user reaching for it means it.
-fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+pub(crate) fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     if app.ui.quit_pending {
         app.ui.quit_pending = false;
         return confirms_quit(key.code);

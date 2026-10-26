@@ -54,6 +54,11 @@ pub mod theme;
 pub mod ui;
 pub mod uptime;
 
+#[cfg(test)]
+mod scale_tests;
+#[cfg(test)]
+mod testutil;
+
 /// A simple hello world function that returns a greeting message.
 pub fn hello_world() -> String {
     "Hello, World!".to_string()

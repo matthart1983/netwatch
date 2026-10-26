@@ -362,6 +362,13 @@ impl ConnectionCollector {
         *safe_write(&self.snapshot, "connections::publish") = Arc::new(rows);
     }
 
+    /// Whether the poll [`Self::update`] spawned is still running, for tests
+    /// that time one.
+    #[cfg(all(target_os = "linux", test))]
+    pub(crate) fn poll_in_flight(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     /// Record `coverage` as if a poll had measured it, for render tests.
     #[cfg(all(target_os = "linux", test))]
     pub(crate) fn set_coverage_for_test(&self, coverage: super::attribution::Coverage) {

@@ -347,6 +347,17 @@ All notable changes to NetWatch will be documented in this file.
   macOS runner sometimes missed, failing the run and cancelling the Linux
   and Windows jobs with it. The sampler now takes its clock as an argument,
   and the test gives it one that moves only when it is slept on.
+- **CI checks the connection table at 10,000 rows.** A generator builds
+  connection tables shaped like a busy host's. In every run, a 10,000-row
+  table must show its true count and scroll to its last row, and the
+  Timeline must keep every active connection when 10,000 are open. Timed
+  tests for frames, the scroll key, the tick's connection consumers and
+  Diagnose's socket join at 2,000, 10,000 and 50,000 rows, and for a real
+  poll of up to 50,000 loopback sockets, run in a new weekly perf workflow
+  that gates nothing yet. `scripts/scale-bench.sh` prints their numbers as
+  a table and fails on any budget not met. The workflow sets
+  `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
+  printed there and do not fail the run.
 
 ## [0.38.0] - 2026-10-25
 
