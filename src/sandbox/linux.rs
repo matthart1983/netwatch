@@ -82,7 +82,7 @@ pub(crate) const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
     // that costs something. Without CAP_SYS_PTRACE the kernel's ptrace read
     // check passes for another process only if its uids and gids match the
     // reader's, it is dumpable, and its permitted set lies within the
-    // reader's effective set. A confined thread keeps at most 11
+    // reader's effective set. A confined thread keeps at most 10
     // capabilities, so the connections worker can no longer read
     // `/proc/<pid>/exe` or the `/proc/<pid>/fd` links of almost any process
     // but netwatch's own: not another user's, not one that is not dumpable,

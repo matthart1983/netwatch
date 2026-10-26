@@ -205,19 +205,21 @@ write: /dev/null
    a compromised parser cannot read SSH keys was too broad: shared descriptors,
    other threads and privileged interfaces must also be considered
    ([retained capabilities](../src/sandbox/linux.rs#L45)).
-8. Parser and capture threads drop CAP_NET_RAW in every mode. A best-effort TUI
-   keeps it on main and the network workers, because `c`, `i` and `Shift+R`
-   reopen capture on a new thread started from main; a parser running injected
-   code can still reach main's (item 1). The daemon, `diagnose run`, `diagnose
-   coverage` and strict sessions drop it on every thread once capture has
-   opened, so capture cannot reopen there, and the startup audit checks that no
-   thread holds it. In those sessions the `ping` that health falls back to, and
-   the one Diagnose's PMTU probe runs, can hold no more than the worker that
-   starts it, so on a host whose `ping_group_range` excludes the user both fail
-   and health falls back to TCP. No thread keeps CAP_NET_ADMIN. Dropping
-   CAP_NET_RAW stops a thread opening raw or packet sockets and setting
-   `IP_TRANSPARENT` or `SO_MARK`, and its subprocesses inheriting it through the
-   Ambient set; it does not revoke the capture descriptor (below)
+8. Parser and capture threads drop CAP_NET_RAW in best-effort and strict mode.
+   A best-effort TUI keeps it on main and the network workers, because `c`,
+   `i` and `Shift+R` reopen capture on a new thread started from main; a parser
+   running injected code can still reach main's (item 1). The daemon,
+   `diagnose run`, `diagnose coverage` and strict sessions drop it on every
+   thread once capture has opened, so capture cannot reopen there, and the
+   startup audit checks that no thread holds it. In those sessions the `ping`
+   that health falls back to, and the one Diagnose's PMTU probe runs, can hold
+   no more than the worker that starts it, so on a host whose `ping_group_range`
+   excludes the user both fail and health falls back to TCP. With the sandbox
+   on, no thread keeps CAP_NET_ADMIN; disabled mode drops neither capability
+   from main or the workers. Dropping CAP_NET_RAW stops a thread opening raw or
+   packet sockets and setting `IP_TRANSPARENT` or `SO_MARK`, and its
+   subprocesses inheriting it through the Ambient set; it does not revoke the
+   capture descriptor (below)
    ([parser list](../src/sandbox/linux.rs#L135),
    [after-open list](../src/sandbox/linux.rs#L143),
    [strict list](../src/sandbox/linux.rs#L124)).
