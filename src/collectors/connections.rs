@@ -304,30 +304,45 @@ impl ConnectionCollector {
     /// The returned `Arc` derefs to `&Vec<Connection>` so call sites work
     /// with it like a slice.
     pub fn connections(&self) -> Arc<Vec<Connection>> {
-        let (snapshot, generation) = {
+        self.connections_with_generation().1
+    }
+
+    /// [`Self::connections`], and a generation that changes whenever the
+    /// table it returns does: one more after every publish, and one more
+    /// each time a row goes stale between publishes, which blanks its owner
+    /// with no new poll. A view built from the table can key on the
+    /// generation alone. Both come from one call, so a poll that publishes
+    /// in between cannot pair one table's generation with another's rows.
+    pub fn connections_with_generation(&self) -> (u64, Arc<Vec<Connection>>) {
+        let mut served = safe_lock(&self.served, "connections::served");
+        // Read under `served`, so a reader holding an older publish cannot
+        // replace a newer one there and take the generation backwards.
+        let (snapshot, published) = {
             let published = safe_read(&self.snapshot, "connections::snapshot");
             (Arc::clone(&published.rows), published.generation)
         };
         let now = Instant::now();
-        let mut served = safe_lock(&self.served, "connections::served");
         if let Some(hit) = served
             .as_ref()
-            .filter(|s| s.generation == generation && s.until.is_none_or(|until| now <= until))
+            .filter(|s| s.published == published && s.until.is_none_or(|until| now <= until))
         {
-            return Arc::clone(&hit.rows);
+            return (hit.generation(), Arc::clone(&hit.rows));
         }
+        // The same publish served again means another row went stale.
+        let strips = served
+            .as_ref()
+            .map_or(0, |s| s.strips + u64::from(s.published == published));
         let (rows, until) = strip_stale(snapshot, now);
-        *served = Some(Served {
-            generation,
-            rows: Arc::clone(&rows),
+        let next = Served {
+            published,
+            strips,
+            rows,
             until,
-        });
-        rows
-    }
-
-    /// How many tables have been published: one more after every poll.
-    pub fn generation(&self) -> u64 {
-        safe_read(&self.snapshot, "connections::snapshot").generation
+        };
+        let generation = next.generation();
+        let rows = Arc::clone(&next.rows);
+        *served = Some(next);
+        (generation, rows)
     }
 
     /// Attach a PKTAP attribution cache. When set, `update()` will overlay
@@ -595,11 +610,23 @@ struct Published {
 
 /// What [`ConnectionCollector::connections`] returned for one publish.
 struct Served {
-    generation: u64,
+    /// The [`Published::generation`] `rows` came from.
+    published: u64,
+    /// How many times a row went stale between publishes, counting every
+    /// publish so far.
+    strips: u64,
     rows: Arc<Vec<Connection>>,
     /// When the next of `rows`' fresh rows goes stale; `None` when every row
     /// already has.
     until: Option<Instant>,
+}
+
+impl Served {
+    /// What [`ConnectionCollector::connections_with_generation`] reports:
+    /// each publish and each strip adds one, so no two tables share it.
+    fn generation(&self) -> u64 {
+        self.published + self.strips
+    }
 }
 
 /// Replace the published table and count it, in one write.
@@ -3052,11 +3079,13 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
 
     #[test]
     fn connections_generation_bumps_per_publish() {
+        let generation = |c: &ConnectionCollector| c.connections_with_generation().0;
         let collector = ConnectionCollector::new(Arc::new(Mutex::new(StreamTracker::new())));
-        assert_eq!(collector.generation(), 0);
+        assert_eq!(generation(&collector), 0);
         collector.publish_for_test(Vec::new());
         collector.publish_for_test(Vec::new());
-        assert_eq!(collector.generation(), 2);
+        assert_eq!(generation(&collector), 2);
+        assert_eq!(generation(&collector), 2);
 
         // A poll publishes once.
         #[cfg(target_os = "linux")]
@@ -3068,13 +3097,14 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
             while collector.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(collector.generation(), 3);
+            assert_eq!(generation(&collector), 3);
         }
     }
 
     /// A table with stale rows is copied once to strip them, not on every
     /// call, and again only when a publish, or another row going stale,
-    /// changes what readers see.
+    /// changes what readers see. The generation changes with it, so a view
+    /// keyed on the generation alone sees an owner blanked between polls.
     #[test]
     fn stale_strip_is_cached() {
         use super::super::attribution::{UnknownReason, MAX_MATCH_AGE};
@@ -3098,8 +3128,9 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
         let ageing = row(3, 3, now - MAX_MATCH_AGE + Duration::from_secs(2));
         collector.publish_for_test(vec![fresh.clone(), stale, ageing.clone()]);
 
-        let first = collector.connections();
+        let (first_generation, first) = collector.connections_with_generation();
         assert!(Arc::ptr_eq(&first, &collector.connections()));
+        assert_eq!(collector.connections_with_generation().0, first_generation);
         assert_eq!(
             first.iter().map(|c| c.pid).collect::<Vec<_>>(),
             [Some(1), None, Some(3)]
@@ -3113,19 +3144,24 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
         while ageing.evidence.fresh() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let second = collector.connections();
+        let (second_generation, second) = collector.connections_with_generation();
         assert!(!Arc::ptr_eq(&first, &second));
+        assert!(second_generation > first_generation);
         assert_eq!(
             second.iter().map(|c| c.pid).collect::<Vec<_>>(),
             [Some(1), None, None]
         );
         assert!(Arc::ptr_eq(&second, &collector.connections()));
+        assert_eq!(collector.connections_with_generation().0, second_generation);
 
         // A table with nothing stale is served as published, not copied.
+        // Its generation is past the strip's, not the publish count, which
+        // the strip already reached.
         let mut fresh = fresh;
         fresh.evidence.observe();
         collector.publish_for_test(vec![fresh]);
-        let third = collector.connections();
+        let (third_generation, third) = collector.connections_with_generation();
+        assert!(third_generation > second_generation);
         assert_eq!(third[0].pid, Some(1));
         assert!(Arc::ptr_eq(
             &third,
