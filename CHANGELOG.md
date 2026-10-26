@@ -410,6 +410,22 @@ All notable changes to NetWatch will be documented in this file.
   `src/ui/tty.rs` had the same race and failed 3 of 100. Both now allocate
   one pty at a time. The signal tests then passed 200 runs in a row, and the
   tty tests 100.
+- **A flood soak checks netwatch's memory, capture caps and frame time
+  under load.** `tests/soak/flood_soak.py` joins two unprivileged
+  namespaces with a veth. `tests/soak/flood.py` floods one end with six
+  kinds of traffic, two cycles of each, then two paced rates, while
+  `examples/flood_soak` runs the real App on the other end, capturing and
+  drawing ten frames a second. The second cycle sends new addresses, so
+  a table that grows by address shows up as growth between the cycles.
+  The real `netwatch daemon` runs last, under the mix of traffic and then
+  under full-size TCP that fills its stream budget. The soak fails on a
+  peak RSS over 512 MiB, memory that grows between the cycles, a packet
+  ring, stream tracker or thread count past its cap, a phase in which
+  nothing was sent or decoded, a capture error, a panic in the App or the
+  daemon, a daemon that lost its packet socket, a run with no
+  segmentation-offload frames, or a view whose p99 frame time passes
+  33 ms. It records decode rate, drops and CPU for every phase. A full run
+  takes 75 minutes and `--smoke` five. No workflow runs it yet.
 - **The 10,000-socket poll and Diagnose's socket join are held to their
   budgets.** `scale_poll_real_sockets` fails past 150 ms at the median,
   times `NW_PERF_SLACK`, instead of printing it as pending.
