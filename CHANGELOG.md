@@ -358,6 +358,18 @@ All notable changes to NetWatch will be documented in this file.
   a table and fails on any budget not met. The workflow sets
   `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
   printed there and do not fail the run.
+- **A flood soak checks netwatch's memory, capture caps and frame time
+  under load.** `tests/soak/flood_soak.py` joins two unprivileged
+  namespaces with a veth. `tests/soak/flood.py` floods one end with six
+  kinds of traffic, two cycles of each, then two paced rates, while
+  `examples/flood_soak` runs the real App on the other end, capturing and
+  drawing ten frames a second. The real `netwatch daemon` runs last. The
+  soak fails on a peak RSS over 512 MiB, memory that grows between the
+  cycles, a packet ring, stream tracker or thread count past its cap, a
+  capture error or panic, a run with no segmentation-offload frames, or a
+  view whose p99 frame time passes 33 ms. It records decode rate, drops and
+  CPU for every phase. A full run takes 75 minutes and `--smoke` five. No
+  workflow runs it yet.
 
 ## [0.38.0] - 2026-10-25
 
