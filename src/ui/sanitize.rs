@@ -107,9 +107,9 @@ pub fn scrub_buffer(buf: &mut Buffer) {
         } else {
             cell.cell_width().max(1)
         };
-        // One pass over the graphemes. Measuring all that was kept after
-        // every char was quadratic: 32,000 combining marks took a second a
-        // frame.
+        // Measure once, over the graphemes. Measuring what is kept after
+        // each char would be quadratic, and one cell can hold thousands of
+        // combining marks.
         let safe: String = cell.symbol().chars().filter(|&c| !is_unsafe(c)).collect();
         let kept = crate::ui::text::prefix(&safe, before as usize);
         if kept.is_empty() {
@@ -257,8 +257,8 @@ mod tests {
     }
 
     /// However many combining marks follow it, `a` is one grapheme, one
-    /// column wide. The scrub measured everything it had kept after each
-    /// char, so its time grew with the square of the cell's length.
+    /// column wide. A 1-column cell holding `a`, 4,000 marks and a
+    /// zero-width space keeps `a` and every mark, and loses the space.
     #[test]
     fn scrub_buffer_keeps_a_long_grapheme_whole() {
         let marks = "\u{301}".repeat(4000);
