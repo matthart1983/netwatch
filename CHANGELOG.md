@@ -397,6 +397,16 @@ All notable changes to NetWatch will be documented in this file.
   a table and fails on any budget not met. The workflow sets
   `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
   printed there and do not fail the run.
+- **The terminal signal tests no longer fail at random on FreeBSD.**
+  FreeBSD's openpty(3) finds the slave's path with ptsname(3), which keeps
+  it in one buffer for the whole process. The four tests in
+  `tests/tui_signals.rs` allocate their ptys at the same moment on parallel
+  threads, so a test could open another test's slave. Its netwatch then drew
+  where nothing was reading, and the test failed, mostly with `no first
+  frame: ""`: 23 of 120 runs on a FreeBSD 15.1 VM. The pty tests in
+  `src/ui/tty.rs` had the same race and failed 3 of 100. Both now allocate
+  one pty at a time. The signal tests then passed 200 runs in a row, and the
+  tty tests 100.
 - **The 10,000-socket poll and Diagnose's socket join are held to their
   budgets.** `scale_poll_real_sockets` fails past 150 ms at the median,
   times `NW_PERF_SLACK`, instead of printing it as pending.
