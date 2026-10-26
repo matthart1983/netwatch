@@ -33,10 +33,14 @@ together, and `--paced-seconds` and `--daemon-seconds` the other two steps;
 a `--daemon-seconds` of 0 skips the daemon. `--geoip-db` and
 `--geoip-asn-db` load offline GeoIP databases into the driver and the
 daemon, and a release candidate's soak runs with Country and ASN loaded.
+netwatch loads ASN only beside a Country database, so `--geoip-asn-db`
+needs `--geoip-db`, and the driver stops if either does not load.
 `--calibration` takes an earlier `flood-soak.json` and fails any scenario
-that decodes less than 25% of the packets a second it did there.
-`--tcpreplay FILE` sends the replay scenario with tcpreplay instead of the
-generator's own sender.
+that decodes less than 25% of the packets a second it did there. It refuses
+a file in which a scenario decoded nothing. `--tcpreplay FILE` sends the
+replay scenario with tcpreplay instead of the generator's own sender.
+`--ceiling-mib` changes the VmHWM ceiling. With `--summarise`, the ceiling
+is the one the saved run recorded unless `--ceiling-mib` is given.
 
 The driver also runs on its own, decoding only, with no namespace:
 
@@ -65,13 +69,23 @@ leaves the host.
 ## Schedule
 
 One driver process runs steps 1 and 2, so a leak shows as growth from the
-first cycle to the second.
+first cycle to the second. The second cycle's `udp-churn`, `syn-churn` and
+`replay` send flows the first cycle did not: `flood.py --cycle` sets the
+top two bits of their source addresses and address masks. A table keyed by
+address therefore gains new keys in cycle 2. `dns` and `mtu-tcp` send the
+same flows in both cycles.
 
 | Step | Full run | `--smoke` |
 | --- | --- | --- |
 | 1. Each scenario at full rate, two cycles | 5 min each, 60 min | 20 s each, 4 min |
 | 2. Small UDP paced at 50,000 and 100,000 packets a second | 2.5 min each | 10 s each |
-| 3. `netwatch daemon` under `mix` and `bulk` at once | 10 min | 30 s |
+| 3. `netwatch daemon` under `mix` and `bulk` at once, then `mtu-tcp` and `bulk` | 5 min each | 15 s each |
+
+The daemon runs under two loads because `mix` alone leaves its stream
+budget nearly empty. Between two segments of one `mtu-tcp` flow, `mix` opens
+thousands of churn and DNS flows, so the tracker evicts each stream before
+it grows. Under `mtu-tcp` the streams fill to the budget, as they do in the
+driver.
 
 | Scenario | Traffic |
 | --- | --- |
@@ -92,7 +106,8 @@ stack. Here only capture and netwatch pay for it.
 | Gate | Passes when |
 | --- | --- |
 | `run` | Every step finished, and the driver exited 0 |
-| `generator` | Every planned phase ran and its generator reported |
+| `generator` | Every planned phase ran, and its generator reported no error and sent something |
+| `decoded` | The driver's decoded total rose in every phase, counted from the phase's third line, when the phase before has drained |
 | `hwm` | The driver's VmHWM is at most 512 MiB, or `--ceiling-mib` |
 | `plateau` | Cycle 2's highest VmRSS is at most cycle 1's plus 16 MiB |
 | `held_bytes` | Stream bytes held are within the stream budget on every line |
@@ -100,12 +115,14 @@ stack. Here only capture and netwatch pay for it.
 | `streams` | At most 1,280 streams on every line |
 | `threads` | Fewer than 100 threads, in the driver and the daemon |
 | `capture` | Capturing, with no capture error, on every line |
-| `panic` | No thread panicked, counting a parser panic that capture caught |
+| `panic` | No driver thread panicked, counting a parser panic that capture caught |
 | `sampled` | The driver printed a line for at least 95% of the planned seconds |
 | `super_frames` | A frame larger than 16 KiB reached the ring during a bulk phase. Without one, the runner's veth did no segmentation offload and the ring never held large frames |
 | `frame_p99` | Every view drew, and each view's 99th-percentile frame took at most 33 ms over the run |
 | `daemon_hwm` | The daemon's VmHWM is at most the ceiling |
-| `daemon_capture` | The daemon held an AF_PACKET socket |
+| `daemon_load` | Each of the daemon's generators reported no error and sent something |
+| `daemon_capture` | The daemon held an AF_PACKET socket when the flood began and when it ended |
+| `daemon_panic` | No daemon thread panicked. A collector thread's panic leaves the daemon running and exiting 0, so this reads its stderr |
 | `daemon_exit` | The daemon was still running at the end and exited 0 on SIGTERM |
 | `pps_floor` | With `--calibration` only. Each scenario's median decoded rate is at least 25% of the calibration's |
 
@@ -119,17 +136,21 @@ configuration the 512 MiB ceiling is stated for.
 `--out`, `flood-soak.json` by default, holds the summary. Per phase it gives
 the offered rate, the median received, decoded and dropped packets a
 second, drop %, CPU, peak VmRSS and VmHWM, and frame p50, p99 and max by
-view. It also gives the medians by scenario across both cycles, the
-daemon's figures, and every gate with its reading. The `.jsonl` beside it
-keeps the raw records, one per line, each with a `kind`:
+view. These leave out the phase's first two lines, which straddle its
+generator starting. The first of them also records the end of the phase
+before. The gates but `decoded` read every line. The summary also gives the medians by
+scenario across both cycles, the daemon's figures for each load, the GeoIP
+databases the driver loaded (`geoip`) and asked for (`geoip_asked`), and
+every gate with its reading. The `.jsonl` beside it keeps the raw records,
+one per line, each with a `kind`:
 
 | `kind` | What it records |
 | --- | --- |
-| `run` | The plan, the ceiling, the commit and the host |
+| `run` | The plan, the ceiling, the GeoIP databases asked for, the commit and the host |
 | `driver` | One line the driver printed |
 | `phase` | A phase's first and last driver second and the generator's report |
-| `daemon` | One second of the daemon's /proc figures |
-| `daemon_end` | Whether the daemon held a packet socket, and how it exited |
+| `daemon` | One second of the daemon's /proc figures, and the load it was under |
+| `daemon_end` | The daemon's packet sockets at the start and the end, whether it panicked, how it exited, and its generators' reports |
 | `end` | Anything that went wrong in the steps |
 
 A driver line has these fields:
@@ -147,6 +168,7 @@ A driver line has these fields:
 | `tick_ms` | The longest App tick that second |
 | `frame_ms` | Every frame time that second, by view |
 | `capturing`, `capture_error`, `panicked` | Whether capture is running, its error, and whether any thread panicked |
+| `geoip` | The GeoIP databases the App holds, by config key |
 
 Frame times are listed rather than summarised per line. Ten frames a second
 over six views is one or two per view, and percentiles taken that way
@@ -157,7 +179,16 @@ cannot be combined over a phase.
 - The generator is a Python AF_PACKET sender, not tcpreplay. It sent more
   than a million small frames a second here, several times what netwatch
   decodes, so it never limits a phase. `--tcpreplay` uses tcpreplay
-  instead.
+  instead. tcpreplay's `--unique-ip` starts from the same addresses on
+  every run, so with `--tcpreplay` the replay scenario sends cycle 1's
+  flows again in cycle 2.
+- A send fails with ENOBUFS when the veth's queue is full, and the
+  generator counts it and goes on. Any other send error ends the generator
+  with an error, which fails the `generator` gate.
+- Each cycle has 2^22 replay address masks, about 109 million frames of
+  the fixtures. The replay scenario sent about 550,000 frames a second
+  here, so a 5-minute phase uses them all in about 3.3 minutes. Its later
+  passes then repeat its own earlier addresses, but never another cycle's.
 - Drop % is libpcap's dropped count over its received count. On Linux the
   kernel counts a dropped packet in both.
 - The detectors read only the packets still in the ring at each tick, so
@@ -171,4 +202,6 @@ cannot be combined over a phase.
   they apply themselves. A run as real root would drop a different set of
   capabilities. Memory and frame times do not depend on that.
 - `netwatch daemon` exports no capture counters yet, so its phase reports
-  memory, threads and CPU only.
+  memory, threads and CPU only. It reports no GeoIP state either. It reads
+  the same database paths as the driver from its config, but nothing checks
+  that it loaded them.

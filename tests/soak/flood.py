@@ -2,7 +2,7 @@
 """Floods an interface for the flood soak (tests/soak/flood_soak.py), from
 the namespace on the far side of the veth netwatch captures on.
 
-  flood.py SCENARIO --iface IFACE --seconds S [--pps N] [--to ADDR] [--tcpreplay FILE]
+  flood.py SCENARIO --iface IFACE --seconds S [--pps N] [--cycle N] [--to ADDR] [--tcpreplay FILE]
   flood.py sink --bind ADDR
 
 Frame scenarios write prebuilt Ethernet frames to an AF_PACKET socket, as
@@ -18,6 +18,11 @@ fast as it takes them or paced to --pps:
   mix         udp-churn, syn-churn, dns, mtu-tcp and replay, 256 frames of
               each in turn
 
+--cycle N, 0 to 3, gives udp-churn, syn-churn and replay (in mix as well)
+source addresses and address masks that no other cycle uses, so a soak's
+second cycle is new flows to netwatch, not the first cycle's again. dns and
+mtu-tcp send the same flows in every cycle.
+
 Crafted frames go to a MAC nobody owns, so the receiving stack drops them
 without answering: netwatch captures them and the kernel does no more. The
 fixtures keep their own MACs, which are not the lab's either.
@@ -27,10 +32,11 @@ sending kernel's segmentation offload then puts frames of up to 64 KB on the
 veth, which no frame scenario can: AF_PACKET writes are limited to the MTU.
 sink, run on the capture side, accepts and drains it.
 
-Prints one JSON line when it stops: what it sent, and over how long.
+Prints one JSON line when it stops: what it sent, and over how long. A send
+that fails for any reason but a full queue (ENOBUFS) ends it with an error.
 Standard library only.
 """
-import argparse, json, pathlib, re, signal, socket, struct, subprocess, threading, time
+import argparse, errno, json, pathlib, re, signal, socket, struct, subprocess, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / 'tests/fixtures/pcap'
@@ -47,6 +53,9 @@ MTU_FLOWS = 1_000
 MTU_PAYLOAD = 1460
 # Frames sent between looks at the clock, and between pacing sleeps.
 BATCH = 64
+# --cycle N is the top two of the 24 bits churn's source addresses and
+# replay's address masks are made of, so no two cycles share one.
+CYCLE_SHIFT = 22
 
 
 def checksum(data):
@@ -65,16 +74,17 @@ def ipv4_head(proto, src, dst, l4_len):
     return DST_MAC + SRC_MAC + b'\x08\x00' + ip
 
 
-def churn(syn):
+def churn(syn, cycle):
     """Batches of frames whose source no earlier batch used: CHURN_PORTS
-    source ports on each of 2^24 source addresses, so a run never repeats a
-    5-tuple. Only the address changes per batch, so only the IPv4 header is
-    built once per batch; the ports are spliced in."""
+    source ports on each of the cycle's 2^22 source addresses, so a run
+    never repeats a 5-tuple and no other cycle sends one of its 5-tuples.
+    Only the address changes per batch, so only the IPv4 header is built
+    once per batch; the ports are spliced in."""
     ports = [struct.pack('!H', 1024 + i) for i in range(CHURN_PORTS)]
     generation = 0
     while True:
-        generation = (generation + 1) % (1 << 24)
-        src = bytes([10]) + generation.to_bytes(3, 'big')
+        generation = (generation + 1) % (1 << CYCLE_SHIFT)
+        src = bytes([10]) + (cycle << CYCLE_SHIFT | generation).to_bytes(3, 'big')
         if syn:
             head = ipv4_head(6, src, SERVER, 20)
             tail = struct.pack('!HIIBBHHH', 443, generation, 0, 5 << 4, 0x02, 64240, 0, 0)
@@ -158,19 +168,22 @@ def readdress(frame, mask):
     return bytes(out)
 
 
-def replay():
-    """The fixtures, every pass with addresses no earlier pass used."""
+def replay(cycle):
+    """The fixtures, every pass with a mask no earlier pass used, for 2^22
+    passes. The cycle is the mask's top two bits. Two cycles could send the
+    same address pair only if two fixture addresses with the same first
+    byte differed in those bits, and none do."""
     fixture = [f for p in sorted(FIXTURES.glob('*.pcap')) for f in pcap_frames(p)]
     assert fixture, f'no frames in {FIXTURES}'
     passes = 0
     while True:
-        passes = passes % ((1 << 24) - 1) + 1
-        yield [readdress(f, passes) for f in fixture]
+        passes = passes % ((1 << CYCLE_SHIFT) - 1) + 1
+        yield [readdress(f, cycle << CYCLE_SHIFT | passes) for f in fixture]
 
 
-def mix():
+def mix(cycle):
     """256 frames of each frame scenario in turn."""
-    sources = [churn(False), churn(True), dns(), mtu_tcp(), replay()]
+    sources = [churn(False, cycle), churn(True, cycle), dns(), mtu_tcp(), replay(cycle)]
     pending = [[] for _ in sources]
     while True:
         out = []
@@ -182,11 +195,12 @@ def mix():
         yield out
 
 
+# Each takes the cycle.
 SCENARIOS = {
-    'udp-churn': lambda: churn(False),
-    'syn-churn': lambda: churn(True),
-    'dns': dns,
-    'mtu-tcp': mtu_tcp,
+    'udp-churn': lambda cycle: churn(False, cycle),
+    'syn-churn': lambda cycle: churn(True, cycle),
+    'dns': lambda cycle: dns(),
+    'mtu-tcp': lambda cycle: mtu_tcp(),
     'replay': replay,
     'mix': mix,
 }
@@ -231,9 +245,12 @@ def send_frames(iface, seconds, pps, batches, stop):
                 send(frame)
                 sent += 1
                 nbytes += len(frame)
-            except OSError:
+            except OSError as e:
                 # ENOBUFS: the veth's queue is full. The frame is not sent,
-                # and is not counted.
+                # and is not counted. Anything else, such as a link that is
+                # down, would fail every send, so it ends the run.
+                if e.errno != errno.ENOBUFS:
+                    raise
                 errors += 1
     return sent, nbytes, errors, time.monotonic() - started
 
@@ -290,6 +307,8 @@ def main():
     ap.add_argument('--iface', help='the interface frame scenarios write to')
     ap.add_argument('--seconds', type=float, default=10)
     ap.add_argument('--pps', type=int, default=0, help='frames a second; 0 sends as fast as it can')
+    ap.add_argument('--cycle', type=int, default=0, choices=range(1 << (24 - CYCLE_SHIFT)),
+                    help='churn and replay send flows no other cycle sends (default %(default)s)')
     ap.add_argument('--to', help='bulk: the address sink listens on')
     ap.add_argument('--bind', help='sink: the address to listen on')
     ap.add_argument('--tcpreplay', metavar='FILE', help='replay: send FILE with tcpreplay')
@@ -308,7 +327,8 @@ def main():
             sent, nbytes, errors, elapsed = tcpreplay(args.iface, args.seconds, args.pps, args.tcpreplay, stop)
         else:
             sent, nbytes, errors, elapsed = send_frames(args.iface, args.seconds, args.pps,
-                                                        SCENARIOS[args.scenario](), stop)
+                                                        SCENARIOS[args.scenario](args.cycle), stop)
+            report['cycle'] = args.cycle
         report.update(sent=sent, bytes=nbytes, send_errors=errors, seconds=round(elapsed, 3),
                       pps=round(sent / elapsed) if elapsed else 0)
     print(json.dumps(report), flush=True)

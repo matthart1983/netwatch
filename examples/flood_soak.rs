@@ -12,10 +12,12 @@
 //! without a tty. Each line carries libpcap's totals, what the packet ring,
 //! the stream tracker and the detectors hold, the process's memory, threads
 //! and CPU time from /proc, the longest tick, every frame time by view, the
-//! capture error and whether any thread panicked. `--stop-file` ends the run
-//! after the line on which FILE first exists. `--geoip-db` and
-//! `--geoip-asn-db` load offline GeoIP databases, as a release candidate's
-//! soak runs with Country and ASN loaded.
+//! capture error, whether any thread panicked, and the GeoIP databases
+//! loaded. `--stop-file` ends the run after the line on which FILE first
+//! exists. `--geoip-db` and `--geoip-asn-db` load offline GeoIP databases, as
+//! a release candidate's soak runs with Country and ASN loaded. A database
+//! that does not load stops the run; netwatch reads ASN only beside Country,
+//! so `--geoip-asn-db` needs `--geoip-db`.
 //!
 //! Run by `tests/soak/flood_soak.py` inside its namespaces, never by hand
 //! against a real home: live, it refuses to start unless every directory the
@@ -132,6 +134,10 @@ fn parse() -> Result<Options> {
         // A typo would otherwise run without GeoIP and measure the wrong thing.
         ensure!(Path::new(path).is_file(), "{path} is not a file");
     }
+    ensure!(
+        opts.geoip_asn_db.is_none() || opts.geoip_db.is_some(),
+        "--geoip-asn-db needs --geoip-db: netwatch loads ASN only beside a Country database"
+    );
     Ok(opts)
 }
 
@@ -249,6 +255,10 @@ fn live(opts: &Options) -> Result<()> {
         config.geoip_db = db.clone();
     }
     if let Some(db) = &opts.geoip_asn_db {
+        // The App keeps no sign of whether this one opened, so open it here as
+        // the App does, and drop it before the App opens its own.
+        maxminddb::Reader::open_readfile(db)
+            .with_context(|| format!("--geoip-asn-db: {db} did not load"))?;
         config.geoip_asn_db = db.clone();
     }
     flag_panics();
@@ -259,6 +269,16 @@ fn live(opts: &Options) -> Result<()> {
     if opts.geoip_db.is_some() && !app.geo_cache.has_offline_db() {
         bail!("--geoip-db: the database did not load");
     }
+    // What the App holds, by config key: the ASN database opened above, and
+    // the App keeps it only beside a Country one.
+    let country = app.geo_cache.has_offline_db();
+    let geoip: Vec<&str> = [
+        ("geoip_db", country),
+        ("geoip_asn_db", country && opts.geoip_asn_db.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(key, loaded)| loaded.then_some(key))
+    .collect();
     bootstrap::start(&mut app, SessionKind::Daemon, mode)?;
     bootstrap::prime_collectors(&mut app);
     let waited = Instant::now();
@@ -320,6 +340,7 @@ fn live(opts: &Options) -> Result<()> {
             let usage = usage();
             let line = json!({
                 "t": second,
+                "geoip": geoip,
                 "capturing": app.packet_collector.is_capturing(),
                 "capture_error": app.packet_collector.get_error(),
                 "panicked": PANICKED.load(Ordering::Relaxed),

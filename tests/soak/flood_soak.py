@@ -22,11 +22,12 @@ The run, all in one driver process (examples/flood_soak, the real App with
 capture on nw0, drawn at 10 fps):
 
   1. two cycles of every scenario in SCENARIOS at full rate, --minutes over
-     both cycles (5 min each in a 60-minute run)
+     both cycles (5 min each in a 60-minute run), the second cycle's churn
+     and replay flows new
   2. small UDP paced at each rate in PACED_PPS, --paced-seconds between them
   3. then, with the driver gone, the real `netwatch daemon` for
-     --daemon-seconds under the mix scenario and a bulk transfer at once,
-     its memory read from /proc/PID
+     --daemon-seconds under each load in DAEMON_LOADS in turn, its memory
+     read from /proc/PID
 
 --smoke is the same at 20 s a scenario, 10 s a paced rate and 30 s of the
 daemon: about five minutes.
@@ -40,7 +41,7 @@ the run. Needs ip, nsenter, unshare and mount, and
 target/release/examples/flood_soak and target/release/netwatch
 (cargo build --release --example flood_soak --bin netwatch).
 """
-import argparse, json, math, os, pathlib, platform, signal, socket, statistics, subprocess, sys, tempfile, threading, time
+import argparse, importlib.util, itertools, json, math, os, pathlib, platform, signal, socket, statistics, subprocess, sys, tempfile, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DRIVER = ROOT / 'target/release/examples/flood_soak'
@@ -53,6 +54,10 @@ ADDR, PEER_ADDR = '203.0.113.1', '203.0.113.2'
 SCENARIOS = ['udp-churn', 'syn-churn', 'dns', 'mtu-tcp', 'replay', 'bulk']
 CYCLES = 2
 PACED_PPS = [50_000, 100_000]
+# What the real daemon runs under, one after the other. mix opens flows
+# faster than any stream fills, so the stream budget stays nearly empty
+# under it; mtu-tcp then fills the budget. bulk adds super-frames to both.
+DAEMON_LOADS = [('mix', 'bulk'), ('mtu-tcp', 'bulk')]
 # examples/flood_soak's VIEWS, by the names its lines use.
 VIEWS = ['dashboard', 'connections', 'packets', 'packets_filtered', 'stats', 'timeline']
 
@@ -73,8 +78,9 @@ SUPER_FRAME = 16 << 10
 FRAME_P99_MS = 33
 # Decoded pps below this share of the calibrated median is a regression.
 PPS_FLOOR = 0.25
-# A phase's first lines straddle the generator starting, so rates and CPU
-# leave them out. Every gate still reads them.
+# A phase's first lines straddle the generator starting, and the first one
+# records the end of the phase before, so a phase's figures leave them out.
+# Every gate but `decoded` still reads them.
 WARMUP = 2
 # Past a step's own length before the lab gives up on it.
 GRACE_SECS = 60
@@ -179,13 +185,13 @@ class Lab:
         with open(self.config, 'a') as f:
             f.writelines(lines)
 
-    def flood(self, scenario, seconds, pps=0, tcpreplay=None):
+    def flood(self, scenario, seconds, pps=0, tcpreplay=None, cycle=0):
         """flood.py in the peer namespace."""
         argv = [sys.executable, '-I', FLOOD, scenario, '--seconds', seconds]
         if scenario == 'bulk':
             argv += ['--to', ADDR]
         else:
-            argv += ['--iface', PEER_IFACE, '--pps', pps]
+            argv += ['--iface', PEER_IFACE, '--pps', pps, '--cycle', cycle]
         if tcpreplay and scenario == 'replay':
             argv += ['--tcpreplay', tcpreplay]
         p = subprocess.Popen(['nsenter', '-t', str(self.peer), '-n', *map(str, argv)],
@@ -261,6 +267,9 @@ def proc_sample(pid, hz):
         key, _, value = line.partition(':')
         if key in ('VmRSS', 'VmHWM', 'Threads'):
             row[{'VmRSS': 'rss_kib', 'VmHWM': 'hwm_kib', 'Threads': 'threads'}[key]] = int(value.split()[0])
+    if 'rss_kib' not in row:
+        # A zombie: exited, not yet reaped, and with no memory to report.
+        return None
     fields = stat.rpartition(')')[2].split()
     row['utime_s'], row['stime_s'] = int(fields[11]) / hz, int(fields[12]) / hz
     return row
@@ -282,7 +291,7 @@ def run(args, log):
     phases = plan(args)
     geoip = {k: os.path.abspath(v) for k, v in [('geoip_db', args.geoip_db), ('geoip_asn_db', args.geoip_asn_db)] if v}
     log({'kind': 'run', 'phases': phases, 'daemon_seconds': args.daemon_seconds, 'ceiling_mib': args.ceiling_mib,
-         'geoip': sorted(geoip), 'recorder': 'disarmed', 'commit': commit(), 'host': host()})
+         'geoip_asked': sorted(geoip), 'recorder': 'disarmed', 'commit': commit(), 'host': host()})
     errors = []
     with Lab(geoip) as lab, open(lab.dir / 'driver.err', 'w+') as err:
         total = sum(p['seconds'] for p in phases)
@@ -297,8 +306,8 @@ def run(args, log):
                 errors.append(f'the driver exited {driver.p.returncode} before {phase["name"]}')
                 break
             start = driver.last_t + 1
-            report = finish(lab.flood(phase['scenario'], phase['seconds'], phase['pps'], args.tcpreplay),
-                            phase['seconds'])
+            report = finish(lab.flood(phase['scenario'], phase['seconds'], phase['pps'], args.tcpreplay,
+                                      phase['cycle'] or 0), phase['seconds'])
             log({'kind': 'phase', **phase, 'start_t': start, 'end_t': driver.last_t, 'generator': report})
             print(f'{phase["name"]:<14} t {start}..{driver.last_t}  {json.dumps(report)}', flush=True)
         code = driver.end()
@@ -314,11 +323,13 @@ def run(args, log):
 
 
 def daemon(lab, args, log):
-    """The real `netwatch daemon` under the mix scenario and a bulk transfer
-    at once, sampled from /proc once a second. Returns what went wrong."""
+    """The real `netwatch daemon` under each of DAEMON_LOADS in turn, its
+    generators at once, sampled from /proc once a second. Returns what went
+    wrong."""
     lab.daemon_config()
     hz = os.sysconf('SC_CLK_TCK')
-    errors = []
+    errors, reports = [], []
+    seconds = args.daemon_seconds // len(DAEMON_LOADS)
     with open(lab.dir / 'daemon.err', 'w+') as err:
         p = subprocess.Popen([NETWATCH, 'daemon'], env=lab.env, stdout=err, stderr=err, start_new_session=True)
         lab.children.append(p)
@@ -327,16 +338,20 @@ def daemon(lab, args, log):
         while not held and p.poll() is None and time.monotonic() < deadline:
             time.sleep(0.1)
             held = packet_sockets(p.pid)
-        seconds = args.daemon_seconds
-        flood = [lab.flood('mix', seconds), lab.flood('bulk', seconds)]
-        started = time.monotonic()
-        for t in range(1, seconds + 1):
-            time.sleep(max(0.0, started + t - time.monotonic()))
-            row = proc_sample(p.pid, hz)
-            if row is None:
+        for i, load in enumerate(DAEMON_LOADS):
+            flood = [lab.flood(scenario, seconds) for scenario in load]
+            started = time.monotonic()
+            for t in range(1, seconds + 1):
+                time.sleep(max(0.0, started + t - time.monotonic()))
+                row = proc_sample(p.pid, hz)
+                if row is None:
+                    break
+                log({'kind': 'daemon', 't': i * seconds + t, 'load': '+'.join(load), **row})
+            reports += [finish(f, seconds) for f in flood]
+            if p.poll() is not None:
                 break
-            log({'kind': 'daemon', 't': t, **row})
-        reports = [finish(f, seconds) for f in flood]
+        # Capture that stopped during the flood shows here, not at the start.
+        held_end = packet_sockets(p.pid)
         alive = p.poll() is None
         if alive:
             p.send_signal(signal.SIGTERM)
@@ -349,9 +364,14 @@ def daemon(lab, args, log):
         stderr = err.read()
     if args.artifacts:
         (args.artifacts / 'daemon.err').write_text(stderr)
-    log({'kind': 'daemon_end', 'seconds': seconds, 'packet_sockets': held, 'alive_at_end': alive,
+    # The daemon's panic hook chains to the default one, which writes this to
+    # stderr. A panic in a collector thread leaves the daemon running and its
+    # exit status 0.
+    panicked = 'panicked at' in stderr
+    log({'kind': 'daemon_end', 'seconds': seconds * len(DAEMON_LOADS), 'loads': ['+'.join(l) for l in DAEMON_LOADS],
+         'packet_sockets': held, 'packet_sockets_end': held_end, 'panicked': panicked, 'alive_at_end': alive,
          'exit': p.returncode, 'generators': reports})
-    print(f'daemon         {seconds}s  {json.dumps(reports)}', flush=True)
+    print(f'daemon         {seconds}s each  {json.dumps(reports)}', flush=True)
     if not alive:
         errors.append(f'the daemon exited {p.returncode} during its phase: {stderr.strip()[-2000:]}')
     return errors
@@ -407,8 +427,13 @@ def rates(rows, key):
     return [(b[key] - a[key]) / (b['t'] - a['t']) for a, b in zip(rows, rows[1:]) if b['t'] > a['t']]
 
 
+def measured(rows):
+    """A phase's lines after WARMUP, or all of them in a phase too short to
+    spare those."""
+    return rows[WARMUP:] if len(rows) > WARMUP + 1 else rows
+
+
 def phase_stats(phase, rows):
-    measured = rows[WARMUP:] if len(rows) > WARMUP + 1 else rows
     out = {k: phase[k] for k in ('name', 'cycle', 'scenario', 'pps', 'seconds', 'start_t', 'end_t')}
     gen = phase.get('generator', {})
     out['offered_pps'] = gen.get('pps')
@@ -417,10 +442,11 @@ def phase_stats(phase, rows):
     out['rows'] = len(rows)
     if not rows:
         return out
+    rows = measured(rows)
     for key in ('received', 'decoded', 'dropped'):
-        r = rates(measured, key)
+        r = rates(rows, key)
         out[f'{key}_pps'] = round(statistics.median(r)) if r else None
-    first, last = measured[0], measured[-1]
+    first, last = rows[0], rows[-1]
     received = last['received'] - first['received']
     out['drop_pct'] = round(100 * (last['dropped'] - first['dropped']) / received, 2) if received else 0.0
     span = last['t'] - first['t']
@@ -433,6 +459,18 @@ def phase_stats(phase, rows):
     ticks = [r['tick_ms'] for r in rows if r.get('tick_ms') is not None]
     out['tick_ms_max'] = max(ticks) if ticks else None
     out['frame_ms'] = frame_stats(rows)
+    return out
+
+
+def daemon_stats(rows):
+    """One daemon load's peak VmRSS and VmHWM, and its CPU."""
+    if not rows:
+        return {}
+    out = {'rss_max_mib': mib(max(r['rss_kib'] for r in rows)), 'hwm_mib': mib(max(r['hwm_kib'] for r in rows))}
+    first, last = rows[0], rows[-1]
+    if last['t'] > first['t']:
+        cpu = (last['utime_s'] + last['stime_s']) - (first['utime_s'] + first['stime_s'])
+        out['cpu_pct'] = round(100 * cpu / (last['t'] - first['t']))
     return out
 
 
@@ -462,19 +500,19 @@ def summarise(records, calibration=None, ceiling_mib=None):
     daemon_end = next((r for r in records if r['kind'] == 'daemon_end'), None)
     daemon = None
     if daemon_end:
-        daemon = {**{k: daemon_end[k] for k in ('seconds', 'packet_sockets', 'alive_at_end', 'exit')},
+        daemon = {**{k: daemon_end[k] for k in ('seconds', 'packet_sockets', 'packet_sockets_end', 'panicked',
+                                                'alive_at_end', 'exit')},
                   'samples': len(daemon_rows), 'generators': daemon_end['generators']}
         if daemon_rows:
             daemon['rss_max_mib'] = mib(max(r['rss_kib'] for r in daemon_rows))
             daemon['hwm_mib'] = mib(max(r['hwm_kib'] for r in daemon_rows))
             daemon['threads_max'] = max(r['threads'] for r in daemon_rows)
-            first, last = daemon_rows[0], daemon_rows[-1]
-            if last['t'] > first['t']:
-                cpu = (last['utime_s'] + last['stime_s']) - (first['utime_s'] + first['stime_s'])
-                daemon['cpu_pct'] = round(100 * cpu / (last['t'] - first['t']))
+            daemon['loads'] = {load: daemon_stats([r for r in daemon_rows if r['load'] == load])
+                               for load in daemon_end['loads']}
     end = next((r for r in records if r['kind'] == 'end'), {'errors': ['the run did not finish']})
-    summary = {'commit': run.get('commit'), 'host': run.get('host'), 'geoip': run.get('geoip'),
-               'recorder': run.get('recorder'), 'ceiling_mib': ceiling, 'phases': stats,
+    summary = {'commit': run.get('commit'), 'host': run.get('host'), 'geoip_asked': run.get('geoip_asked'),
+               'geoip': rows[0]['geoip'] if rows else None, 'recorder': run.get('recorder'),
+               'ceiling_mib': ceiling, 'phases': stats,
                'scenarios': scenarios, 'frame_ms': frame_stats(in_phases), 'daemon': daemon,
                'errors': end['errors']}
     summary['gates'] = gates(run, phases, by_phase, in_phases, rows, daemon_rows, daemon, scenarios,
@@ -494,9 +532,14 @@ def gates(run, phases, by_phase, in_phases, rows, daemon_rows, daemon, scenarios
         return max((r[key] for r in rows), default=0)
 
     gate('run', not errors, '; '.join(errors) or 'every step finished')
-    failed = [p['name'] for p in phases if p['generator'].get('error')]
+    failed = {p['name']: idle(p['generator']) for p in phases if idle(p['generator'])}
     gate('generator', len(phases) == len(run['phases']) and not failed,
          f'{len(phases)} of {len(run["phases"])} phases ran' + (f', generator failed in {failed}' if failed else ''))
+    # Over the measured lines only: in the first, capture can still be
+    # draining the phase before.
+    lines = {p['name']: measured(by_phase[p['name']]) for p in phases}
+    silent = [name for name, ls in lines.items() if not ls or ls[-1]['decoded'] <= ls[0]['decoded']]
+    gate('decoded', not silent, f'decoded nothing in {silent}' if silent else 'decoded packets in every phase')
     hwm = worst('hwm_kib', rows)
     gate('hwm', rows and hwm <= ceiling * 1024, f'VmHWM {mib(hwm)} MiB, ceiling {ceiling} MiB')
     peaks = {c: worst('rss_kib', [r for p in phases if p['cycle'] == c for r in by_phase[p['name']]])
@@ -533,9 +576,14 @@ def gates(run, phases, by_phase, in_phases, rows, daemon_rows, daemon, scenarios
         dhwm = worst('hwm_kib', daemon_rows)
         gate('daemon_hwm', daemon_rows and dhwm <= ceiling * 1024,
              f'daemon VmHWM {mib(dhwm)} MiB, ceiling {ceiling} MiB')
-        gate('daemon_capture', daemon['packet_sockets'],
-             "could not read the daemon's fds" if daemon['packet_sockets'] is None
-             else f'daemon held {daemon["packet_sockets"]} packet sockets')
+        failed = [idle(g) for g in daemon['generators'] if idle(g)]
+        gate('daemon_load', daemon['generators'] and not failed,
+             f'generator failed: {failed}' if failed else f'{len(daemon["generators"])} generators sent traffic')
+        held = daemon['packet_sockets'], daemon['packet_sockets_end']
+        gate('daemon_capture', all(held), "could not read the daemon's fds" if None in held
+             else f'daemon held {held[0]} packet sockets when the flood began and {held[1]} when it ended')
+        gate('daemon_panic', not daemon['panicked'],
+             'a thread panicked: see daemon.err' if daemon['panicked'] else 'no panic')
         gate('daemon_exit', daemon['alive_at_end'] and daemon['exit'] == 0,
              f'alive at the end: {daemon["alive_at_end"]}, exit {daemon["exit"]} on SIGTERM')
     if calibration:
@@ -546,10 +594,23 @@ def gates(run, phases, by_phase, in_phases, rows, daemon_rows, daemon, scenarios
     return out
 
 
+def idle(report):
+    """Why a generator's report shows no flood, or None. Every report but an
+    error has bytes."""
+    if report.get('error'):
+        return report['error']
+    if not report.get('bytes'):
+        return 'sent nothing'
+    return None
+
+
 def calibration_from(path):
     """Decoded pps by scenario from an earlier run's flood-soak.json."""
-    return {s: v['decoded_pps'] for s, v in json.loads(pathlib.Path(path).read_text())['scenarios'].items()
-            if v.get('decoded_pps')}
+    scenarios = json.loads(pathlib.Path(path).read_text())['scenarios']
+    # A scenario that decoded nothing there would set no floor here.
+    zero = [s for s, v in scenarios.items() if not v.get('decoded_pps')]
+    assert not zero, f'{path} decoded nothing in {zero}: calibrate from a run that did'
+    return {s: v['decoded_pps'] for s, v in scenarios.items()}
 
 
 def report(summary):
@@ -574,9 +635,9 @@ def report(summary):
         print(f'{p["name"]:<14} {offered:>8} {num(p.get("decoded_pps")):>8} {num(p.get("drop_pct"), "%"):>6} '
               f'{num(p.get("cpu_pct"), "%"):>5} {num(p.get("rss_max_mib")):>6} {num(p.get("hwm_mib")):>6} {worst:>26}')
     d = summary['daemon']
-    if d:
-        print(f'{"daemon":<14} {"mix+bulk":>8} {"":>8} {"":>6} {num(d.get("cpu_pct"), "%"):>5} '
-              f'{num(d.get("rss_max_mib")):>6} {num(d.get("hwm_mib")):>6}')
+    for load, figures in (d or {}).get('loads', {}).items():
+        print(f'{"daemon":<14} {load:>17} {"":>6} {num(figures.get("cpu_pct"), "%"):>5} '
+              f'{num(figures.get("rss_max_mib")):>6} {num(figures.get("hwm_mib")):>6}')
     for view, s in summary['frame_ms'].items():
         print(f'  {view:<17} {s["n"]:>6} frames  p50 {s["p50"]} ms  p99 {s["p99"]} ms  max {s["max"]} ms')
     for g in summary['gates']:
@@ -593,8 +654,8 @@ def canned(case):
     phase_s, paced_s = 10, 10
     args = argparse.Namespace(scenarios=SCENARIOS, phase_seconds=phase_s, paced_seconds=paced_s)
     phases = plan(args)
-    records = [{'kind': 'run', 'phases': phases, 'daemon_seconds': 5, 'ceiling_mib': CEILING_MIB,
-                'geoip': [], 'recorder': 'disarmed', 'commit': None, 'host': None}]
+    records = [{'kind': 'run', 'phases': phases, 'daemon_seconds': 6, 'ceiling_mib': CEILING_MIB,
+                'geoip_asked': [], 'recorder': 'disarmed', 'commit': None, 'host': None}]
     t, rss, hwm, totals = 0, 0, 0, [0, 0, 0]
     for p in phases:
         start = t + 1
@@ -605,10 +666,13 @@ def canned(case):
             rss = (300 << 10) + (t % 5) * 1024 + (32 << 10 if case == 'plateau' and p['cycle'] == 2 else 0)
             spike = case == 'ceiling' and p['name'] == 'c1-mtu-tcp'
             hwm = max(hwm, rss, (600 << 10) if spike else 0)
-            totals = [totals[0] + 200_000, totals[1] + 20_000, totals[2] + 180_000]
+            # In nothing-decoded, c1-syn-churn decodes only in its first two
+            # lines, as capture drains the phase before.
+            if not (case == 'nothing-decoded' and p['name'] == 'c1-syn-churn' and t > start + 1):
+                totals = [totals[0] + 200_000, totals[1] + 20_000, totals[2] + 180_000]
             super_frame = p['scenario'] == 'bulk' and case != 'no-super-frames'
             records.append({
-                'kind': 'driver', 't': t, 'capturing': True, 'capture_error': None, 'panicked': False,
+                'kind': 'driver', 't': t, 'geoip': [], 'capturing': True, 'capture_error': None, 'panicked': False,
                 'received': totals[0], 'dropped': totals[1], 'decoded': totals[2], 'ring_len': 5000,
                 'ring_bytes': 30 << 20, 'max_frame': 65_226 if super_frame else 1514, 'streams': 1200,
                 'held_bytes': (300 << 20) if case == 'held' and t == 50 else 200 << 20,
@@ -617,13 +681,20 @@ def canned(case):
                 'threads': 40, 'utime_s': t * 0.9, 'stime_s': t * 0.1, 'tick_ms': 12.5,
                 'frame_ms': {v: [1.5, 2.5, 40.0 if case == 'slow-frames' and v == 'stats' else 3.0]
                              for v in VIEWS}})
+        sent = 0 if case == 'nothing-sent' and p['name'] == 'c1-dns' else 1_000_000
         records.append({'kind': 'phase', **p, 'start_t': start, 'end_t': t,
-                        'generator': {'scenario': p['scenario'], 'sent': 1, 'pps': 1_000_000}})
-    for s in range(1, 6):
-        records.append({'kind': 'daemon', 't': s, 'rss_kib': 200 << 10, 'hwm_kib': 210 << 10, 'threads': 35,
-                        'utime_s': s * 0.5, 'stime_s': s * 0.1})
-    records.append({'kind': 'daemon_end', 'seconds': 5, 'packet_sockets': 1, 'alive_at_end': True, 'exit': 0,
-                    'generators': []})
+                        'generator': {'scenario': p['scenario'], 'sent': sent, 'bytes': sent * 60, 'pps': sent}})
+    loads = ['+'.join(load) for load in DAEMON_LOADS]
+    for s in range(1, 7):
+        records.append({'kind': 'daemon', 't': s, 'load': loads[(s - 1) // 3], 'rss_kib': 200 << 10,
+                        'hwm_kib': 210 << 10, 'threads': 35, 'utime_s': s * 0.5, 'stime_s': s * 0.1})
+    generators = [{'scenario': s, 'sent': 1_000_000, 'bytes': 60_000_000} if s != 'bulk'
+                  else {'scenario': s, 'bytes': 1 << 30} for load in DAEMON_LOADS for s in load]
+    if case == 'daemon-idle':
+        generators[0] = {'error': 'exit 1: OSError: [Errno 100] Network is down'}
+    records.append({'kind': 'daemon_end', 'seconds': 6, 'loads': loads, 'packet_sockets': 1,
+                    'packet_sockets_end': 0 if case == 'daemon-lost-capture' else 1,
+                    'panicked': case == 'daemon-panic', 'alive_at_end': True, 'exit': 0, 'generators': generators})
     records.append({'kind': 'end', 'errors': []})
     return records
 
@@ -632,7 +703,9 @@ def self_test():
     """Each case's records go through a JSONL file and load() as a run's do."""
     cases = {'pass': [], 'plateau': ['plateau'], 'ceiling': ['hwm'], 'no-super-frames': ['super_frames'],
              'held': ['held_bytes'], 'stall': ['sampled'], 'slow-frames': ['frame_p99'],
-             'pps-floor': ['pps_floor']}
+             'pps-floor': ['pps_floor'], 'nothing-sent': ['generator'], 'nothing-decoded': ['decoded'],
+             'daemon-idle': ['daemon_load'], 'daemon-panic': ['daemon_panic'],
+             'daemon-lost-capture': ['daemon_capture']}
     with tempfile.TemporaryDirectory(prefix='nw-flood-self-test-') as tmp:
         for case, expect in cases.items():
             path = pathlib.Path(tmp) / f'{case}.jsonl'
@@ -649,6 +722,59 @@ def self_test():
     failed = [g['gate'] for g in summarise(records)['gates'] if not g['passed']]
     assert {'run', 'generator', 'sampled'} <= set(failed), failed
     print('self-test cut-short: fails run, generator and sampled, as it should', flush=True)
+    # A phase's first line records the end of the phase before it. The
+    # phase's own figures leave it out, and the gates still read it.
+    records = canned('pass')
+    phase = next(r for r in records if r['kind'] == 'phase' and r['name'] == 'c2-replay')
+    first = next(r for r in records if r['kind'] == 'driver' and r['t'] == phase['start_t'])
+    first.update(rss_kib=345 << 10, max_frame=65_226, frame_ms={v: [9.6] for v in VIEWS})
+    summary = summarise(records)
+    stats = next(p for p in summary['phases'] if p['name'] == 'c2-replay')
+    figures = stats['rss_max_mib'], stats['max_frame_max'], stats['frame_ms']['stats']['max']
+    assert figures == (304.0, 1514, 3.0), f'c2-replay counted the line before it: {figures}'
+    assert summary['frame_ms']['stats']['max'] == 9.6, summary['frame_ms']
+    print('self-test phase-figures: leave out the line before the phase, as they should', flush=True)
+    # --summarise gates on the ceiling the run recorded, unless told another.
+    records = canned('pass')
+    records[0]['ceiling_mib'] = 600
+    for r in records:
+        if r['kind'] == 'driver':
+            r['hwm_kib'] = 550 << 10
+    with tempfile.TemporaryDirectory(prefix='nw-flood-self-test-') as tmp:
+        path = pathlib.Path(tmp) / 'ceiling.jsonl'
+        path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+        for extra, code in [([], 0), (['--ceiling-mib', '512'], 1)]:
+            done = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), '--summarise', path,
+                                   '--out', pathlib.Path(tmp) / 'ceiling.json', *extra], capture_output=True, text=True)
+            assert done.returncode == code, f'--summarise {extra}: exit {done.returncode}\n{done.stdout}{done.stderr}'
+    print('self-test summarise-ceiling: gates on the recorded 600 MiB, or on --ceiling-mib, as it should', flush=True)
+    # flood.py's churn and replay send each cycle from addresses no other
+    # cycle uses, so cycle 2 is new flows to every table. Importing it would
+    # otherwise leave a __pycache__ in the tree.
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location('flood', FLOOD)
+    flood = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(flood)
+    for name in ('udp-churn', 'syn-churn', 'replay'):
+        pairs = [addresses(f for batch in itertools.islice(flood.SCENARIOS[name](cycle), 64) for f in batch)
+                 for cycle in (1, 2)]
+        assert pairs[0] and not pairs[0] & pairs[1], f'{name}: cycles 1 and 2 share {len(pairs[0] & pairs[1])} address pairs'
+    print('self-test cycles: churn and replay send each cycle from new addresses, as they should', flush=True)
+    # A daemon that dies mid-phase stays a zombie until poll() reaps it, and
+    # a zombie has no VmRSS to sample.
+    p = subprocess.Popen(['true'])
+    while pathlib.Path(f'/proc/{p.pid}/stat').read_text().rpartition(')')[2].split()[0] != 'Z':
+        time.sleep(0.01)
+    sample = proc_sample(p.pid, os.sysconf('SC_CLK_TCK'))
+    p.wait()
+    assert sample is None, f'a zombie sampled as {sample}'
+    print('self-test zombie: samples as gone, as it should', flush=True)
+
+
+def addresses(frames):
+    """The source and destination addresses of each IPv4 or IPv6 frame."""
+    spans = {b'\x08\x00': slice(26, 34), b'\x86\xdd': slice(22, 54)}
+    return {frame[spans[frame[12:14]]] for frame in frames if frame[12:14] in spans}
 
 
 def main():
@@ -659,9 +785,10 @@ def main():
     mode.add_argument('--self-test', action='store_true', help='run the gates against canned lines')
     ap.add_argument('--minutes', type=int, default=60, help='both cycles together (default %(default)s)')
     ap.add_argument('--paced-seconds', type=int, help='all paced rates together (default 300, smoke 20)')
-    ap.add_argument('--daemon-seconds', type=int, help='real daemon phase; 0 skips it (default 600, smoke 30)')
+    ap.add_argument('--daemon-seconds', type=int, help='both daemon loads together; 0 skips the daemon (default 600, smoke 30)')
     ap.add_argument('--scenarios', default=','.join(SCENARIOS), help='comma-separated, from %(default)s')
-    ap.add_argument('--ceiling-mib', type=int, default=CEILING_MIB, help='VmHWM gate (default %(default)s)')
+    ap.add_argument('--ceiling-mib', type=int, help=f'VmHWM gate (default {CEILING_MIB}, or with --summarise '
+                    'the ceiling that run recorded)')
     ap.add_argument('--calibration', metavar='JSON', help='an earlier flood-soak.json: each scenario must '
                     f'decode at least {PPS_FLOOR * 100:.0f}%% of the pps it did there')
     ap.add_argument('--geoip-db', metavar='MMDB', help='Country (or City) database to load')
@@ -682,6 +809,7 @@ def main():
         out.write_text(json.dumps(summary, indent=1) + '\n')
         report(summary)
         sys.exit(0 if summary['passed'] else 1)
+    args.ceiling_mib = args.ceiling_mib or CEILING_MIB
     args.scenarios = [s for s in args.scenarios.split(',') if s]
     assert set(args.scenarios) <= set(SCENARIOS), f'scenarios are {SCENARIOS}'
     args.phase_seconds = 20 if args.smoke else args.minutes * 60 // (CYCLES * len(args.scenarios))
