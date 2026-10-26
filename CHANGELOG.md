@@ -52,7 +52,10 @@ All notable changes to NetWatch will be documented in this file.
   ago. Open connections are never dropped. It drops at least 256 at a time,
   so the Timeline is not reindexed on every tick that something closes, and
   right after a drop it can hold as few as 1,745 closed connections. The
-  `M` overlay shows the closed count against 2,000.
+  `M` overlay shows the closed count against 2,000. Library callers lose
+  `ConnectionTimeline::tracked_len` and `tracked_cap`, and gain
+  `ConnectionTimeline::closed_len`, `closed_trimmed` and `first_seen`, and
+  `ConnectionCollector::connections_with_generation`.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,

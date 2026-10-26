@@ -274,8 +274,8 @@ impl Host {
 
     /// Publish the table again with fresh evidence, as the next poll would.
     /// Rows older than `MAX_MATCH_AGE` show as unattributed, and
-    /// `connections()` copies the whole table on every call to say so, which
-    /// is not the cost being measured. A kernel dump older than 30 s is
+    /// `connections()` copies the whole table when they go stale to say so,
+    /// which is not the cost being measured. A kernel dump older than 30 s is
     /// ignored by Diagnose.
     fn publish(&mut self) {
         for row in &mut self.rows {

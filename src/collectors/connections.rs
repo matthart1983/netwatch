@@ -1877,8 +1877,9 @@ fn apply_owner(conn: &mut Connection, owner: &SocketOwner, checked: (u64, u64)) 
     conn.evidence.observe();
     conn.evidence.owner_checked_utc_ms = Some(checked);
 }
-/// Revalidate every Linux polling match, including ss-provided PIDs. A PID name
-/// alone cannot establish that the socket still belongs to that process.
+/// Find every Linux polling row's owner in `/proc`. Rows from `ss -tuna` and
+/// the `/proc/net` fallback carry no PID, and any a row holds is dropped: a
+/// PID alone cannot establish that the socket still belongs to that process.
 ///
 /// A sandboxed worker cannot read other processes' `/proc/<pid>/fd` (Landlock
 /// denies ptrace-mode access outside its domain), so when a [`ProcBroker`]
