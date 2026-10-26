@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use super::geo::lookup_addr;
+use super::lru::BoundedLru;
 
 const WHOIS_CACHE_MAX: usize = 2048;
 
@@ -28,9 +31,10 @@ enum WhoisEntry {
 
 #[derive(Clone)]
 pub struct WhoisCache {
-    cache: Arc<Mutex<HashMap<String, WhoisEntry>>>,
-    tx: std_mpsc::Sender<String>,
-    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<String>>>>,
+    /// Keyed by [`lookup_addr`]'s canonical address.
+    cache: Arc<Mutex<BoundedLru<IpAddr, WhoisEntry>>>,
+    tx: std_mpsc::Sender<IpAddr>,
+    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<IpAddr>>>>,
 }
 
 impl Default for WhoisCache {
@@ -41,8 +45,8 @@ impl Default for WhoisCache {
 
 impl WhoisCache {
     pub fn new() -> Self {
-        let (tx, rx) = std_mpsc::channel::<String>();
-        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = std_mpsc::channel::<IpAddr>();
+        let cache = Arc::new(Mutex::new(BoundedLru::new(WHOIS_CACHE_MAX)));
 
         Self {
             cache,
@@ -72,21 +76,11 @@ impl WhoisCache {
                 if crate::sandbox::worker::stopping() {
                     break;
                 }
-                let result = lookup_whois(&ip);
+                let result = lookup_whois(ip);
                 let mut c = resolver_cache.lock().unwrap();
                 match result {
-                    Some(info) => {
-                        c.insert(ip, WhoisEntry::Resolved(info));
-                    }
-                    None => {
-                        c.insert(ip, WhoisEntry::Failed);
-                    }
-                }
-                if c.len() > WHOIS_CACHE_MAX {
-                    let keys: Vec<String> = c.keys().take(WHOIS_CACHE_MAX / 4).cloned().collect();
-                    for k in keys {
-                        c.remove(&k);
-                    }
+                    Some(info) => c.put(ip, WhoisEntry::Resolved(info)),
+                    None => c.put(ip, WhoisEntry::Failed),
                 }
             }
         });
@@ -97,24 +91,26 @@ impl WhoisCache {
     /// the cache only. The detail panes call this on every frame for the
     /// selected row, and drawing a row must not send its address anywhere.
     pub fn lookup(&self, ip: &str) -> Option<WhoisInfo> {
-        match self.cache.lock().unwrap().get(ip) {
+        let addr = lookup_addr(ip)?;
+        match self.cache.lock().unwrap().get(&addr) {
             Some(WhoisEntry::Resolved(info)) => Some(info.clone()),
             Some(WhoisEntry::Failed) | Some(WhoisEntry::Pending) | None => None,
         }
     }
 
-    /// Queue `ip` for an RDAP lookup unless it is private or already cached.
-    /// Only the W key calls this.
+    /// Queue `ip` for an RDAP lookup unless it is not a global unicast
+    /// address (see [`lookup_addr`]) or is already cached. Only the W key
+    /// calls this.
     pub fn request(&self, ip: &str) {
-        if ip == "—" || ip.is_empty() || is_private_ip(ip) {
+        let Some(addr) = lookup_addr(ip) else {
             return;
-        }
+        };
         let mut cache = self.cache.lock().unwrap();
-        if cache.contains_key(ip) {
+        if cache.contains_key(&addr) {
             return;
         }
-        cache.insert(ip.to_string(), WhoisEntry::Pending);
-        if let Err(e) = self.tx.send(ip.to_string()) {
+        cache.put(addr, WhoisEntry::Pending);
+        if let Err(e) = self.tx.send(addr) {
             tracing::error!(target: "netwatch::whois", error = %e, "whois resolver thread is gone; lookups will not progress");
         }
     }
@@ -125,44 +121,12 @@ impl WhoisCache {
     pub(crate) fn queued_for_test(&self) -> Vec<String> {
         let rx = self.pending_rx.lock().unwrap();
         rx.as_ref()
-            .map(|rx| rx.try_iter().collect())
+            .map(|rx| rx.try_iter().map(|ip| ip.to_string()).collect())
             .unwrap_or_default()
     }
 }
 
-fn is_private_ip(ip: &str) -> bool {
-    ip.starts_with("10.")
-        || ip.starts_with("172.16.")
-        || ip.starts_with("172.17.")
-        || ip.starts_with("172.18.")
-        || ip.starts_with("172.19.")
-        || ip.starts_with("172.20.")
-        || ip.starts_with("172.21.")
-        || ip.starts_with("172.22.")
-        || ip.starts_with("172.23.")
-        || ip.starts_with("172.24.")
-        || ip.starts_with("172.25.")
-        || ip.starts_with("172.26.")
-        || ip.starts_with("172.27.")
-        || ip.starts_with("172.28.")
-        || ip.starts_with("172.29.")
-        || ip.starts_with("172.30.")
-        || ip.starts_with("172.31.")
-        || ip.starts_with("192.168.")
-        || ip.starts_with("127.")
-        || ip == "0.0.0.0"
-        || ip == "::"
-        || ip == "::1"
-        || ip.starts_with("fe80:")
-        || ip.starts_with("fc")
-        || ip.starts_with("fd")
-        || ip.starts_with("ff")
-        || ip.starts_with("169.254.")
-        || ip.starts_with("224.")
-        || ip.starts_with("239.")
-}
-
-fn lookup_whois(ip: &str) -> Option<WhoisInfo> {
+fn lookup_whois(ip: IpAddr) -> Option<WhoisInfo> {
     let url = format!("{RDAP_URL}{ip}");
     let body = crate::http::get_text(&url).ok()?;
     parse_rdap(&body)
@@ -279,7 +243,7 @@ mod lifecycle_tests {
     #[test]
     fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
         let cache = WhoisCache::new();
-        cache.request("192.0.2.1");
+        cache.request("8.8.8.8");
         assert_eq!(
             cache
                 .pending_rx
@@ -289,7 +253,7 @@ mod lifecycle_tests {
                 .unwrap()
                 .try_recv()
                 .unwrap(),
-            "192.0.2.1"
+            IpAddr::from([8, 8, 8, 8])
         );
         let clone = cache.clone();
         assert!(clone.start());
@@ -325,7 +289,7 @@ mod lifecycle_tests {
             .cache
             .lock()
             .unwrap()
-            .insert("8.8.8.8".into(), WhoisEntry::Resolved(info));
+            .put(IpAddr::from([8, 8, 8, 8]), WhoisEntry::Resolved(info));
         assert_eq!(cache.lookup("8.8.8.8").unwrap().org, "Google LLC");
         assert!(cache.queued_for_test().is_empty());
     }
@@ -340,7 +304,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn request_skips_private() {
+    fn request_skips_non_global() {
         let cache = WhoisCache::new();
         for ip in [
             "",
@@ -355,10 +319,65 @@ mod lifecycle_tests {
             "::1",
             "fe80::1",
             "fd00::1",
+            // Sent to rdap.org before W used geo's global-unicast check.
+            "::ffff:192.168.1.5",
+            "100.64.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "2001:db8::1",
+            "fe90::1",
+            "64:ff9b::a00:1",
+            "255.255.255.255",
+            "64:ff9b:1::a00:1",
+            "2001:2::1",
+            "5f00::1",
+            "[::ffff:192.168.1.5]",
         ] {
             cache.request(ip);
         }
         assert!(cache.queued_for_test().is_empty());
+    }
+
+    #[test]
+    fn a_v4_mapped_request_asks_for_the_ipv4_address() {
+        let cache = WhoisCache::new();
+        cache.request("::ffff:8.8.8.8");
+        cache.request("8.8.8.8");
+        assert_eq!(cache.queued_for_test(), ["8.8.8.8"]);
+    }
+
+    /// The worker cut the cache by whichever quarter the map listed first,
+    /// so the entry a detail pane was showing could go while ones nobody had
+    /// looked at for hours stayed.
+    #[test]
+    fn eviction_is_lru() {
+        let cache = WhoisCache::new();
+        let addr = |i: u32| IpAddr::from(std::net::Ipv4Addr::from(0x0800_0000 + i));
+        let info = WhoisInfo {
+            net_name: "LVLT-ORG-8-8".into(),
+            net_range: "8.0.0.0 - 8.127.255.255".into(),
+            org: "Level 3".into(),
+            country: "US".into(),
+            description: String::new(),
+        };
+        {
+            let mut c = cache.cache.lock().unwrap();
+            c.put(addr(0), WhoisEntry::Resolved(info));
+            for i in 1..WHOIS_CACHE_MAX as u32 {
+                c.put(addr(i), WhoisEntry::Failed);
+            }
+        }
+        // The detail pane draws the oldest entry, so it is in use.
+        assert!(cache.lookup("8.0.0.0").is_some());
+        cache.request("9.9.9.9");
+        assert_eq!(cache.queued_for_test(), ["9.9.9.9"]);
+
+        let c = cache.cache.lock().unwrap();
+        assert_eq!(c.len(), WHOIS_CACHE_MAX - WHOIS_CACHE_MAX / 4 + 1);
+        assert!(c.contains_key(&addr(0)));
+        assert!(!c.contains_key(&addr(1)));
+        assert!(!c.contains_key(&addr(WHOIS_CACHE_MAX as u32 / 4)));
+        assert!(c.contains_key(&addr(WHOIS_CACHE_MAX as u32 / 4 + 1)));
     }
 
     #[test]
