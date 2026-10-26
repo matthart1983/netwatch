@@ -224,8 +224,9 @@ All notable changes to NetWatch will be documented in this file.
   Diagnose's socket join at 2,000, 10,000 and 50,000 rows, and for a real
   poll of up to 50,000 loopback sockets, run in a new weekly perf workflow
   that gates nothing yet. `scripts/scale-bench.sh` prints their numbers as
-  a table. With `NW_PERF_STRICT=1`, for a release candidate, it fails on
-  any budget not met.
+  a table and fails on any budget not met. The workflow sets
+  `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
+  printed there and do not fail the run.
 
 ## [0.38.0] - 2026-10-25
 

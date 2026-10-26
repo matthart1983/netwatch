@@ -3,8 +3,8 @@
 //! Two tests run with the rest of the suite: a 10,000-row table renders its
 //! true count and every row can be scrolled to, and the timeline keeps every
 //! active entry when 10,000 are active and some close. Two more check the
-//! timings below: each timed frame follows a tick, and `NW_PERF_STRICT`
-//! fails a missed `Pending` budget.
+//! timings below: each timed frame follows a tick, and a missed `Pending`
+//! budget fails unless `NW_PERF_STRICT=0`.
 //!
 //! The rest are timings, `#[ignore]`d and named `scale_*`, for a release
 //! build:
@@ -23,10 +23,11 @@
 //! Budgets apply at 10,000 rows only and are multiplied by `NW_PERF_SLACK`
 //! (1 on the reference machine, 3 in CI). The 2,000 and 50,000 rows are
 //! printed but not judged; 50,000 has to work, not to be fast. A budget
-//! today's code misses is `Pending` on the branch expected to meet it: it is
-//! measured and printed and does not fail the test, and that branch makes it
-//! `Enforced`. `NW_PERF_STRICT=1` fails a missed `Pending` budget as well,
-//! for a release candidate, which has to meet every one.
+//! today's code misses is `Pending` on the branch expected to meet it, and
+//! that branch makes it `Enforced`. A missed `Pending` budget fails like any
+//! other, so the command above, like a release candidate's run, passes only
+//! when every budget is met. `NW_PERF_STRICT=0`, which the perf workflow
+//! sets, prints it as pending and does not fail the test.
 
 use crate::app::{draw_frame, handle_key, App, ConnectionGroup, Tab, ViewMode};
 use crate::collectors::attribution::MAX_MATCH_AGE;
@@ -57,8 +58,8 @@ enum Stat {
 #[derive(Clone, Copy)]
 enum Gate {
     Enforced,
-    /// Measured and printed, and failed only under `NW_PERF_STRICT=1`, until
-    /// the named branch meets it.
+    /// Today's code misses it, and the named branch should meet it. Fails
+    /// the test unless `NW_PERF_STRICT=0`.
     Pending(&'static str),
 }
 
@@ -110,15 +111,16 @@ fn slack() -> f64 {
     }
 }
 
-/// Whether a missed `Pending` budget fails, from `NW_PERF_STRICT`.
+/// Whether a missed `Pending` budget fails: yes, unless `NW_PERF_STRICT=0`.
 fn strict() -> bool {
-    match std::env::var("NW_PERF_STRICT") {
-        Ok(v) => match v.trim() {
-            "1" => true,
-            "0" => false,
-            _ => panic!("NW_PERF_STRICT={v}: not 0 or 1"),
-        },
-        Err(_) => false,
+    strict_from(std::env::var("NW_PERF_STRICT").ok().as_deref())
+}
+
+fn strict_from(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(v) => panic!("NW_PERF_STRICT={v}: not 0 or 1"),
     }
 }
 
@@ -474,6 +476,11 @@ fn every_timed_frame_follows_a_tick() {
 
 #[test]
 fn strict_fails_a_missed_pending_budget() {
+    // Strict unless NW_PERF_STRICT=0, so a bare run judges every budget.
+    assert!(strict_from(None));
+    assert!(strict_from(Some("1")));
+    assert!(!strict_from(Some("0")));
+
     let pending = budget(Stat::P50, 10.0, Gate::Pending(VIEW_CACHE));
     let samples = || vec![Duration::from_millis(20); 10];
     let mut report = Report {
