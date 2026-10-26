@@ -152,10 +152,12 @@ All notable changes to NetWatch will be documented in this file.
   CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
   memory, page cache included, through `/proc/kcore`, past every filesystem
   rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
-  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more, and keep 11 (10 in
-  strict mode): file access in the user's directories, resource limits and
-  scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
-  CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
+  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more. Main and the network
+  workers keep 11: file access in the user's directories, resource limits
+  and scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture,
+  and CAP_NET_ADMIN. Parser and capture threads keep 10, without
+  CAP_NET_RAW, and so does every confined thread in strict mode. Root still
+  owns most files, so under sudo the sandbox
   remains defence in depth, not containment. Losing CAP_SYS_PTRACE costs
   something under sudo on a kernel where Landlock does not enforce (older
   than 5.13, or Landlock missing from `lsm=`): confined threads can no
@@ -168,9 +170,9 @@ All notable changes to NetWatch will be documented in this file.
   process is named by the kernel's 15-character `comm` rather than its
   executable, and its connections have no owner on a poll that finds the
   latest process-attribution scan more than 5 seconds old. Where Landlock
-  enforces, it already refused those reads. Runs without elevation, with the
-  documented `setcap` line or under the systemd unit drop what they did
-  before.
+  enforces, it already refused those reads. Runs without elevation drop what
+  they did before, and so do runs with the documented `setcap` line or under
+  the systemd unit, apart from the CAP_NET_RAW change below.
 - **The process-attribution thread no longer keeps every capability
   netwatch started with.** It reads other processes' socket fds in `/proc`
   to name each connection's owner, so it runs outside the sandbox, and it
@@ -227,12 +229,16 @@ All notable changes to NetWatch will be documented in this file.
   release notes overstated protection by saying a compromised parser cannot
   read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.
   Threads share memory and descriptors, the proc broker is outside Landlock,
-  and outbound networking remains unrestricted. Under the `setcap` line or
-  sudo, the default best-effort mode leaves CAP_NET_RAW on every confined
-  thread, the parser included, so capture can reopen, and every thread
-  shares the open capture descriptor: a compromised parser can open or use
-  raw sockets. Only `--sandbox-strict` drops CAP_NET_RAW, and it does not
-  close a descriptor already open. Root operation has limited containment.
+  and outbound networking was unrestricted. From this release parser threads
+  cannot connect or bind TCP sockets on Linux 6.7 or newer, which still
+  leaves them UDP and the other ways out listed below. Under the `setcap`
+  line or sudo, the default best-effort mode left CAP_NET_RAW on every
+  confined thread, the parser included, so capture could reopen, and only
+  `--sandbox-strict` dropped it. Parser and capture threads now drop it in
+  every mode, but that does not close a descriptor already open, and every
+  thread shares the open capture descriptor, so a compromised parser can
+  still capture and inject through it. Root operation has limited
+  containment.
   The preferred Linux setup restricts a capability-enabled binary to a
   dedicated group; policy and endpoint tables are checked in tests, and the
   outbound inventory lists the trace to 1.1.1.1 that every TUI session runs
