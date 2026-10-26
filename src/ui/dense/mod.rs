@@ -2891,6 +2891,45 @@ mod tests {
         }
     }
 
+    /// A value is cut between the graphemes ratatui lays out, by the columns
+    /// it gives each one. Measured with unicode-width and cut a char at a
+    /// time, eight `ﾊﾟ` were not cut at all, and right-aligned they ran into
+    /// the next column. Eight `❤️` or `#️⃣` were cut one late, so the column
+    /// edge clipped the last one and the `…`. `👍🏽` was cut short, the last
+    /// hand without its skin tone.
+    #[test]
+    fn a_wide_value_is_cut_inside_its_column() {
+        for col in [left(0, 15, "process"), right(0, 15, "process")] {
+            for base in [
+                "ﾊﾟ",
+                "❤\u{FE0F}",
+                "#\u{FE0F}\u{20E3}",
+                "👍\u{1F3FD}",
+                "👨\u{200D}👩\u{200D}👧",
+            ] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 1)).unwrap();
+                terminal
+                    .draw(|f| {
+                        f.buffer_mut()[(15, 0)].set_symbol("|");
+                        cell(f, &col, 0, &base.repeat(8), Style::default());
+                    })
+                    .unwrap();
+                let buf = terminal.backend().buffer();
+                let tag = format!("{base:?} {:?}", col.align);
+                assert_eq!(buf[(15, 0)].symbol(), "|", "{tag} ran into the next column");
+                // Each is 2 columns, so seven and the `…` fill the 15. A wide
+                // grapheme's second cell is blank.
+                let drawn: String = (0..15).map(|x| buf[(x, 0)].symbol()).collect();
+                assert_eq!(
+                    drawn.replace(' ', ""),
+                    format!("{}…", base.repeat(7)),
+                    "{tag}"
+                );
+            }
+        }
+    }
+
     /// Dense advertises its keybinds in the box borders — that is what buys the
     /// layout its zero chrome rows, and it means the border is the only
     /// documentation most users will read. So a key printed there must exist.
