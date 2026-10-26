@@ -23,10 +23,11 @@ fn threat_model_policy_tables_match_code() {
     assert_eq!(
         block("policy:caps"),
         format!(
-            "default: {}\nstrict-extra: {}\nparser-extra: {}\nbpf-load: {}\nproc-broker: {}",
+            "default: {}\nstrict-extra: {}\nparser-extra: {}\nafter-open: {}\nbpf-load: {}\nproc-broker: {}",
             caps(linux::CAPS_TO_DROP_DEFAULT),
             caps(linux::CAPS_TO_DROP_STRICT),
             caps(linux::CAPS_TO_DROP_PARSER),
+            caps(linux::CAPS_TO_DROP_AFTER_OPEN),
             caps(linux::CAPS_FOR_BPF_LOAD),
             caps(linux::CAPS_FOR_PROC_BROKER)
         )

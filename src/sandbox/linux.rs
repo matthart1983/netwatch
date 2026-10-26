@@ -12,7 +12,7 @@
 //! rules at all.
 
 use super::paths::SandboxPaths;
-use super::{Mode, Report, Role};
+use super::{CaptureAuthority, Mode, NetRaw, Report, Role};
 
 use caps::{CapSet, Capability, CapsHashSet};
 use landlock::{
@@ -54,9 +54,9 @@ pub(crate) const PARSER_FS: AccessFs = AccessFs::ResolveUnix;
 /// access in the user's directories (CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH,
 /// CAP_FOWNER, CAP_CHOWN, CAP_FSETID), limits and scheduling
 /// (CAP_SYS_RESOURCE, CAP_SYS_NICE, CAP_IPC_LOCK), CAP_NET_BIND_SERVICE for a
-/// metrics port below 1024, CAP_NET_RAW on main and the network workers so
-/// capture can reopen (see `CAPS_TO_DROP_STRICT` and `CAPS_TO_DROP_PARSER`),
-/// and for now CAP_NET_ADMIN.
+/// metrics port below 1024, and CAP_NET_RAW on main and the network workers in
+/// a best-effort TUI so capture can reopen (see `CAPS_TO_DROP_STRICT`,
+/// `CAPS_TO_DROP_PARSER` and `CAPS_TO_DROP_AFTER_OPEN`).
 pub(crate) const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
     // Once the kprobe is attached and the ringbuffer is open, we don't need
     // to load new BPF programs at runtime.
@@ -114,6 +114,11 @@ pub(crate) const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
     // Checked nowhere in the kernel; dropped so every capability is either
     // here or kept for a reason above.
     Capability::CAP_NET_BROADCAST,
+    // Interfaces, routes and firewall rules. No code path configures any.
+    // There is no ethtool or SIOCS* ioctl, `iw dev link` reads unprivileged,
+    // inet_diag reads over netlink, and promiscuous capture opens with
+    // CAP_NET_RAW alone.
+    Capability::CAP_NET_ADMIN,
 ];
 
 /// Additional caps dropped in `Mode::Strict` only. CAP_NET_RAW is the
@@ -131,9 +136,18 @@ pub(crate) const CAPS_TO_DROP_STRICT: &[Capability] = &[Capability::CAP_NET_RAW]
 /// does not mediate raw or packet sockets, so this is what stops a parser
 /// opening one. Capture opens its device before entry, and every reopen
 /// (`c`, `i`, `Shift+R`) runs on a new thread main starts, which keeps
-/// CAP_NET_RAW in best-effort. The open device is not revoked: whoever
+/// CAP_NET_RAW in a best-effort TUI. The open device is not revoked: whoever
 /// holds its descriptor can still capture and inject on it.
 pub(crate) const CAPS_TO_DROP_PARSER: &[Capability] = &[Capability::CAP_NET_RAW];
+
+/// Additional caps main and the network workers drop under
+/// [`CaptureAuthority::DropAfterOpen`]: in the daemon, the Diagnose CLI and
+/// strict sessions, which open capture once and never reopen it. Main drops
+/// after `start_workers`, so capture has opened by then. The `ping` that
+/// health falls back to, and Diagnose's PMTU probe, can hold no more than the
+/// worker running them, so on a host whose `ping_group_range` excludes the
+/// user both fail there and health falls back to TCP.
+pub(crate) const CAPS_TO_DROP_AFTER_OPEN: &[Capability] = &[Capability::CAP_NET_RAW];
 
 /// What loading and attaching a BPF program needs. CAP_SYS_ADMIN is the
 /// pre-5.8 fallback and is listed for the same kernels the drop list names.
@@ -166,35 +180,46 @@ pub fn drop_bpf_caps() -> Result<(), String> {
     Ok(())
 }
 
-/// Drop every capability but [`CAPS_FOR_PROC_BROKER`] from the calling
+/// Drop every capability `role` does not keep unconfined from the calling
 /// thread's Effective, Inheritable, Permitted and Ambient sets. No Landlock.
-pub fn relinquish_caps(report: &mut Report) {
+pub fn relinquish_caps(role: Role, report: &mut Report) {
     let held = held_caps(report);
-    for cap in broker_drop_set(&held) {
-        drop_verified(
-            cap,
-            &[
-                CapSet::Effective,
-                CapSet::Inheritable,
-                CapSet::Permitted,
-                CapSet::Ambient,
-            ],
-            report,
-        );
+    for cap in relinquish_set(&held, kept_unconfined(role)) {
+        drop_verified(cap, ALL_SETS, report);
     }
+    record_net_raw(&held, report);
     record_retained(report);
 }
 
-/// Everything in `held` the broker does not keep, in capability order.
-fn broker_drop_set(held: &CapsHashSet) -> Vec<Capability> {
+/// What a thread that never enters keeps: the broker its scan's two
+/// capabilities, any other thread nothing.
+fn kept_unconfined(role: Role) -> &'static [Capability] {
+    match role {
+        Role::Broker => CAPS_FOR_PROC_BROKER,
+        _ => &[],
+    }
+}
+
+/// Everything in `held` but `keep`, in capability order.
+fn relinquish_set(held: &CapsHashSet, keep: &[Capability]) -> Vec<Capability> {
     let mut drop: Vec<_> = held
         .iter()
-        .filter(|cap| !CAPS_FOR_PROC_BROKER.contains(cap))
+        .filter(|cap| !keep.contains(cap))
         .copied()
         .collect();
     drop.sort_by_key(|cap| cap.index());
     drop
 }
+
+/// Every set a drop is checked in. The kernel lowers a capability's Ambient
+/// bit when it leaves Permitted or Inheritable; checking it too makes an
+/// Ambient grant, as the systemd unit gives, visible if that ever fails.
+const ALL_SETS: &[CapSet] = &[
+    CapSet::Effective,
+    CapSet::Inheritable,
+    CapSet::Permitted,
+    CapSet::Ambient,
+];
 
 /// Drop capabilities, then stack the filesystem layer and the role's layer,
 /// in that order. A worker started from main carries main's layer too, and
@@ -205,11 +230,12 @@ pub fn apply(
     paths: &SandboxPaths,
     retain: super::Retain,
     role: Role,
+    authority: CaptureAuthority,
     report: &mut Report,
 ) {
     report.mode.effective = Some(mode.label());
 
-    drop_caps(mode, retain, role, report);
+    drop_caps(mode, retain, role, authority, report);
     record_retained(report);
 
     let result = if let Some(prepared) = super::worker::prepared_ruleset() {
@@ -255,9 +281,9 @@ pub fn apply(
     }
 }
 
-/// The capabilities a `role` thread drops on entry in `mode`, before
-/// `Retain` holds any back.
-fn drop_list(mode: Mode, role: Role) -> Vec<Capability> {
+/// The capabilities a `role` thread drops on entry in `mode` under
+/// `authority`, before `Retain` holds any back.
+fn drop_list(mode: Mode, role: Role, authority: CaptureAuthority) -> Vec<Capability> {
     let mut drop = CAPS_TO_DROP_DEFAULT.to_vec();
     let strict: &[Capability] = if matches!(mode, Mode::Strict) {
         CAPS_TO_DROP_STRICT
@@ -269,7 +295,12 @@ fn drop_list(mode: Mode, role: Role) -> Vec<Capability> {
     } else {
         &[]
     };
-    for cap in strict.iter().chain(parser) {
+    let after_open: &[Capability] = if authority == CaptureAuthority::DropAfterOpen {
+        CAPS_TO_DROP_AFTER_OPEN
+    } else {
+        &[]
+    };
+    for cap in strict.iter().chain(parser).chain(after_open) {
         if !drop.contains(cap) {
             drop.push(*cap);
         }
@@ -277,9 +308,15 @@ fn drop_list(mode: Mode, role: Role) -> Vec<Capability> {
     drop
 }
 
-fn drop_caps(mode: Mode, retain: super::Retain, role: Role, report: &mut Report) {
+fn drop_caps(
+    mode: Mode,
+    retain: super::Retain,
+    role: Role,
+    authority: CaptureAuthority,
+    report: &mut Report,
+) {
     let held = held_caps(report);
-    for cap in &drop_list(mode, role) {
+    for cap in &drop_list(mode, role, authority) {
         // Held deliberately and briefly — see `Retain`. The worker drops
         // them itself once the load is done, and the report says which
         // worker held what until it did.
@@ -290,13 +327,26 @@ fn drop_caps(mode: Mode, retain: super::Retain, role: Role, report: &mut Report)
         // Only what the thread holds: every worker entry runs this, and an
         // unprivileged one holds nothing on the list.
         if held.contains(cap) {
-            drop_verified(
-                *cap,
-                &[CapSet::Effective, CapSet::Inheritable, CapSet::Permitted],
-                report,
-            );
+            drop_verified(*cap, ALL_SETS, report);
         }
     }
+    record_net_raw(&held, report);
+}
+
+/// Record what the drops left of CAP_NET_RAW, given what the thread `held`
+/// before them.
+fn record_net_raw(held: &CapsHashSet, report: &mut Report) {
+    let cap = Capability::CAP_NET_RAW;
+    let still = [CapSet::Permitted, CapSet::Inheritable]
+        .into_iter()
+        .any(|set| caps::has_cap(None, set, cap).unwrap_or(true));
+    report.platform.capture_authority = if !held.contains(&cap) {
+        NetRaw::NotHeld
+    } else if still {
+        NetRaw::RetainedForReopen
+    } else {
+        NetRaw::Dropped
+    };
 }
 
 /// Every capability the calling thread holds in any set. Effective is within
@@ -806,6 +856,7 @@ mod tests {
             Mode::BestEffort,
             super::super::Retain::Nothing,
             Role::Network,
+            CaptureAuthority::RetainForReopen,
             &mut report,
         );
         assert!(
@@ -819,6 +870,7 @@ mod tests {
             Mode::BestEffort,
             super::super::Retain::BpfLoad,
             Role::Parser,
+            CaptureAuthority::DropAfterOpen,
             &mut report,
         );
         // Reported whether or not the process had them: the field says what
@@ -870,17 +922,37 @@ mod tests {
     #[test]
     fn besteffort_keeps_cap_net_raw_for_pcap_reopen() {
         // Regression: pcap re-opens (Packets `c` toggle, interface cycle
-        // via `i`, Flight Recorder arm) need CAP_NET_RAW. Dropping it in
-        // BestEffort produced "Capture failed: libpcap error: socket:
-        // Operation not permitted" on Linux NUCs. Strict still drops it
-        // — those users opted in to fail-closed semantics.
+        // via `i`, Flight Recorder arm) need CAP_NET_RAW on main, which
+        // starts each new capture thread. Dropping it in a best-effort TUI
+        // produced "Capture failed: libpcap error: socket: Operation not
+        // permitted" on Linux NUCs. Strict still drops it, since those users
+        // opted in to fail-closed semantics, and so do the sessions that
+        // never reopen.
         assert!(
             !CAPS_TO_DROP_DEFAULT.contains(&Capability::CAP_NET_RAW),
             "BestEffort must keep CAP_NET_RAW so capture toggle works"
         );
         assert!(
+            !drop_list(
+                Mode::BestEffort,
+                Role::Main,
+                CaptureAuthority::RetainForReopen
+            )
+            .contains(&Capability::CAP_NET_RAW),
+            "a best-effort TUI's main must keep CAP_NET_RAW so capture toggle works"
+        );
+        assert!(
             CAPS_TO_DROP_STRICT.contains(&Capability::CAP_NET_RAW),
             "Strict mode should still drop CAP_NET_RAW (opt-in trade-off)"
+        );
+        assert!(
+            drop_list(
+                Mode::BestEffort,
+                Role::Main,
+                CaptureAuthority::DropAfterOpen
+            )
+            .contains(&Capability::CAP_NET_RAW),
+            "the daemon never reopens, so its main drops CAP_NET_RAW"
         );
     }
 
@@ -911,14 +983,14 @@ mod tests {
             Capability::CAP_BPF,
             Capability::CAP_PERFMON,
             Capability::CAP_SYS_ADMIN,
+            Capability::CAP_NET_ADMIN,
         ] {
             assert!(CAPS_TO_DROP_DEFAULT.contains(&cap), "{cap} kept under root");
         }
         // Everything else is kept on purpose: a root session's file access in
         // the user's directories, limits and scheduling, a low metrics port,
-        // reopening capture, and for now CAP_NET_ADMIN. A capability in
-        // neither list, such as one a caps upgrade adds, fails here until
-        // someone decides.
+        // and reopening capture. A capability in neither list, such as one a
+        // caps upgrade adds, fails here until someone decides.
         let kept = [
             Capability::CAP_CHOWN,
             Capability::CAP_DAC_OVERRIDE,
@@ -929,7 +1001,6 @@ mod tests {
             Capability::CAP_SYS_NICE,
             Capability::CAP_IPC_LOCK,
             Capability::CAP_NET_BIND_SERVICE,
-            Capability::CAP_NET_ADMIN,
             Capability::CAP_NET_RAW,
         ];
         for cap in caps::all() {
@@ -945,7 +1016,7 @@ mod tests {
     fn broker_relinquish_keeps_only_ptrace_and_dac_read_search() {
         // Root's set, which the broker starts with under sudo.
         let full = caps::all();
-        let dropped = broker_drop_set(&full);
+        let dropped = relinquish_set(&full, kept_unconfined(Role::Broker));
         assert_eq!(dropped.len(), full.len() - CAPS_FOR_PROC_BROKER.len());
         for cap in [Capability::CAP_SYS_PTRACE, Capability::CAP_DAC_READ_SEARCH] {
             assert!(!dropped.contains(&cap), "{cap} dropped");
@@ -961,10 +1032,20 @@ mod tests {
             assert!(dropped.contains(&cap), "{cap} kept");
         }
 
+        // Any other thread that never enters, such as the TUI's shutdown
+        // deadline or a capture thread that failed to open, keeps nothing.
+        for role in [Role::Parser, Role::Capture, Role::Network, Role::Main] {
+            assert!(kept_unconfined(role).is_empty(), "{role:?}");
+            assert_eq!(
+                relinquish_set(&full, kept_unconfined(role)).len(),
+                full.len()
+            );
+        }
+
         // On a real thread, whatever it held, only those two remain.
         let (report, permitted) = std::thread::spawn(|| {
             let mut report = Report::default();
-            relinquish_caps(&mut report);
+            relinquish_caps(Role::Broker, &mut report);
             (report, caps::read(None, CapSet::Permitted).unwrap())
         })
         .join()
@@ -992,9 +1073,11 @@ mod tests {
                 Mode::Strict,
                 super::super::Retain::Nothing,
                 Role::Parser,
+                CaptureAuthority::DropAfterOpen,
                 &mut report,
             );
-            relinquish_caps(&mut report);
+            assert_eq!(report.platform.capture_authority, NetRaw::NotHeld);
+            relinquish_caps(Role::Broker, &mut report);
             assert!(
                 report.mode.warnings.is_empty(),
                 "{:?}",
@@ -1002,6 +1085,7 @@ mod tests {
             );
             assert!(report.platform.caps_dropped.is_empty());
             assert!(report.platform.caps_retained.is_empty());
+            assert_eq!(report.platform.capture_authority, NetRaw::NotHeld);
         })
         .join()
         .unwrap();
@@ -1024,14 +1108,22 @@ mod tests {
         }
     }
 
-    /// Apply `role`'s best-effort policy on the calling thread.
+    /// Apply `role`'s best-effort policy on the calling thread, as a TUI
+    /// session would.
     fn enter_as(role: Role, paths: &SandboxPaths) -> Report {
+        enter_under(role, paths, CaptureAuthority::RetainForReopen)
+    }
+
+    /// Apply `role`'s best-effort policy on the calling thread under
+    /// `authority`.
+    fn enter_under(role: Role, paths: &SandboxPaths, authority: CaptureAuthority) -> Report {
         let mut report = Report::default();
         apply(
             Mode::BestEffort,
             paths,
             super::super::Retain::Nothing,
             role,
+            authority,
             &mut report,
         );
         report
@@ -1304,115 +1396,113 @@ mod tests {
     }
 
     #[test]
-    fn parser_and_capture_threads_drop_cap_net_raw_in_every_mode() {
+    fn drop_list_for_authority() {
         // The drop itself is checked below, in a user namespace, which CI's
-        // runners refuse. This checks the list without one.
+        // runners refuse. This checks the list without one. Parser and
+        // capture threads drop CAP_NET_RAW in every mode; main and the
+        // network workers only where capture never reopens.
         for mode in [Mode::BestEffort, Mode::Strict] {
             let strict = matches!(mode, Mode::Strict);
-            for (role, drops) in [
-                (Role::Parser, true),
-                (Role::Capture, true),
-                (Role::Broker, true),
-                (Role::Network, strict),
-                (Role::Main, strict),
+            for authority in [
+                CaptureAuthority::RetainForReopen,
+                CaptureAuthority::DropAfterOpen,
             ] {
-                let drop = drop_list(mode, role);
-                assert_eq!(
-                    drop.contains(&Capability::CAP_NET_RAW),
-                    drops,
-                    "{role:?} in {mode:?}"
-                );
-                assert!(CAPS_TO_DROP_DEFAULT.iter().all(|cap| drop.contains(cap)));
+                let after_open = authority == CaptureAuthority::DropAfterOpen;
+                for (role, drops) in [
+                    (Role::Parser, true),
+                    (Role::Capture, true),
+                    (Role::Broker, true),
+                    (Role::Network, strict || after_open),
+                    (Role::Main, strict || after_open),
+                ] {
+                    let drop = drop_list(mode, role, authority);
+                    assert_eq!(
+                        drop.contains(&Capability::CAP_NET_RAW),
+                        drops,
+                        "{role:?} in {mode:?} under {authority:?}"
+                    );
+                    assert!(
+                        drop.contains(&Capability::CAP_NET_ADMIN),
+                        "{role:?} in {mode:?} under {authority:?}"
+                    );
+                    assert!(CAPS_TO_DROP_DEFAULT.iter().all(|cap| drop.contains(cap)));
+                }
             }
         }
     }
 
     #[test]
     fn denied_thread_drops_cap_net_raw_only_on_itself() {
-        const CHILD: &str = "NETWATCH_NET_RAW_DROP_TEST";
-        let net_raw = |set| caps::has_cap(None, set, Capability::CAP_NET_RAW).unwrap();
-        if !net_raw(CapSet::Effective) {
-            assert!(
-                std::env::var_os(CHILD).is_none(),
-                "the user namespace gave no CAP_NET_RAW"
-            );
-            // Root in a new user namespace holds every capability in it.
-            let unshare = || {
-                let mut command = std::process::Command::new("unshare");
-                command.args(["--user", "--map-root-user"]);
-                command
-            };
-            let status = unshare()
-                .args(["cat", "/proc/self/status"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default();
-            let effective = status
-                .lines()
-                .find_map(|l| l.strip_prefix("CapEff:"))
-                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-                .unwrap_or(0);
-            if effective & (1 << Capability::CAP_NET_RAW.index()) == 0 {
-                eprintln!("skipped: no user namespace with CAP_NET_RAW here");
-                return;
-            }
-            let result = unshare()
-                .arg(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "sandbox::linux::tests::denied_thread_drops_cap_net_raw_only_on_itself",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::linux::tests::denied_thread_drops_cap_net_raw_only_on_itself",
+        ) {
             return;
         }
-        for (role, keeps) in [
-            (Role::Parser, false),
-            (Role::Capture, false),
-            (Role::Network, true),
-            (Role::Main, true),
+        let held = |cap, set| caps::has_cap(None, set, cap).unwrap();
+        // The sets the calling thread holds `cap` in, by name.
+        let in_all = move |cap| {
+            ALL_SETS
+                .iter()
+                .filter(|&&set| held(cap, set))
+                .map(|set| format!("{set:?}"))
+                .collect::<Vec<_>>()
+        };
+        for (authority, network_keeps) in [
+            (CaptureAuthority::RetainForReopen, true),
+            (CaptureAuthority::DropAfterOpen, false),
         ] {
-            let (report, effective, permitted) = std::thread::spawn(move || {
-                let report = enter_as(role, &SandboxPaths::default());
-                (
-                    report,
-                    net_raw(CapSet::Effective),
-                    net_raw(CapSet::Permitted),
-                )
-            })
-            .join()
-            .unwrap();
-            assert_eq!(
-                (effective, permitted),
-                (keeps, keeps),
-                "{role:?}: {report:?}"
-            );
-            assert_eq!(
-                report
-                    .platform
-                    .caps_dropped
-                    .contains(&Capability::CAP_NET_RAW.to_string()),
-                !keeps,
-                "{role:?}: {report:?}"
-            );
-            assert!(
-                report.mode.warnings.is_empty(),
-                "{role:?}: {:?}",
-                report.mode.warnings
-            );
+            for (role, keeps) in [
+                (Role::Parser, false),
+                (Role::Capture, false),
+                (Role::Network, network_keeps),
+                (Role::Main, network_keeps),
+            ] {
+                let (report, net_raw, net_admin) = std::thread::spawn(move || {
+                    let report = enter_under(role, &SandboxPaths::default(), authority);
+                    (
+                        report,
+                        in_all(Capability::CAP_NET_RAW),
+                        in_all(Capability::CAP_NET_ADMIN),
+                    )
+                })
+                .join()
+                .unwrap();
+                let context = format!("{role:?} under {authority:?}: {report:?}");
+                // Root in a user namespace holds every capability in its
+                // Effective, Permitted and Bounding sets, none Inheritable
+                // or Ambient.
+                let kept: &[&str] = if keeps {
+                    &["Effective", "Permitted"]
+                } else {
+                    &[]
+                };
+                assert_eq!(net_raw, kept, "{context}");
+                assert!(net_admin.is_empty(), "{context}");
+                let dropped = &report.platform.caps_dropped;
+                assert_eq!(
+                    dropped.contains(&Capability::CAP_NET_RAW.to_string()),
+                    !keeps,
+                    "{context}"
+                );
+                assert!(
+                    dropped.contains(&Capability::CAP_NET_ADMIN.to_string()),
+                    "{context}"
+                );
+                assert_eq!(
+                    report.platform.capture_authority,
+                    if keeps {
+                        NetRaw::RetainedForReopen
+                    } else {
+                        NetRaw::Dropped
+                    },
+                    "{context}"
+                );
+                assert!(report.mode.warnings.is_empty(), "{context}");
+            }
         }
-        // The thread that started them keeps it.
-        assert!(net_raw(CapSet::Effective) && net_raw(CapSet::Permitted));
+        // The thread that started them keeps both.
+        assert!(held(Capability::CAP_NET_RAW, CapSet::Effective));
+        assert!(held(Capability::CAP_NET_ADMIN, CapSet::Effective));
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub fn role_for(name: &str) -> Role {
         // keylog, metrics-listener, metrics-client, ebpf, connections,
         // tcp-info, traffic, process-cpu, terminal, logging, capture-export,
         // policy-preflight and pktap, and any name added without a row here.
+        // shutdown-deadline never enters; as a parser it relinquishes every
+        // capability.
         _ => Role::Parser,
     }
 }
@@ -96,6 +98,7 @@ mod tests {
         ("capture-export", Role::Parser),
         ("policy-preflight", Role::Parser),
         ("pktap", Role::Parser),
+        ("shutdown-deadline", Role::Parser),
     ];
 
     #[test]

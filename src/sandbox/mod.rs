@@ -9,14 +9,18 @@
 //! strict requires the TCP deny (Landlock ABI 4, Linux 6.7). Main applies its
 //! policy after resource startup. macOS, Windows and FreeBSD have no backend.
 //!
-//! Selected capability removals are checked after each attempt. Best-effort
-//! keeps CAP_NET_RAW on main and the network workers so capture can reopen;
-//! parser and capture threads drop it in every mode, and strict drops it on
-//! every confined thread, so later capture reopening may fail.
+//! Selected capability removals are checked after each attempt. Every
+//! confined thread drops CAP_NET_ADMIN, which nothing uses. A best-effort TUI
+//! keeps CAP_NET_RAW on main and the network workers so capture can reopen
+//! ([`CaptureAuthority`]); parser and capture threads drop it in every mode,
+//! and the daemon, the Diagnose CLI and strict drop it on every confined
+//! thread, so a later capture reopen fails there. Once main has entered,
+//! [`audit`] checks every thread of the process for either capability.
 //! Worker reports describe policy entry, not an exploit-proof process boundary.
 //! The eBPF SDK reader inherits the eBPF worker's policy but retains load
 //! capabilities. See docs/THREAT-MODEL.md for the remaining containment limits.
 
+pub mod audit;
 pub mod paths;
 pub mod roles;
 pub mod worker;
@@ -60,6 +64,52 @@ impl Mode {
             "off" | "disabled" | "false" | "no" | "0" => Mode::Disabled,
             "strict" => Mode::Strict,
             _ => Mode::BestEffort,
+        }
+    }
+}
+
+/// Whether main and the network workers keep CAP_NET_RAW after capture has
+/// opened.
+///
+/// Capabilities are per thread, and every capture reopen (`c`, `i`,
+/// `Shift+R`) opens a new packet socket on a thread main starts, so keeping
+/// the ability to reopen means main keeps CAP_NET_RAW. Dropping it does not
+/// revoke the descriptor capture already holds, which can still capture and
+/// inject on every interface in the network namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureAuthority {
+    /// A best-effort TUI session, which reopens capture on a key press.
+    RetainForReopen,
+    /// Sessions that open capture once and never reopen it: the daemon,
+    /// `diagnose run` and `diagnose coverage`, and any strict session. Also
+    /// what a thread gets that enters before the session says which it is.
+    DropAfterOpen,
+}
+
+/// What a thread's entry left of CAP_NET_RAW, the capability every capture
+/// open needs. Reported per component as its capture authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetRaw {
+    /// Held before entry and verified absent after it.
+    Dropped,
+    /// Still held after entry. Main and the network workers keep it under
+    /// [`CaptureAuthority::RetainForReopen`]; anywhere else the report's
+    /// warnings say why the drop failed.
+    RetainedForReopen,
+    /// The thread never held it.
+    NotHeld,
+    /// No capability backend ran, off Linux or with the sandbox disabled.
+    #[default]
+    NotApplicable,
+}
+
+impl NetRaw {
+    pub fn label(self) -> &'static str {
+        match self {
+            NetRaw::Dropped => "dropped",
+            NetRaw::RetainedForReopen => "retained_for_reopen",
+            NetRaw::NotHeld => "not_held",
+            NetRaw::NotApplicable => "not_applicable",
         }
     }
 }
@@ -133,6 +183,9 @@ pub struct PlatformReport {
     /// `caps_retained` so "still held because the policy kept it" cannot be
     /// read as "the drop failed".
     pub caps_retained_for_load: Vec<String>,
+    /// Linux: what this thread's entry did with CAP_NET_RAW. Which threads of
+    /// the process still hold it is process-wide, in [`audit`].
+    pub capture_authority: NetRaw,
     /// macOS: whether `sandbox_init_with_parameters` returned 0.
     pub macos_seatbelt: bool,
     /// Windows: whether the restricted-token + job-object pair applied.
@@ -210,7 +263,8 @@ pub fn apply_retaining(mode: Mode, paths: &SandboxPaths, retain: Retain, role: R
 
     #[cfg(target_os = "linux")]
     {
-        linux::apply(mode, paths, retain, role, &mut report);
+        let authority = worker::capture_authority();
+        linux::apply(mode, paths, retain, role, authority, &mut report);
     }
 
     #[cfg(not(target_os = "linux"))]

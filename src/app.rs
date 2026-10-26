@@ -1894,6 +1894,9 @@ fn shutdown_deadline() {
     let _ = std::thread::Builder::new()
         .name("shutdown-deadline".into())
         .spawn(move || {
+            // Started before main drops anything and never confined, so it
+            // would keep every capability netwatch started with.
+            crate::sandbox::worker::relinquish("shutdown-deadline");
             if let Some(signal) = signals.forever().next() {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 if !SHUTDOWN_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {

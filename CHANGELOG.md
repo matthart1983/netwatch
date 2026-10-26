@@ -258,11 +258,12 @@ All notable changes to NetWatch will be documented in this file.
   CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
   memory, page cache included, through `/proc/kcore`, past every filesystem
   rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
-  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more. Main and the network
-  workers keep 11: file access in the user's directories, resource limits
-  and scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture,
-  and CAP_NET_ADMIN. Parser and capture threads keep 10, without
-  CAP_NET_RAW, and so does every confined thread in strict mode. Root still
+  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more. In the TUI, main and
+  the network workers keep 10: file access in the user's directories,
+  resource limits and scheduling, a metrics port below 1024, and CAP_NET_RAW
+  to reopen capture. Parser and capture threads keep 9, without CAP_NET_RAW,
+  and so does every confined thread in strict mode, the daemon and the
+  Diagnose CLI. Root still
   owns most files, so under sudo the sandbox
   remains defence in depth, not containment. Losing CAP_SYS_PTRACE costs
   something under sudo on a kernel where Landlock does not enforce (older
@@ -399,15 +400,39 @@ All notable changes to NetWatch will be documented in this file.
   raw and packet sockets and inject frames. Those threads now drop it in
   every mode. Capture opens its device before it drops the capability, and
   `c`, `i` and `Shift+R` reopen capture on a new thread, so they keep
-  working. Main and the network workers keep CAP_NET_RAW in best-effort.
-  The capture thread still holds the device it opened, which can capture
-  and inject on its interface.
+  working. Main and the network workers keep CAP_NET_RAW in a best-effort
+  TUI. The capture thread still holds the device it opened, which can
+  capture and inject on its interface.
 - **The capture thread can no longer write files.** It had every write
   grant the other confined threads have, so a parser bug in it could
   rewrite `config.toml`, for example to turn the sandbox off for the next
   start. Its Landlock layer now allows reading only. Nothing in the capture
   loop writes a file; exports and incident bundles are written by other
   threads. The other confined threads can still write the configuration.
+- **The daemon and the Diagnose CLI hold no raw-socket capability once
+  capture has opened, and no thread keeps CAP_NET_ADMIN.** Under the
+  `setcap` line, sudo or the systemd unit, `netwatch daemon`, `diagnose run`
+  and `diagnose coverage` kept CAP_NET_RAW on the main thread and the
+  network workers for the whole session, though none of them ever reopens
+  capture. A thread running injected code could open raw sockets, set
+  `IP_TRANSPARENT` or `SO_MARK`, and hand the capability to the commands it
+  started through the Ambient set the systemd unit grants. Run as root,
+  every thread also kept CAP_NET_ADMIN, which nothing in netwatch uses.
+  Promiscuous capture opens with CAP_NET_RAW alone. Those sessions now drop
+  CAP_NET_RAW from main and the network workers after capture opens, and
+  every thread drops CAP_NET_ADMIN in every mode, so `netwatch doctor
+  --check-capture --json` under sudo no longer lists it in `caps_retained`.
+  The TUI keeps CAP_NET_RAW on main and the network workers in best-effort
+  mode, so `c`, `i` and `Shift+R` still reopen capture. In strict mode they
+  fail, as before. Once startup is done, netwatch reads every thread's
+  capability sets. If a thread still holds CAP_NET_ADMIN, or CAP_NET_RAW in
+  a session that drops it, netwatch names the thread in a warning, and with
+  `--sandbox-strict` refuses to start. None of this revokes the capture
+  descriptor already open, which every thread shares and which can still
+  capture and inject on any interface in its network namespace. In the
+  daemon and the Diagnose CLI, on a host whose `net.ipv4.ping_group_range`
+  leaves out the user netwatch runs as, the `ping` that health falls back to
+  and the Diagnose PMTU probe now fail, and health measures over TCP instead.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
@@ -436,6 +461,13 @@ All notable changes to NetWatch will be documented in this file.
   kernels with a message, and the `/proc/net` fallback test, which needs no
   TCP deny, runs in best-effort mode. Older kernels, and kernels without
   Landlock, fail both tests as before.
+- **The capability tests cover capture authority.** Which capabilities
+  each role drops in each session, how the startup audit reads a thread's
+  status file, and which session keeps CAP_NET_RAW are checked on every
+  runner. Where a user namespace can be made, the tests also enter each
+  role as root in one, start a capture on a missing interface and audit a
+  thread holding CAP_NET_RAW; CI's runners refuse user namespaces, so
+  those skip there.
 
 ## [0.38.0] - 2026-10-25
 
