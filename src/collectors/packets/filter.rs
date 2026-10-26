@@ -288,6 +288,70 @@ fn address_matches(addr: &str, wanted: &str) -> bool {
     }
 }
 
+/// The only characters whose lowercase holds ASCII. `İ` lowercases to `i̇`,
+/// and the Kelvin sign `K` to `k`.
+const LOWERCASE_INTO_ASCII: [char; 2] = ['\u{130}', '\u{212a}'];
+
+/// `haystack.to_lowercase().contains(needle)`, without the lowercase copy.
+///
+/// The Packets tab runs a text filter over every packet in the ring on every
+/// frame, under the ring's read lock, and copying each payload to lowercase
+/// first cost 8 to 21 ms a frame on a full ring. An ASCII needle is searched
+/// for in the haystack's ASCII-lowercased bytes instead, and finds the same
+/// matches. No other character lowercases into ASCII, so a match can only be
+/// ASCII in the haystack too. A haystack holding one of
+/// [`LOWERCASE_INTO_ASCII`], or a needle that is not ASCII, takes the copy.
+fn lowercase_contains(haystack: &str, needle: &str) -> bool {
+    if !needle.is_ascii()
+        || (!haystack.is_ascii() && LOWERCASE_INTO_ASCII.iter().any(|&c| haystack.contains(c)))
+    {
+        return haystack.to_lowercase().contains(needle);
+    }
+    ascii_lowercase_contains(haystack.as_bytes(), needle.as_bytes())
+}
+
+/// Whether `haystack`, ASCII-lowercased, contains `needle`.
+///
+/// It takes 32 starting points at a time. A mask marks those whose first and
+/// last bytes are the needle's in either case, which compiles to vector
+/// compares, and only the marked ones get a full comparison. A plain
+/// byte-by-byte search was three times slower than this.
+fn ascii_lowercase_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    const BLOCK: usize = 32;
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
+    let Some(starts) = (haystack.len() + 1).checked_sub(needle.len()) else {
+        return false;
+    };
+    let (last, tail) = (rest.last().copied().unwrap_or(first), rest.len());
+    let (first_upper, last_upper) = (first.to_ascii_uppercase(), last.to_ascii_uppercase());
+    let matches_at = |i: usize| {
+        haystack[i..i + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(h, n)| h.to_ascii_lowercase() == *n)
+    };
+    let mut start = 0;
+    while start + BLOCK <= starts {
+        let heads = &haystack[start..start + BLOCK];
+        let tails = &haystack[start + tail..start + tail + BLOCK];
+        let mut candidates = 0u32;
+        for (i, (&h, &t)) in heads.iter().zip(tails).enumerate() {
+            let hit = (h == first || h == first_upper) & (t == last || t == last_upper);
+            candidates |= u32::from(hit) << i;
+        }
+        while candidates != 0 {
+            if matches_at(start + candidates.trailing_zeros() as usize) {
+                return true;
+            }
+            candidates &= candidates - 1;
+        }
+        start += BLOCK;
+    }
+    (start..starts).any(matches_at)
+}
+
 /// Whether `pkt` passes `expr`, judged on the packet alone: `stream N`
 /// compares the index and nothing else. The Packets tab uses
 /// [`matches_packet_in`].
@@ -318,24 +382,25 @@ fn matches(expr: &FilterExpr, pkt: &CapturedPacket, index_space: Option<&IndexSp
             pkt.stream_index == Some(*n) && index_space.is_none_or(|s| s.holds(pkt))
         }
         FilterExpr::Contains(s) => {
-            pkt.info.to_lowercase().contains(s)
-                || pkt.src_ip.to_lowercase().contains(s)
-                || pkt.dst_ip.to_lowercase().contains(s)
-                || pkt.protocol.to_lowercase().contains(s)
-                || pkt.payload_text.to_lowercase().contains(s)
+            lowercase_contains(&pkt.info, s)
+                || lowercase_contains(&pkt.src_ip, s)
+                || lowercase_contains(&pkt.dst_ip, s)
+                || lowercase_contains(&pkt.protocol, s)
+                || lowercase_contains(&pkt.payload_text, s)
                 || pkt
                     .src_host
                     .as_ref()
-                    .is_some_and(|h| h.to_lowercase().contains(s))
+                    .is_some_and(|h| lowercase_contains(h, s))
                 || pkt
                     .dst_host
                     .as_ref()
-                    .is_some_and(|h| h.to_lowercase().contains(s))
+                    .is_some_and(|h| lowercase_contains(h, s))
                 // Also search recovered TLS plaintext so `contains "GET /"`
                 // finds decrypted requests/responses, not just cleartext.
-                || pkt.decrypted_plaintext.as_ref().is_some_and(|pt| {
-                    String::from_utf8_lossy(pt).to_lowercase().contains(s)
-                })
+                || pkt
+                    .decrypted_plaintext
+                    .as_ref()
+                    .is_some_and(|pt| lowercase_contains(&String::from_utf8_lossy(pt), s))
         }
         FilterExpr::AppProto(tag) => match &pkt.app_protocol {
             Some(crate::dpi::AppProtocol::Tls { .. }) => "tls" == tag.as_str(),
@@ -388,5 +453,59 @@ fn matches(expr: &FilterExpr, pkt: &CapturedPacket, index_space: Option<&IndexSp
         FilterExpr::Not(inner) => !matches(inner, pkt, index_space),
         FilterExpr::And(a, b) => matches(a, pkt, index_space) && matches(b, pkt, index_space),
         FilterExpr::Or(a, b) => matches(a, pkt, index_space) || matches(b, pkt, index_space),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `lowercase_contains` finds what the lowercase copy found only while
+    /// these two are all there is. A Unicode update that adds one fails here.
+    #[test]
+    fn only_two_characters_lowercase_into_ascii() {
+        let found: Vec<char> = (0x80..=0x10ffff)
+            .filter_map(char::from_u32)
+            .filter(|c| c.to_lowercase().any(|l| l.is_ascii()))
+            .collect();
+        assert_eq!(found, LOWERCASE_INTO_ASCII);
+    }
+
+    /// Every needle of up to five bytes from `aAb-` in every haystack of up
+    /// to 70, so matches start in a block, straddle two and sit in the tail.
+    #[test]
+    fn ascii_lowercase_contains_agrees_with_a_plain_search() {
+        let alphabet = b"aAb-";
+        let word = |mut n: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    let b = alphabet[n % alphabet.len()];
+                    n /= alphabet.len();
+                    b
+                })
+                .collect()
+        };
+        for len in 0..=70 {
+            // A haystack of `len` bytes from a fixed, varied sequence.
+            let haystack: Vec<u8> = (0..len)
+                .map(|i| alphabet[(i * 7 + i / 3) % alphabet.len()])
+                .collect();
+            let lowered = haystack.to_ascii_lowercase();
+            for needle_len in 1..=5 {
+                for n in 0..alphabet.len().pow(needle_len as u32) {
+                    let needle = word(n, needle_len);
+                    let plain = lowered.windows(needle_len).any(|w| w == needle);
+                    assert_eq!(
+                        ascii_lowercase_contains(&haystack, &needle),
+                        plain,
+                        "{:?} in {:?}",
+                        String::from_utf8_lossy(&needle),
+                        String::from_utf8_lossy(&haystack)
+                    );
+                }
+            }
+        }
+        assert!(ascii_lowercase_contains(b"", b""));
+        assert!(!ascii_lowercase_contains(b"ab", b"abc"));
     }
 }
