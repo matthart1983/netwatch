@@ -424,6 +424,10 @@ mod tests {
     fn isolated_worker_boundaries() {
         const CHILD: &str = "NETWATCH_WORKER_POLICY_TEST";
         let Ok(root) = std::env::var(CHILD) else {
+            if super::super::linux::kernel_denies_files_but_not_tcp() {
+                eprintln!("skipped: strict needs Landlock ABI 4 (Linux 6.7) to deny TCP");
+                return;
+            }
             struct TestDir(std::path::PathBuf);
             impl Drop for TestDir {
                 fn drop(&mut self) {

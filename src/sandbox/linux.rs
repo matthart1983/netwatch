@@ -490,6 +490,20 @@ pub(super) fn prepare_parser_layer(mode: Mode) -> Result<landlock::RulesetCreate
         .map_err(|e| e.to_string())
 }
 
+/// Whether the kernel enforces the filesystem layer in full but cannot deny
+/// TCP, as Linux 6.2 to 6.6 do. Strict refuses every parser thread there, so
+/// a strict test that starts one cannot pass.
+#[cfg(test)]
+pub(super) fn kernel_denies_files_but_not_tcp() -> bool {
+    let required = || Ruleset::default().set_compatibility(CompatLevel::HardRequirement);
+    required()
+        .handle_access(AccessFs::from_all(TARGET_ABI))
+        .is_ok()
+        && required()
+            .handle_access(AccessNet::from_all(PARSER_NET_ABI))
+            .is_err()
+}
+
 /// The capture layer: the parser layer's rights plus every filesystem
 /// right, with the read grants and none of the write grants. Nothing the
 /// capture loop runs writes a file; exports and incident bundles are written

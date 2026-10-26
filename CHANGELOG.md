@@ -300,6 +300,11 @@ All notable changes to NetWatch will be documented in this file.
   capabilities each role drops is also checked without a user namespace,
   which CI's runners refuse, so CI fails if CAP_NET_RAW leaves the parser
   and capture threads' list.
+- **`cargo test` still passes on Linux 6.2 to 6.6.** Strict mode now refuses
+  parser threads there, so the strict worker acceptance test skips on those
+  kernels with a message, and the `/proc/net` fallback test, which needs no
+  TCP deny, runs in best-effort mode. Older kernels, and kernels without
+  Landlock, fail both tests as before.
 
 ## [0.38.0] - 2026-10-25
 
