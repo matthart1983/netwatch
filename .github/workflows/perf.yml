@@ -1,0 +1,90 @@
+name: Perf
+
+# Connection-table scale timings (src/scale_tests.rs): frames, the scroll key,
+# the UI tick's connection consumers and Diagnose's socket join at 2,000,
+# 10,000 and 50,000 synthetic rows, and a real poll of up to 50,000 loopback
+# sockets. Once a week, by hand, and on pull requests that touch the code
+# they time: the views and the sort and caches behind them, the connection
+# collector, what the tick feeds its table to, and Diagnose's sampler and
+# socket classifier. Kept out of ci.yml so the release guard, which waits on
+# every ci.yml run, never waits on this, and not a required check: it gates
+# nothing until it has passed 10 runs in a row. Shared runners are slower
+# and noisier than the reference machine, so the budgets are tripled here,
+# and a budget still Pending on a later branch is printed without failing
+# the job.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/ui/**"
+      - "src/app.rs"
+      - "src/sort.rs"
+      - "src/state.rs"
+      - "src/collectors/connections.rs"
+      - "src/collectors/attribution.rs"
+      - "src/collectors/egress.rs"
+      - "src/collectors/egress/**"
+      - "src/collectors/geo.rs"
+      - "src/collectors/packets/**"
+      - "src/collectors/process_bandwidth.rs"
+      - "src/collectors/tcp_info.rs"
+      - "src/diagnose/live.rs"
+      - "src/diagnose/detectors.rs"
+      - "src/scale_tests.rs"
+      - "src/testutil/**"
+      - "scripts/scale-bench.sh"
+      - ".config/nextest.toml"
+      - ".github/workflows/perf.yml"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-nextest
+
+      # cargo nextest run --release --run-ignored only --no-fail-fast
+      # -E 'test(/scale_/)', then the table of what it measured.
+      - name: Time the connection table at scale
+        env:
+          NW_PERF_SLACK: "3"
+          NW_PERF_STRICT: "0"
+        run: scripts/scale-bench.sh scale-bench.md
+
+      - name: Put the table on the run's summary page
+        if: always()
+        run: |
+          if [ -f scale-bench.md ]; then
+            cat scale-bench.md >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scale-bench
+          path: |
+            scale-bench.md
+            scale-bench.log
+          if-no-files-found: warn

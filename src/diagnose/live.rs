@@ -549,7 +549,7 @@ impl LiveSampler {
         vec![path]
     }
 
-    fn sockets(&mut self, app: &App, thresholds: &Thresholds) -> Vec<SocketObs> {
+    pub(crate) fn sockets(&mut self, app: &App, thresholds: &Thresholds) -> Vec<SocketObs> {
         let (flows, completed) = app.tcp_info.timed_snapshot();
         self.completed.sockets = completed;
         if flows.is_empty() || !crate::collectors::health::ProbeTimes::fresh(completed, 30) {
