@@ -295,7 +295,11 @@ All notable changes to NetWatch will be documented in this file.
   role table does not list, so renaming a network worker can no longer turn
   it into a parser unnoticed. A child test hides Landlock behind a seccomp
   filter and checks that strict mode refuses a parser thread because it
-  cannot deny TCP.
+  cannot deny TCP. Another enters the capture role through the installed
+  policy and checks that it cannot write the configuration. The list of
+  capabilities each role drops is also checked without a user namespace,
+  which CI's runners refuse, so CI fails if CAP_NET_RAW leaves the parser
+  and capture threads' list.
 
 ## [0.38.0] - 2026-10-25
 

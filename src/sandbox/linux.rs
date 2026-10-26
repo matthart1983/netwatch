@@ -255,7 +255,9 @@ pub fn apply(
     }
 }
 
-fn drop_caps(mode: Mode, retain: super::Retain, role: Role, report: &mut Report) {
+/// The capabilities a `role` thread drops on entry in `mode`, before
+/// `Retain` holds any back.
+fn drop_list(mode: Mode, role: Role) -> Vec<Capability> {
     let mut drop = CAPS_TO_DROP_DEFAULT.to_vec();
     let strict: &[Capability] = if matches!(mode, Mode::Strict) {
         CAPS_TO_DROP_STRICT
@@ -272,8 +274,12 @@ fn drop_caps(mode: Mode, retain: super::Retain, role: Role, report: &mut Report)
             drop.push(*cap);
         }
     }
+    drop
+}
+
+fn drop_caps(mode: Mode, retain: super::Retain, role: Role, report: &mut Report) {
     let held = held_caps(report);
-    for cap in &drop {
+    for cap in &drop_list(mode, role) {
         // Held deliberately and briefly — see `Retain`. The worker drops
         // them itself once the load is done, and the report says which
         // worker held what until it did.
@@ -1280,6 +1286,30 @@ mod tests {
             })
             .join()
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn parser_and_capture_threads_drop_cap_net_raw_in_every_mode() {
+        // The drop itself is checked below, in a user namespace, which CI's
+        // runners refuse. This checks the list without one.
+        for mode in [Mode::BestEffort, Mode::Strict] {
+            let strict = matches!(mode, Mode::Strict);
+            for (role, drops) in [
+                (Role::Parser, true),
+                (Role::Capture, true),
+                (Role::Broker, true),
+                (Role::Network, strict),
+                (Role::Main, strict),
+            ] {
+                let drop = drop_list(mode, role);
+                assert_eq!(
+                    drop.contains(&Capability::CAP_NET_RAW),
+                    drops,
+                    "{role:?} in {mode:?}"
+                );
+                assert!(CAPS_TO_DROP_DEFAULT.iter().all(|cap| drop.contains(cap)));
+            }
         }
     }
 

@@ -553,6 +553,32 @@ mod tests {
                 snapshot()
             );
         }
+        // Capture enters with the layer `install` prepared for its role, which
+        // has the read grants and none of the write grants. Every other
+        // confined thread can write the configuration.
+        let config = root.join("config").join("config.toml");
+        for (name, writes) in [("connections", true), ("capture", false)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let config = config.clone();
+            spawn(name, move || {
+                let wrote = std::fs::write(&config, b"sandbox = \"off\"\n");
+                tx.send(wrote.map_err(|e| e.kind())).unwrap();
+            })
+            .join()
+            .unwrap();
+            let expected = if writes {
+                Ok(())
+            } else {
+                Err(std::io::ErrorKind::PermissionDenied)
+            };
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(1)),
+                Ok(expected),
+                "{name}"
+            );
+        }
+        let capture = snapshot()["capture"].report.clone().unwrap();
+        assert_eq!(capture.platform.landlock_layer, Some("capture"));
         // Online lookups are opt-in (off by default, see `geoip_online` in
         // NetwatchConfig); force them on here so the geoip worker actually
         // spawns and this test still covers its sandbox entry.
@@ -626,6 +652,7 @@ mod tests {
             "metrics-listener",
             "metrics-client",
             "boundary-check",
+            "capture",
         ] {
             assert_eq!(
                 net.get(name),
