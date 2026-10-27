@@ -14,6 +14,7 @@
   </p>
   <p align="center">
     <a title="Tool of The Week on Terminal Trove" href="https://terminaltrove.com/netwatch/"><img src="docs/media/terminal_trove_totw_badge.svg" alt="Terminal Trove Tool of The Week" height="54" /></a>
+    <a href="https://trendshift.io/repositories/22467?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-22467" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/22467/daily?language=Rust" alt="matthart1983%2Fnetwatch | Trendshift" width="250" height="55"/></a>
   </p>
 </p>
 
