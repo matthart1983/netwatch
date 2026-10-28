@@ -45,6 +45,9 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
 fn system_directory() -> Option<PathBuf> {
     // MAX_PATH is the documented ceiling for this call.
     let mut buf = [0u16; 260];
+    // SAFETY: `buf` is writable for `buf.len()` UTF-16 units, the size passed,
+    // and the call writes no more than that. When the path does not fit it
+    // returns the size it needs instead, which the check below rejects.
     let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
     if len == 0 || len >= buf.len() {
         return None;
@@ -116,6 +119,9 @@ fn add_npcap_dir_to_search_path() -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
     }
+    // SAFETY: `wide` returns a NUL-terminated UTF-16 copy of `dir`, a
+    // temporary that lives until the call has returned, and the loader keeps
+    // its own copy of the directory rather than the pointer.
     let ok = unsafe { SetDllDirectoryW(wide(dir.as_os_str()).as_ptr()) } != 0;
     ok.then_some(dir)
 }
@@ -133,6 +139,10 @@ fn add_npcap_dir_to_search_path() -> Option<PathBuf> {
 pub fn ensure_wpcap() -> Result<(), String> {
     let npcap_dir = add_npcap_dir_to_search_path();
 
+    // SAFETY: the name is a NUL-terminated UTF-16 temporary that lives until
+    // the call has returned. Loading runs the initialisation of wpcap.dll, the
+    // DLL the capture code imports anyway, and the module is never freed, so
+    // the MSVC build's delay-loaded imports resolved against it stay valid.
     let handle = unsafe { LoadLibraryW(wide(std::ffi::OsStr::new("wpcap.dll")).as_ptr()) };
     if !handle.is_null() {
         return Ok(());

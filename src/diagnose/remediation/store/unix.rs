@@ -46,6 +46,10 @@ impl Directory {
     }
     fn open_file(&self, name: &str, flags: i32) -> io::Result<File> {
         let name = CString::new(name).map_err(io::Error::other)?;
+        // SAFETY: `self.0` is the open directory this `Directory` owns, so its
+        // descriptor is valid for the call, and `name` is a CString that
+        // outlives it. The mode goes through openat's variadic argument as a
+        // C int, the type mode_t is promoted to.
         let fd = unsafe {
             libc::openat(
                 self.0.as_raw_fd(),
@@ -57,6 +61,9 @@ impl Directory {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `fd` is the descriptor openat just returned, checked
+        // non-negative above and owned by nothing else, so `file` takes sole
+        // ownership and closes it once.
         let file = unsafe { File::from_raw_fd(fd) };
         let meta = file.metadata()?;
         if !meta.is_file()
@@ -91,6 +98,8 @@ impl Directory {
     fn replace(&self, from: &str) -> io::Result<()> {
         let from = CString::new(from).map_err(io::Error::other)?;
         let to = CString::new(JOURNAL).unwrap();
+        // SAFETY: both directory descriptors are `self.0`, open for as long as
+        // `self` lives, and `from` and `to` are CStrings that outlive the call.
         if unsafe {
             libc::renameat(
                 self.0.as_raw_fd(),

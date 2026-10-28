@@ -434,6 +434,8 @@ pub(super) fn prepare_ruleset(paths: &SandboxPaths) -> Result<landlock::RulesetC
             }
             if write && path != Path::new("/dev/null") {
                 if !meta.is_dir()
+                    // SAFETY: geteuid takes no arguments, reads no memory of
+                    // ours and cannot fail.
                     || meta.uid() != unsafe { nix::libc::geteuid() }
                     || meta.mode() & 0o077 != 0
                 {
