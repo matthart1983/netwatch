@@ -12,6 +12,7 @@
 //! deliberately without: how long a socket has held its verdict, what the
 //! interface counters were last tick, and the previous trace to each target.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -22,6 +23,7 @@ use super::detectors::{
 };
 use crate::app::App;
 use crate::collectors::connections::Connection;
+use crate::collectors::tcp_info::normalize_endpoint;
 use crate::collectors::traceroute::{TracerouteResult, TracerouteStatus};
 use crate::collectors::traffic::InterfaceTraffic;
 use crate::platform::InterfaceInfo;
@@ -568,7 +570,10 @@ impl LiveSampler {
 
         for ((local, remote), info) in flows.iter() {
             let conn = by_endpoints
-                .get(&(local.as_str(), remote.as_str()))
+                .get(&(
+                    Cow::Borrowed(local.as_str()),
+                    Cow::Borrowed(remote.as_str()),
+                ))
                 .copied();
 
             let mut s = SocketObs {
@@ -587,8 +592,8 @@ impl LiveSampler {
                 ssthresh: info.ssthresh,
                 rwnd: info.rwnd,
                 mss: info.mss,
-                tx_bps: conn.and_then(|c| c.tx_rate).unwrap_or(0.0),
-                rx_bps: conn.and_then(|c| c.rx_rate).unwrap_or(0.0),
+                tx_bps: conn.and_then(|c| c.tx_rate),
+                rx_bps: conn.and_then(|c| c.rx_rate),
                 verdict_age_secs: 0,
             };
 
@@ -613,18 +618,54 @@ impl LiveSampler {
     }
 }
 
+/// A (local, remote) pair spelled as the kernel flows key it.
+pub(crate) type EndpointKey<'a> = (Cow<'a, str>, Cow<'a, str>);
+
 /// The connection-table row for each (local, remote) pair: the first that
 /// has it, as a search of `conns` in order finds. Built once per sample:
 /// searching the table for each kernel flow instead cost about 50 ms a sample
 /// at 10,000 connections.
-pub(crate) fn rows_by_endpoints(conns: &[Connection]) -> HashMap<(&str, &str), &Connection> {
+///
+/// Keyed as the kernel flows are. Rows bracket IPv6 and the flows do not, so
+/// keying rows as the table spells them gave every IPv6 socket no row: no
+/// process, and no rates.
+pub(crate) fn rows_by_endpoints(conns: &[Connection]) -> HashMap<EndpointKey<'_>, &Connection> {
     let mut by_endpoints = HashMap::with_capacity(conns.len());
     for conn in conns {
         by_endpoints
-            .entry((conn.local_addr.as_str(), conn.remote_addr.as_str()))
+            .entry((
+                flow_spelling(&conn.local_addr),
+                flow_spelling(&conn.remote_addr),
+            ))
             .or_insert(conn);
     }
     by_endpoints
+}
+
+/// A row's endpoint as `normalize_endpoint` spells it, without parsing the
+/// address where that would change nothing: parsing every IPv6 row cost the
+/// join twice its budget at 10,000 rows.
+///
+/// Rows spell addresses as `inet_ntop` and Rust's `Display` do, which is the
+/// canonical text `normalize_endpoint` writes too. So an unbracketed row is
+/// already in that form, and a bracketed one only loses its brackets, unless
+/// it holds a dotted IPv4-mapped address, which becomes plain IPv4. Any other
+/// shape, such as lsof's lone closing bracket, takes the full parse.
+fn flow_spelling(addr: &str) -> Cow<'_, str> {
+    match addr
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("]:"))
+    {
+        Some((host, port)) if !host.contains(['.', '[', ']']) => {
+            let mut key = String::with_capacity(host.len() + 1 + port.len());
+            key.push_str(host);
+            key.push(':');
+            key.push_str(port);
+            Cow::Owned(key)
+        }
+        _ if addr.contains(['[', ']']) => Cow::Owned(normalize_endpoint(addr)),
+        _ => Cow::Borrowed(addr),
+    }
 }
 
 fn gateway(app: &App) -> Option<GatewayObs> {
@@ -1191,28 +1232,41 @@ mod tests {
         assert_ne!(restarted, t0);
     }
 
-    /// The index finds the row a search of the table in order would, the
-    /// first of two that share endpoints included, and nothing for a flow
-    /// the table does not list.
+    /// The index finds the row a search of the table in order, by canonical
+    /// endpoints, would: the first of two that share endpoints included, and
+    /// nothing for a flow the table does not list.
     #[test]
     fn diagnose_join_hashmap_matches_linear() {
         let mut conns = crate::testutil::connections::synthetic_connections(2_000, 3);
+        assert!(conns.iter().any(|c| c.local_addr.starts_with('[')));
         let mut twin = conns[10].clone();
         twin.protocol = "UDP".into();
         twin.process_name = Some("twin".into());
         conns.push(twin);
         let by_endpoints = rows_by_endpoints(&conns);
 
-        let mut flows: Vec<(&str, &str)> = conns
+        let canonical: Vec<(String, String)> = conns
             .iter()
-            .map(|c| (c.local_addr.as_str(), c.remote_addr.as_str()))
+            .map(|c| {
+                (
+                    normalize_endpoint(&c.local_addr),
+                    normalize_endpoint(&c.remote_addr),
+                )
+            })
             .collect();
-        flows.push(("192.0.2.1:1", "192.0.2.2:2"));
-        for (local, remote) in flows {
-            let linear = conns
+        let mut flows = canonical.clone();
+        flows.push(("192.0.2.1:1".into(), "192.0.2.2:2".into()));
+        for (local, remote) in &flows {
+            let linear = canonical
                 .iter()
-                .find(|c| c.local_addr == local && c.remote_addr == remote);
-            let joined = by_endpoints.get(&(local, remote)).copied();
+                .position(|(l, r)| l == local && r == remote)
+                .map(|i| &conns[i]);
+            let joined = by_endpoints
+                .get(&(
+                    Cow::Borrowed(local.as_str()),
+                    Cow::Borrowed(remote.as_str()),
+                ))
+                .copied();
             assert!(
                 match (linear, joined) {
                     (Some(a), Some(b)) => std::ptr::eq(a, b),
@@ -1220,6 +1274,110 @@ mod tests {
                 },
                 "{local} → {remote}"
             );
+        }
+    }
+
+    /// Review R4: kernel flows spell IPv6 without brackets and the table
+    /// brackets it, so every IPv6 socket found no row, and with it no
+    /// process and no rates. Each spelling now finds its own row, and a flow
+    /// the table does not list takes nothing from another row.
+    #[test]
+    fn sockets_find_their_row_in_every_address_spelling() {
+        use crate::collectors::tcp_info::{FlowMap, TcpInfo};
+        let template = crate::testutil::connections::synthetic_connections(1, 1).remove(0);
+        let row = |local: &str, remote: &str, process: &str, tx: f64| {
+            let mut c = Connection {
+                protocol: "TCP".into(),
+                state: "ESTABLISHED".into(),
+                local_addr: local.into(),
+                remote_addr: remote.into(),
+                process_name: Some(process.into()),
+                tx_rate: Some(tx),
+                rx_rate: Some(tx / 2.0),
+                ..template.clone()
+            };
+            c.evidence.observe();
+            c
+        };
+        let rows = vec![
+            row("192.0.2.10:50000", "198.51.100.1:443", "v4", 1_000.0),
+            row("[2001:db8::10]:50001", "[2001:db8::1]:443", "v6", 2_000.0),
+            row(
+                "[::ffff:192.0.2.10]:50002",
+                "[::ffff:198.51.100.2]:443",
+                "mapped",
+                3_000.0,
+            ),
+        ];
+        let info = TcpInfo {
+            rtt_us: Some(20_000),
+            ..TcpInfo::default()
+        };
+        let mut flows: FlowMap = rows
+            .iter()
+            .map(|c| {
+                let key = (
+                    normalize_endpoint(&c.local_addr),
+                    normalize_endpoint(&c.remote_addr),
+                );
+                (key, info)
+            })
+            .collect();
+        flows.insert(("192.0.2.10:50009".into(), "198.51.100.9:443".into()), info);
+
+        let app = App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.connection_collector.publish_for_test(rows);
+        app.tcp_info.publish_for_test(flows);
+        let sockets = LiveSampler::new().sockets(&app, &Thresholds::default());
+        let socket = |local: &str| {
+            sockets
+                .iter()
+                .find(|s| s.local == local)
+                .unwrap_or_else(|| panic!("no socket {local}"))
+        };
+
+        for (local, process, tx) in [
+            ("192.0.2.10:50000", "v4", 1_000.0),
+            ("2001:db8::10:50001", "v6", 2_000.0),
+            ("192.0.2.10:50002", "mapped", 3_000.0),
+        ] {
+            let s = socket(local);
+            assert_eq!(s.process.as_deref(), Some(process), "{local}");
+            assert_eq!(s.tx_bps, Some(tx), "{local}");
+            assert_eq!(s.rx_bps, Some(tx / 2.0), "{local}");
+        }
+        let stray = socket("192.0.2.10:50009");
+        assert_eq!(stray.process, None);
+        assert_eq!(
+            (stray.tx_bps, stray.rx_bps),
+            (None, None),
+            "unknown, not idle"
+        );
+    }
+
+    /// The join's shortcut spells every row as `normalize_endpoint` does.
+    #[test]
+    fn flow_spelling_agrees_with_normalize_endpoint() {
+        let mut addrs: Vec<String> = crate::testutil::connections::synthetic_connections(2_000, 5)
+            .into_iter()
+            .flat_map(|c| [c.local_addr, c.remote_addr])
+            .collect();
+        addrs.extend(
+            [
+                "[::1]:443",
+                "[2001:db8::1]:8080",
+                "[::ffff:192.0.2.1]:443",
+                "[fe80::1%eth0]:22",
+                "fe80::1]:1024",
+                "[::]:*",
+                "0.0.0.0:*",
+                "192.0.2.1:53",
+                "*:*",
+            ]
+            .map(String::from),
+        );
+        for addr in &addrs {
+            assert_eq!(flow_spelling(addr), normalize_endpoint(addr), "{addr}");
         }
     }
 

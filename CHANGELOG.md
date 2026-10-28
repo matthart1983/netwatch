@@ -258,6 +258,17 @@ All notable changes to NetWatch will be documented in this file.
   against a list of the live ones, so its cost grew with the square of the
   connection count. At 10,000 connections a pass took about 100 ms, and now
   takes about 11 ms.
+- **Diagnose matches IPv6 sockets to their connections.** The kernel's TCP
+  flows spell an IPv6 endpoint `2001:db8::1:443` and the connection table
+  `[2001:db8::1]:443`, and Diagnose compared the two as text, so no IPv6
+  socket found its connection. It lost its process name, and its send and
+  receive rates read as zero, which classified a busy IPv6 socket as idle
+  and kept it from ever counting as bufferbloat. IPv4-mapped addresses such
+  as `[::ffff:192.0.2.1]:443` failed the same way. Both now match. A socket
+  that matches no connection, or whose connection has no rate yet, now has
+  unknown rates rather than zero: it is neither idle nor sending, and the
+  bufferbloat check that needs its rate says it was not measured. Episodes
+  record unknown rates as `null`.
 - **The tick does less work per connection.** Every read of the connection
   table checked each row's age, and once any row was more than five seconds
   old, it copied the whole table to blank the stale owners. A tick

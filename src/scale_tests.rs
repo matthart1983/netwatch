@@ -41,6 +41,7 @@ use crate::testutil::connections::synthetic_connections;
 use crate::ui::connections::{build_view, selected_connection, ConnRow, COLUMNS};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -381,7 +382,10 @@ fn diagnose_join(app: &App) -> usize {
         .keys()
         .filter_map(|(local, remote)| {
             by_endpoints
-                .get(&(local.as_str(), remote.as_str()))
+                .get(&(
+                    Cow::Borrowed(local.as_str()),
+                    Cow::Borrowed(remote.as_str()),
+                ))
                 .copied()
         })
         .count()
@@ -720,16 +724,9 @@ fn scale_diagnose_join() {
     for n in sizes() {
         let mut host = Host::new(n).with_kernel_flows();
         let flows = host.app.tcp_info.snapshot().len();
-        // Kernel flows are keyed in canonical form and the join looks rows
-        // up as the table spells them, so a bracketed IPv6 row finds none.
-        let canonical = |a: &str| normalize_endpoint(a) == a;
-        let spelled_alike = host
-            .rows
-            .iter()
-            .filter(|c| c.protocol == "TCP" && c.state == "ESTABLISHED")
-            .filter(|c| canonical(&c.local_addr) && canonical(&c.remote_addr))
-            .count();
-        assert_eq!(diagnose_join(&host.app), spelled_alike);
+        // Every flow is one of the table's established rows, bracketed IPv6
+        // ones included, so every flow finds its row.
+        assert_eq!(diagnose_join(&host.app), flows);
         let samples = host.time(iterations(n), |app| {
             diagnose_join(app);
         });
