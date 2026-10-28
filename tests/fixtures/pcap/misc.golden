@@ -35,9 +35,9 @@
   | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 257
   | TCP: 50443 (—) → 443 (HTTPS), Seq: 1001, Flags: [PSH,ACK], Win: 64240, Ack: 5001
 #6 TCP 192.0.2.10 -> 198.51.100.20 len=34 expert=Chat
-  info: 192.0.2.10 → 198.51.100.20 TCP
+  info: 192.0.2.10 → 198.51.100.20 TCP (truncated)
   | Frame: 34 bytes on wire
   | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
   | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 65535
-  | TCP: 192.0.2.10 → 198.51.100.20
+  | TCP: (truncated)
 #7 (not decoded)

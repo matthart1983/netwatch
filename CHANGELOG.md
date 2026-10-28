@@ -224,6 +224,31 @@ All notable changes to NetWatch will be documented in this file.
   in `summary.md` give the number of rows left out, and `connections.json`
   keeps its shape. The bundle's JSON files are also written through a
   buffer now; 50,000 rows took about 12 million write calls before.
+- **The packet decoder stops at the length each header gives, and no longer
+  reads an IPv4 fragment as if it started with a UDP or TCP header.** The
+  UDP or TCP segment ran to the end of the captured frame instead of the
+  length in the IPv4, IPv6 or UDP header, so netwatch read the Ethernet
+  padding after a short packet as payload. A pure ACK from a peer that does
+  not use TCP timestamps arrives padded from 54 to 60 bytes. Each one added
+  6 bytes to its stream, and in a run of them every ACK after the first
+  counted as out of order, which the Connections tab shows as `↹N`. The
+  protocol classifiers and the stream view saw the padding too. netwatch
+  read the payload of an IPv4 fragment after the first as a UDP or TCP
+  header, which gave the fragment ports, and so a stream, from bytes that
+  were not a header. It classified the first fragment and added it to its
+  stream as if it held the whole message. The Packets tab now lists a later
+  fragment as `IPv4`, with the protocol, the datagram's ID and the
+  fragment's offset in the Info column, and no ports or stream. A first
+  fragment shows its ports and `[first fragment, ID 0x…]`, but netwatch does
+  not classify it or add it to a stream. netwatch does not reassemble
+  fragments. The Info column now names an IPv4 header length under 20 bytes,
+  a total length shorter than the header, a TCP data offset under 20 bytes
+  and a UDP length under 8, as in `TCP (bad header length 16)`, and a TCP or
+  UDP header cut short, as in `TCP (truncated)`. None of these gets ports or
+  a stream. netwatch used to decode them from the wrong bytes. With an IPv4
+  header length of 16 it read the ports out of the destination address. The
+  DNS timing and the QUIC breakdown in the detail pane read the same bounded
+  payload.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to

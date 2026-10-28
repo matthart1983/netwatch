@@ -2592,7 +2592,11 @@ fn decode_and_track(
         } else {
             StreamProtocol::Udp
         };
-        let payload = extract_app_payload(data, proto);
+        // The first fragment of a datagram has ports but only part of the
+        // payload. It is listed, but not added to a stream.
+        let Some(payload) = extract_app_payload(data, proto) else {
+            return Some(parsed);
+        };
         let (idx, app_proto, decrypted) = {
             let mut t = crate::app::safe_lock(tracker, "packets::capture_loop");
             let i = t.track_packet(
@@ -2601,7 +2605,7 @@ fn decode_and_track(
                 &parsed.dst_ip,
                 dp,
                 proto,
-                &payload,
+                payload,
                 parsed.id,
                 &parsed.timestamp,
                 parsed.tcp_flags,
@@ -2625,12 +2629,12 @@ fn decode_and_track(
                 .map(|(ip, port)| ip.as_str() == parsed.src_ip.as_str() && *port == sp)
                 .unwrap_or(true);
             let dec = t
-                .try_decrypt_tls_record(i, &payload, client_to_server)
+                .try_decrypt_tls_record(i, payload, client_to_server)
                 .or_else(|| {
                     // QUIC 1-RTT short-header packets ride UDP; the
                     // TLS path above no-ops on them.
                     if proto == StreamProtocol::Udp {
-                        t.try_decrypt_quic_1rtt(i, &payload, client_to_server)
+                        t.try_decrypt_quic_1rtt(i, payload, client_to_server)
                     } else {
                         None
                     }
@@ -2748,18 +2752,146 @@ fn parse_packet(data: &[u8], counter: &Arc<Mutex<u64>>, dns: &DnsCache) -> Optio
 }
 
 // Transport parse result:
-// (protocol, src_port, dst_port, info, app_payload_offset, tcp_flags, tcp_seq)
-// app_payload_offset is relative to the transport data start. tcp_seq is
-// the TCP sequence number, used for retransmit / OOO classification.
-type TransportResult = (
+// (protocol, src_port, dst_port, info, app_payload, tcp_flags, tcp_seq)
+// app_payload is the data after the transport header, cut to the lengths
+// the headers declare. tcp_seq is the TCP sequence number, used for
+// retransmit / OOO classification.
+type TransportResult<'a> = (
     String,
     Option<u16>,
     Option<u16>,
     String,
-    usize,
+    &'a [u8],
     Option<u8>,
     Option<u32>,
 );
+
+const ETHERNET_HEADER_LEN: usize = 14;
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_IPV6: u16 = 0x86DD;
+/// An IPv4 header without options, the least its IHL field can give.
+const IPV4_MIN_HEADER_LEN: usize = 20;
+/// The IPv4 flags and fragment offset field: More Fragments, and the offset
+/// in 8-byte units.
+const IPV4_MORE_FRAGMENTS: u16 = 0x2000;
+const IPV4_FRAGMENT_OFFSET: u16 = 0x1FFF;
+const IPV4_FRAGMENT_UNIT: usize = 8;
+/// The fixed IPv6 header. Extension headers after it are not walked.
+const IPV6_HEADER_LEN: usize = 40;
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+/// A TCP header without options, the least its data offset can give.
+const TCP_MIN_HEADER_LEN: usize = 20;
+const UDP_HEADER_LEN: usize = 8;
+
+/// What an IP packet carries, cut to the length its header declares as well
+/// as to the bytes captured, so Ethernet padding after the datagram is not
+/// read as part of it. The Packets tab's decode and the stream tracker both
+/// find the transport segment through this, so they agree on where it ends.
+struct IpPayload<'a> {
+    /// The IPv4 protocol, or the IPv6 next header.
+    protocol: u8,
+    segment: &'a [u8],
+    /// Set when the packet is one fragment of a larger IPv4 datagram.
+    fragment: Option<Fragment>,
+}
+
+/// Where an IPv4 fragment sits in its datagram. Fragments are not
+/// reassembled, so only the first has a transport header, and no fragment
+/// holds a whole message.
+#[derive(Clone, Copy)]
+struct Fragment {
+    id: u16,
+    /// Bytes of the datagram's payload that come before this fragment's.
+    offset: usize,
+    more: bool,
+}
+
+impl Fragment {
+    fn detail(&self) -> String {
+        format!(
+            "IPv4 fragment: ID 0x{:04x}, offset {}, {} (not reassembled)",
+            self.id,
+            self.offset,
+            if self.more { "more follow" } else { "last" }
+        )
+    }
+}
+
+/// An IPv4 packet's payload, or why its header does not locate one.
+fn ipv4_payload(ip: &[u8]) -> Result<IpPayload<'_>, String> {
+    if ip.len() < IPV4_MIN_HEADER_LEN {
+        return Err("truncated header".into());
+    }
+    let header_len = usize::from(ip[0] & 0x0F) * 4;
+    if header_len < IPV4_MIN_HEADER_LEN {
+        return Err(format!("bad header length {header_len}"));
+    }
+    if header_len > ip.len() {
+        return Err("truncated header".into());
+    }
+    let end = match usize::from(u16::from_be_bytes([ip[2], ip[3]])) {
+        // Segmentation offload can hand libpcap a frame whose length is
+        // left for the NIC to fill in, or too large for the field (Linux
+        // BIG TCP). The captured bytes bound it.
+        0 => ip.len(),
+        total if total < header_len => return Err(format!("bad total length {total}")),
+        total => total.min(ip.len()),
+    };
+    let field = u16::from_be_bytes([ip[6], ip[7]]);
+    let offset = usize::from(field & IPV4_FRAGMENT_OFFSET) * IPV4_FRAGMENT_UNIT;
+    let more = field & IPV4_MORE_FRAGMENTS != 0;
+    Ok(IpPayload {
+        protocol: ip[9],
+        segment: &ip[header_len..end],
+        fragment: (offset > 0 || more).then(|| Fragment {
+            id: u16::from_be_bytes([ip[4], ip[5]]),
+            offset,
+            more,
+        }),
+    })
+}
+
+/// An IPv6 packet's payload after the fixed header.
+fn ipv6_payload(ip: &[u8]) -> Option<IpPayload<'_>> {
+    let rest = ip.get(IPV6_HEADER_LEN..)?;
+    let end = match usize::from(u16::from_be_bytes([ip[4], ip[5]])) {
+        // A jumbogram, or an offload frame over 64 KiB (BIG TCP).
+        0 => rest.len(),
+        len => len.min(rest.len()),
+    };
+    Some(IpPayload {
+        protocol: ip[6],
+        segment: &rest[..end],
+        fragment: None,
+    })
+}
+
+/// The data after a TCP header and its options, or why the header cannot
+/// be read.
+fn tcp_payload(segment: &[u8]) -> Result<&[u8], String> {
+    if segment.len() < TCP_MIN_HEADER_LEN {
+        return Err("truncated".into());
+    }
+    let header_len = usize::from(segment[12] >> 4) * 4;
+    if header_len < TCP_MIN_HEADER_LEN {
+        return Err(format!("bad header length {header_len}"));
+    }
+    segment.get(header_len..).ok_or_else(|| "truncated".into())
+}
+
+/// The data in a UDP datagram, cut to the length its header gives, or why
+/// the header cannot be read.
+fn udp_payload(segment: &[u8]) -> Result<&[u8], String> {
+    if segment.len() < UDP_HEADER_LEN {
+        return Err("truncated".into());
+    }
+    let len = usize::from(u16::from_be_bytes([segment[4], segment[5]]));
+    if len < UDP_HEADER_LEN {
+        return Err(format!("bad length {len}"));
+    }
+    Ok(&segment[UDP_HEADER_LEN..len.min(segment.len())])
+}
 
 fn parse_ipv4_packet(
     raw: &[u8],
@@ -2768,10 +2900,9 @@ fn parse_ipv4_packet(
     counter: &Arc<Mutex<u64>>,
     dns: &DnsCache,
 ) -> Option<CapturedPacket> {
-    if data.len() < 20 {
+    if data.len() < IPV4_MIN_HEADER_LEN {
         return None;
     }
-    let ihl = ((data[0] & 0x0F) as usize) * 4;
     let total_len = u16::from_be_bytes([data[2], data[3]]);
     let ttl = data[8];
     let protocol_num = data[9];
@@ -2788,14 +2919,33 @@ fn parse_ipv4_packet(
         total_len
     ));
 
-    let transport_data = if data.len() > ihl { &data[ihl..] } else { &[] };
-    let (protocol, src_port, dst_port, info, payload_off, flags, seq) =
-        parse_transport(protocol_num, transport_data, &src, &dst, details);
-
-    let app_payload = if transport_data.len() > payload_off {
-        &transport_data[payload_off..]
-    } else {
-        &[]
+    let (protocol, src_port, dst_port, info, app_payload, flags, seq) = match ipv4_payload(data) {
+        Err(problem) => {
+            details.push(format!("IPv4: {problem}"));
+            let info = format!("{src} → {dst} IPv4 ({problem})");
+            ("IPv4".into(), None, None, info, &[][..], None, None)
+        }
+        Ok(carried) => match carried.fragment {
+            None => parse_transport(protocol_num, carried.segment, &src, &dst, details, true),
+            // Only the first fragment starts with the transport header.
+            Some(fragment) if fragment.offset > 0 => {
+                details.push(fragment.detail());
+                let info = format!(
+                    "{src} → {dst} {} fragment, ID 0x{:04x}, offset {}",
+                    ip_protocol_name(protocol_num),
+                    fragment.id,
+                    fragment.offset
+                );
+                ("IPv4".into(), None, None, info, &[][..], None, None)
+            }
+            Some(fragment) => {
+                details.push(fragment.detail());
+                let (protocol, src_port, dst_port, info, payload, flags, seq) =
+                    parse_transport(protocol_num, carried.segment, &src, &dst, details, false);
+                let info = format!("{info} [first fragment, ID 0x{:04x}]", fragment.id);
+                (protocol, src_port, dst_port, info, payload, flags, seq)
+            }
+        },
     };
 
     Some(build_packet(
@@ -2823,7 +2973,7 @@ fn parse_ipv6_packet(
     counter: &Arc<Mutex<u64>>,
     dns: &DnsCache,
 ) -> Option<CapturedPacket> {
-    if data.len() < 40 {
+    if data.len() < IPV6_HEADER_LEN {
         return None;
     }
     let payload_len = u16::from_be_bytes([data[4], data[5]]);
@@ -2842,15 +2992,9 @@ fn parse_ipv6_packet(
         payload_len
     ));
 
-    let transport_data = if data.len() > 40 { &data[40..] } else { &[] };
-    let (protocol, src_port, dst_port, info, payload_off, flags, seq) =
-        parse_transport(next_header, transport_data, &src, &dst, details);
-
-    let app_payload = if transport_data.len() > payload_off {
-        &transport_data[payload_off..]
-    } else {
-        &[]
-    };
+    let carried = ipv6_payload(data)?;
+    let (protocol, src_port, dst_port, info, app_payload, flags, seq) =
+        parse_transport(next_header, carried.segment, &src, &dst, details, true);
 
     Some(build_packet(
         counter,
@@ -2870,19 +3014,22 @@ fn parse_ipv6_packet(
     ))
 }
 
-fn parse_transport(
+/// `whole` is false for the first fragment of an IPv4 datagram. Its header
+/// is read, but DPI does not run on what is only the start of a message.
+fn parse_transport<'a>(
     proto: u8,
-    data: &[u8],
+    data: &'a [u8],
     src_ip: &str,
     dst_ip: &str,
     details: &mut Vec<String>,
-) -> TransportResult {
+    whole: bool,
+) -> TransportResult<'a> {
     match proto {
-        6 if data.len() >= 20 => parse_tcp(data, src_ip, dst_ip, details),
-        17 if data.len() >= 8 => parse_udp(data, src_ip, dst_ip, details),
+        IPPROTO_TCP => parse_tcp(data, src_ip, dst_ip, details, whole),
+        IPPROTO_UDP => parse_udp(data, src_ip, dst_ip, details, whole),
         1 => {
             let r = parse_icmp(data, src_ip, dst_ip, details);
-            (r.0, r.1, r.2, r.3, data.len(), None, None)
+            (r.0, r.1, r.2, r.3, &[], None, None)
         }
         2 => {
             // IGMP — IP protocol 2. Not a TCP/UDP flow; no stream is
@@ -2890,11 +3037,11 @@ fn parse_transport(
             // the message type here so the Packets-tab INFO column
             // shows something more useful than just "IGMP".
             let r = parse_igmp(data, src_ip, dst_ip, details);
-            (r.0, r.1, r.2, r.3, data.len(), None, None)
+            (r.0, r.1, r.2, r.3, &[], None, None)
         }
         58 => {
             let r = parse_icmpv6(data, src_ip, dst_ip, details);
-            (r.0, r.1, r.2, r.3, data.len(), None, None)
+            (r.0, r.1, r.2, r.3, &[], None, None)
         }
         _ => {
             let name = ip_protocol_name(proto);
@@ -2904,12 +3051,26 @@ fn parse_transport(
                 None,
                 None,
                 format!("{} → {} {}", src_ip, dst_ip, name),
-                data.len(),
+                &[],
                 None,
                 None,
             )
         }
     }
+}
+
+/// A TCP or UDP header that cannot be read. No ports are reported, so the
+/// packet joins no stream, and the Info column says why.
+fn unreadable_transport(
+    name: &str,
+    problem: &str,
+    src_ip: &str,
+    dst_ip: &str,
+    details: &mut Vec<String>,
+) -> TransportResult<'static> {
+    details.push(format!("{name}: ({problem})"));
+    let info = format!("{src_ip} → {dst_ip} {name} ({problem})");
+    (name.into(), None, None, info, &[], None, None)
 }
 
 /// Render a classified `AppProtocol` into the `(protocol-label, summary)` the
@@ -3014,17 +3175,21 @@ fn describe_app_protocol(p: &crate::dpi::AppProtocol) -> (&'static str, String) 
     }
 }
 
-fn parse_tcp(
-    data: &[u8],
+fn parse_tcp<'a>(
+    data: &'a [u8],
     src_ip: &str,
     dst_ip: &str,
     details: &mut Vec<String>,
-) -> TransportResult {
+    whole: bool,
+) -> TransportResult<'a> {
+    let payload = match tcp_payload(data) {
+        Ok(payload) => payload,
+        Err(problem) => return unreadable_transport("TCP", &problem, src_ip, dst_ip, details),
+    };
     let src_port = u16::from_be_bytes([data[0], data[1]]);
     let dst_port = u16::from_be_bytes([data[2], data[3]]);
     let seq = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     let ack = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-    let data_offset = ((data[12] >> 4) as usize) * 4;
     let flags = data[13];
     let window = u16::from_be_bytes([data[14], data[15]]);
     let flag_str = tcp_flags(flags);
@@ -3041,16 +3206,14 @@ fn parse_tcp(
     }
     details.push(detail);
 
-    // Check for application-layer protocols in TCP payload
-    let payload = if data.len() > data_offset {
-        &data[data_offset..]
-    } else {
-        &[]
-    };
-
     // Single DPI path: classify via `crate::dpi` and render the Info string
     // from the result. Replaces the old per-packet TCP parser registry.
-    if let Some(ap) = crate::dpi::classify_once(payload, true, src_port, dst_port) {
+    let app = if whole {
+        crate::dpi::classify_once(payload, true, src_port, dst_port)
+    } else {
+        None
+    };
+    if let Some(ap) = app {
         let (label, summary) = describe_app_protocol(&ap);
         details.push(format!("{label}: {summary}"));
         let info = format!(
@@ -3065,7 +3228,7 @@ fn parse_tcp(
             Some(src_port),
             Some(dst_port),
             info,
-            data_offset,
+            payload,
             Some(flags),
             Some(seq),
         );
@@ -3100,18 +3263,23 @@ fn parse_tcp(
         Some(src_port),
         Some(dst_port),
         info,
-        data_offset,
+        payload,
         Some(flags),
         Some(seq),
     )
 }
 
-fn parse_udp(
-    data: &[u8],
+fn parse_udp<'a>(
+    data: &'a [u8],
     src_ip: &str,
     dst_ip: &str,
     details: &mut Vec<String>,
-) -> TransportResult {
+    whole: bool,
+) -> TransportResult<'a> {
+    let payload = match udp_payload(data) {
+        Ok(payload) => payload,
+        Err(problem) => return unreadable_transport("UDP", &problem, src_ip, dst_ip, details),
+    };
     let src_port = u16::from_be_bytes([data[0], data[1]]);
     let dst_port = u16::from_be_bytes([data[2], data[3]]);
     let udp_len = u16::from_be_bytes([data[4], data[5]]);
@@ -3124,10 +3292,13 @@ fn parse_udp(
         src_port, src_svc, dst_port, dst_svc, udp_len
     ));
 
-    let payload = if data.len() > 8 { &data[8..] } else { &[] };
-
     // Single DPI path (see parse_tcp). UDP Info omits TCP flags.
-    if let Some(ap) = crate::dpi::classify_once(payload, false, src_port, dst_port) {
+    let app = if whole {
+        crate::dpi::classify_once(payload, false, src_port, dst_port)
+    } else {
+        None
+    };
+    if let Some(ap) = app {
         let (label, summary) = describe_app_protocol(&ap);
         details.push(format!("{label}: {summary}"));
         let info = format!(
@@ -3141,7 +3312,7 @@ fn parse_udp(
             Some(src_port),
             Some(dst_port),
             info,
-            8,
+            payload,
             None,
             None,
         );
@@ -3165,7 +3336,15 @@ fn parse_udp(
     } else {
         "UDP".into()
     };
-    (proto, Some(src_port), Some(dst_port), info, 8, None, None)
+    (
+        proto,
+        Some(src_port),
+        Some(dst_port),
+        info,
+        payload,
+        None,
+        None,
+    )
 }
 
 fn parse_igmp(
@@ -3402,49 +3581,31 @@ fn build_packet(
 /// requiring callers to construct a `StreamProtocol` value.
 pub fn extract_udp_app_payload(raw: &[u8]) -> Vec<u8> {
     extract_app_payload(raw, StreamProtocol::Udp)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default()
 }
 
-fn extract_app_payload(raw: &[u8], proto: StreamProtocol) -> Vec<u8> {
-    if raw.len() < 14 {
-        return Vec::new();
+/// The application data of a whole TCP or UDP segment in an Ethernet frame,
+/// bounded as the Packets tab's decode bounds it. `None` when the frame has
+/// no such segment: another protocol, a header cut short or invalid, or an
+/// IPv4 fragment, which is not reassembled.
+fn extract_app_payload(raw: &[u8], proto: StreamProtocol) -> Option<&[u8]> {
+    if raw.len() < ETHERNET_HEADER_LEN {
+        return None;
     }
-    let ethertype = u16::from_be_bytes([raw[12], raw[13]]);
-    let ip_start = 14;
-    let transport_start = match ethertype {
-        0x0800 => {
-            if raw.len() < ip_start + 20 {
-                return Vec::new();
-            }
-            let ihl = ((raw[ip_start] & 0x0F) as usize) * 4;
-            ip_start + ihl
-        }
-        0x86DD => ip_start + 40,
-        _ => return Vec::new(),
+    let ip = &raw[ETHERNET_HEADER_LEN..];
+    let carried = match u16::from_be_bytes([raw[12], raw[13]]) {
+        ETHERTYPE_IPV4 => ipv4_payload(ip).ok()?,
+        ETHERTYPE_IPV6 => ipv6_payload(ip)?,
+        _ => return None,
     };
-    if raw.len() <= transport_start {
-        return Vec::new();
+    if carried.fragment.is_some() {
+        return None;
     }
-    match proto {
-        StreamProtocol::Tcp => {
-            if raw.len() < transport_start + 20 {
-                return Vec::new();
-            }
-            let data_offset = ((raw[transport_start + 12] >> 4) as usize) * 4;
-            let payload_start = transport_start + data_offset;
-            if raw.len() > payload_start {
-                raw[payload_start..].to_vec()
-            } else {
-                Vec::new()
-            }
-        }
-        StreamProtocol::Udp => {
-            let payload_start = transport_start + 8;
-            if raw.len() > payload_start {
-                raw[payload_start..].to_vec()
-            } else {
-                Vec::new()
-            }
-        }
+    match (proto, carried.protocol) {
+        (StreamProtocol::Tcp, IPPROTO_TCP) => tcp_payload(carried.segment).ok(),
+        (StreamProtocol::Udp, IPPROTO_UDP) => udp_payload(carried.segment).ok(),
+        _ => None,
     }
 }
 
@@ -4003,6 +4164,316 @@ mod tests {
         let mut details = vec![];
         let info = parse_arp(&[0; 10], &mut details);
         assert!(info.contains("truncated"));
+    }
+
+    // ── packet boundaries and fragments ─────────────────────
+
+    /// Ethernet, then an IPv4 header from 192.0.2.1 to 192.0.2.2 with ID
+    /// 0x1a2b and the given flags and fragment offset field and total
+    /// length, then `rest`. Checksums stay zero.
+    fn ipv4_frame(protocol: u8, fragment: u16, total_len: u16, rest: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN];
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        let ip = &mut frame[ETHERNET_HEADER_LEN..];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&total_len.to_be_bytes());
+        ip[4..6].copy_from_slice(&0x1a2b_u16.to_be_bytes());
+        ip[6..8].copy_from_slice(&fragment.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = protocol;
+        ip[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        ip[16..20].copy_from_slice(&[192, 0, 2, 2]);
+        frame.extend_from_slice(rest);
+        frame
+    }
+
+    /// A UDP header from port 12345 to 53 giving length `len`, then `payload`.
+    fn udp_segment(len: u16, payload: &[u8]) -> Vec<u8> {
+        let mut udp = [12345u16, 53, len, 0].map(u16::to_be_bytes).concat();
+        udp.extend_from_slice(payload);
+        udp
+    }
+
+    /// TCP from port 50000 to 80 over IPv4 or IPv6, carrying `payload`.
+    fn tcp_v4(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let (c, s) = ("192.0.2.10:50000", "192.0.2.20:80");
+        tcp_frame(
+            c.parse().unwrap(),
+            s.parse().unwrap(),
+            flags,
+            (1, 1),
+            payload,
+        )
+    }
+
+    fn tcp_v6(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let (c, s) = ("[2001:db8::10]:50000", "[2001:db8::20]:80");
+        tcp_frame(
+            c.parse().unwrap(),
+            s.parse().unwrap(),
+            flags,
+            (1, 1),
+            payload,
+        )
+    }
+
+    /// A DNS query for `a`, type A, which DPI shows as `a (type=1)`.
+    const DNS_QUERY: [u8; 19] = [
+        0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1,
+    ];
+
+    fn read_as_dns(p: &CapturedPacket) -> bool {
+        p.info.contains("(type=1)") || p.app_protocol.is_some()
+    }
+
+    #[test]
+    fn a_later_fragment_gets_no_ports_app_or_stream() {
+        // Offset 8, the last fragment: its first bytes are datagram payload,
+        // whatever they look like.
+        let frame = ipv4_frame(17, 1, 28, &udp_segment(8, &[]));
+        let p = Replay::new().frame(&frame).unwrap();
+        assert_eq!((p.src_port, p.dst_port, p.stream_index), (None, None, None));
+        assert_eq!(p.protocol, "IPv4");
+        assert_eq!(
+            p.info,
+            "192.0.2.1 → 192.0.2.2 UDP fragment, ID 0x1a2b, offset 8"
+        );
+        let detail = "IPv4 fragment: ID 0x1a2b, offset 8, last (not reassembled)";
+        assert!(p.details.iter().any(|d| d == detail), "{:?}", p.details);
+
+        // A middle fragment whose bytes read as UDP to port 53 carrying a
+        // DNS query is not classified either.
+        let frame = ipv4_frame(
+            17,
+            IPV4_MORE_FRAGMENTS | 185,
+            47,
+            &udp_segment(27, &DNS_QUERY),
+        );
+        let p = Replay::new().frame(&frame).unwrap();
+        assert_eq!((p.src_port, p.stream_index), (None, None));
+        assert!(!read_as_dns(&p), "{p:?}");
+        assert!(p.info.ends_with("offset 1480"), "{}", p.info);
+        assert!(p.payload_text.is_empty());
+        assert!(extract_udp_app_payload(&frame).is_empty());
+    }
+
+    #[test]
+    fn ip_padding_never_reaches_dpi_or_the_stream() {
+        // The query inside the datagram is classified...
+        let inside = ipv4_frame(17, 0, 47, &udp_segment(27, &DNS_QUERY));
+        assert!(read_as_dns(&Replay::new().frame(&inside).unwrap()));
+
+        // ...but after an empty datagram, as Ethernet padding, it is not.
+        let mut padded = ipv4_frame(17, 0, 28, &udp_segment(8, &[]));
+        padded.extend_from_slice(&DNS_QUERY);
+        let replay = Replay::new();
+        let p = replay.frame(&padded).unwrap();
+        assert!(!read_as_dns(&p), "padding decoded as DNS: {p:?}");
+        assert!(p.payload_text.is_empty());
+        assert!(extract_udp_app_payload(&padded).is_empty());
+        // The datagram is whole, so it has a stream, with nothing in it.
+        let tracker = replay.tracker.lock().unwrap();
+        let stream = tracker.get_stream(p.stream_index.unwrap()).unwrap();
+        assert_eq!(stream.total_bytes_a_to_b + stream.total_bytes_b_to_a, 0);
+    }
+
+    #[test]
+    fn bytes_past_the_udp_length_are_not_payload() {
+        // The IP datagram holds the query, but the UDP datagram ends before it.
+        let frame = ipv4_frame(17, 0, 47, &udp_segment(8, &DNS_QUERY));
+        assert!(!read_as_dns(&Replay::new().frame(&frame).unwrap()));
+        assert!(extract_udp_app_payload(&frame).is_empty());
+
+        // A UDP length past the captured bytes is cut to them.
+        let frame = ipv4_frame(17, 0, 47, &udp_segment(500, &DNS_QUERY));
+        assert_eq!(extract_udp_app_payload(&frame), DNS_QUERY);
+    }
+
+    #[test]
+    fn a_first_fragment_shows_its_ports_but_not_a_whole_message() {
+        // The first fragment of a 3000-byte DNS datagram: the UDP header and
+        // the start of the message.
+        let udp = udp_segment(3000, &DNS_QUERY);
+        let frame = ipv4_frame(17, IPV4_MORE_FRAGMENTS, 47, &udp);
+        let p = Replay::new().frame(&frame).unwrap();
+        assert_eq!((p.src_port, p.dst_port), (Some(12345), Some(53)));
+        assert_eq!(p.stream_index, None);
+        assert!(!read_as_dns(&p), "{p:?}");
+        assert_eq!(
+            p.info,
+            "192.0.2.1:12345 → 192.0.2.2:53 Len=3000 (DNS) [first fragment, ID 0x1a2b]"
+        );
+        let detail = "IPv4 fragment: ID 0x1a2b, offset 0, more follow (not reassembled)";
+        assert!(p.details.iter().any(|d| d == detail), "{:?}", p.details);
+        assert!(extract_udp_app_payload(&frame).is_empty());
+    }
+
+    #[test]
+    fn padded_pure_acks_are_not_data() {
+        // A 54-byte ACK padded to Ethernet's 60-byte minimum, as a peer
+        // without TCP timestamps sends them, three times over.
+        let mut ack = tcp_v4(TCP_FLAG_ACK, b"");
+        ack.extend_from_slice(&[0; 6]);
+        let replay = Replay::new();
+        let first = replay.frame(&ack).unwrap();
+        replay.frame(&ack).unwrap();
+        replay.frame(&ack).unwrap();
+        assert!(first.info.ends_with("Payload=0"), "{}", first.info);
+        assert!(first.payload_text.is_empty());
+        let tracker = replay.tracker.lock().unwrap();
+        let stream = tracker.get_stream(first.stream_index.unwrap()).unwrap();
+        assert_eq!(stream.packet_count, 3);
+        assert_eq!(stream.total_bytes_a_to_b + stream.total_bytes_b_to_a, 0);
+        assert_eq!(stream.out_of_order_a_to_b + stream.out_of_order_b_to_a, 0);
+    }
+
+    #[test]
+    fn display_and_stream_read_the_same_payload() {
+        // UDP length 13, IP length three bytes past it, then padding.
+        let mut udp = ipv4_frame(17, 0, 20 + 16, &udp_segment(13, b"hello..."));
+        udp.extend_from_slice(b"xxxxxx");
+        let tcp = tcp_v4(TCP_FLAG_PSH | TCP_FLAG_ACK, b"GET /");
+        let mut padded_tcp = tcp.clone();
+        padded_tcp.extend_from_slice(b"PAD");
+        for (frame, payload) in [(udp, "hello"), (tcp, "GET /"), (padded_tcp, "GET /")] {
+            let replay = Replay::new();
+            let p = replay.frame(&frame).unwrap();
+            assert_eq!(p.payload_text, payload);
+            let tracker = replay.tracker.lock().unwrap();
+            let stream = tracker.get_stream(p.stream_index.unwrap()).unwrap();
+            assert_eq!(stream.segments.last().unwrap().payload, payload.as_bytes());
+        }
+    }
+
+    #[test]
+    fn bad_ipv4_lengths_stop_the_decode_at_ip() {
+        let udp = udp_segment(27, &DNS_QUERY);
+        // IHL 4: a 16-byte header, below the minimum.
+        let mut short_ihl = ipv4_frame(17, 0, 47, &udp);
+        short_ihl[ETHERNET_HEADER_LEN] = 0x44;
+        // IHL 15: 60 bytes of header, but the frame ends after 47.
+        let mut long_ihl = ipv4_frame(17, 0, 47, &udp);
+        long_ihl[ETHERNET_HEADER_LEN] = 0x4F;
+        // A total length shorter than the header.
+        let short_total = ipv4_frame(17, 0, 10, &udp);
+        for (frame, problem) in [
+            (short_ihl, "bad header length 16"),
+            (long_ihl, "truncated header"),
+            (short_total, "bad total length 10"),
+        ] {
+            let p = Replay::new().frame(&frame).unwrap();
+            assert_eq!(p.protocol, "IPv4");
+            assert_eq!(p.info, format!("192.0.2.1 → 192.0.2.2 IPv4 ({problem})"));
+            assert_eq!((p.src_port, p.stream_index), (None, None));
+            assert!(!read_as_dns(&p), "{p:?}");
+            assert!(extract_udp_app_payload(&frame).is_empty());
+        }
+    }
+
+    #[test]
+    fn bad_tcp_and_udp_headers_show_no_ports() {
+        let tcp = tcp_v4(TCP_FLAG_ACK, b"GET / HTTP/1.1\r\n\r\n");
+        let offset_at = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + 12;
+        // Data offset 4: a 16-byte header, below the minimum.
+        let mut short_offset = tcp.clone();
+        short_offset[offset_at] = 4 << 4;
+        // Data offset 15: 60 bytes of header in a 38-byte segment.
+        let mut long_offset = tcp.clone();
+        long_offset[offset_at] = 15 << 4;
+        // The frame ends inside the fixed TCP header.
+        let cut_tcp = tcp[..offset_at].to_vec();
+        // A UDP length below the UDP header's own, and a cut UDP header.
+        let short_udp = ipv4_frame(17, 0, 47, &udp_segment(4, &DNS_QUERY));
+        let cut_udp = ipv4_frame(17, 0, 47, &udp_segment(27, &DNS_QUERY)[..5]);
+        for (frame, info) in [
+            (short_offset, "TCP (bad header length 16)"),
+            (long_offset, "TCP (truncated)"),
+            (cut_tcp, "TCP (truncated)"),
+            (short_udp, "UDP (bad length 4)"),
+            (cut_udp, "UDP (truncated)"),
+        ] {
+            let p = Replay::new().frame(&frame).unwrap();
+            assert!(p.info.ends_with(info), "{}", p.info);
+            assert_eq!((p.src_port, p.dst_port, p.stream_index), (None, None, None));
+            assert!(p.app_protocol.is_none() && p.payload_text.is_empty());
+        }
+    }
+
+    #[test]
+    fn ipv6_payload_length_bounds_the_segment() {
+        let mut padded = tcp_v6(TCP_FLAG_PSH | TCP_FLAG_ACK, b"GET /");
+        padded.extend_from_slice(b"PAD");
+        let p = Replay::new().frame(&padded).unwrap();
+        assert!(p.info.ends_with("Payload=5"), "{}", p.info);
+        let payload = extract_app_payload(&padded, StreamProtocol::Tcp);
+        assert_eq!(payload, Some(&b"GET /"[..]));
+
+        // A payload length past the frame is cut to what was captured.
+        let p = Replay::new().frame(&padded[..padded.len() - 5]).unwrap();
+        assert!(p.info.ends_with("Payload=3"), "{}", p.info);
+        // One that ends inside the TCP header leaves no header to read.
+        let mut short = padded.clone();
+        short[ETHERNET_HEADER_LEN + 4..ETHERNET_HEADER_LEN + 6].copy_from_slice(&[0, 12]);
+        let p = Replay::new().frame(&short).unwrap();
+        assert!(p.info.ends_with("TCP (truncated)"), "{}", p.info);
+        assert_eq!(p.stream_index, None);
+    }
+
+    #[test]
+    fn offload_frames_without_an_ip_length_still_decode() {
+        // Linux BIG TCP leaves the length at zero in frames over 64 KiB.
+        let mut v4 = tcp_v4(TCP_FLAG_ACK, b"HTTP/1.1 200 OK\r\n");
+        v4[ETHERNET_HEADER_LEN + 2..ETHERNET_HEADER_LEN + 4].fill(0);
+        let mut v6 = tcp_v6(TCP_FLAG_ACK, b"HTTP/1.1 200 OK\r\n");
+        v6[ETHERNET_HEADER_LEN + 4..ETHERNET_HEADER_LEN + 6].fill(0);
+        for frame in [v4, v6] {
+            let p = Replay::new().frame(&frame).unwrap();
+            assert!(p.stream_index.is_some(), "{p:?}");
+            assert_eq!(p.payload_text, "HTTP/1.1 200 OK");
+        }
+    }
+
+    /// Every cut of each frame, and every IHL and TCP data offset, decode
+    /// without a panic, and the decode and the stream tracker agree on
+    /// whether there is a whole segment to read.
+    #[test]
+    fn cut_or_corrupt_frames_never_panic() {
+        let http = b"GET / HTTP/1.1\r\n\r\n";
+        let seeds = [
+            tcp_v4(TCP_FLAG_PSH | TCP_FLAG_ACK, http),
+            tcp_v6(TCP_FLAG_PSH | TCP_FLAG_ACK, http),
+            ipv4_frame(17, 0, 47, &udp_segment(27, &DNS_QUERY)),
+            ipv4_frame(17, IPV4_MORE_FRAGMENTS, 47, &udp_segment(3000, &DNS_QUERY)),
+            ipv4_frame(17, 185, 47, &udp_segment(27, &DNS_QUERY)),
+        ];
+        let replay = Replay::new();
+        let check = |frame: &[u8]| {
+            let _ = extract_udp_app_payload(frame);
+            let Some(p) = replay.frame(frame) else {
+                return;
+            };
+            let proto = if p.tcp_flags.is_some() {
+                StreamProtocol::Tcp
+            } else {
+                StreamProtocol::Udp
+            };
+            let whole = p.src_port.is_some() && !p.info.contains("[first fragment");
+            assert_eq!(whole, extract_app_payload(frame, proto).is_some(), "{p:?}");
+            assert_eq!(whole, p.stream_index.is_some(), "{p:?}");
+        };
+        for seed in &seeds {
+            for end in 0..=seed.len() {
+                check(&seed[..end]);
+            }
+            for nibble in 0..16u8 {
+                let mut frame = seed.clone();
+                frame[ETHERNET_HEADER_LEN] = (frame[ETHERNET_HEADER_LEN] & 0xF0) | nibble;
+                check(&frame);
+                let mut frame = seed.clone();
+                frame[ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + 12] = nibble << 4;
+                check(&frame);
+            }
+        }
     }
 
     // ── extract_readable_payload ────────────────────────────
