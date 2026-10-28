@@ -56,6 +56,15 @@ All notable changes to NetWatch will be documented in this file.
   across the plot as if they covered all 60 seconds. The plot now spreads
   the last 60 seconds across the row at every width and refresh rate, and a
   short history fills in from the right.
+- **`--remote` backs off up to its 60-second cap when the backend keeps
+  failing.** The retry delay is a random point below a ceiling that doubles
+  from 0.5 s with each failure, but the randomness came from the clock's
+  sub-second nanoseconds, so every delay stayed under one second, and a
+  backend that answered every POST with an error got one about every 0.6 s
+  for as long as it was down. The delay now reaches across the whole
+  ceiling, and the wait counts from when the failed POST ends rather than
+  when it started, so a POST that took its whole timeout no longer used up
+  the wait after it.
 - **The Connections and Processes detail graphs fill their width, and their
   labels name the window they draw.** The Connections detail graph drew its
   30 samples at the right edge, one or two to a column, so in a wider pane

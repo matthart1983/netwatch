@@ -71,13 +71,19 @@ fn outcome_for_error(e: &ureq::Error) -> SendOutcome {
     }
 }
 
-/// Cheap entropy for backoff jitter — low bits of the wall clock. No RNG dep,
-/// and good enough to desynchronize a reconnecting fleet's retries.
+/// Entropy for backoff jitter, uniform over all of `u64` as
+/// [`Backoff::fail`] needs. The wall clock hashed by a fresh `RandomState`,
+/// whose keys come from the OS and differ on every call, so agents that
+/// start together still spread their retries. No RNG dependency. The
+/// sub-second nanoseconds alone, used before, stay under 10^9 and kept every
+/// delay under a second.
 fn jitter_entropy() -> u64 {
-    SystemTime::now()
+    use std::hash::BuildHasher;
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::collections::hash_map::RandomState::new().hash_one(now)
 }
 
 /// Refuse a remote URL before anything is sent to it, and return the form of
@@ -147,6 +153,8 @@ pub struct RemotePublisher {
     shutdown: Arc<AtomicBool>,
     /// Sender-thread handle, joined on shutdown for a clean flush.
     handle: Mutex<Option<crate::sandbox::worker::WorkerHandle>>,
+    /// Where the sender's backoff jitter comes from; tests fix it.
+    jitter: fn() -> u64,
 }
 
 impl RemotePublisher {
@@ -159,6 +167,7 @@ impl RemotePublisher {
             collectors_ok: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
+            jitter: jitter_entropy,
         }
     }
 
@@ -177,6 +186,7 @@ impl RemotePublisher {
         let queue = self.queue.clone();
         let collectors_ok = self.collectors_ok.clone();
         let shutdown = self.shutdown.clone();
+        let jitter = self.jitter;
 
         let handle = crate::sandbox::worker::spawn("remote", move || {
             let host_info = collect_host_info(host_id);
@@ -239,9 +249,11 @@ impl RemotePublisher {
                         next_send_at = now;
                     }
                     // Poison batch is dropped inside try_flush_once; pace the drain
-                    // so a persistent 4xx doesn't spin.
+                    // so a persistent 4xx doesn't spin. The wait runs from when
+                    // the attempt ended: a POST that took its whole timeout would
+                    // otherwise use up the wait it was owed.
                     Some(SendOutcome::Poison) | Some(SendOutcome::Retry) => {
-                        next_send_at = now + backoff.fail(jitter_entropy());
+                        next_send_at = Instant::now() + backoff.fail(jitter());
                     }
                     None => {}
                 }
@@ -1015,5 +1027,88 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(queue.len(), 1, "an unanswered batch stays queued");
+    }
+
+    /// Review R5: the entropy the sender really uses covers the whole of
+    /// `u64`, so its delays reach past a second. The sub-second nanoseconds
+    /// it returned before kept every delay under one, whatever the ceiling.
+    #[test]
+    fn production_jitter_spreads_retries_past_a_second() {
+        let draws: Vec<u64> = (0..64).map(|_| jitter_entropy()).collect();
+        assert!(draws.iter().any(|&e| e >= 1 << 63), "{draws:?}");
+        assert!(draws.iter().any(|&e| e < 1 << 63), "{draws:?}");
+
+        let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(60));
+        let longest = (0..20)
+            .map(|_| backoff.fail(jitter_entropy()))
+            .max()
+            .unwrap();
+        assert!(longest > Duration::from_secs(1), "{longest:?}");
+    }
+
+    /// Review R5: against a backend that answers every POST with a 503
+    /// after 700 ms, the sender waits each backoff ceiling in turn, counted
+    /// from when the answer came. It timed the wait from before the POST, so
+    /// a slow answer used up part of the wait. The batch stays queued, and
+    /// shutdown still returns on time.
+    #[test]
+    fn sender_paces_retries_to_a_failing_backend() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // When each POST arrived and when its answer went out.
+        let posts = Arc::new(Mutex::new(Vec::<(Instant, Instant)>::new()));
+        let seen = posts.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let len = String::from_utf8_lossy(&head)
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(str::to_owned))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let _ = stream.read_exact(&mut vec![0u8; len]);
+                let arrived = Instant::now();
+                thread::sleep(Duration::from_millis(700));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                seen.lock().unwrap().push((arrived, Instant::now()));
+            }
+        });
+
+        let mut publisher = RemotePublisher::new(RemoteConfig {
+            url,
+            api_key: "key".into(),
+        });
+        // Every draw takes the whole ceiling, so the waits are known.
+        publisher.jitter = || u64::MAX;
+        *publisher.snapshot_data.lock().unwrap() = Some(json!({"n": 1}));
+        publisher.start();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while posts.lock().unwrap().len() < 4 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let posts = posts.lock().unwrap().clone();
+        assert!(posts.len() >= 4, "{} POSTs in 30 s", posts.len());
+        for (i, ceiling) in [500, 1_000, 2_000].into_iter().enumerate() {
+            let wait = posts[i + 1].0 - posts[i].1;
+            assert!(
+                wait >= Duration::from_millis(ceiling),
+                "wait {i} was {wait:?}, ceiling {ceiling} ms"
+            );
+        }
+        assert_eq!(publisher.queue.len(), 1, "a 503 keeps the batch");
+
+        let started = Instant::now();
+        publisher.shutdown(Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
