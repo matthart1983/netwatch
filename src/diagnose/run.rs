@@ -198,7 +198,7 @@ fn run_config(loaded: crate::config::NetwatchConfig) -> crate::config::NetwatchC
 fn run(opts: Options) -> anyhow::Result<Outcome> {
     use crate::{app::App, config::NetwatchConfig, diagnose::live::LiveSampler};
 
-    let config = run_config(NetwatchConfig::load());
+    let config = run_config(NetwatchConfig::load()?);
     print_threshold_warnings(&config.diagnose_thresholds);
     let mut asked = opts
         .target

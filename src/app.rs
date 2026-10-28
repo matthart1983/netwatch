@@ -581,8 +581,10 @@ pub enum AttributionStatus {
 }
 
 impl App {
-    fn prepare() -> Self {
-        Self::prepare_with_config(NetwatchConfig::load())
+    /// Reads the config again after main has. One that stopped loading in
+    /// between is an error here too, before any worker starts.
+    fn prepare() -> Result<Self> {
+        Ok(Self::prepare_with_config(NetwatchConfig::load()?))
     }
 
     /// Construct shared application state without starting workers. Native
@@ -1667,7 +1669,7 @@ where
     tokio::pin!(shutdown);
     #[cfg(unix)]
     shutdown_deadline();
-    let mut app = App::prepare();
+    let mut app = App::prepare()?;
     crate::runtime::bootstrap::start(
         &mut app,
         if demo {
@@ -1920,7 +1922,7 @@ pub async fn run_headless(
 ) -> Result<()> {
     install_collector_panic_flag();
 
-    let mut app = App::prepare();
+    let mut app = App::prepare()?;
     crate::runtime::bootstrap::start(
         &mut app,
         crate::runtime::bootstrap::SessionKind::Daemon,
