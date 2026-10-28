@@ -1970,6 +1970,7 @@ pub async fn run_headless(
                         &app.traffic.interfaces(),
                         &app.health_prober,
                         &app.connection_collector,
+                        &app.packet_collector,
                         app.egress_profiler.violation_totals_sorted(),
                     );
                     exporter.set_collectors_ok(healthy);

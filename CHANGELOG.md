@@ -4,6 +4,22 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`netwatch daemon --metrics` exports the capture's packet counts.**
+  `netwatch_capture_packets_received_total` and
+  `netwatch_capture_packets_dropped_total` count the packets libpcap
+  received and dropped since the capture opened, and
+  `netwatch_capture_packets_decoded_total` the ones netwatch decoded. Frames
+  in a framing netwatch does not decode, the `Raw` rows in Packets, are not
+  counted as decoded, so on a Linux `any` capture or a tunnel that counter
+  stays at 0. Until now only the TUI showed capture drops, so on a dashboard
+  a daemon losing packets to a full kernel buffer looked the same as one
+  that saw every packet. The counters are 64-bit and keep counting past
+  libpcap's 32-bit wrap. While no capture is running, for example when the
+  daemon lacks permission to capture, they have no sample rather than a
+  zero. docs/observability-export.md lists them, and puts its table of
+  metric names, types and labels under the 1.0 compatibility promise.
+
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
   what they assume.** Six places that read the effective user ID, and three
@@ -572,6 +588,9 @@ All notable changes to NetWatch will be documented in this file.
   Diagnose's whole socket pass against that budget before, which no change
   to the join could meet; the pass is still printed, with no budget. The
   Timeline churn test now expects the last 2,000 closed connections to stay.
+- **A test checks the metrics table in docs/observability-export.md
+  against the exporter.** It fails when a metric is added, renamed or given
+  another type without the table.
 
 ## [0.38.0] - 2026-10-25
 
