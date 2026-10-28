@@ -197,9 +197,11 @@ fn rows<T: OwnerPidTable>(buf: &[u32], filled: usize) -> Vec<T::Row> {
         return Vec::new();
     }
     let bytes = filled.min(size_of_val(buf));
-    // SAFETY: the check above leaves at least `size_of::<T>()` bytes, the
-    // assert above makes the u32 elements aligned for `T`, and a successful
-    // call wrote a table header at the start.
+    // SAFETY: the check above leaves at least `size_of::<T>()` bytes, and the
+    // assert above makes the u32 elements aligned for `T`. `T` is one of the
+    // four tables `owner_pid_table!` names, whose fields are u32s and byte
+    // arrays, so any initialised bytes are a valid `T`, whatever the buffer
+    // holds. The reference ends with this statement.
     let claimed = unsafe { &*buf.as_ptr().cast::<T>() }.claimed();
     let n = socket_table::rows_that_fit(bytes, T::ROWS_AT, size_of::<T::Row>(), claimed as usize);
     // SAFETY: `ROWS_AT` is an offset inside `T`, and the buffer is never

@@ -624,6 +624,8 @@ fn add_grants(
         }
         if write && path != Path::new("/dev/null") {
             if !meta.is_dir()
+                // SAFETY: geteuid takes no arguments, reads no memory of
+                // ours and cannot fail.
                 || meta.uid() != unsafe { nix::libc::geteuid() }
                 || meta.mode() & 0o077 != 0
             {

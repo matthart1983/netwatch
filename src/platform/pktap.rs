@@ -186,6 +186,10 @@ fn set_error(slot: &Arc<Mutex<Option<String>>>, msg: String) {
 }
 
 fn pcap_geterr_string(p: *mut ffi::pcap_t) -> String {
+    // SAFETY: both callers pass the handle `run` got from pcap_create while it
+    // is still open. pcap_geterr returns that handle's NUL-terminated error
+    // text, which libpcap keeps valid until pcap_close, and it is copied out
+    // here before either caller can close the handle.
     unsafe { CStr::from_ptr(ffi::pcap_geterr(p)) }
         .to_string_lossy()
         .into_owned()
@@ -209,12 +213,17 @@ fn enable_pktap_metadata(p: *mut ffi::pcap_t) -> Result<(), String> {
 
     let mut resolved: Option<(&[u8], SetFlagFn)> = None;
     for symbol in CANDIDATES {
-        // SAFETY: dlsym with a NUL-terminated symbol name is safe; null
-        // return means "not found", handled by the loop.
+        // SAFETY: every CANDIDATES entry ends in `\0`, so `symbol` is a C
+        // string, and RTLD_DEFAULT is a pseudo-handle dlsym accepts. A null
+        // return means the symbol is absent, and the loop never uses it.
         let raw = unsafe { nix::libc::dlsym(nix::libc::RTLD_DEFAULT, symbol.as_ptr() as *const _) };
         if !raw.is_null() {
-            // SAFETY: Apple's ABI for both symbols is documented as
-            // `int func(pcap_t*, int)`.
+            // SAFETY: `raw` is the non-null address dlsym found for `symbol`,
+            // and a function pointer is the size of a data pointer on macOS.
+            // Apple's pcap/pcap.h declares `pcap_set_want_pktap` as
+            // `int (pcap_t *, int)`, which is `SetFlagFn`. It does not declare
+            // `pcap_set_want_pktap_pktmetadata`, so for that name the same
+            // signature is assumed, not checked against a header.
             let func: SetFlagFn = unsafe { std::mem::transmute(raw) };
             resolved = Some((symbol, func));
             break;
@@ -233,6 +242,9 @@ fn enable_pktap_metadata(p: *mut ffi::pcap_t) -> Result<(), String> {
         }
     };
 
+    // SAFETY: `func` has the C signature `SetFlagFn` names (see the transmute
+    // above), and `p` is the handle `run` passes in straight after
+    // pcap_create, which stays open until this function has returned.
     let rc = unsafe { func(p, 1) };
     if rc != 0 {
         let name = std::str::from_utf8(&symbol[..symbol.len() - 1]).unwrap_or("?");
@@ -258,10 +270,14 @@ fn run(
     };
     let mut errbuf = [0i8; ffi::PCAP_ERRBUF_SIZE];
 
-    // SAFETY: pcap_create takes a NUL-terminated source string and a buffer
-    // of at least PCAP_ERRBUF_SIZE bytes; both invariants are satisfied.
+    // SAFETY: `device` is a CString, and `errbuf` is a writable array of
+    // PCAP_ERRBUF_SIZE bytes, the 256 that pcap.h defines and pcap_create may
+    // write. Both outlive the call.
     let p = unsafe { ffi::pcap_create(device.as_ptr(), errbuf.as_mut_ptr()) };
     if p.is_null() {
+        // SAFETY: `errbuf` started all zero, and pcap_create writes a
+        // NUL-terminated message no longer than the array, so a NUL lies
+        // inside it either way. The text is copied out while `errbuf` lives.
         let msg = unsafe { CStr::from_ptr(errbuf.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -272,6 +288,8 @@ fn run(
     // Apple's metadata flag must be set BEFORE activate so the kernel
     // attaches the pktap_header to every frame.
     if let Err(e) = enable_pktap_metadata(p) {
+        // SAFETY: `p` came from pcap_create and is still open. This path
+        // returns straight after, so `p` is closed once and not used again.
         unsafe { ffi::pcap_close(p) };
         set_error(&startup_error, e);
         return;
@@ -280,22 +298,32 @@ fn run(
     // Configure capture parameters. Errors here are non-fatal — libpcap
     // returns negative on failure but the activate path will surface
     // anything important.
+    // SAFETY: `p` is the open, not yet activated handle from pcap_create.
+    // Each of the three calls takes it and an integer, and reads no other
+    // memory of ours.
     unsafe {
         ffi::pcap_set_snaplen(p, PKTAP_SNAPLEN);
         ffi::pcap_set_timeout(p, PKTAP_TIMEOUT_MS);
         ffi::pcap_set_immediate_mode(p, 1);
     }
 
+    // SAFETY: `p` is the open handle from pcap_create, activated only here.
     let rc = unsafe { ffi::pcap_activate(p) };
     if rc < 0 {
         let err = pcap_geterr_string(p);
+        // SAFETY: a handle whose activation failed stays open for the caller
+        // to close. `err` was copied out above, and this path returns
+        // straight after, so `p` is closed once and not used again.
         unsafe { ffi::pcap_close(p) };
         set_error(&startup_error, format!("pcap_activate(pktap): {err}"));
         return;
     }
 
+    // SAFETY: `p` is open, and activated: `rc` above was not an error.
     let link = unsafe { ffi::pcap_datalink(p) };
     if link != DLT_PKTAP && link != LINKTYPE_PKTAP {
+        // SAFETY: `p` is still open, and this path returns straight after,
+        // so it is closed once and not used again.
         unsafe { ffi::pcap_close(p) };
         set_error(
             &startup_error,
@@ -308,13 +336,25 @@ fn run(
     while !stop.load(Ordering::Relaxed) {
         let mut header_ptr: *mut ffi::pcap_pkthdr = std::ptr::null_mut();
         let mut data_ptr: *const u8 = std::ptr::null();
-        // SAFETY: pcap_next_ex writes to both out-params on rc==1, leaves
-        // them untouched on rc==0 (timeout). We check both before reading.
+        // SAFETY: `p` is open and activated, and both out-params are locals
+        // that outlive the call. Their values are only read below when the
+        // call returns 1, and only once both are checked non-null.
         let rc = unsafe { ffi::pcap_next_ex(p, &mut header_ptr, &mut data_ptr) };
         match rc {
             1 => {
                 if !header_ptr.is_null() && !data_ptr.is_null() {
+                    // SAFETY: on a return of 1, `header_ptr` points at the
+                    // header libpcap keeps for this packet until the next
+                    // pcap_next_ex or pcap_close on `p`. `ffi::pcap_pkthdr`
+                    // matches the C struct up to and including `caplen`,
+                    // which is read by name.
                     let caplen = unsafe { (*header_ptr).caplen } as usize;
+                    // SAFETY: libpcap's contract is that `data_ptr` points at
+                    // `caplen` readable bytes with the same lifetime as the
+                    // header. `caplen` is not checked against the snaplen;
+                    // that contract is all this relies on. `slice` is dead,
+                    // and `parse_frame` returns owned values, before the
+                    // loop calls pcap_next_ex again or closes `p`.
                     let slice = unsafe { std::slice::from_raw_parts(data_ptr, caplen) };
                     if let Some((key, attr)) = parse_frame(slice) {
                         attributor.record(key, attr);
@@ -331,6 +371,9 @@ fn run(
         }
     }
 
+    // SAFETY: every path that closes `p` earlier returns before the loop, so
+    // it is still open here and is closed once. No packet slice outlives the
+    // loop body.
     unsafe { ffi::pcap_close(p) };
 }
 
@@ -360,6 +403,11 @@ mod ffi {
 
     pub const PCAP_ERRBUF_SIZE: usize = 256;
 
+    // SAFETY: each declaration matches its prototype in libpcap's
+    // pcap/pcap.h, Apple's included (`pcap_geterr` returns `char *`, read
+    // here only through a const pointer). `pcap_pkthdr` above matches the C
+    // struct's leading fields, and is only read through pointers libpcap
+    // returns, never built or copied by value.
     extern "C" {
         pub fn pcap_create(source: *const c_char, errbuf: *mut c_char) -> *mut pcap_t;
         pub fn pcap_set_snaplen(p: *mut pcap_t, snaplen: c_int) -> c_int;

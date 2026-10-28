@@ -162,10 +162,12 @@ unsafe fn walk(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter> {
     while let Some(a) = unsafe { cur.as_ref() } {
         cur = a.Next.cast_const();
         let mac_len = (a.PhysicalAddressLength as usize).min(a.PhysicalAddress.len());
-        // SAFETY: the string and list pointers of a record the API filled are
-        // null or point into the same live buffer. `Luid` is a union of a u64
-        // and a bitfield over that same u64, so reading `Value` reads
-        // initialised plain data.
+        // SAFETY: in a record the API filled, `AdapterName` and
+        // `FriendlyName` are null or NUL-terminated strings, and the three
+        // address lists are null or lists of their node type, all in the same
+        // live buffer, which is what `narrow_to_string`, `wide_to_string` and
+        // `list_ips` require. `Luid` is a union of a u64 and a bitfield over
+        // that same u64, so reading `Value` reads initialised plain data.
         let adapter = unsafe {
             Adapter {
                 luid: a.Luid.Value,
@@ -238,8 +240,11 @@ unsafe fn socket_address_ip(sa: SOCKET_ADDRESS) -> Option<IpAddr> {
 /// The address in a `SOCKADDR_INET`, the form the route table uses.
 fn sockaddr_inet_ip(sa: &SOCKADDR_INET) -> Option<IpAddr> {
     // SAFETY: SOCKADDR_INET is a union of sockaddr_in, sockaddr_in6 and the
-    // family word, all integers, and `sa` is a live reference to a value the
-    // API wrote whole, so its `size_of` bytes are readable and initialised.
+    // family word, all integers, and `sa` is a live reference, so its
+    // `size_of` bytes are readable. They are initialised for every caller:
+    // `route` passes rows the API wrote whole, and the test a zeroed value.
+    // A SOCKADDR_INET built in Rust from its IPv4 member alone would leave
+    // the rest uninitialised, which this safe fn cannot check.
     let raw = unsafe {
         std::slice::from_raw_parts(
             (sa as *const SOCKADDR_INET).cast::<u8>(),
@@ -343,13 +348,13 @@ fn counters(r: &MIB_IF_ROW2) -> IfCounters {
 /// The routing table from `GetIpForwardTable2`, both families.
 fn routes() -> Result<Vec<Route>, u32> {
     let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
-    // SAFETY: as in `if_counters`.
+    // SAFETY: as in `if_rows`.
     let rc = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) };
     if rc != NO_ERROR {
         return Err(rc);
     }
     let table = MibTable(table);
-    // SAFETY: as in `if_counters`, for the route table's rows.
+    // SAFETY: as in `if_rows`, for the route table's rows.
     let rows: &[MIB_IPFORWARD_ROW2] = unsafe {
         std::slice::from_raw_parts(
             std::ptr::addr_of!((*table.0).Table).cast::<MIB_IPFORWARD_ROW2>(),

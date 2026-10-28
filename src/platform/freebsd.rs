@@ -132,11 +132,16 @@ fn up_interfaces_from_getifaddrs() -> GetifaddrsFlags {
     }
     let mut cur = ifap;
     while !cur.is_null() {
+        // SAFETY: `cur` is non-null, and is the head or an `ifa_next` of the
+        // list getifaddrs returned, which is only freed after the loop.
         let entry = unsafe { &*cur };
         cur = entry.ifa_next;
         if entry.ifa_name.is_null() {
             continue;
         }
+        // SAFETY: `ifa_name` is checked non-null above, and getifaddrs
+        // NUL-terminates it. It is copied into an owned String before the
+        // list is freed.
         let name = unsafe { CStr::from_ptr(entry.ifa_name) }
             .to_string_lossy()
             .into_owned();
