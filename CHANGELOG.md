@@ -436,6 +436,43 @@ All notable changes to NetWatch will be documented in this file.
   kernels with a message, and the `/proc/net` fallback test, which needs no
   TCP deny, runs in best-effort mode. Older kernels, and kernels without
   Landlock, fail both tests as before.
+- **CI checks the connection table at 10,000 rows.** A generator builds
+  connection tables shaped like a busy host's. In every run, a 10,000-row
+  table must show its true count and scroll to its last row, and the
+  Timeline must keep every active connection when 10,000 are open. Timed
+  tests for frames, the scroll key, the tick's connection consumers and
+  Diagnose's socket join at 2,000, 10,000 and 50,000 rows, and for a real
+  poll of up to 50,000 loopback sockets, run in a new weekly perf workflow
+  that gates nothing yet. `scripts/scale-bench.sh` prints their numbers as
+  a table and fails on any budget not met. The workflow sets
+  `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
+  printed there and do not fail the run.
+- **The terminal signal tests no longer fail at random on FreeBSD.**
+  FreeBSD's openpty(3) finds the slave's path with ptsname(3), which keeps
+  it in one buffer for the whole process. The four tests in
+  `tests/tui_signals.rs` allocate their ptys at the same moment on parallel
+  threads, so a test could open another test's slave. Its netwatch then drew
+  where nothing was reading, and the test failed, mostly with `no first
+  frame: ""`: 23 of 120 runs on a FreeBSD 15.1 VM. The pty tests in
+  `src/ui/tty.rs` had the same race and failed 3 of 100. Both now allocate
+  one pty at a time. The signal tests then passed 200 runs in a row, and the
+  tty tests 100.
+- **A flood soak checks netwatch's memory, capture caps and frame time
+  under load.** `tests/soak/flood_soak.py` joins two unprivileged
+  namespaces with a veth. `tests/soak/flood.py` floods one end with six
+  kinds of traffic, two cycles of each, then two paced rates, while
+  `examples/flood_soak` runs the real App on the other end, capturing and
+  drawing ten frames a second. The second cycle sends new addresses, so
+  a table that grows by address shows up as growth between the cycles.
+  The real `netwatch daemon` runs last, under the mix of traffic and then
+  under full-size TCP that fills its stream budget. The soak fails on a
+  peak RSS over 512 MiB, memory that grows between the cycles, a packet
+  ring, stream tracker or thread count past its cap, a phase in which
+  nothing was sent or decoded, a capture error, a panic in the App or the
+  daemon, a daemon that lost its packet socket, a run with no
+  segmentation-offload frames, or a view whose p99 frame time passes
+  33 ms. It records decode rate, drops and CPU for every phase. A full run
+  takes 75 minutes and `--smoke` five. No workflow runs it yet.
 
 ## [0.38.0] - 2026-10-25
 

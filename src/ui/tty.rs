@@ -187,7 +187,7 @@ mod tests {
         use std::os::fd::OwnedFd;
         use std::os::unix::process::CommandExt;
         use std::process::{Command, ExitStatus, Stdio};
-        use std::sync::mpsc;
+        use std::sync::{mpsc, Mutex, PoisonError};
         use std::time::{Duration, Instant};
 
         pub struct Run {
@@ -210,7 +210,15 @@ mod tests {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
-            let pty = openpty(&size, None).unwrap();
+            // FreeBSD's openpty(3) finds the slave's path with ptsname(3),
+            // whose buffer every thread shares, so two of these tests
+            // allocating at once could each open the other's slave. They
+            // take turns.
+            static TURN: Mutex<()> = Mutex::new(());
+            let pty = {
+                let _turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+                openpty(&size, None).unwrap()
+            };
             let before = tcgetattr(&pty.slave).unwrap();
             let stdio = |fd: &OwnedFd| Stdio::from(fd.try_clone().unwrap());
             let mut cmd = Command::new(std::env::current_exe().unwrap());

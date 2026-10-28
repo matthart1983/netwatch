@@ -7,7 +7,7 @@
 //! The last three tests take the terminal away or stop it reading, where the
 //! pty cannot be put back. A hangup must still exit 0, and SIGTERM must still
 //! end netwatch when its terminal has stopped reading.
-use nix::pty::{openpty, Winsize};
+use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::termios::{tcgetattr, LocalFlags, Termios};
 use nix::unistd::Pid;
@@ -17,10 +17,22 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 const ENTER: &str = "\x1b[?1049h";
+
+/// A new pty with its slave open. FreeBSD's openpty(3) finds the slave's path
+/// with ptsname(3), whose buffer every thread shares, so two tests allocating
+/// at once could each open the other's slave, or both open the same one.
+/// netwatch then drew on a pty its test was not reading, and the test saw no
+/// first frame. Allocations take turns.
+fn open_pty(size: &Winsize) -> OpenptyResult {
+    static TURN: Mutex<()> = Mutex::new(());
+    let _turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+    openpty(size, None).unwrap()
+}
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -65,7 +77,7 @@ impl Pty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pty = openpty(&size, None).unwrap();
+        let pty = open_pty(&size);
         let before = tcgetattr(&pty.slave).unwrap();
         let stdio = |fd: &OwnedFd| Stdio::from(fd.try_clone().unwrap());
         cmd.stdin(stdio(&pty.slave))
@@ -247,7 +259,7 @@ impl Ctty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pty = openpty(&size, None).unwrap();
+        let pty = open_pty(&size);
         let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
         cmd.stdin(stdio()).stdout(stdio()).stderr(stdio());
         // SAFETY: setsid and ioctl are async-signal-safe, which is all that may
