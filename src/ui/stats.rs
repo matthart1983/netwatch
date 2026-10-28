@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::app::{App, StatsRange};
 use crate::collectors::packets::CapturedPacket;
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{prelude::*, widgets::Paragraph};
 
@@ -816,15 +817,6 @@ where
         }
     }
     acc
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
