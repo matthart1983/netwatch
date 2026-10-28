@@ -224,6 +224,12 @@ All notable changes to NetWatch will be documented in this file.
   in `summary.md` give the number of rows left out, and `connections.json`
   keeps its shape. The bundle's JSON files are also written through a
   buffer now; 50,000 rows took about 12 million write calls before.
+- **`diagnose run --budget` rejects a huge minute count instead of
+  panicking.** `--budget 18446744073709551615m` overflowed the conversion to
+  seconds. A debug build panicked, and a release build wrapped around, so
+  some huge values landed back inside the 5 s to 10 min range and were
+  accepted. Every out-of-range budget now exits 3 with "budget must be
+  between 5s and 10m", including numbers too large to read at all.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
