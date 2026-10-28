@@ -83,6 +83,22 @@ All notable changes to NetWatch will be documented in this file.
   `ConnectionCollector::connections_with_generation`.
 
 ### Fixed
+- **One bad value in config.toml no longer throws the whole file away.** A
+  file that was not valid TOML, or gave a key a value of the wrong type, was
+  replaced by the defaults without a word. With `refresh_rate_ms = 'oops'` in
+  a file that also set `sandbox = "strict"` and `record_uptime = false`,
+  netwatch started with a best-effort sandbox and recorded uptime. A file it
+  could not read, or a symlink to one that had gone, was treated the same
+  way. `netwatch` and `netwatch daemon` now print the file, line and column
+  and exit 1 before anything starts or is written. `diagnose run` exits 3,
+  its status for no session, and `diagnose coverage` exits 1, with the same
+  message. `netwatch doctor` names the file, line and column in its `config`
+  entry, still without quoting the file, and `--check-capture` no longer
+  opens capture on the defaults in its place. `--generate-config` and the
+  Settings save no longer overwrite a file that does not load. With no file
+  at all the defaults apply as before, and keys a file leaves out keep
+  theirs. In the library, `NetwatchConfig::load` returns a `Result`, and
+  `load_from` and `save_to` are new.
 - Dense view's connection and process sparklines now use their full width,
   including on wide terminals. Their time labels reflect the retained history
   and refresh interval instead of always saying `60s`.

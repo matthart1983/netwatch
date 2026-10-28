@@ -79,13 +79,11 @@ fn main() -> Result<()> {
         ),
         None => None,
     };
-    // `load` falls back to defaults on a parse error, which here would run
-    // the lab without episode recording and pass for the wrong reason.
+    // Missing, the file would load as the defaults, which here would run the
+    // lab without episode recording and pass for the wrong reason.
     let path = NetwatchConfig::path().context("no config directory")?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("the lab writes {}", path.display()))?;
-    toml::from_str::<NetwatchConfig>(&text).with_context(|| format!("{}", path.display()))?;
-    let config = NetwatchConfig::load();
+    ensure!(path.is_file(), "the lab writes {}", path.display());
+    let config = NetwatchConfig::load_from(&path)?;
 
     let _session = netwatch::sandbox::worker::SessionGuard;
     let mode = netwatch::sandbox::Mode::from_config(&config.sandbox);

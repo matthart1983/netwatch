@@ -52,7 +52,11 @@ fn main() -> Result<()> {
         }
         netwatch::cli::Command::Run(options) => options,
     };
-    let config = NetwatchConfig::load();
+    // Before anything is created or started. A config that is there but does
+    // not load stops the TUI and the daemon here, naming the file and the
+    // cause: the defaults would drop every setting in it, the sandbox mode
+    // and `record_uptime` included.
+    let config = NetwatchConfig::load()?;
     let remote_url = options
         .remote
         .or_else(|| std::env::var("NETWATCH_REMOTE_URL").ok());
