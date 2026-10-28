@@ -21,6 +21,27 @@ All notable changes to NetWatch will be documented in this file.
   pointer, and reads only the speed field rather than borrowing the whole
   `if_data` record. Nothing netwatch shows changes, and no new crate is
   compiled.
+- **The stream tracker's budget is an eighth of the host's memory, up to
+  256 MiB.** It was 256 MiB on every host, half the memory of a 512 MiB
+  board. netwatch reads the host's memory once at start, `MemTotal` on Linux
+  and the physical memory the system reports on macOS, Windows and FreeBSD,
+  so a 512 MiB host gets 64 MiB, a 1 GiB host 128 MiB, and a host with 2 GiB
+  or more keeps 256 MiB. In a Linux container the budget follows the host's
+  memory, not the container's limit. Past the budget the tracker drops the
+  least recently seen streams, as before, so a small host keeps payloads for
+  fewer flows under heavy traffic. One decrypted HTTP/3 flow can hold about
+  69 MiB on its own, and the tracker does not drop a flow while that flow is
+  the one growing. With an SSLKEYLOGFILE on a host under about 550 MiB, the
+  tracker can pass its budget by the difference, about 5 MiB on a 512 MiB
+  host, until another flow's traffic drops that one.
+- **The `M` overlay shows the bytes the packet list and the stream tracker
+  hold, in MiB, against their budgets.** It also took the packet list's
+  count cap from a copy of 5000, and now reads the constant the list uses.
+- **`CapturedPacket` no longer has `raw_hex` and `raw_ascii`.** Library
+  callers can build the same text from `raw_bytes` with
+  `collectors::packets::hex_dump` and `ascii_dump`. `PacketCollector::ring_bytes`
+  and the hidden `StreamTracker::held_bytes`, `byte_budget` and
+  `dropped_flows` are new. The library is not a stable interface.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
@@ -118,6 +139,91 @@ All notable changes to NetWatch will be documented in this file.
   past the 20 that raise the alert, and each window starts with an empty
   set. Domain counts are cut to the 500 most queried as soon as a new name
   would take them past 1,000.
+- **With a GeoIP database configured, the GeoIP cache stops growing at
+  16,384 addresses.** Each address the database answered for got a cache
+  entry that was never removed, so a TUI or daemon left running kept one
+  for every public address it had looked up. On a public server that is
+  every client. Every GeoIP lookup now goes through one cache of 16,384
+  entries, room for the 10,000 connections netwatch is sized for, that
+  drops the least recently used quarter when it fills, as reverse DNS
+  already did. The WHOIS cache of 2,048 entries and the online GeoIP cache
+  dropped whichever quarter their map listed first, which could include the
+  address on screen. They now drop the least recently used too. A
+  v4-mapped address such as `::ffff:8.8.8.8` and its IPv4 form share one
+  entry and are looked up as the IPv4 address. With `geoip_online` on, the
+  queue of addresses waiting for ip-api.com, which is asked about one every
+  1.4 seconds, had no limit, and with more peers than the cache held it
+  grew by hundreds a second. It now holds 256, and an address that finds
+  it full is asked for again on a later lookup.
+- **The Connections GEO column shows a location for IPv6 peers.** The
+  column looked up the address with its brackets on, as in
+  `[2606:4700:4700::1111]`, which the lookup could not parse, so every IPv6
+  row showed a dash. So did an IPv4 peer of a dual-stack socket, which
+  Linux shows as `[::ffff:8.8.8.8]`. The lookup now drops the brackets.
+- **Dense shows the org and city of a peer that sent a server name.** The
+  line under the selected connection looked up the TLS or QUIC server name
+  instead of the address, and a GeoIP database knows only addresses, so
+  those rows never showed one. It now looks up the address.
+- **A bulk transfer no longer fills memory through the packet list.** Every
+  captured packet carried a hex and an ASCII dump of its frame, built with a
+  `format!` per byte. The dumps took about five times the frame's size and
+  most of the capture thread's decode time, and the list of the last 5,000
+  packets had no byte limit. A local bulk transfer, whose segmentation
+  offload hands libpcap 64 KB frames, left the list holding 1.8 GB, and
+  5,000 full-size Ethernet frames held 53 MB. Only the selected packet's dump
+  is ever drawn, so the Packets tab now builds it from the frame as it
+  draws, and only as many lines as the pane has rows. The list keeps 5,000
+  packets or 32 MiB of them, whichever is fewer. That is about 500 of those
+  64 KB frames, or 5,000 full-size ones in 18 MB. Each packet's copy of its
+  flow's DPI label counts too, since a peer chooses how long it is: a few
+  QUIC Initials of ordinary size can name a 15,000-byte SNI, which every
+  later datagram on the flow then carries. The capture strip said
+  `ring 5000` whatever the list held. It now measures the list against the
+  cap it is nearer, `ring 3120/5000`, or `ring 494 · 31.9/32 MiB` under
+  large frames. The drop count moves to the front of those figures, since
+  the strip is cut off at the terminal's edge: at 80 columns, with a long
+  interface name or filter, the end of the line was lost, and the drop
+  count with it. Decoding full-size frames went from about 13,000 to about
+  150,000 a second on the development machine.
+- **The stream tracker charges each segment its full cost, and charges the
+  QUIC CRYPTO buffer and each flow's DPI label.** The tracker charged each
+  stored segment its payload and its own size, but not the `Arc` it lives in
+  or its slot in the stream's list, 24 bytes a segment on a 64-bit host. It
+  did not charge a QUIC flow's CRYPTO reassembly buffer at all, up to
+  16 KiB, or the flow's label, whose SNI a peer can make 15,000 bytes long.
+  Small UDP payloads over a thousand flows filled 300 MiB against the
+  256 MiB budget. The tracker charges all three now and stays under its
+  budget, and it takes the CRYPTO buffer's charge back when it frees the
+  buffer.
+- **A text filter on the Packets tab no longer slows every frame.** A bare
+  word or a `contains` filter lowercased a copy of each packet's info,
+  addresses, host names and payload text to search them. It did that for
+  every packet in the list on every frame, while holding the list's lock.
+  With 5,000 text packets and the filter `zzz`, a Packets frame took 11 ms,
+  17.6 ms at the 99th percentile, against 0.4 ms unfiltered. It now takes
+  4 ms, or 6.3 ms at the 99th percentile. The search compares in place and
+  finds the same packets.
+- **An armed flight recorder no longer grows to gigabytes on a busy host.**
+  It kept up to 20,000 packets whatever their size, and a copy of the whole
+  connection table at every refresh for five minutes. Under bulk TCP, where
+  one GSO frame can be 64 KiB, each recorded frame held about 380 KB with
+  its hex and text, so 20,000 could reach 7 GB. A host with 10,000
+  connections reached 3 million rows, about 3.3 GB. The recorder now also
+  stops at 64 MiB of packets, dropping the oldest first. That counts the
+  text decoded from them as well as their bytes, including the SNI or
+  request path that every packet of a flow carries, which a peer can make
+  kilobytes long. Connection snapshots stop at 50,000 rows or 64 MiB in
+  all, whichever comes first, and past that the recorder leaves out whole
+  older snapshots. Each row carries its flow's SNI or request path too, so
+  1,024 connections each carrying an 8 KB name held about 2.7 GB over the
+  window; they now keep seven snapshots. With rows of the usual size, up
+  to 16,666 connections the rest stay spread across the window at a longer
+  interval. From there to 25,000 only one older snapshot fits beside the
+  newest, and past 25,000 the recorder keeps only the newest. That one is
+  always whole. A new manifest key, `connection_rows_dropped`, and a line
+  in `summary.md` give the number of rows left out, and `connections.json`
+  keeps its shape. The bundle's JSON files are also written through a
+  buffer now; 50,000 rows took about 12 million write calls before.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -230,6 +336,70 @@ All notable changes to NetWatch will be documented in this file.
   at startup. `netwatch doctor` said eBPF was disabled by the sandbox
   policy, untrue since 0.32.2; it now says eBPF loads under the policy and
   its reader keeps the load capabilities.
+- **WHOIS and online GeoIP look up global unicast addresses only.** Their
+  private-address check compared the start of the text against a short
+  list, so it let through local addresses written another way or in ranges
+  the list left out. Among them were a LAN peer in the `::ffff:192.168.1.5`
+  form Linux gives a dual-stack socket's peer, the 100.64.0.0/10 range that
+  carrier-grade NAT and Tailscale use, the documentation and benchmarking
+  ranges, link-local addresses outside `fe80::/16`, multicast groups
+  outside 224/8 and 239/8, 255.255.255.255, local-use NAT64 addresses in
+  `64:ff9b:1::/48` and SRv6 addresses in `5f00::/16`. `W` sent such an
+  address to rdap.org, and with `geoip_online` on, netwatch sent it to
+  ip-api.com in cleartext. Both now skip any address that is not global
+  unicast: multicast, and every address the IANA special-purpose
+  registries mark as not globally reachable. A NAT64 address in
+  `64:ff9b::/96` or a 6to4 address in `2002::/16` counts as global only if
+  the IPv4 address inside it does.
+- **Dense no longer sends server names to ip-api.com.** With
+  `geoip_online` on, the line under the selected connection sent
+  ip-api.com, in cleartext, the server name a TLS or QUIC connection had
+  sent instead of its address. It now sends the address.
+
+### CI
+- **A Diagnose load test unit test no longer fails on a slow runner.**
+  `loaded_samples_are_taken_only_while_the_body_goes_out` slept on the real
+  clock and needed its first sample before a 900 ms cut-off, which a busy
+  macOS runner sometimes missed, failing the run and cancelling the Linux
+  and Windows jobs with it. The sampler now takes its clock as an argument,
+  and the test gives it one that moves only when it is slept on.
+- **CI checks the connection table at 10,000 rows.** A generator builds
+  connection tables shaped like a busy host's. In every run, a 10,000-row
+  table must show its true count and scroll to its last row, and the
+  Timeline must keep every active connection when 10,000 are open. Timed
+  tests for frames, the scroll key, the tick's connection consumers and
+  Diagnose's socket join at 2,000, 10,000 and 50,000 rows, and for a real
+  poll of up to 50,000 loopback sockets, run in a new weekly perf workflow
+  that gates nothing yet. `scripts/scale-bench.sh` prints their numbers as
+  a table and fails on any budget not met. The workflow sets
+  `NW_PERF_STRICT=0`, so budgets that wait on later 0.39 changes are
+  printed there and do not fail the run.
+- **The terminal signal tests no longer fail at random on FreeBSD.**
+  FreeBSD's openpty(3) finds the slave's path with ptsname(3), which keeps
+  it in one buffer for the whole process. The four tests in
+  `tests/tui_signals.rs` allocate their ptys at the same moment on parallel
+  threads, so a test could open another test's slave. Its netwatch then drew
+  where nothing was reading, and the test failed, mostly with `no first
+  frame: ""`: 23 of 120 runs on a FreeBSD 15.1 VM. The pty tests in
+  `src/ui/tty.rs` had the same race and failed 3 of 100. Both now allocate
+  one pty at a time. The signal tests then passed 200 runs in a row, and the
+  tty tests 100.
+- **A flood soak checks netwatch's memory, capture caps and frame time
+  under load.** `tests/soak/flood_soak.py` joins two unprivileged
+  namespaces with a veth. `tests/soak/flood.py` floods one end with six
+  kinds of traffic, two cycles of each, then two paced rates, while
+  `examples/flood_soak` runs the real App on the other end, capturing and
+  drawing ten frames a second. The second cycle sends new addresses, so
+  a table that grows by address shows up as growth between the cycles.
+  The real `netwatch daemon` runs last, under the mix of traffic and then
+  under full-size TCP that fills its stream budget. The soak fails on a
+  peak RSS over 512 MiB, memory that grows between the cycles, a packet
+  ring, stream tracker or thread count past its cap, a phase in which
+  nothing was sent or decoded, a capture error, a panic in the App or the
+  daemon, a daemon that lost its packet socket, a run with no
+  segmentation-offload frames, or a view whose p99 frame time passes
+  33 ms. It records decode rate, drops and CPU for every phase. A full run
+  takes 75 minutes and `--smoke` five. No workflow runs it yet.
 
 ## [0.38.0] - 2026-10-25
 

@@ -26,3 +26,15 @@ filter = """
     | test(/^ui::tty::tests::a_/)
 """
 retries = 2
+
+# The scale timings (src/scale_tests.rs) run one at a time, so a frame is not
+# timed while another test's poll or render competes for the cores. They are
+# #[ignore]d and run only on request, in a release build, and without
+# fail-fast, so one slow case does not cancel the others' numbers:
+# cargo nextest run --release --run-ignored only --no-fail-fast -E 'test(/scale_/)'
+[test-groups]
+scale = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "test(/^scale_tests::scale_/)"
+test-group = "scale"

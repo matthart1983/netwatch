@@ -2419,7 +2419,8 @@ fn render_detail(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, c: &ConnRow
             &ramps.down,
         );
     }
-    if let Some(geo) = app.geo_cache.lookup(&c.host) {
+    // The address, not `host`: that is the SNI name when there is one.
+    if let Some(geo) = app.geo_cache.lookup(&split_host_port(&c.remote).0) {
         let label = if geo.city.is_empty() {
             geo.org.clone()
         } else {
@@ -2960,6 +2961,53 @@ mod tests {
             // A pathological SNI must be cut, not allowed to overflow.
             let long = format!("rtt 1ms   retrans 0   ooo 0   HTTPS {}", "a".repeat(200));
             assert!(truncate(&long, avail as usize).width() as u16 <= avail);
+        }
+    }
+
+    /// The detail label looked up the row's host, which is the SNI name when
+    /// the connection sent one. A name is not an address, so a TLS or QUIC
+    /// row never showed its peer's org and city, and with `geoip_online` on
+    /// the name itself went to ip-api.com.
+    #[test]
+    fn detail_geo_label_looks_up_the_address_not_the_sni() {
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.geo_cache = crate::collectors::geo::GeoCache::every_address_us_for_test();
+        let theme = crate::theme::nord();
+        let ramps = Ramps::from_theme(&theme);
+        let l = Layout::new(Rect::new(0, 0, 160, 44));
+        for (host, remote) in [
+            ("www.example.com", "8.8.8.8:443"),
+            ("www.example.com", "[2606:4700:4700::1111]:443"),
+            ("8.8.8.8", "8.8.8.8:443"),
+        ] {
+            let row = ConnRow {
+                process: "curl".into(),
+                pid: None,
+                host: host.into(),
+                port: "443".into(),
+                proto: "tcp".into(),
+                rx_rate: 0.0,
+                tx_rate: 0.0,
+                rtt_ms: None,
+                state: "ESTABLISHED".into(),
+                retransmits: 0,
+                out_of_order: 0,
+                app_proto: None,
+                local: "10.0.0.2:50000".into(),
+                remote: remote.into(),
+                history: Vec::new(),
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 44)).unwrap();
+            terminal
+                .draw(|f| render_detail(f, &app, &theme, &ramps, &row, &l))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let line: String = (0..160)
+                .map(|x| buffer[(x, l.row_detail_3)].symbol())
+                .collect();
+            assert!(line.contains("Ashburn"), "{host} at {remote}: {line}");
         }
     }
 
