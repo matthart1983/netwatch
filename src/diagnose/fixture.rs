@@ -110,8 +110,8 @@ pub fn bloated_socket(age_secs: u64) -> SocketObs {
         ssthresh: Some(u32::MAX),
         rwnd: Some(262_144),
         mss: Some(1448),
-        tx_bps: 2.4e6,
-        rx_bps: 1.1e4,
+        tx_bps: Some(2.4e6),
+        rx_bps: Some(1.1e4),
         verdict_age_secs: age_secs,
     }
 }
@@ -499,8 +499,8 @@ fn neighbour_socket(t: u64) -> SocketObs {
         ssthresh: Some(u32::MAX),
         rwnd: Some(131_072),
         mss: Some(1448),
-        tx_bps: 1.2e4,
-        rx_bps: 8.6e5,
+        tx_bps: Some(1.2e4),
+        rx_bps: Some(8.6e5),
         verdict_age_secs: t,
     }
 }
@@ -522,8 +522,8 @@ fn retrans_socket_closes(t: u64) -> Observations {
         ssthresh: Some(u32::MAX),
         rwnd: Some(1_048_576),
         mss: Some(1448),
-        tx_bps: 3.8e6,
-        rx_bps: 4.2e4,
+        tx_bps: Some(3.8e6),
+        rx_bps: Some(4.2e4),
         verdict_age_secs: t,
     };
     match phase(t, &STORY) {
@@ -533,7 +533,7 @@ fn retrans_socket_closes(t: u64) -> Observations {
             retrans: Some(18),
             cwnd: Some(12),
             ssthresh: Some(21),
-            tx_bps: 6.1e5,
+            tx_bps: Some(6.1e5),
             verdict_age_secs: t - 120,
             ..scp
         }),
@@ -576,16 +576,16 @@ fn zero_window_socket_closes(t: u64) -> Observations {
         ssthresh: Some(u32::MAX),
         rwnd: Some(524_288),
         mss: Some(1448),
-        tx_bps: 9.1e7,
-        rx_bps: 2.2e5,
+        tx_bps: Some(9.1e7),
+        rx_bps: Some(2.2e5),
         verdict_age_secs: t,
     };
     match phase(t, &STORY) {
         Phase::Healthy => obs.sockets.push(rsync),
         Phase::Fault => obs.sockets.push(SocketObs {
             rwnd: Some(0),
-            tx_bps: 0.0,
-            rx_bps: 0.0,
+            tx_bps: Some(0.0),
+            rx_bps: Some(0.0),
             verdict_age_secs: t - 120,
             ..rsync
         }),
