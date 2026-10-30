@@ -736,9 +736,11 @@ All notable changes to NetWatch will be documented in this file.
 - **The capture authority claims have a lab.** `tests/capture_authority.rs` runs
   real daemon and TUI sessions as root in a user and network namespace with a veth
   pair. It checks that capture still receives frames, what every thread holds, that
-  a stopped daemon cannot reopen capture and a TUI can, and what capture, keylog and
-  the metrics threads get from TCP connect, socket(2) and io_uring_setup(2). It
-  skips unless `NETWATCH_CAP_LAB=1`. `scripts/capture-authority-audit.sh` audits the real
+  a stopped daemon cannot reopen capture and a TUI can, what capture, keylog and the
+  metrics threads get from socket(2) and io_uring_setup(2), and that a live capture
+  thread gets EACCES from TCP connect. `isolated_worker_boundaries`, a worker unit
+  test, covers TCP connect on keylog and the metrics threads. The lab skips unless
+  `NETWATCH_CAP_LAB=1`. `scripts/capture-authority-audit.sh` audits the real
   `netwatch daemon` from outside. `sandbox-lab.yml` runs both, with the sandbox tests
   that make their own user namespace, on pull requests touching the sandbox or
   capture and once a week. It is separate from `ci.yml`, so it holds no tag, and the

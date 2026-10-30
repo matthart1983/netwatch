@@ -71,10 +71,10 @@ pub fn role_for(name: &str) -> Role {
 /// first, the metrics listener binds first and accept4 is not socket(2).
 ///
 /// Everything else goes without. connections, tcp-info and traffic start ss,
-/// ip and iw, which need netlink; terminal's signal handling uses a socketpair;
-/// ebpf waits until its load path is audited. A name missing from the table
-/// goes without too: unlike the network, nothing here fails closed, because a
-/// worker that needs a socket would only find out when it failed.
+/// ip and iw, which need netlink. The rest, terminal and ebpf among them, have not
+/// been audited for it. A name missing from the table goes without too: unlike
+/// the network, nothing here fails closed, because a worker that needs a socket
+/// would only find out when it failed.
 pub fn no_sockets(name: &str) -> bool {
     matches!(
         name,

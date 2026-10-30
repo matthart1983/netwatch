@@ -423,7 +423,7 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   | Threads | TCP bind and connect | socket(2) |
   | --- | --- | --- |
   | Main and the network workers (reverse DNS, WHOIS, GeoIP, health, traceroute, Insights, remote, Diagnose probes, blocking pool) | Allowed | Allowed |
-  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink |
+  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink, and the others have not been audited for the filter |
   | Capture, keylog, metrics listener and client | Denied from Linux 6.7 | EPERM |
 
   `netwatch doctor --json` reports the kernel's ABI and what a parser thread enforces

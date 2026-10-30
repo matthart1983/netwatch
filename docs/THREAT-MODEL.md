@@ -90,9 +90,9 @@ Where the architecture is supported and the kernel refuses the filter, the entry
 gets a warning, so strict refuses to start
 ([filter](../src/sandbox/seccomp.rs#L1),
 [which workers](../src/sandbox/roles.rs#L78)). The other parser threads go
-without it because of what they run: connections, tcp-info and traffic start `ss`,
-`ip` and `iw`, which need netlink, the terminal thread's signal handling uses a
-socketpair, and the eBPF worker's load path has not been audited for it.
+without it. Connections, tcp-info and traffic start `ss`, `ip` and `iw`, which need
+netlink. The rest, the terminal thread and the eBPF worker's load path among them,
+have not been audited for it.
 
 ```text
 <!-- policy:no-sockets -->
