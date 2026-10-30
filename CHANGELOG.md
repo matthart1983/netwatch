@@ -722,6 +722,16 @@ All notable changes to NetWatch will be documented in this file.
 - **A test checks the metrics table in docs/observability-export.md
   against the exporter.** It fails when a metric is added, renamed or given
   another type without the table.
+- **The capture authority claims have a lab.** `tests/capture_authority.rs` runs
+  real daemon and TUI sessions as root in a user and network namespace with a veth
+  pair. It checks that capture still receives frames, what every thread holds, that
+  a stopped daemon cannot reopen capture and a TUI can, and what capture, keylog and
+  the metrics threads get from TCP connect and socket(2). It skips unless
+  `NETWATCH_CAP_LAB=1`. `scripts/capture-authority-audit.sh` audits the real
+  `netwatch daemon` from outside. `sandbox-lab.yml` runs both, with the sandbox tests
+  that make their own user namespace, on pull requests touching the sandbox or
+  capture and once a week. It is separate from `ci.yml`, so it holds no tag, and the
+  release checklist in `docs/PACKAGING.md` asks for a green run on the candidate.
 
 ## [0.38.0] - 2026-10-25
 

@@ -293,7 +293,11 @@ rebound, read another interface's traffic (Linux 7.1, libpcap 1.10.6). Every
 thread shares it (item 1), so no capability drop takes capture authority away
 from a compromised parser. Capture opens before policy entry; a dumpcap-style
 separate capture process is needed for a stronger boundary. The drops and the
-audit were measured as root in a user and network namespace with a veth pair;
+audit are measured as root in a user and network namespace with a veth pair, by
+[the sandbox lab](../tests/capture_authority.rs) on real sessions and
+[an audit of the real daemon](../scripts/capture-authority-audit.sh). A user
+namespace is not real root. In particular the `/proc/kcore` check is against the
+initial namespace's capabilities, so it stays a manual `sudo` acceptance step, and
 this document does not claim an independent root capture acceptance test was
 performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 
