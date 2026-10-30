@@ -19,6 +19,23 @@ All notable changes to NetWatch will be documented in this file.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
+- **`netwatch geoip update [--city]` downloads the databases the GeoIP column
+  needs, and an empty `geoip_db` or `geoip_asn_db` now uses them.** Offline
+  lookups used to need a MaxMind account and two paths in the config. The
+  command fetches DB-IP's free Country and ASN databases, plus City with
+  `--city`, reports each file as updated or already current, and exits 0 when
+  every file is up to date and 1 otherwise. A path in the config still wins.
+  The gzip and the database are read on a worker thread with TCP denied from
+  Linux 6.7 on, and a file that fails its checks leaves the old one in place.
+  Nothing refreshes the files on its own, and the provider and file location
+  are not part of the stable interface.
+- **`netwatch doctor` reports a `geoip_db` capability, and Settings says which
+  database is loaded.** A path that did not open looked the same as no path:
+  the column stayed empty and nothing said why. `geoip_db` is now `ready`
+  (`db_loaded`), `degraded` (`db_stale`, over 60 days old), `unavailable`
+  (`db_unreadable`) or `disabled` (`not_configured`, with the command to run).
+  The Settings rows show the database type and path, or the path that waits for
+  the next start.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check

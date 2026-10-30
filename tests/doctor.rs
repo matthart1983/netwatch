@@ -113,6 +113,79 @@ fn malformed_config_is_reported_without_echoing_secrets() {
     assert!(detail.contains(&path.display().to_string()), "{detail}");
     assert!(detail.contains("line 1, column 11"), "{detail}");
 }
+/// A database that does not open used to look the same as no database at all,
+/// and doctor reports it without opening any connection to find out.
+#[test]
+fn a_junk_geoip_db_is_unreadable_and_static_doctor_stays_offline() {
+    use netwatch::runtime::capabilities::{CapabilitySnapshot, State};
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let junk = fixture.0.join("junk.mmdb");
+    fs::write(&junk, "not a database").unwrap();
+    let config = netwatch::config::NetwatchConfig {
+        geoip_db: junk.display().to_string(),
+        insights_enabled: true,
+        insights_endpoint: format!("http://{}", listener.local_addr().unwrap()),
+        ..Default::default()
+    };
+    fs::write(
+        fixture.0.join("config/netwatch/config.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
+    let geoip = snapshot.get("geoip_db");
+    assert_eq!(geoip.state, State::Unavailable);
+    assert_eq!(geoip.reason, "db_unreadable");
+    assert!(geoip.detail.contains("junk.mmdb"), "{}", geoip.detail);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+/// An empty `geoip_db` looks where `netwatch geoip update` puts its files,
+/// and with nothing there suggests the command. Junk is enough to show which
+/// file a session would open.
+#[test]
+fn an_empty_geoip_db_uses_the_downloaded_file() {
+    use netwatch::runtime::capabilities::{CapabilitySnapshot, State};
+    let fixture = Fixture::new();
+    let doctor = || {
+        let output = fixture
+            .command()
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
+        snapshot.get("geoip_db").clone()
+    };
+    let none = doctor();
+    assert_eq!(none.state, State::Disabled);
+    assert_eq!(none.reason, "not_configured");
+    assert_eq!(none.next_check.as_deref(), Some("netwatch geoip update"));
+
+    let dir = fixture.0.join("cache/netwatch/geoip");
+    fs::create_dir_all(&dir).unwrap();
+    for (name, after) in [
+        ("dbip-country-lite.mmdb", "dbip-country-lite.mmdb"),
+        ("dbip-city-lite.mmdb", "dbip-city-lite.mmdb"),
+    ] {
+        fs::write(dir.join(name), "junk").unwrap();
+        let found = doctor();
+        assert_eq!(found.reason, "db_unreadable");
+        assert!(found.detail.contains(after), "{}", found.detail);
+    }
+    fs::write(dir.join("dbip-asn-lite.mmdb"), "junk").unwrap();
+    assert!(doctor().detail.contains("dbip-asn-lite.mmdb"));
+}
 /// A live session refuses a config that does not load, so the capture check
 /// does not run on the defaults in its place: they could check a weaker
 /// sandbox than the one configured. The report still completes and exits 0.

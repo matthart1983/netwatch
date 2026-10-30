@@ -108,6 +108,10 @@ fn threat_model_lists_every_outbound_endpoint() {
         ("Internet reachability", health::INTERNET_TARGET.to_owned()),
         ("Startup trace", traceroute::STARTUP_TARGET.to_owned()),
         ("WHOIS on W", whois::RDAP_URL.to_owned()),
+        (
+            "GeoIP update",
+            crate::geoip_update::DOWNLOAD_BASE.to_owned(),
+        ),
     ];
     endpoints.extend(
         health::STUN_SERVERS

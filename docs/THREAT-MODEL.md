@@ -229,10 +229,16 @@ write: /dev/null
    ([write grants](../src/sandbox/linux.rs#L427),
    [capture layer](../src/sandbox/linux.rs#L487)).
 10. Subcommands returning before worker installation are outside this policy,
-    including file-oriented operations ([dispatch](../src/main.rs#L20)).
-11. GeoIP downloading and parsing need separate review. The planned `netwatch
-    geoip update` command and sandboxed parser are future work, not current
-    protection (E2 below).
+    including file-oriented operations ([dispatch](../src/main.rs#L20)). Static
+    doctor is one, and opens the GeoIP databases it reports on unconfined.
+11. `netwatch geoip update` installs the policy, downloads on main, which stays
+    unconfined and keeps any capability the process started with, and undoes the
+    gzip, reads and writes each database on a `geoip-update` parser thread. TLS
+    and HTTP framing are handled on main by rustls and ureq. A body marked with a
+    content coding, which ureq would decompress on main, is refused unread. A
+    session reads each database on main before main enters its policy, then looks
+    addresses up on the threads that ask, so a hostile file that passed validation
+    still reaches them ([update](../src/geoip_update.rs#L1)).
 12. macOS, Windows and FreeBSD have no NetWatch filesystem sandbox backend
     ([platform dispatch](../src/sandbox/mod.rs#L1)).
 13. Strict means required policy entry succeeds, the parser TCP deny included; it
@@ -269,7 +275,7 @@ performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 | I6 eBPF events | B2/B7, [tracker](../src/ebpf/conn_tracker.rs#L1) |
 | I7 Interface/OS API data | B2, [platform](../src/platform/mod.rs#L1) |
 | I8 TLS keylog | B3/B5, exact configured file grant above |
-| I9 GeoIP databases | B3, exact city/ASN file grants above |
+| I9 GeoIP databases | B3, exact city/ASN file grants above; [reader](../src/collectors/geo.rs#L1) |
 | I10 Configuration | B3/B5, [config](../src/config.rs#L1) |
 | I11 Episode JSON/gzip | B3/B4, [episodes](../src/diagnose/episode.rs#L1); A1 hardening pending |
 | I12 Uptime history | B3/B4, [uptime](../src/uptime.rs#L1); A1 hardening pending |
@@ -279,6 +285,7 @@ performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 | I16 Insights responses | B6, [Insights](../src/collectors/insights.rs#L1) |
 | I17 Remote ingestion errors | B6, [remote](../src/remote/mod.rs#L1); A1 URL redaction pending |
 | I18 Probe responses | B1/B6, [active probes](../src/diagnose/active.rs#L1) |
+| I19 Downloaded GeoIP gzip and databases | B3/B6, [update](../src/geoip_update.rs#L1), on a parser thread |
 
 These rows identify review surfaces; they do not claim every parser has the same
 bounds or that terminal sanitization protects other output formats.
@@ -286,15 +293,16 @@ bounds or that terminal sanitization protects other output formats.
 ## Outbound inventory
 
 The marked inventory is checked row by row against default health, startup-trace,
-active-probe, load-test and WHOIS endpoints. User-configured endpoints can differ.
-DNS resolution itself can contact the system resolver. Health checks and one
-startup trace run automatically; explicit experiments and WHOIS require their
-respective user actions. See
+active-probe, load-test, WHOIS and GeoIP update endpoints. User-configured endpoints
+can differ. DNS resolution itself can contact the system resolver. Health checks and
+one startup trace run automatically; explicit experiments, WHOIS and the GeoIP update
+require their respective user actions. See
 [health](../src/collectors/health.rs#L177),
 [startup trace](../src/collectors/traceroute.rs#L37),
 [active defaults](../src/diagnose/active.rs#L35),
-[load test](../src/diagnose/next_test.rs#L378), and
-[WHOIS](../src/collectors/whois.rs#L11).
+[load test](../src/diagnose/next_test.rs#L378),
+[WHOIS](../src/collectors/whois.rs#L11), and
+[GeoIP update](../src/geoip_update.rs#L1).
 
 <!-- egress -->
 | Service | Destination and disclosure |
@@ -307,6 +315,7 @@ respective user actions. See
 | Captive portal | http://connectivitycheck.gstatic.com/generate_204 and http://cp.cloudflare.com/generate_204 |
 | Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB |
 | WHOIS on W | https://rdap.org/ip/ and the registry it redirects to; on Connections the selected remote address; on Packets the selected packet's source and destination, your own public address included; private ranges are not sent |
+| GeoIP update | https://download.db-ip.com/free/ ; only when `netwatch geoip update` runs; HTTPS only, no redirects; the file name and date, no addresses |
 | Online GeoIP fallback | http://ip-api.com; peer address, cleartext; E2 will remove it |
 | Insights, opt-in | Configured Ollama-compatible /api/chat endpoint; network and packet summaries |
 | Remote, opt-in | Configured ingestion endpoint; metrics; HTTPS unless explicitly allowed insecure |
@@ -336,7 +345,8 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | B1 parser TCP deny, scopes, ResolveUnix, no-write capture policy, CAP_NET_RAW off parser threads | Included |
 | C1 capture authority and NET_ADMIN audit | Included |
 | D1 seccomp no-socket policy | Later 0.39 work |
-| E2 local GeoIP/update command | Later 0.39 work |
+| C2 `netwatch geoip update`, downloads parsed on a parser thread | Included |
+| E2 removing the online GeoIP fallback | Later 0.39 work |
 | E3 capture-error hint and package messages still setcap a world-executable binary | Later 0.39 work |
 | E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Later 0.39 work |
 | F1 doctor reports actual containment | Later 0.39 work |

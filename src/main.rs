@@ -42,6 +42,9 @@ fn main() -> Result<()> {
             return netwatch::diagnose::episode::command(&args)
         }
         netwatch::cli::Command::Uptime(args) => return netwatch::uptime::command(&args),
+        netwatch::cli::Command::GeoipUpdate { city } => {
+            return netwatch::geoip_update::command(city)
+        }
         netwatch::cli::Command::Doctor {
             json,
             check_capture,

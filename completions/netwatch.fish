@@ -16,10 +16,13 @@ complete -c netwatch -n __fish_use_subcommand -a daemon -d 'Headless agent, no T
 complete -c netwatch -n __fish_use_subcommand -a doctor -d 'Read-only setup report'
 complete -c netwatch -n __fish_use_subcommand -a diagnose -d 'Diagnose runs, coverage, episodes and exports'
 complete -c netwatch -n __fish_use_subcommand -a uptime -d 'Outage history from the uptime log'
+complete -c netwatch -n __fish_use_subcommand -a geoip -d 'Download offline GeoIP databases'
 complete -c netwatch -n __fish_use_subcommand -a resolver -d 'Inspect or change the DNS resolver'
 
 complete -c netwatch -n '__fish_seen_subcommand_from diagnose' -a 'run coverage episodes replay features export corpus'
 complete -c netwatch -n '__fish_seen_subcommand_from resolver' -a 'status set recover'
+complete -c netwatch -n '__fish_seen_subcommand_from geoip' -a update
+complete -c netwatch -n '__fish_seen_subcommand_from geoip' -l city -d 'Also download the City database'
 complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l since -x -d 'Period, e.g. 7d, 24h, 90m'
 complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l json -d 'JSON output'
 complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l csv -d 'CSV output'

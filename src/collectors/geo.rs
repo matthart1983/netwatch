@@ -48,27 +48,80 @@ enum GeoEntry {
 
 // ── MaxMind offline reader ─────────────────────────────────
 
+/// What became of one database path. The database type and the error come
+/// from a file we did not write, so they are made safe to draw.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DbFile {
+    /// No path to open.
+    #[default]
+    NotConfigured,
+    Loaded {
+        path: String,
+        database_type: String,
+        build_epoch: u64,
+    },
+    Unreadable {
+        path: String,
+        error: String,
+    },
+}
+
+/// The databases a lookup can use, for doctor and Settings: a path that does
+/// not open otherwise looks the same as no path at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DbStatus {
+    pub city: DbFile,
+    pub asn: DbFile,
+}
+
+impl DbStatus {
+    /// Open both files to see what a session would make of them. Reads each
+    /// whole, so this is for a report, not for every frame.
+    pub fn open(city_path: &str, asn_path: &str) -> Self {
+        MaxMindReader::open(city_path, asn_path).1
+    }
+}
+
+fn open_database(path: &str) -> (Option<maxminddb::Reader<Vec<u8>>>, DbFile) {
+    use crate::ui::sanitize::display_owned;
+    if path.is_empty() {
+        return (None, DbFile::NotConfigured);
+    }
+    match maxminddb::Reader::open_readfile(path) {
+        Ok(reader) => {
+            let file = DbFile::Loaded {
+                path: path.to_owned(),
+                database_type: display_owned(reader.metadata().database_type.clone()),
+                build_epoch: reader.metadata().build_epoch,
+            };
+            (Some(reader), file)
+        }
+        Err(error) => (
+            None,
+            DbFile::Unreadable {
+                path: path.to_owned(),
+                error: display_owned(error.to_string()),
+            },
+        ),
+    }
+}
+
 struct MaxMindReader {
     city_reader: Option<maxminddb::Reader<Vec<u8>>>,
     asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 impl MaxMindReader {
-    fn open(city_path: &str, asn_path: &str) -> Self {
-        let city_reader = if !city_path.is_empty() {
-            maxminddb::Reader::open_readfile(city_path).ok()
-        } else {
-            None
-        };
-        let asn_reader = if !asn_path.is_empty() {
-            maxminddb::Reader::open_readfile(asn_path).ok()
-        } else {
-            None
-        };
-        Self {
-            city_reader,
-            asn_reader,
-        }
+    fn open(city_path: &str, asn_path: &str) -> (Self, DbStatus) {
+        let (city_reader, city) = open_database(city_path);
+        let (asn_reader, asn) = open_database(asn_path);
+        (
+            Self {
+                city_reader,
+                asn_reader,
+            },
+            DbStatus { city, asn },
+        )
     }
 
     fn lookup(&self, addr: IpAddr) -> Option<GeoInfo> {
@@ -130,6 +183,7 @@ pub struct GeoCache {
     /// Keyed by [`lookup_addr`]'s canonical address.
     cache: Arc<Mutex<BoundedLru<IpAddr, GeoEntry>>>,
     mmdb: Arc<Option<MaxMindReader>>,
+    db_status: Arc<DbStatus>,
     online_tx: std_mpsc::SyncSender<IpAddr>,
     pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<IpAddr>>>>,
     /// Opt-in: without it, an IP with no offline DB hit simply has no geo
@@ -158,10 +212,11 @@ impl GeoCache {
     }
 
     pub fn with_mmdb_and_online(city_path: &str, asn_path: &str, online_enabled: bool) -> Self {
-        Self::with_reader(MaxMindReader::open(city_path, asn_path), online_enabled)
+        let (reader, status) = MaxMindReader::open(city_path, asn_path);
+        Self::with_reader(reader, status, online_enabled)
     }
 
-    fn with_reader(reader: MaxMindReader, online_enabled: bool) -> Self {
+    fn with_reader(reader: MaxMindReader, status: DbStatus, online_enabled: bool) -> Self {
         let has_db = reader.city_reader.is_some();
         let mmdb = Arc::new(if has_db { Some(reader) } else { None });
 
@@ -172,6 +227,7 @@ impl GeoCache {
             online_enabled,
             cache,
             mmdb,
+            db_status: Arc::new(status),
             online_tx: tx,
             pending_rx: Arc::new(Mutex::new(Some(rx))),
         }
@@ -220,6 +276,11 @@ impl GeoCache {
 
     pub fn has_offline_db(&self) -> bool {
         self.mmdb.is_some()
+    }
+
+    /// What this session opened when it started.
+    pub fn db_status(&self) -> &DbStatus {
+        &self.db_status
     }
 
     pub fn lookup(&self, ip: &str) -> Option<GeoInfo> {
@@ -464,7 +525,85 @@ impl GeoCache {
     /// A cache whose database puts every address in Ashburn, United States,
     /// for tests outside this module.
     pub(crate) fn every_address_us_for_test() -> Self {
-        Self::with_reader(tests::every_address_us(), false)
+        Self::with_reader(tests::every_address_us(), DbStatus::default(), false)
+    }
+}
+
+/// Small databases in the MaxMind format, for tests here and of the code that
+/// downloads them: one search-tree node whose two records both point at the
+/// only data record, so every address, v4 or v6, finds it.
+#[cfg(test)]
+pub(crate) mod test_db {
+    /// A UTF-8 string: type 2 in the top three bits, then its length.
+    fn text(s: &str) -> Vec<u8> {
+        let mut out = if s.len() < 29 {
+            vec![0x40 | s.len() as u8]
+        } else {
+            vec![0x40 | 29, (s.len() - 29) as u8]
+        };
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    fn build(data: &[u8], database_type: &str, build_epoch: u32) -> Vec<u8> {
+        // One node, 24-bit records. A record past the node count points into
+        // the data section, which starts 16 bytes after the tree:
+        // 1 + 16 + offset 0.
+        let mut db = vec![0, 0, 17, 0, 0, 17];
+        db.extend_from_slice(&[0; 16]);
+        db.extend_from_slice(data);
+        db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
+        let epoch = [&[0x04, 0x02][..], &build_epoch.to_be_bytes()].concat(); // uint64
+        let database_type = text(database_type);
+        let metadata: [(&str, &[u8]); 9] = [
+            ("binary_format_major_version", &[0xA1, 2]), // uint16
+            ("binary_format_minor_version", &[0xA0]),
+            ("build_epoch", &epoch),
+            ("database_type", &database_type),
+            ("description", &[0xE0]), // empty map
+            ("ip_version", &[0xA1, 6]),
+            ("languages", b"\x01\x04\x42en"), // array of one string
+            ("node_count", &[0xC1, 1]),       // uint32
+            ("record_size", &[0xA1, 24]),
+        ];
+        db.push(0xE0 | metadata.len() as u8);
+        for (key, value) in metadata {
+            db.extend(text(key));
+            db.extend_from_slice(value);
+        }
+        db
+    }
+
+    /// Every address is in Ashburn, United States.
+    pub(crate) fn city(database_type: &str, build_epoch: u32) -> Vec<u8> {
+        // {city: {names: {en: "Ashburn"}},
+        //  country: {iso_code: "US", names: {en: "United States"}}}
+        let mut data = vec![0xE2];
+        data.extend(text("city"));
+        data.push(0xE1);
+        data.extend(text("names"));
+        data.push(0xE1);
+        data.extend(text("en"));
+        data.extend(text("Ashburn"));
+        data.extend(text("country"));
+        data.push(0xE2);
+        data.extend(text("iso_code"));
+        data.extend(text("US"));
+        data.extend(text("names"));
+        data.push(0xE1);
+        data.extend(text("en"));
+        data.extend(text("United States"));
+        build(&data, database_type, build_epoch)
+    }
+
+    /// Every address is in AS 42, "Test Org".
+    pub(crate) fn asn(database_type: &str, build_epoch: u32) -> Vec<u8> {
+        let mut data = vec![0xE2];
+        data.extend(text("autonomous_system_number"));
+        data.extend_from_slice(&[0xC1, 42]); // uint32
+        data.extend(text("autonomous_system_organization"));
+        data.extend(text("Test Org"));
+        build(&data, database_type, build_epoch)
     }
 }
 
@@ -632,6 +771,56 @@ mod tests {
         assert!(!cache.has_offline_db());
     }
 
+    /// `open_readfile(..).ok()` threw the reason away, so a wrong path looked
+    /// the same as none to everything that could have reported it.
+    #[test]
+    fn a_database_that_does_not_open_says_why() {
+        let status = DbStatus::open("/nonexistent/path.mmdb", "");
+        assert_eq!(status.asn, DbFile::NotConfigured);
+        let DbFile::Unreadable { path, error } = &status.city else {
+            panic!("{status:?}");
+        };
+        assert_eq!(path, "/nonexistent/path.mmdb");
+        assert!(!error.is_empty());
+        assert_eq!(
+            *GeoCache::with_mmdb("/nonexistent/path.mmdb", "").db_status(),
+            status
+        );
+        assert_eq!(DbStatus::open("", ""), DbStatus::default());
+    }
+
+    #[test]
+    fn a_loaded_database_reports_its_type_and_date() {
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (city, asn) = (dir.join("city.mmdb"), dir.join("asn.mmdb"));
+        std::fs::write(&city, test_db::city("Ctrl\x1b-City", 1_790_000_000)).unwrap();
+        std::fs::write(&asn, test_db::asn("Test-ASN", 1_790_000_001)).unwrap();
+        let cache = GeoCache::with_mmdb(city.to_str().unwrap(), asn.to_str().unwrap());
+        assert_eq!(
+            cache.db_status().city,
+            DbFile::Loaded {
+                path: city.to_str().unwrap().to_owned(),
+                database_type: "Ctrl·-City".into(),
+                build_epoch: 1_790_000_000,
+            }
+        );
+        assert!(matches!(
+            cache.db_status().asn,
+            DbFile::Loaded {
+                build_epoch: 1_790_000_001,
+                ..
+            }
+        ));
+        // And the ASN shape reaches a lookup.
+        let info = cache.lookup("8.8.8.8").unwrap();
+        assert_eq!(
+            (info.country_code.as_str(), info.org.as_str()),
+            ("US", "Test Org")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn with_mmdb_bad_path_falls_back() {
         let cache = GeoCache::with_mmdb("/nonexistent.mmdb", "/also-bad.mmdb");
@@ -657,59 +846,13 @@ mod tests {
         assert_eq!(info.org, "Evil·Net");
     }
 
-    /// A MaxMind DB that puts every address, v4 or v6, in Ashburn, United
-    /// States: one search-tree node whose two records both point at the only
-    /// data record. Enough to drive the offline path without a database file.
+    /// A reader that puts every address, v4 or v6, in Ashburn, United States.
+    /// Enough to drive the offline path without a database file.
     pub(super) fn every_address_us() -> MaxMindReader {
-        // A UTF-8 string shorter than 29 bytes: type 2 in the top three
-        // bits, length in the low five.
-        fn text(s: &str) -> Vec<u8> {
-            assert!(s.len() < 29);
-            let mut out = vec![0x40 | s.len() as u8];
-            out.extend_from_slice(s.as_bytes());
-            out
-        }
-        // One node, 24-bit records. A record past the node count points
-        // into the data section, which starts 16 bytes after the tree:
-        // 1 + 16 + offset 0.
-        let mut db = vec![0, 0, 17, 0, 0, 17];
-        db.extend_from_slice(&[0; 16]);
-        // {city: {names: {en: "Ashburn"}},
-        //  country: {iso_code: "US", names: {en: "United States"}}}
-        db.push(0xE2);
-        db.extend(text("city"));
-        db.push(0xE1);
-        db.extend(text("names"));
-        db.push(0xE1);
-        db.extend(text("en"));
-        db.extend(text("Ashburn"));
-        db.extend(text("country"));
-        db.push(0xE2);
-        db.extend(text("iso_code"));
-        db.extend(text("US"));
-        db.extend(text("names"));
-        db.push(0xE1);
-        db.extend(text("en"));
-        db.extend(text("United States"));
-        db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
-        let metadata: [(&str, &[u8]); 9] = [
-            ("binary_format_major_version", &[0xA1, 2]), // uint16
-            ("binary_format_minor_version", &[0xA0]),
-            ("build_epoch", &[0x04, 0x02, 0x68, 0xE7, 0xB7, 0x00]), // uint64
-            ("database_type", b"\x49Test-City"),
-            ("description", &[0xE0]), // empty map
-            ("ip_version", &[0xA1, 6]),
-            ("languages", b"\x01\x04\x42en"), // array of one string
-            ("node_count", &[0xC1, 1]),       // uint32
-            ("record_size", &[0xA1, 24]),
-        ];
-        db.push(0xE0 | metadata.len() as u8);
-        for (key, value) in metadata {
-            db.extend(text(key));
-            db.extend_from_slice(value);
-        }
         MaxMindReader {
-            city_reader: Some(maxminddb::Reader::from_source(db).unwrap()),
+            city_reader: Some(
+                maxminddb::Reader::from_source(test_db::city("Test-City", 1_760_016_128)).unwrap(),
+            ),
             asn_reader: None,
         }
     }
@@ -728,7 +871,7 @@ mod tests {
     /// host with a database kept every distinct peer it ever saw.
     #[test]
     fn offline_cache_stays_bounded() {
-        let cache = GeoCache::with_reader(every_address_us(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
         assert!(cache.has_offline_db());
         for i in 0..100_000u32 {
             let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
@@ -743,7 +886,7 @@ mod tests {
     /// went back to the database.
     #[test]
     fn ten_thousand_peers_stay_cached() {
-        let cache = GeoCache::with_reader(every_address_us(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
         let peers: Vec<IpAddr> = (0..10_000u32)
             .map(|i| IpAddr::from(Ipv4Addr::from(0x0800_0000 + i)))
             .collect();
@@ -811,7 +954,7 @@ mod tests {
 
     #[test]
     fn v4_mapped_and_plain_share_one_entry() {
-        let cache = GeoCache::with_reader(every_address_us(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
         assert!(cache.lookup("8.8.8.8").is_some());
         assert!(cache.lookup("::ffff:8.8.8.8").is_some());
         assert!(cache.lookup("[::ffff:8.8.8.8]").is_some());
@@ -827,7 +970,7 @@ mod tests {
     #[test]
     fn non_global_addresses_are_never_looked_up() {
         // Every address is in the fake database, so None means skipped.
-        let offline = GeoCache::with_reader(every_address_us(), false);
+        let offline = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
         let online = GeoCache::with_mmdb_and_online("", "", true);
         for ip in [
             "::ffff:192.168.1.5",

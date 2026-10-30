@@ -39,6 +39,7 @@ pub mod diagnose;
 pub mod dpi;
 pub mod ebpf;
 pub mod event;
+pub mod geoip_update;
 pub mod graph;
 pub mod http;
 pub mod logging;

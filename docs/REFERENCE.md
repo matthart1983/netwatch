@@ -406,7 +406,7 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   There is no whole-CWD, shared `/tmp` or `/run/user` write grant. Directories are
   prepared before restrictions; broad roots and symlink directory targets fail
   preparation. Exports normally land in `~/.cache/netwatch/exports` on Linux.
-- **Inputs:** configured GeoIP and keylog files receive exact read grants; system
+- **Inputs:** GeoIP files in use and the configured keylog file receive exact read grants; system
   executable/library and resolver paths remain readable. Missing or replaced
   keylog/database files require restarting Netwatch. Rotation does not expand the
   policy to a parent directory.
@@ -443,6 +443,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose features [--out FILE] [--schema FILE] FILE\|DIR...` | Write the feature table of recorded episodes. |
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
+| `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
 | `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
@@ -499,6 +500,35 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
 
 The log is `~/.local/state/netwatch/uptime/`, one small file per day (about 80 KB), kept 90
 days, readable only by you. Nothing is uploaded. `record_uptime = false` turns it off.
+
+### GeoIP databases
+
+`netwatch geoip update` downloads DB-IP's free Country and ASN databases, which fill the GeoIP
+column and the organisation names. `--city` adds the City database, and later runs keep it up to
+date. That is a 60 MB download, and a session holds its 127 MB in memory, against 8 MB for Country.
+
+```
+$ netwatch geoip update
+updated /home/you/.cache/netwatch/geoip/dbip-country-lite.mmdb (DBIP-Country-Lite, built 2026-10-01)
+updated /home/you/.cache/netwatch/geoip/dbip-asn-lite.mmdb (DBIP-ASN-Lite (compat=GeoLite2-ASN), built 2026-10-01)
+IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0
+restart netwatch to load it
+```
+
+A file the server has nothing newer for is reported as `already current`. The command exits 0 when
+every file is up to date and 1 otherwise, and a file it could not replace stays as it was. It runs
+only when you run it. Nothing refreshes the files on its own, and `netwatch doctor` reports
+`geoip_db` as `degraded` (`db_stale`) once a loaded database is over 60 days old.
+
+An empty `geoip_db` or `geoip_asn_db` uses these files, City ahead of Country, and a path in the
+config wins. Run the command as the user who runs netwatch: the files live in that user's cache
+directory and only that user can read them.
+
+The command name, `--city` and the exit codes are stable. The data source and the file location may
+change between releases, so a script should ask `netwatch doctor --json` what loaded rather than
+look for a file name. On Linux the download is read on a worker thread that cannot open TCP
+connections from Linux 6.7 on; see the [threat model](THREAT-MODEL.md). IP geolocation by DB-IP
+(https://db-ip.com), CC BY 4.0.
 
 ---
 
@@ -884,8 +914,8 @@ full resolution.
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `show_geo` | `true` | `true` `false` | Show the GeoIP column in Connections. |
-| `geoip_db` | `""` | file path | MaxMind GeoLite2-City or GeoLite2-Country `.mmdb`. Empty means no offline lookups; see `geoip_online` for the fallback. |
-| `geoip_asn_db` | `""` | file path | MaxMind GeoLite2-ASN `.mmdb`, for AS numbers. Optional. |
+| `geoip_db` | `""` | file path | A City or Country `.mmdb`, DB-IP's or MaxMind's. Empty uses what [`netwatch geoip update`](#geoip-databases) downloaded, if anything; see `geoip_online` for the fallback. |
+| `geoip_asn_db` | `""` | file path | An ASN `.mmdb`, DB-IP's or MaxMind's, for organisation names. Empty uses what `netwatch geoip update` downloaded, if anything. |
 | `geoip_online` | `false` | `true` `false` | Fall back to `http://ip-api.com` when `geoip_db` is empty or fails to open. Off by default: enabling it sends every public peer IP to a third party over cleartext HTTP, with no per-host opt-out, and anyone on the path can read the lookups and change the answers. ip-api.com offers HTTPS only on its paid tier, so there is no encrypted option. With this on, Settings shows the GeoIP DB Path as `ip-api.com (cleartext)`, or as `ip-api.com (cleartext) if unreadable:` and the path when `geoip_db` is set. |
 
 ### Security
@@ -951,7 +981,7 @@ and the [Diagnose rule coverage](diagnostic-coverage.md).
 | Connections | 2s | `lsof` + PKTAP | `/proc/net/tcp` + eBPF kprobe |
 | Health probes | Every 5 ticks | Gateway/internet ICMP, DNS queries | Gateway/internet ICMP, DNS queries |
 | Packets | Real-time | libpcap (BPF) | libpcap |
-| GeoIP | On-demand | MaxMind .mmdb / ip-api.com | MaxMind .mmdb / ip-api.com |
+| GeoIP | On-demand | `.mmdb` / ip-api.com | `.mmdb` / ip-api.com |
 
 ```
 Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders

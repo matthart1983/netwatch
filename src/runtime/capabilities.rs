@@ -2,11 +2,16 @@
 //! inspection never starts collectors, loads Npcap, or contacts an endpoint.
 use crate::{
     app::{App, AttributionStatus},
+    collectors::geo::{DbFile, DbStatus},
     config::NetwatchConfig,
     sandbox::{self, Mode},
 };
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How old a loaded GeoIP database gets before doctor calls it stale. DB-IP
+/// publishes monthly, so this is a refresh or two missed.
+const GEOIP_DB_STALE_AFTER: Duration = Duration::from_secs(60 * 86_400);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,7 +90,14 @@ pub struct CapabilitySnapshot {
     pub attribution_coverage: Option<crate::collectors::attribution::Coverage>,
 }
 impl CapabilitySnapshot {
+    /// With the databases read from disk, for a report. A live session passes
+    /// what it opened to [`Self::configured_with`] instead, as Settings
+    /// redraws this every frame.
     fn configured(config: &NetwatchConfig) -> Self {
+        let (db, asn) = config.geoip_paths();
+        Self::configured_with(config, &DbStatus::open(&db, &asn))
+    }
+    fn configured_with(config: &NetwatchConfig, geoip: &DbStatus) -> Self {
         let mut snapshot = Self {
             schema_version: 1,
             scope: "static".into(),
@@ -188,6 +200,8 @@ impl CapabilitySnapshot {
             ),
             Some("Inspect live Settings for component enforcement"),
         );
+        let (state, reason, detail, next) = geoip_db_assessment(geoip, SystemTime::now());
+        snapshot.put("geoip_db", state, reason, &detail, next);
         for (id, enabled, detail) in [
             (
                 "online_geo",
@@ -301,7 +315,7 @@ impl CapabilitySnapshot {
         lines.join("\n") + "\n"
     }
     pub fn live(app: &App) -> Self {
-        let mut snapshot = Self::configured(&app.user_config);
+        let mut snapshot = Self::configured_with(&app.user_config, app.geo_cache.db_status());
         snapshot.scope = "runtime".into();
         snapshot.interface = Some(app.capture_interface.clone());
         snapshot.put(
@@ -619,8 +633,66 @@ fn npcap_capture_library(npcap: Npcap) -> (State, &'static str, String, String) 
 }
 
 /// A capability's state, reason code, detail and next check.
-#[cfg(target_os = "linux")]
 type Assessment = (State, &'static str, String, Option<&'static str>);
+
+/// One database as doctor words it, and how old it is when it is loaded.
+fn describe_db(what: &str, file: &DbFile, now: SystemTime) -> (String, Option<Duration>) {
+    match file {
+        DbFile::NotConfigured => (format!("{what}: none"), None),
+        DbFile::Unreadable { path, error } => {
+            (format!("{what}: {path} did not open: {error}"), None)
+        }
+        DbFile::Loaded {
+            path,
+            database_type,
+            build_epoch,
+        } => {
+            let built = UNIX_EPOCH.checked_add(Duration::from_secs(*build_epoch));
+            let date = built
+                .map(chrono::DateTime::<chrono::Utc>::from)
+                .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
+            (
+                format!("{what}: {database_type} built {date}, {path}"),
+                built.and_then(|built| now.duration_since(built).ok()),
+            )
+        }
+    }
+}
+
+/// Doctor's view of the GeoIP databases, from a read of their metadata. No
+/// lookup is made and no endpoint contacted.
+fn geoip_db_assessment(status: &DbStatus, now: SystemTime) -> Assessment {
+    const UPDATE: &str = "netwatch geoip update";
+    const FIX: &str = "netwatch geoip update, or fix the path in config.toml";
+    const REFRESH: &str =
+        "netwatch geoip update refreshes the downloaded files; replace any you set yourself";
+    let (city, city_age) = describe_db("Country/City", &status.city, now);
+    let (asn, asn_age) = describe_db("ASN", &status.asn, now);
+    let detail = format!("{city}; {asn}");
+    let stale = [city_age, asn_age]
+        .into_iter()
+        .flatten()
+        .any(|age| age > GEOIP_DB_STALE_AFTER);
+    match (&status.city, &status.asn) {
+        (DbFile::NotConfigured, _) => (
+            State::Disabled,
+            "not_configured",
+            format!("No Country or City database, so no GeoIP lookups; {asn}"),
+            Some(UPDATE),
+        ),
+        (DbFile::Unreadable { .. }, _) => (State::Unavailable, "db_unreadable", detail, Some(FIX)),
+        (DbFile::Loaded { .. }, DbFile::Unreadable { .. }) => {
+            (State::Degraded, "db_unreadable", detail, Some(FIX))
+        }
+        (DbFile::Loaded { .. }, _) if stale => (
+            State::Degraded,
+            "db_stale",
+            format!("Older than 60 days. {detail}"),
+            Some(REFRESH),
+        ),
+        (DbFile::Loaded { .. }, _) => (State::Ready, "db_loaded", detail, None),
+    }
+}
 
 /// Doctor's view of the Linux connection table, before any poll: `ss` on
 /// `PATH`, or the `/proc/net` tables a live session falls back to without it.
@@ -1107,6 +1179,94 @@ mod tests {
         let restored: CapabilitySnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(restored.get("capture").reason, "open_not_attempted");
+    }
+    fn loaded(age_days: u64, now: SystemTime) -> DbFile {
+        let built = now.duration_since(UNIX_EPOCH).unwrap().as_secs() - age_days * 86_400;
+        DbFile::Loaded {
+            path: "/geo/db.mmdb".into(),
+            database_type: "DBIP-Country-Lite".into(),
+            build_epoch: built,
+        }
+    }
+    #[test]
+    fn geoip_db_absent_suggests_update() {
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let geoip = snapshot.get("geoip_db");
+        assert_eq!(geoip.state, State::Disabled);
+        assert_eq!(geoip.reason, "not_configured");
+        assert_eq!(geoip.next_check.as_deref(), Some("netwatch geoip update"));
+    }
+    #[test]
+    fn geoip_db_unreadable_is_unavailable() {
+        let config = NetwatchConfig {
+            geoip_db: "/nonexistent/x.mmdb".into(),
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&config);
+        let geoip = snapshot.get("geoip_db");
+        assert_eq!(geoip.state, State::Unavailable);
+        assert_eq!(geoip.reason, "db_unreadable");
+        assert!(
+            geoip.detail.contains("/nonexistent/x.mmdb"),
+            "{}",
+            geoip.detail
+        );
+        assert!(geoip
+            .next_check
+            .as_deref()
+            .unwrap()
+            .contains("geoip update"));
+    }
+    /// Country still answers with the ASN file broken, so it is not called
+    /// unavailable, but the reason is the same.
+    #[test]
+    fn geoip_db_with_only_the_asn_file_unreadable_is_degraded() {
+        let now = SystemTime::now();
+        let status = DbStatus {
+            city: loaded(1, now),
+            asn: DbFile::Unreadable {
+                path: "/geo/asn.mmdb".into(),
+                error: "bad".into(),
+            },
+        };
+        let (state, reason, detail, _) = geoip_db_assessment(&status, now);
+        assert_eq!((state, reason), (State::Degraded, "db_unreadable"));
+        assert!(
+            detail.contains("/geo/asn.mmdb did not open: bad"),
+            "{detail}"
+        );
+    }
+    #[test]
+    fn geoip_db_ready_until_sixty_days_old() {
+        let now = SystemTime::now();
+        let assess = |city: u64, asn: u64| {
+            let status = DbStatus {
+                city: loaded(city, now),
+                asn: loaded(asn, now),
+            };
+            geoip_db_assessment(&status, now)
+        };
+        let (state, reason, detail, next) = assess(59, 59);
+        assert_eq!((state, reason, next), (State::Ready, "db_loaded", None));
+        assert!(detail.contains("DBIP-Country-Lite built "), "{detail}");
+        for (city, asn) in [(61, 1), (1, 61)] {
+            let (state, reason, _, next) = assess(city, asn);
+            assert_eq!((state, reason), (State::Degraded, "db_stale"));
+            assert!(next.unwrap().contains("netwatch geoip update"));
+        }
+    }
+    /// Without a Country or City database a session makes no lookup, so an
+    /// ASN file alone does not count as loaded.
+    #[test]
+    fn geoip_db_with_only_an_asn_file_is_not_configured() {
+        let now = SystemTime::now();
+        let status = DbStatus {
+            city: DbFile::NotConfigured,
+            asn: loaded(1, now),
+        };
+        let (state, reason, detail, _) = geoip_db_assessment(&status, now);
+        assert_eq!((state, reason), (State::Disabled, "not_configured"));
+        assert!(detail.contains("ASN: "), "{detail}");
     }
     #[test]
     fn online_geo_is_labelled_cleartext() {

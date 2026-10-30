@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::collectors::geo::DbFile;
 use crate::config::NetwatchConfig;
 use crate::ui::widgets;
 use ratatui::{
@@ -208,16 +209,8 @@ const ROWS: &[Setting] = &[
         at: cursor::GEOIP_DB,
         label: "GeoIP DB Path",
         raw: |c| c.geoip_db.clone(),
-        // With `geoip_online` on, lookups go to ip-api.com, which has no
-        // HTTPS on its free tier, whenever no database answers: none is
-        // set, or the one set fails to open. Say so where geo is set, and
-        // before the path, so a long path cannot push it out of view.
-        show: Some(|c| match (c.geoip_db.is_empty(), c.geoip_online) {
-            (true, true) => "ip-api.com (cleartext)".into(),
-            (true, false) => "(none)".into(),
-            (false, true) => format!("ip-api.com (cleartext) if unreadable: {}", c.geoip_db),
-            (false, false) => c.geoip_db.clone(),
-        }),
+        // `draw` shows what the session opened, through `geoip_row`.
+        show: None,
         apply: |c, v| {
             c.geoip_db = v.to_string();
             Ok(())
@@ -228,7 +221,8 @@ const ROWS: &[Setting] = &[
         at: cursor::GEOIP_ASN_DB,
         label: "GeoIP ASN DB Path",
         raw: |c| c.geoip_asn_db.clone(),
-        show: Some(|c| or_placeholder(&c.geoip_asn_db, "(none)")),
+        // `draw` shows what the session opened, through `geoip_row`.
+        show: None,
         apply: |c, v| {
             c.geoip_asn_db = v.to_string();
             Ok(())
@@ -457,6 +451,16 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             format!("{}▏", app.ui.settings_edit_buf)
         } else if is_selected && row.cycles {
             format!("◀ {} ▶", row.shown(cfg))
+        } else if i == cursor::GEOIP_DB {
+            let (wanted, _) = cfg.geoip_paths();
+            let status = app.geo_cache.db_status();
+            match geoip_online_row(status, cfg.geoip_online) {
+                Some(online) => online,
+                None => geoip_row(&wanted, &status.city),
+            }
+        } else if i == cursor::GEOIP_ASN_DB {
+            let (_, wanted) = cfg.geoip_paths();
+            geoip_row(&wanted, &app.geo_cache.db_status().asn)
         } else {
             row.shown(cfg)
         };
@@ -591,6 +595,41 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(footer, footer_area);
 }
 
+/// A GeoIP row's text: the database this session opened, type first so a long
+/// path cannot push it out of view. Databases open once, so a path changed
+/// since, or a download made since, is named as waiting for the next start.
+fn geoip_row(wanted: &str, opened: &DbFile) -> String {
+    let held = match opened {
+        DbFile::NotConfigured => "",
+        DbFile::Loaded { path, .. } | DbFile::Unreadable { path, .. } => path,
+    };
+    if wanted != held {
+        return format!("{} on next start", or_placeholder(wanted, "(none)"));
+    }
+    match opened {
+        DbFile::NotConfigured => "(none)".into(),
+        DbFile::Unreadable { path, .. } => format!("unreadable: {path}"),
+        DbFile::Loaded {
+            path,
+            database_type,
+            ..
+        } => format!("{database_type}: {path}"),
+    }
+}
+
+/// With `geoip_online` on, lookups go to ip-api.com, which has no HTTPS on its
+/// free tier, whenever no database answers: none is set, or the one set failed
+/// to open. Say so where geo is set, and before the path.
+fn geoip_online_row(status: &crate::collectors::geo::DbStatus, online: bool) -> Option<String> {
+    match (&status.city, online) {
+        (DbFile::NotConfigured, true) => Some("ip-api.com (cleartext)".into()),
+        (DbFile::Unreadable { path, .. }, true) => {
+            Some(format!("ip-api.com (cleartext), unreadable: {path}"))
+        }
+        _ => None,
+    }
+}
+
 /// Returns the raw config value for the setting at `cursor` position,
 /// suitable for pre-filling the edit buffer.
 pub fn get_edit_value(cfg: &NetwatchConfig, cursor: usize) -> String {
@@ -682,20 +721,70 @@ mod tests {
 
     #[test]
     fn geoip_db_row_says_when_lookups_go_out_in_cleartext() {
-        let row = &ROWS[cursor::GEOIP_DB];
-        let mut cfg = NetwatchConfig::default();
-        assert_eq!(row.shown(&cfg), "(none)");
-        cfg.geoip_online = true;
-        assert_eq!(row.shown(&cfg), "ip-api.com (cleartext)");
+        use crate::collectors::geo::DbStatus;
+        let mut status = DbStatus::default();
+        assert_eq!(geoip_online_row(&status, false), None);
+        assert_eq!(
+            geoip_online_row(&status, true).as_deref(),
+            Some("ip-api.com (cleartext)")
+        );
         // A database that fails to open sends every lookup to ip-api.com too,
         // so a set path is no reason to drop the label.
-        cfg.geoip_db = "/usr/share/GeoIP/GeoLite2-City.mmdb".into();
+        status.city = DbFile::Unreadable {
+            path: "/usr/share/GeoIP/GeoLite2-City.mmdb".into(),
+            error: "bad".into(),
+        };
         assert_eq!(
-            row.shown(&cfg),
-            "ip-api.com (cleartext) if unreadable: /usr/share/GeoIP/GeoLite2-City.mmdb"
+            geoip_online_row(&status, true).as_deref(),
+            Some("ip-api.com (cleartext), unreadable: /usr/share/GeoIP/GeoLite2-City.mmdb")
         );
-        cfg.geoip_online = false;
-        assert_eq!(row.shown(&cfg), cfg.geoip_db);
+        assert_eq!(geoip_online_row(&status, false), None);
+        // One that opened answers every lookup itself.
+        status.city = loaded("/geo/db.mmdb");
+        assert_eq!(geoip_online_row(&status, true), None);
+    }
+
+    fn loaded(path: &str) -> DbFile {
+        DbFile::Loaded {
+            path: path.into(),
+            database_type: "DBIP-Country-Lite".into(),
+            build_epoch: 1_790_000_000,
+        }
+    }
+
+    #[test]
+    fn geoip_row_says_which_database_is_loaded() {
+        assert_eq!(geoip_row("", &DbFile::NotConfigured), "(none)");
+        assert_eq!(
+            geoip_row("/geo/db.mmdb", &loaded("/geo/db.mmdb")),
+            "DBIP-Country-Lite: /geo/db.mmdb"
+        );
+        let unreadable = DbFile::Unreadable {
+            path: "/geo/db.mmdb".into(),
+            error: "bad".into(),
+        };
+        assert_eq!(
+            geoip_row("/geo/db.mmdb", &unreadable),
+            "unreadable: /geo/db.mmdb"
+        );
+    }
+
+    /// Databases open once. A path edited in the overlay, or a file downloaded
+    /// while this session runs, is not what lookups are using yet.
+    #[test]
+    fn geoip_row_names_a_change_that_waits_for_a_restart() {
+        assert_eq!(
+            geoip_row("/geo/new.mmdb", &loaded("/geo/old.mmdb")),
+            "/geo/new.mmdb on next start"
+        );
+        assert_eq!(
+            geoip_row("/cache/dbip-country-lite.mmdb", &DbFile::NotConfigured),
+            "/cache/dbip-country-lite.mmdb on next start"
+        );
+        assert_eq!(
+            geoip_row("", &loaded("/geo/old.mmdb")),
+            "(none) on next start"
+        );
     }
 
     /// `get_edit_value` numbered rows without the View row, so Enter on
