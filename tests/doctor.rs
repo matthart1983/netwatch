@@ -107,6 +107,53 @@ fn malformed_config_is_reported_without_echoing_secrets() {
     let snapshot: netwatch::runtime::capabilities::CapabilitySnapshot =
         serde_json::from_str(&text).unwrap();
     assert_eq!(snapshot.get("config").reason, "config_invalid");
+    // Where to look, without the line itself.
+    let detail = &snapshot.get("config").detail;
+    let path = fixture.0.join("config/netwatch/config.toml");
+    assert!(detail.contains(&path.display().to_string()), "{detail}");
+    assert!(detail.contains("line 1, column 11"), "{detail}");
+}
+/// A live session refuses a config that does not load, so the capture check
+/// does not run on the defaults in its place: they could check a weaker
+/// sandbox than the one configured. The report still completes and exits 0.
+#[test]
+fn capture_check_does_not_run_on_a_config_that_does_not_load() {
+    let fixture = Fixture::new();
+    let config = fixture.0.join("config/netwatch/config.toml");
+    let broken = "sandbox = 'strict'\nrefresh_rate_ms = 'oops'\n";
+    fs::write(&config, broken).unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "doctor",
+            "--json",
+            "--check-capture",
+            "--interface",
+            "netwatch-nonexistent-interface",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: netwatch::runtime::capabilities::CapabilitySnapshot =
+        serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(snapshot.get("config").reason, "config_invalid");
+    assert!(
+        snapshot.get("config").detail.contains("line 2, column 19"),
+        "{:?}",
+        snapshot.get("config")
+    );
+    let capture = snapshot.get("capture");
+    assert_eq!(
+        capture.state,
+        netwatch::runtime::capabilities::State::NotChecked
+    );
+    assert_eq!(capture.reason, "config_not_loaded");
+    assert!(snapshot.protections.is_empty());
+    assert_eq!(fs::read_to_string(&config).unwrap(), broken);
 }
 #[test]
 fn explicit_capture_check_reports_failure_and_creates_no_state() {
@@ -189,4 +236,46 @@ fn doctor_reports_the_proc_net_fallback_when_ss_is_missing() {
         "{}",
         found.detail
     );
+}
+/// `--check-capture` enters with the capture thread's policy, so it reports
+/// what capture runs under: in best-effort that drops CAP_NET_RAW, which main
+/// keeps. Holding CAP_NET_RAW takes a user and network namespace, so this
+/// skips where it cannot make one.
+#[test]
+fn capture_check_applies_the_capture_policy() {
+    let fixture = Fixture::new();
+    let mut command = Command::new("unshare");
+    command
+        .args(["--user", "--map-root-user", "--net", "sh", "-c"])
+        .arg(r#"ip link set lo up && exec "$0" doctor --json --check-capture --interface lo"#)
+        .arg(env!("CARGO_BIN_EXE_netwatch"));
+    for (key, value) in fixture.command().get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let output = match command.output() {
+        Ok(output) if output.status.success() => output,
+        other => {
+            eprintln!("skipped: no user and network namespace with lo up: {other:?}");
+            return;
+        }
+    };
+    let snapshot: netwatch::runtime::capabilities::CapabilitySnapshot =
+        serde_json::from_slice(&output.stdout).unwrap();
+    let Some(check) = snapshot
+        .protections
+        .iter()
+        .find(|p| p.component == "capture-check")
+    else {
+        eprintln!(
+            "skipped: capture did not open on lo: {:?}",
+            snapshot.get("capture")
+        );
+        return;
+    };
+    assert_eq!(check.effective.as_deref(), Some("best-effort"));
+    let net_raw = "CAP_NET_RAW".to_string();
+    assert!(check.caps_dropped.contains(&net_raw), "{check:?}");
+    assert!(!check.caps_retained.contains(&net_raw), "{check:?}");
 }

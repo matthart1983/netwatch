@@ -36,10 +36,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::theme::Theme;
+use crate::ui::text::{self, truncate_end as truncate};
 use crate::ui::widgets::{format_bytes_rate, format_bytes_total};
 use paint::Ramps;
 
@@ -1056,7 +1056,7 @@ fn split_host_port(addr: &str) -> (String, String) {
 /// display width so a CJK process name doesn't push the next column right.
 fn cell(f: &mut Frame, col: &Col, y: u16, s: &str, style: Style) {
     let s = truncate(s, col.w as usize);
-    let w = s.width() as u16;
+    let w = text::width(&s) as u16;
     let x = match col.align {
         Align::Left => col.x,
         Align::Right => col.x + col.w.saturating_sub(w),
@@ -1106,29 +1106,8 @@ fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
 }
 
 fn put_right(f: &mut Frame, x_end: u16, y: u16, s: &str, style: Style) {
-    let w = s.width() as u16;
+    let w = text::width(s) as u16;
     put(f, x_end.saturating_sub(w.saturating_sub(1)), y, s, style);
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in s.chars() {
-        let cw = ch.to_string().width();
-        if used + cw > max - 1 {
-            break;
-        }
-        out.push(ch);
-        used += cw;
-    }
-    out.push('…');
-    out
 }
 
 /// Abbreviate a TCP state to fit its column without eliding.
@@ -2396,7 +2375,7 @@ fn render_detail(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, c: &ConnRow
         l.row_detail_2,
         &truncate(
             &stats,
-            detail_stats_width(l, internals.width() as u16) as usize,
+            detail_stats_width(l, text::width(&internals) as u16) as usize,
         ),
         dim,
     );
@@ -2903,10 +2882,49 @@ mod tests {
         ] {
             for col in cols.iter() {
                 assert!(
-                    col.label.width() as u16 <= col.w,
+                    text::width(col.label) as u16 <= col.w,
                     "{name}: header {:?} is wider than its {}-col field",
                     col.label,
                     col.w
+                );
+            }
+        }
+    }
+
+    /// A value is cut between the graphemes ratatui lays out, by the columns
+    /// it gives each one. Measured with unicode-width and cut a char at a
+    /// time, eight `ﾊﾟ` were not cut at all, and right-aligned they ran into
+    /// the next column. Eight `❤️` or `#️⃣` were cut one late, so the column
+    /// edge clipped the last one and the `…`. `👍🏽` was cut short, the last
+    /// hand without its skin tone.
+    #[test]
+    fn a_wide_value_is_cut_inside_its_column() {
+        for col in [left(0, 15, "process"), right(0, 15, "process")] {
+            for base in [
+                "ﾊﾟ",
+                "❤\u{FE0F}",
+                "#\u{FE0F}\u{20E3}",
+                "👍\u{1F3FD}",
+                "👨\u{200D}👩\u{200D}👧",
+            ] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 1)).unwrap();
+                terminal
+                    .draw(|f| {
+                        f.buffer_mut()[(15, 0)].set_symbol("|");
+                        cell(f, &col, 0, &base.repeat(8), Style::default());
+                    })
+                    .unwrap();
+                let buf = terminal.backend().buffer();
+                let tag = format!("{base:?} {:?}", col.align);
+                assert_eq!(buf[(15, 0)].symbol(), "|", "{tag} ran into the next column");
+                // Each is 2 columns, so seven and the `…` fill the 15. A wide
+                // grapheme's second cell is blank.
+                let drawn: String = (0..15).map(|x| buf[(x, 0)].symbol()).collect();
+                assert_eq!(
+                    drawn.replace(' ', ""),
+                    format!("{}…", base.repeat(7)),
+                    "{tag}"
                 );
             }
         }
@@ -2950,7 +2968,7 @@ mod tests {
     fn detail_stats_cannot_run_under_the_tcp_internals() {
         for area in sizes() {
             let l = Layout::new(area);
-            let internals = "cwnd 666  ssthresh 128  mss 1388  rwnd 2M".width() as u16;
+            let internals = text::width("cwnd 666  ssthresh 128  mss 1388  rwnd 2M") as u16;
             let avail = detail_stats_width(&l, internals);
             assert!(
                 DETAIL_STATS_X + avail + internals < l.content_x_end,
@@ -2960,7 +2978,7 @@ mod tests {
             );
             // A pathological SNI must be cut, not allowed to overflow.
             let long = format!("rtt 1ms   retrans 0   ooo 0   HTTPS {}", "a".repeat(200));
-            assert!(truncate(&long, avail as usize).width() as u16 <= avail);
+            assert!(text::width(&truncate(&long, avail as usize)) as u16 <= avail);
         }
     }
 
@@ -3347,7 +3365,7 @@ mod tests {
         for s in every_state_name() {
             let short = short_state(s);
             assert!(
-                short.width() <= w,
+                text::width(short) <= w,
                 "state {s:?} renders as {short:?}, wider than its {w}-col column"
             );
         }

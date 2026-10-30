@@ -383,6 +383,9 @@ Edit the file by hand freely; it reloads on startup.
 
 ### Landlock sandbox (Linux)
 
+See the [threat model](THREAT-MODEL.md) for boundaries, outbound traffic and
+remaining gaps. Root operation works, but containment is limited.
+
 Linux worker entry points apply a prepared Landlock filesystem policy before
 processing input. Capture opens/configures its device first and marks itself ready
 after policy entry. Main applies policy after resource startup. Rules pin opened
@@ -407,8 +410,8 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   executable/library and resolver paths remain readable. Missing or replaced
   keylog/database files require restarting Netwatch. Rotation does not expand the
   policy to a parent directory.
-- **SDK source:** eBPF attribution is disabled under enabled sandbox policy until
-  its SDK reader has an enforcement hook. Socket polling remains available.
+- **SDK source:** eBPF loads inside the filesystem policy. Its SDK reader
+  inherits that policy but retains load capabilities until it has its own entry hook.
 - **Strict mode:** preflight/required worker entry failures stop startup with a
   nonzero exit. After the main thread drops raw-socket authority, capture restart
   may fail; it never retries unsandboxed. macOS/Windows have no backend and reject
@@ -441,7 +444,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
-| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. |
+| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
 
 TUI flags:
@@ -702,18 +705,47 @@ Degrades gracefully — features that need root show a clear message, never cras
 ### Running without sudo (Linux)
 
 Packet capture and eBPF process attribution need elevated capabilities, but you don't have to
-run the whole TUI as root. Grant them once to the binary:
+run the whole TUI as root. Prefer a root-owned binary executable only by an
+authorized group. Create the group if needed and add your account, then log in
+again for membership to take effect. Apply capabilities last, after ownership:
 
 ```bash
-sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"
-netwatch
+sudo groupadd -f netwatch
+sudo usermod -aG netwatch "$USER"
+# The first netwatch on PATH outside /usr/local/bin, where this recipe puts
+# its copy, so a re-run after an upgrade finds the new binary. A symlink, such
+# as a Nix profile's, is followed to its file.
+bin=$(echo "$PATH" | tr : '\n' | grep -vx '/usr/local/bin/*' | while read -r dir; do
+  [ -x "$dir/netwatch" ] && echo "$dir/netwatch" && break
+done)
+bin=$(readlink -f "${bin:-/usr/local/bin/netwatch}")
+# A package's /usr/bin/netwatch is changed in place, so an upgrade resets it.
+# Anything else is copied to a root-owned path first: a binary you own could
+# otherwise be made executable by everyone, and a Nix store file is shared.
+case $bin in
+  /usr/bin/netwatch | /usr/local/bin/netwatch) ;;
+  *)
+    sudo install -o root -g netwatch -m 0750 "$bin" /usr/local/bin/netwatch
+    bin=/usr/local/bin/netwatch
+    ;;
+esac
+sudo chown root:netwatch "$bin"
+sudo chmod 0750 "$bin"
+sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$bin"
+echo "After logging in again, run $bin"
 ```
 
-> **Re-run after every install.** `setcap` attaches to a specific binary on disk; `cargo
-> install netwatch-tui` and the Release tarballs overwrite that file, so the capabilities
-> don't carry over. If you see `pcap open failed: socket: Operation not permitted` or `BPF
-> load failed: PermissionDenied` in `~/.cache/netwatch/netwatch.log.*` after an upgrade, the
-> new binary just needs `setcap` re-applied.
+> **Re-run after every install.** `setcap` attaches to a specific binary on disk. A package
+> upgrade replaces `/usr/bin/netwatch` with a root-owned, world-executable file without
+> capabilities, so capture fails until the recipe runs again. `cargo install netwatch-tui`,
+> the Release tarballs, Homebrew and Nix replace only their own file: the copy in
+> `/usr/local/bin` keeps the old version and its capabilities until the recipe copies the
+> new binary over it. The recipe skips `/usr/local/bin` when it looks for netwatch, so the
+> re-run finds the new binary wherever `/usr/local/bin` sits in `PATH`. If you see `pcap
+> open failed: socket: Operation not permitted` or `BPF load failed: PermissionDenied` in
+> `~/.cache/netwatch/netwatch.log.*` after an upgrade, the binary needs the root ownership,
+> group execution restriction and `setcap` re-applied. Never grant capture capabilities to
+> a world-executable copy.
 
 | Capability | What it unlocks |
 |------------|-----------------|
@@ -793,6 +825,15 @@ release can retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
 A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
 out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
 to start.
+
+A file netwatch cannot read or parse is different. If the TOML is broken, or a key has a value
+of the wrong type (`refresh_rate_ms = "fast"`), `netwatch` and `netwatch daemon` print the
+file, line and column and exit 1 without starting. Running on the defaults instead would
+drop every other setting in the file, `sandbox = "strict"` and `record_uptime = false`
+included. `diagnose run` exits 3 and `diagnose coverage` exits 1 with the same message.
+`netwatch doctor` reports it as `config_invalid` or `config_unreadable` without quoting the
+file. Neither `--generate-config` nor Settings overwrites the file. With no file at all, the
+defaults apply as before.
 
 ### Appearance
 

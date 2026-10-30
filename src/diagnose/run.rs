@@ -148,14 +148,18 @@ pub fn parse_budget(raw: &str) -> anyhow::Result<Duration> {
             None => (raw, 1),
         },
     };
-    let secs: u64 = value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("budget must be a duration like 30s or 2m"))?;
-    let secs = secs * scale;
-    anyhow::ensure!(
-        (5..=600).contains(&secs),
-        "budget must be between 5s and 10m"
-    );
+    const OUT_OF_RANGE: &str = "budget must be between 5s and 10m";
+    let secs = match value.parse::<u64>() {
+        Ok(n) => n,
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => anyhow::bail!(OUT_OF_RANGE),
+        Err(_) => anyhow::bail!("budget must be a duration like 30s or 2m"),
+    };
+    // Checked: a minute count near u64::MAX overflows the multiply, which
+    // panics in a debug build and wraps into the valid range in a release one.
+    let secs = secs
+        .checked_mul(scale)
+        .filter(|s| (5..=600).contains(s))
+        .ok_or_else(|| anyhow::anyhow!(OUT_OF_RANGE))?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -198,7 +202,7 @@ fn run_config(loaded: crate::config::NetwatchConfig) -> crate::config::NetwatchC
 fn run(opts: Options) -> anyhow::Result<Outcome> {
     use crate::{app::App, config::NetwatchConfig, diagnose::live::LiveSampler};
 
-    let config = run_config(NetwatchConfig::load());
+    let config = run_config(NetwatchConfig::load()?);
     print_threshold_warnings(&config.diagnose_thresholds);
     let mut asked = opts
         .target
@@ -572,6 +576,45 @@ mod tests {
         assert!(parse_budget("1s").is_err(), "shorter than a probe interval");
         assert!(parse_budget("30m").is_err(), "that is a session, not a run");
         assert!(parse_budget("soon").is_err());
+    }
+
+    #[test]
+    fn budget_bounds_are_inclusive() {
+        assert_eq!(parse_budget("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_budget("600").unwrap(), Duration::from_secs(600));
+        assert_eq!(parse_budget("10m").unwrap(), Duration::from_secs(600));
+        assert!(parse_budget("4s").is_err());
+        assert!(parse_budget("601s").is_err());
+        assert!(parse_budget("0m").is_err());
+    }
+
+    /// Review R6: `18446744073709551615m` overflowed the minutes multiply,
+    /// a panic in a debug build. Each of these is out of range, and says so.
+    #[test]
+    fn huge_budgets_are_out_of_range_not_a_panic() {
+        for raw in [
+            "18446744073709551615m",
+            "307445734561825861m",  // just past u64::MAX / 60
+            "2152120141932781022m", // wraps to 8 s where the multiply wraps
+            "18446744073709551615s",
+            "18446744073709551615",
+            "99999999999999999999999m", // too big for u64 at all
+        ] {
+            let err = parse_budget(raw).expect_err(raw);
+            assert_eq!(
+                err.to_string(),
+                "budget must be between 5s and 10m",
+                "{raw}"
+            );
+        }
+        for raw in ["", "m", "s", "-5s", "1.5m", "5 s", "5ms"] {
+            let err = parse_budget(raw).expect_err(raw);
+            assert_eq!(
+                err.to_string(),
+                "budget must be a duration like 30s or 2m",
+                "{raw:?}"
+            );
+        }
     }
 
     /// D33-B04 review: a run never traces on a timer, so its samples must
