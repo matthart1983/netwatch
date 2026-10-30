@@ -106,6 +106,17 @@ pub fn command(city: bool) -> Result<()> {
     // A config that does not load could be hiding `sandbox = "strict"`, so
     // this stops the same way a live session does.
     let config = NetwatchConfig::load()?;
+    let dir = downloaded_dir().context("cannot determine the cache directory")?;
+    // A session takes database paths as text, so it could never open a file
+    // saved here, and running this again would not help.
+    if dir.to_str().is_none() {
+        bail!(
+            "the cache directory {} is not valid UTF-8, so netwatch could not load a \
+             database saved there; use another cache directory, or set geoip_db to a \
+             database you downloaded yourself",
+            dir.display()
+        );
+    }
     let mode = Mode::from_config(&config.sandbox);
     let paths = SandboxPaths::from_config(&config);
     if !matches!(mode, Mode::Disabled) {
@@ -115,39 +126,45 @@ pub fn command(city: bool) -> Result<()> {
     let _session = worker::SessionGuard;
     worker::preflight().map_err(anyhow::Error::msg)?;
 
-    let dir = downloaded_dir().context("cannot determine the cache directory")?;
     crate::owner_only::create_dir_all(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
-    // Both runs would write the same partial file, and the first to rename
-    // would publish what the second had written so far.
-    let lock = crate::owner_only::create(&dir.join(".update.lock"))?;
-    if let Err(std::fs::TryLockError::WouldBlock) = lock.try_lock() {
-        bail!("another netwatch geoip update is running");
-    }
+    let _lock = take_lock(&dir)?;
+    remove_stale_partials(&dir);
 
+    let agent = crate::http::agent();
+    let mut over_https = |url: &str, since: Option<SystemTime>| fetch(agent, true, url, since);
+    run(city, &dir, Utc::now(), &mut over_https, &config)
+}
+
+/// Update each database in turn and report on them. One that fails does not
+/// stop the next.
+fn run(
+    city: bool,
+    dir: &Path,
+    now: DateTime<Utc>,
+    fetch: &mut impl FnMut(&str, Option<SystemTime>) -> Result<Fetched>,
+    config: &NetwatchConfig,
+) -> Result<()> {
     let mut wanted = vec![Database::Country, Database::Asn];
     // City wins over Country once it is there, so a file left to go stale
     // would hide the Country file this run refreshes.
     if city || dir.join(Database::City.file_name()).is_file() {
         wanted.push(Database::City);
     }
-    let now = Utc::now();
-    let agent = crate::http::agent();
-    let mut over_https = |url: &str, since: Option<SystemTime>| fetch(agent, true, url, since);
     let (mut updated, mut failed) = (0, 0);
     for db in &wanted {
         let path = dir.join(db.file_name());
-        match update_one(*db, &dir, now, &mut over_https) {
+        match update_one(*db, dir, now, fetch) {
             Ok(Outcome::Updated(checked)) => {
                 updated += 1;
-                println!("updated {}", describe(&path, &checked));
+                say(&format!("updated {}", describe(&path, &checked)));
             }
             Ok(Outcome::AlreadyCurrent(checked)) => {
-                println!("already current {}", describe(&path, &checked));
+                say(&format!("already current {}", describe(&path, &checked)));
             }
             Err(error) => {
                 failed += 1;
-                eprintln!("{}: {error:#}", db.file_name());
+                complain(&format!("{}: {error:#}", db.file_name()));
             }
         }
     }
@@ -155,19 +172,21 @@ pub fn command(city: bool) -> Result<()> {
         .get("geoip-update")
         .and_then(|worker| worker.error.clone())
     {
-        eprintln!("note: {partly}");
+        complain(&format!("note: {partly}"));
     }
     if failed < wanted.len() {
-        println!("{}", crate::collectors::geo::DBIP_ATTRIBUTION);
+        say(crate::collectors::geo::DBIP_ATTRIBUTION);
     }
     if updated > 0 {
-        println!("restart netwatch to load it");
+        say("restart netwatch to load it");
         for (key, value) in [
             ("geoip_db", &config.geoip_db),
             ("geoip_asn_db", &config.geoip_asn_db),
         ] {
             if !value.trim().is_empty() {
-                println!("{key} in config.toml still takes precedence: {value}");
+                say(&format!(
+                    "{key} in config.toml still takes precedence: {value}"
+                ));
             }
         }
     }
@@ -175,6 +194,58 @@ pub fn command(city: bool) -> Result<()> {
         bail!("{failed} of {} databases not updated", wanted.len());
     }
     Ok(())
+}
+
+/// Write a line of the report. A closed pipe or a full disk must not cost the
+/// run its remaining downloads or its exit status, and the print macros panic
+/// on both.
+fn say(line: &str) {
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// [`say`] for stderr, whose print macro panics the same way.
+fn complain(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// Hold this for the run. Two runs would write the same partial file, and the
+/// first to rename would publish what the second had written so far.
+fn take_lock(dir: &Path) -> Result<std::fs::File> {
+    let path = dir.join(".update.lock");
+    let lock = crate::owner_only::create(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    lock_outcome(lock.try_lock(), &path)?;
+    Ok(lock)
+}
+
+/// A lock that could not be taken at all, on a filesystem without them say, is
+/// a refusal too: it says nothing about whether another run is writing.
+fn lock_outcome(result: Result<(), std::fs::TryLockError>, path: &Path) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("another netwatch geoip update is running")
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            bail!("cannot lock {}: {error}", path.display())
+        }
+    }
+}
+
+/// A run stopped partway leaves its partial file, and a first `--city` that
+/// never finishes would otherwise leave 127 MB that no later run looks at. Only
+/// call this holding the lock. What cannot be removed shows when the write to
+/// that path fails.
+fn remove_stale_partials(dir: &Path) {
+    for db in [Database::Country, Database::Asn, Database::City] {
+        let _ = std::fs::remove_file(partial_of(&dir.join(db.file_name())));
+    }
+}
+
+/// Where a database is written before it replaces `path`.
+fn partial_of(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.partial"))
 }
 
 fn describe(path: &Path, checked: &Checked) -> String {
@@ -441,11 +512,7 @@ fn validate(db: Database, bytes: &[u8], now: DateTime<Utc>) -> Result<Checked> {
 /// Replace `path` so a reader sees the old file or the whole new one, and a
 /// failure leaves the old one. `modified` becomes the new file's mtime.
 fn replace_file(path: &Path, bytes: &[u8], modified: SystemTime) -> Result<()> {
-    let name = path
-        .file_name()
-        .context("a database path has a file name")?
-        .to_string_lossy();
-    let partial = path.with_file_name(format!(".{name}.partial"));
+    let partial = partial_of(path);
     let replaced = write_synced(&partial, bytes, modified).and_then(|()| rename(&partial, path));
     if replaced.is_err() {
         let _ = std::fs::remove_file(&partial);
@@ -1262,6 +1329,140 @@ mod tests {
             TcpStream::connect(addr).is_ok(),
             "the main thread downloads"
         );
+    }
+
+    /// The print macros panic on a closed pipe or a full disk, which took the
+    /// process down with exit 101 before ASN was downloaded. Assembled, so this
+    /// test does not match itself.
+    #[test]
+    fn nothing_here_prints_with_a_macro_that_panics() {
+        let source = include_str!("geoip_update.rs");
+        let (code, _tests) = source.split_once(concat!("#[cfg(", "test)]")).unwrap();
+        for printing in [concat!("print", "ln!"), concat!("print", "!(")] {
+            assert!(!code.contains(printing), "{printing}");
+        }
+    }
+
+    #[test]
+    fn a_second_run_is_refused_while_the_first_holds_the_lock() {
+        let dir = TestDir::new();
+        let held = take_lock(&dir.0).unwrap();
+        let error = take_lock(&dir.0).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "another netwatch geoip update is running"
+        );
+        drop(held);
+        take_lock(&dir.0).unwrap();
+    }
+
+    /// Only `WouldBlock` used to stop a run. Every other failure carried on
+    /// unlocked, with concurrent runs sharing one partial file.
+    #[test]
+    fn a_lock_that_cannot_be_taken_fails_closed() {
+        let path = Path::new("/cache/.update.lock");
+        let error = lock_outcome(
+            Err(std::fs::TryLockError::Error(std::io::Error::other(
+                "no locks here",
+            ))),
+            path,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("no locks here"), "{message}");
+        assert!(message.contains(".update.lock"), "{message}");
+        assert!(lock_outcome(Ok(()), path).is_ok());
+    }
+
+    /// Each kind's, whichever this run wants: an orphan from an interrupted
+    /// `--city` is no use to a run without the flag.
+    #[test]
+    fn stale_partials_of_every_kind_are_removed() {
+        let dir = TestDir::new();
+        let keep = dir.file(Database::Country);
+        std::fs::write(&keep, b"database").unwrap();
+        for db in [Database::Country, Database::Asn, Database::City] {
+            std::fs::write(partial_of(&dir.file(db)), b"partial").unwrap();
+        }
+        remove_stale_partials(&dir.0);
+        assert_eq!(dir.names(), [Database::Country.file_name()]);
+        assert_eq!(std::fs::read(&keep).unwrap(), b"database");
+        // Nothing to remove is not a failure.
+        remove_stale_partials(&dir.0);
+    }
+
+    /// City is preferred when present, so a junk City file hides a good Country
+    /// file. Doctor reports it, and a plain update, with no `--city`, repairs it
+    /// and leaves Country alone.
+    #[test]
+    fn a_junk_city_file_is_repaired_by_an_update_without_the_flag() {
+        use crate::collectors::geo::{DbFile, DbStatus};
+        let dir = TestDir::new();
+        let now = at(2026, 11, 2);
+        let country = test_db::city("DBIP-Country-Lite", built(now, 1));
+        std::fs::write(dir.file(Database::Country), &country).unwrap();
+        let city_path = dir.file(Database::City);
+        std::fs::write(&city_path, b"junk").unwrap();
+
+        let config = NetwatchConfig::default();
+        let (selected, _) = config.geoip_paths_in(Some(&dir.0));
+        assert_eq!(selected, city_path.to_str().unwrap());
+        assert!(matches!(
+            DbStatus::open(&selected, "").city,
+            DbFile::Unreadable { .. }
+        ));
+
+        let city = test_db::city("DBIP-City-Lite", built(now, 1));
+        let asn = test_db::asn("DBIP-ASN-Lite", built(now, 1));
+        run(
+            false,
+            &dir.0,
+            now,
+            &mut |url: &str, since| {
+                if url.contains("-city-") {
+                    assert_eq!(since, None, "a junk file is not asked after");
+                    Ok(body(&city))
+                } else if url.contains("-asn-") {
+                    Ok(body(&asn))
+                } else {
+                    assert!(since.is_some());
+                    Ok(Fetched::NotModified)
+                }
+            },
+            &config,
+        )
+        .unwrap();
+
+        let (selected, _) = config.geoip_paths_in(Some(&dir.0));
+        assert_eq!(selected, city_path.to_str().unwrap());
+        let DbFile::Loaded { database_type, .. } = DbStatus::open(&selected, "").city else {
+            panic!("the City file was not repaired");
+        };
+        assert_eq!(database_type, "DBIP-City-Lite");
+        assert_eq!(std::fs::read(dir.file(Database::Country)).unwrap(), country);
+    }
+
+    /// One failure is exit 1, and it does not cost the databases after it.
+    #[test]
+    fn a_failed_database_does_not_stop_the_next() {
+        let dir = TestDir::new();
+        let now = at(2026, 11, 2);
+        let asn = test_db::asn("DBIP-ASN-Lite", built(now, 1));
+        let error = run(
+            false,
+            &dir.0,
+            now,
+            &mut |url: &str, _| {
+                if url.contains("-country-") {
+                    bail!("no route to host");
+                }
+                Ok(body(&asn))
+            },
+            &NetwatchConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "1 of 2 databases not updated");
+        assert_eq!(dir.names(), [Database::Asn.file_name()]);
     }
 
     /// A panic on a hostile file is a failed update, not a hung command.

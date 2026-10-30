@@ -469,13 +469,16 @@ impl NetwatchConfig {
         self.geoip_paths_in(downloaded.as_deref())
     }
 
-    fn geoip_paths_in(&self, downloaded: Option<&Path>) -> (String, String) {
+    pub(crate) fn geoip_paths_in(&self, downloaded: Option<&Path>) -> (String, String) {
         use crate::geoip_update::Database;
+        // A session takes paths as text. One that is not UTF-8 cannot be passed
+        // on, and a lossy copy names a different file, so it is not found.
+        // `netwatch geoip update` refuses to write there and says why.
         let found = |db: Database| {
             downloaded
                 .map(|dir| dir.join(db.file_name()))
                 .filter(|path| path.is_file())
-                .map(|path| path.to_string_lossy().into_owned())
+                .and_then(|path| path.to_str().map(str::to_owned))
         };
         let or_downloaded = |set: &str, downloaded: Option<String>| {
             if set.trim().is_empty() {
@@ -664,6 +667,23 @@ show_geo = false
         fs::create_dir(empty_dir.join("dbip-country-lite.mmdb")).unwrap();
         assert_eq!(empty.geoip_paths_in(Some(&empty_dir)).0, "");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `is_file` accepted the real path and a lossy copy of it went on, so
+    /// doctor looked for a file with a different name and called it unreadable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_downloaded_file_under_a_non_utf8_path_is_not_found() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("nw-geoip-paths-{}", uuid::Uuid::new_v4()));
+        let dir = root.join(std::ffi::OsStr::from_bytes(b"cache-\xff"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("dbip-country-lite.mmdb"), "x").unwrap();
+        assert_eq!(
+            NetwatchConfig::default().geoip_paths_in(Some(&dir)),
+            (String::new(), String::new())
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
