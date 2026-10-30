@@ -65,13 +65,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // full-width strip.
     let timeline_under_interfaces = show_timeline && iface_beside_conns;
     let timeline_full_width = show_timeline && !iface_beside_conns;
-    // A failed capture gets a header row of its own: the dashboard is the
+    // A failed capture gets header rows of its own: the dashboard is the
     // first screen, and the failure used to show only on the Packets tab.
-    let header_rows = if widgets::capture_failure(app).is_some() {
-        4
-    } else {
-        3
-    };
+    let header_rows = widgets::capture_failure(app).map_or(3, |error| {
+        3 + widgets::capture_failure_lines(&app.theme, &error, area.width).len() as u16
+    });
     let mut constraints = vec![
         Constraint::Length(header_rows), // header
         Constraint::Length(KPI_ROWS),    // hero row

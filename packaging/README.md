@@ -40,7 +40,11 @@ journalctl -u netwatch -f
 
 The unit runs unprivileged with only `CAP_NET_RAW`, `CAP_BPF`, and
 `CAP_PERFMON` (eBPF process attribution needs the latter two). netwatch applies
-its own Landlock sandbox on top after startup.
+its own Landlock sandbox on top after startup, and drops `CAP_NET_RAW` from its
+threads once capture has opened. The open capture descriptor can still capture
+and inject on any interface in the network namespace. The unit grants these
+capabilities to its service user, so the binary carries none and can stay 0755:
+it needs no `setcap` and no group restriction.
 
 ## macOS (launchd)
 

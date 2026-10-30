@@ -240,9 +240,10 @@ write: /dev/null
     reader, or a separate parser process
     ([worker startup](../src/sandbox/worker.rs#L1)).
 14. File capabilities on a world-executable binary let every local account invoke
-    capture. Restrict execution to the intended group as in the setup recipe. The
-    capture-error hint and the package install messages still give an in-place
-    `setcap` line without that restriction (E3 below).
+    capture. Restrict execution to the intended group as in the setup recipe, which
+    the capture-error hint and the package install messages also give. A package
+    prints the commands and never runs them, so nothing stops an administrator
+    granting a world-executable binary by hand.
 
 Capture drops CAP_NET_RAW on entry, and in sessions that never reopen every
 other thread drops it too, but that does not revoke the AF_PACKET descriptor
@@ -345,7 +346,7 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | C1 capture authority and NET_ADMIN audit | Included |
 | D1 seccomp no-socket policy | Later 0.39 work |
 | E2 local GeoIP/update command | Later 0.39 work |
-| E3 capture-error hint and package messages still setcap a world-executable binary | Later 0.39 work |
+| E3 capture-error hint and package messages restrict the binary to a group before setcap | Included |
 | E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Included |
 | F1 doctor reports actual containment | Later 0.39 work |
 | Remaining unsafe-block audit | Later hardening; contributor safety policy applies now |

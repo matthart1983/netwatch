@@ -749,6 +749,17 @@ echo "After logging in again, run $bin"
 > group execution restriction and `setcap` re-applied. Never grant capture capabilities to
 > a world-executable copy.
 
+When capture is refused, netwatch prints a shorter form of this for a binary it can change in
+place, such as a package's. Log in again after running it. A binary on a read-only store stops
+it at `chown` before anything is granted, and needs the recipe above:
+
+```bash
+b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b"
+```
+
+The [systemd unit](../packaging/systemd/netwatch.service) needs none of this: it grants the
+capabilities to its own service user.
+
 | Capability | What it unlocks |
 |------------|-----------------|
 | `cap_net_raw` | Opening packet capture on a live interface (libpcap) |

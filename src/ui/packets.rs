@@ -69,14 +69,18 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     } else {
         (Constraint::Min(10), Constraint::Length(16))
     };
+    // The failure takes the verdict's row, and more when its fix wraps.
+    let header_rows = crate::ui::widgets::capture_failure(app).map_or(3, |error| {
+        2 + crate::ui::widgets::capture_failure_lines(&app.theme, &error, area.width).len() as u16
+    });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Length(1), // capture control strip
-            list_constraint,       // packet list
-            detail_constraint,     // detail pane
-            Constraint::Length(3), // footer
+            Constraint::Length(header_rows), // header
+            Constraint::Length(1),           // capture control strip
+            list_constraint,                 // packet list
+            detail_constraint,               // detail pane
+            Constraint::Length(3),           // footer
         ])
         .split(area);
 
@@ -233,7 +237,10 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
 
     if let Some(e) = crate::ui::widgets::capture_failure(app) {
         let line1 = crate::ui::widgets::build_header_line(app, Some(extra));
-        let lines = vec![line1, crate::ui::widgets::capture_failure_line(app, e)];
+        let mut lines = vec![line1];
+        lines.extend(crate::ui::widgets::capture_failure_lines(
+            &app.theme, &e, area.width,
+        ));
         let header = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::BOTTOM)

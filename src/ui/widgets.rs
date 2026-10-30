@@ -629,19 +629,49 @@ pub fn capture_failure(app: &App) -> Option<String> {
         .filter(|_| !app.diagnose.is_demo())
 }
 
-/// The header's capture-failure row: what failed and, for a refused open,
-/// the fix (see [`crate::platform::capture_fix`]).
-pub fn capture_failure_line(app: &App, error: String) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(" ⚠ capture off: "),
-        Span::styled(error, Style::default().fg(app.theme.status_error).bold()),
-    ])
+/// The header's capture-failure rows at `width`: what failed and, for a
+/// refused open, the fix (see [`crate::platform::capture_fix`]).
+///
+/// The Linux fix is a chain of commands longer than most terminals are wide,
+/// and one cut off before its `setcap` fixes nothing. So a row breaks after an
+/// `&&` where it can, which keeps each command whole and lets the rows paste
+/// as one, and between words where it cannot.
+pub fn capture_failure_lines(theme: &Theme, error: &str, width: u16) -> Vec<Line<'static>> {
+    use crate::ui::text::width as cells;
+    const INDENT: &str = " ";
+    let width = usize::from(width);
+    let mut rows = vec![(" ⚠ capture off: ", String::new())];
+    let fits = |rows: &[(&str, String)], text: &str| {
+        let (lead, row) = &rows[rows.len() - 1];
+        cells(lead) + cells(row) + cells(text.trim_end()) <= width
+    };
+    for part in error.split_inclusive(" && ") {
+        if !fits(&rows, part) && cells(INDENT) + cells(part.trim_end()) <= width {
+            rows.push((INDENT, String::new()));
+        }
+        for word in part.split_inclusive(' ') {
+            if !fits(&rows, word) && !rows[rows.len() - 1].1.is_empty() {
+                rows.push((INDENT, String::new()));
+            }
+            let last = rows.len() - 1;
+            rows[last].1.push_str(word);
+        }
+    }
+    let style = Style::default().fg(theme.status_error).bold();
+    rows.into_iter()
+        .map(|(lead, row)| {
+            Line::from(vec![
+                Span::raw(lead),
+                Span::styled(row.trim_end().to_string(), style),
+            ])
+        })
+        .collect()
 }
 
 pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![build_header_line(app, None), build_verdict_line(app)];
     if let Some(error) = capture_failure(app).filter(|_| area.height > 3) {
-        lines.push(capture_failure_line(app, error));
+        lines.extend(capture_failure_lines(&app.theme, &error, area.width));
     }
     let header = Paragraph::new(lines).block(
         Block::default()
@@ -1032,6 +1062,46 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Hi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure_rows(error: &str, width: u16) -> Vec<String> {
+        capture_failure_lines(&crate::theme::by_name("default"), error, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_capture_failure_breaks_between_commands_then_between_words() {
+        // Whole commands, each row but the last ending in the `&&` that lets
+        // the rows paste as one.
+        let chain = "not permitted — first command && second command && third command";
+        assert_eq!(
+            failure_rows(chain, 50),
+            [
+                " ⚠ capture off: not permitted — first command &&",
+                " second command && third command",
+            ]
+        );
+        // A message with no `&&` breaks between words.
+        let plain = "run with sudo, or give your user read access to the device";
+        assert_eq!(
+            failure_rows(plain, 40),
+            [
+                " ⚠ capture off: run with sudo, or give",
+                " your user read access to the device",
+            ]
+        );
+        assert_eq!(
+            failure_rows(plain, 200),
+            [format!(" ⚠ capture off: {plain}")]
+        );
+        // Every row of the Linux fix fits an ordinary terminal.
+        for width in [80, 100, 120] {
+            for row in failure_rows(crate::platform::LINUX_CAPTURE_FIX, width) {
+                assert!(crate::ui::text::width(&row) <= usize::from(width), "{row}");
+            }
+        }
+    }
 
     fn find_first_col(target: Tab) -> Option<u16> {
         (0..220).find(|&col| tab_at_column(col) == Some(target))

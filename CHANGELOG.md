@@ -622,6 +622,20 @@ All notable changes to NetWatch will be documented in this file.
   reports `insights` as degraded with reason `cleartext_off_host`. netwatch
   still sends: there is no new key, and Insights stays experimental. A
   loopback address, `localhost` and `https://` carry no mark.
+- **The capture error and the package install messages restrict the binary to
+  a group before granting it capture.** They printed a bare `setcap`, which on
+  a 0755 binary lets every local account capture. The README, REFERENCE.md and
+  the man page already put a `netwatch` group first, but anyone following the
+  error or the post-install message did not get that. The `.deb` and `.rpm`
+  messages now give `groupadd`, `usermod`, `chown root:netwatch`, `chmod 0750`
+  and `setcap`, in that order. On Linux the capture error gives the same steps
+  as one command, which finds the binary once, before `chmod` takes it away
+  from an account not yet in the group. The header on Dashboard and Packets
+  wraps that command between its steps instead of cutting it off. netwatch
+  changes no file itself, so a binary you already granted stays open to every
+  account until you run the steps. The README now leads with this recipe and
+  the systemd unit, and the container docs drop `--cap-add=NET_ADMIN`, which
+  nothing in netwatch uses.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix

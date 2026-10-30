@@ -5493,7 +5493,33 @@ mod render_safety_tests {
             crate::platform::capture_fix()
         ));
         let row = banner(&mut app).expect("no capture banner on the dashboard");
-        assert!(row.contains(crate::platform::capture_fix()), "{row}");
+        assert!(row.contains("capture off"), "{row}");
+
+        // The whole fix, however narrow the terminal: a command cut off before
+        // its last step fixes nothing. Each row breaks between whole commands.
+        for tab in [Tab::Dashboard, Tab::Packets] {
+            app.ui.current_tab = tab;
+            for width in [80u16, 100, 120, 200, 400] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 50)).unwrap();
+                terminal.draw(|f| draw_frame(f, &mut app)).unwrap();
+                let rows = rows(terminal.backend().buffer());
+                let first = rows
+                    .iter()
+                    .position(|r| r.contains("capture off"))
+                    .unwrap_or_else(|| panic!("{tab:?} at {width} shows no failure"));
+                let shown = rows[first..]
+                    .iter()
+                    .take_while(|r| !r.starts_with('─'))
+                    .map(|r| r.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    shown.contains(crate::platform::capture_fix()),
+                    "{tab:?} at {width}:\n{}",
+                    rows[..8].join("\n")
+                );
+            }
+        }
     }
 
     fn unsafe_cells(buf: &Buffer) -> Vec<String> {

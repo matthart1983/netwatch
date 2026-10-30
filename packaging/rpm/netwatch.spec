@@ -33,9 +33,15 @@ attribution where the platform allows it, packet and interface views, and a
 diagnostic engine that learns a per-network baseline and opens an issue when
 that baseline breaks. Runs in a terminal and needs no configuration.
 
-Packet capture needs elevated access: run netwatch with sudo, or grant the
-capabilities once with
+Packet capture needs elevated access. Prefer to restrict the binary to a group
+and grant the capabilities to it, as root:
+  groupadd -f netwatch
+  usermod -aG netwatch "$USER"
+  chown root:netwatch %{_bindir}/netwatch
+  chmod 0750 %{_bindir}/netwatch
   setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' %{_bindir}/netwatch
+Running netwatch with sudo also works, but as root the sandbox is defence in
+depth only.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -64,12 +70,18 @@ install -Dpm0644 packaging/systemd/%{name}.service \
 # the administrator's decision. See packaging/debian/postinst.
 cat <<'MSG'
 
-netwatch is installed. Packet capture needs elevated access:
+netwatch is installed. Packet capture needs elevated access. Prefer to
+restrict the binary to a group and grant the capabilities to it:
 
-  sudo netwatch                       # works as-is, or grant it once:
+  sudo groupadd -f netwatch
+  sudo usermod -aG netwatch "$USER"   # takes effect at your next login
+  sudo chown root:netwatch /usr/bin/netwatch
+  sudo chmod 0750 /usr/bin/netwatch
   sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' /usr/bin/netwatch
 
-Capabilities attach to the file, so re-apply after each upgrade.
+An upgrade resets the file, so re-run the last three after each one. Without
+the group restriction every local account could capture. `sudo netwatch` also
+works, but as root the sandbox is defence in depth only.
 
 MSG
 
