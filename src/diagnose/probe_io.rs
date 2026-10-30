@@ -54,7 +54,10 @@ pub fn command(
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: stdout owns a valid descriptor, flags only affect this pipe.
+        // SAFETY: `stdout` and `stderr` are this process's ends of the child's
+        // two pipes, owned here and open for the whole block. F_SETFL with
+        // O_NONBLOCK takes integers only and changes the status flags of
+        // those two pipe ends and nothing else.
         let rc = unsafe {
             let a = nix::libc::fcntl(
                 stdout.as_raw_fd(),

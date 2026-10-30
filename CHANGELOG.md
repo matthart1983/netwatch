@@ -35,8 +35,9 @@ All notable changes to NetWatch will be documented in this file.
   holding. macOS and FreeBSD share one walk of the `getifaddrs` list for the
   link speed. It skips an entry with no name instead of reading a null
   pointer, and reads only the speed field rather than borrowing the whole
-  `if_data` record. Nothing netwatch shows changes, and no new crate is
-  compiled.
+  `if_data` record. Every `unsafe` site now has a comment saying what it
+  relies on and why that holds there. Nothing netwatch shows changes, and no
+  new crate is compiled.
 - **The stream tracker's budget is an eighth of the host's memory, up to
   256 MiB.** It was 256 MiB on every host, half the memory of a 512 MiB
   board. netwatch reads the host's memory once at start, `MemTotal` on Linux
