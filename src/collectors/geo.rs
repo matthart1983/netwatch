@@ -40,9 +40,14 @@ enum GeoEntry {
 
 // ── MaxMind offline reader ─────────────────────────────────
 
-/// The largest database file netwatch reads. It holds the whole file in memory,
-/// and DB-IP's largest free one is 127 MiB.
-pub(crate) const MAX_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
+/// The largest file read from where `netwatch geoip update` saves them. DB-IP's
+/// largest free database is 127 MiB.
+pub(crate) const MAX_DOWNLOADED_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The largest file read from a path in the config. A commercial database can be
+/// far larger than a free one, and any size loaded before this limit existed.
+/// This only bounds what doctor and a session hold in memory.
+const MAX_CONFIGURED_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The attribution CC BY 4.0 asks of whatever shows DB-IP's data.
 pub const DBIP_ATTRIBUTION: &str = "IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0";
@@ -105,27 +110,33 @@ pub(crate) fn epoch_date(secs: u64) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp(i64::try_from(secs).ok()?, 0)
 }
 
-/// Read a database file whole. Only a regular file under the limit is read:
+/// The size limit for a database at `path`, given where downloads are saved.
+fn database_limit(path: &Path, downloaded: Option<&Path>) -> u64 {
+    if downloaded.is_some_and(|dir| path.parent() == Some(dir)) {
+        MAX_DOWNLOADED_DATABASE_BYTES
+    } else {
+        MAX_CONFIGURED_DATABASE_BYTES
+    }
+}
+
+/// Read a database file whole. Only a regular file under `limit` is read:
 /// opening a FIFO blocks until something writes to it, and `/dev/zero` never
 /// ends, on a path taken from the config or the cache directory.
-pub(crate) fn read_database(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_database(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
-    let over = |bytes: u64| {
-        std::io::Error::other(format!(
-            "{bytes} bytes is over the {MAX_DATABASE_BYTES} byte limit"
-        ))
-    };
-    if metadata.len() > MAX_DATABASE_BYTES {
+    let over =
+        |bytes: u64| std::io::Error::other(format!("{bytes} bytes is over the {limit} byte limit"));
+    if metadata.len() > limit {
         return Err(over(metadata.len()));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     std::fs::File::open(path)?
-        .take(MAX_DATABASE_BYTES + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_DATABASE_BYTES {
+    if bytes.len() as u64 > limit {
         return Err(over(bytes.len() as u64));
     }
     Ok(bytes)
@@ -136,7 +147,11 @@ fn open_database(path: &str) -> (Option<maxminddb::Reader<Vec<u8>>>, DbFile) {
     if path.is_empty() {
         return (None, DbFile::NotConfigured);
     }
-    let opened = read_database(Path::new(path))
+    let limit = database_limit(
+        Path::new(path),
+        crate::geoip_update::downloaded_dir().as_deref(),
+    );
+    let opened = read_database(Path::new(path), limit)
         .map_err(|error| error.to_string())
         .and_then(|bytes| maxminddb::Reader::from_source(bytes).map_err(|error| error.to_string()))
         .and_then(|reader| {
@@ -766,19 +781,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The limit is the file's place, not its name: a path in the config has
+    /// room for a commercial database, and only the download directory is held
+    /// to what the update writes.
+    #[test]
+    fn the_limit_depends_on_where_the_file_is() {
+        let downloads = Path::new("/cache/netwatch/geoip");
+        for (path, limit) in [
+            (
+                "/cache/netwatch/geoip/dbip-city-lite.mmdb",
+                MAX_DOWNLOADED_DATABASE_BYTES,
+            ),
+            ("/geo/GeoIP2-Enterprise.mmdb", MAX_CONFIGURED_DATABASE_BYTES),
+            ("/geo/dbip-city-lite.mmdb", MAX_CONFIGURED_DATABASE_BYTES),
+            (
+                "/cache/netwatch/geoip/sub/db.mmdb",
+                MAX_CONFIGURED_DATABASE_BYTES,
+            ),
+        ] {
+            assert_eq!(
+                database_limit(Path::new(path), Some(downloads)),
+                limit,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            database_limit(Path::new("/geo/db.mmdb"), None),
+            MAX_CONFIGURED_DATABASE_BYTES
+        );
+    }
+
+    /// Sparse, so this costs nothing, and too big to read by accident.
     #[test]
     fn a_file_over_the_limit_is_unreadable_without_being_read() {
-        // Sparse, so this costs nothing, and too big to read by accident.
         let file = status_of(|path| {
             std::fs::File::create(path)
                 .unwrap()
-                .set_len(MAX_DATABASE_BYTES + 1)
+                .set_len(MAX_CONFIGURED_DATABASE_BYTES + 1)
                 .unwrap()
         });
         let DbFile::Unreadable { error, .. } = &file else {
             panic!("{file:?}");
         };
         assert!(error.contains("limit"), "{error}");
+
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.mmdb");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_DOWNLOADED_DATABASE_BYTES + 1)
+            .unwrap();
+        let error = read_database(&path, MAX_DOWNLOADED_DATABASE_BYTES).unwrap_err();
+        assert!(error.to_string().contains("limit"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commercial database larger than anything the update writes loaded at
+    /// any size before there was a limit, and still does. Padded inside the data
+    /// section, which nothing refers to, and sparse on disk.
+    #[test]
+    fn a_configured_database_over_the_download_limit_still_loads() {
+        use std::io::{Seek, Write};
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("commercial.mmdb");
+        let db = test_db::city("GeoIP2-Enterprise", 1_790_000_000);
+        let marker = db
+            .windows(14)
+            .rposition(|window| window == b"\xab\xcd\xefMaxMind.com")
+            .unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&db[..marker]).unwrap();
+        file.seek(std::io::SeekFrom::Start(MAX_DOWNLOADED_DATABASE_BYTES + 1))
+            .unwrap();
+        file.write_all(&db[marker..]).unwrap();
+        drop(file);
+        assert!(std::fs::metadata(&path).unwrap().len() > MAX_DOWNLOADED_DATABASE_BYTES);
+
+        let cache = GeoCache::with_mmdb(path.to_str().unwrap(), "");
+        assert!(
+            matches!(cache.db_status().city, DbFile::Loaded { .. }),
+            "{:?}",
+            cache.db_status().city
+        );
+        assert_eq!(cache.lookup("8.8.8.8").unwrap().country_code, "US");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

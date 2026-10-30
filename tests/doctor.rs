@@ -307,21 +307,59 @@ fn a_geoip_db_that_is_not_a_regular_file_is_unreadable() {
         );
     }
 }
+const MIB: u64 = 1024 * 1024;
+/// Sparse, so these cost nothing. A path in the config has room for a commercial
+/// database, and what the update saved is held to what it writes.
 #[test]
 fn an_oversized_geoip_db_is_unreadable() {
     use netwatch::runtime::capabilities::State;
     let fixture = Fixture::new();
     let path = fixture.0.join("big.mmdb");
-    // Sparse, so this costs nothing.
     fs::File::create(&path)
         .unwrap()
-        .set_len(256 * 1024 * 1024 + 1)
+        .set_len(2048 * MIB + 1)
         .unwrap();
     fixture.set_geoip_db(&path);
     let geoip = fixture.geoip_db();
     assert_eq!(geoip.state, State::Unavailable);
     assert_eq!(geoip.reason, "db_unreadable");
     assert!(geoip.detail.contains("limit"), "{}", geoip.detail);
+}
+#[test]
+fn an_oversized_download_is_unreadable() {
+    use netwatch::runtime::capabilities::State;
+    let fixture = Fixture::new();
+    let dir = fixture.0.join("cache/netwatch/geoip");
+    fs::create_dir_all(&dir).unwrap();
+    fs::File::create(dir.join("dbip-country-lite.mmdb"))
+        .unwrap()
+        .set_len(256 * MIB + 1)
+        .unwrap();
+    let geoip = fixture.geoip_db();
+    assert_eq!(geoip.state, State::Unavailable);
+    assert_eq!(geoip.reason, "db_unreadable");
+    assert!(geoip.detail.contains("limit"), "{}", geoip.detail);
+}
+/// A commercial database larger than the download limit loaded at any size
+/// before there was one. Padded inside the data section, and sparse on disk.
+#[test]
+fn a_configured_geoip_db_over_the_download_limit_still_loads() {
+    use std::io::{Seek, Write};
+    let fixture = Fixture::new();
+    let path = fixture.0.join("commercial.mmdb");
+    let db = mmdb(1_790_818_572);
+    let marker = db
+        .windows(14)
+        .rposition(|window| window == b"\xab\xcd\xefMaxMind.com")
+        .unwrap();
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(&db[..marker]).unwrap();
+    file.seek(std::io::SeekFrom::Start(256 * MIB + 1)).unwrap();
+    file.write_all(&db[marker..]).unwrap();
+    drop(file);
+    fixture.set_geoip_db(&path);
+    let geoip = fixture.geoip_db();
+    assert_ne!(geoip.reason, "db_unreadable", "{}", geoip.detail);
 }
 /// An empty `geoip_db` looks where `netwatch geoip update` puts its files,
 /// and with nothing there suggests the command. Junk is enough to show which

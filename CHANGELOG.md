@@ -101,11 +101,12 @@ All notable changes to NetWatch will be documented in this file.
   `ConnectionTimeline::tracked_len` and `tracked_cap`, and gain
   `ConnectionTimeline::closed_len`, `closed_trimmed` and `first_seen`, and
   `ConnectionCollector::connections_with_generation`.
-- **A `geoip_db` or `geoip_asn_db` file over 256 MiB, or anything but a regular
+- **A `geoip_db` or `geoip_asn_db` file over 2 GiB, or anything but a regular
   file, now reads as unreadable.** netwatch holds the whole file in memory, and
   doctor now opens these files too, so a FIFO would hang it and `/dev/zero` would
-  read until memory ran out. Doctor and Settings name the cause. A commercial
-  database larger than the limit no longer loads.
+  read until memory ran out. Doctor and Settings name the cause. A database under
+  2 GiB loads as it did, commercial ones included. Files `netwatch geoip update`
+  saved are held to 256 MiB.
 
 ### Fixed
 - **One bad value in config.toml no longer throws the whole file away.** A

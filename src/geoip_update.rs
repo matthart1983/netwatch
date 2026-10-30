@@ -24,7 +24,7 @@ pub const DOWNLOAD_BASE: &str = "https://download.db-ip.com/free/";
 
 /// The City database is about 60 MiB compressed, the others under 6 MiB.
 const MAX_COMPRESSED: u64 = 80 * 1024 * 1024;
-const MAX_DECOMPRESSED: u64 = crate::collectors::geo::MAX_DATABASE_BYTES;
+const MAX_DECOMPRESSED: u64 = crate::collectors::geo::MAX_DOWNLOADED_DATABASE_BYTES;
 /// DB-IP publishes monthly, and the month's file can be a day late, so a good
 /// download can be two months old. Past this the provider has stopped
 /// publishing or someone is replaying an old file.
@@ -457,7 +457,8 @@ fn gunzip(gzip: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn read_and_validate(db: Database, path: &Path, now: DateTime<Utc>) -> Result<Checked> {
-    validate(db, &crate::collectors::geo::read_database(path)?, now)
+    let bytes = crate::collectors::geo::read_database(path, MAX_DECOMPRESSED)?;
+    validate(db, &bytes, now)
 }
 
 /// Is this the database that was asked for, recent, and able to answer?

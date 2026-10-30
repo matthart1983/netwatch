@@ -945,7 +945,7 @@ full resolution.
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `show_geo` | `true` | `true` `false` | Show the GeoIP column in Connections. |
-| `geoip_db` | `""` | file path | A City or Country `.mmdb`, DB-IP's or MaxMind's. Empty uses what [`netwatch geoip update`](#geoip-databases) downloaded, if anything. Lookups never leave this machine. A file over 256 MiB, or anything but a regular file, is reported as unreadable. |
+| `geoip_db` | `""` | file path | A City or Country `.mmdb`, DB-IP's or MaxMind's. Empty uses what [`netwatch geoip update`](#geoip-databases) downloaded, if anything. Lookups never leave this machine. A file over 2 GiB, or anything but a regular file, is reported as unreadable. |
 | `geoip_asn_db` | `""` | file path | An ASN `.mmdb`, DB-IP's or MaxMind's, for organisation names. Empty uses what `netwatch geoip update` downloaded, if anything. The same limits apply. |
 | `geoip_online` | removed | | Removed in 0.39: it sent peer addresses to a third party in cleartext. A config that sets it still loads, the setting is ignored, and the log says so once per start. The next save from Settings drops it. Run [`netwatch geoip update`](#geoip-databases) instead. |
 
