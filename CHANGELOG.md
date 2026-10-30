@@ -417,6 +417,12 @@ All notable changes to NetWatch will be documented in this file.
   header length of 16 it read the ports out of the destination address. The
   DNS timing and the QUIC breakdown in the detail pane read the same bounded
   payload.
+- **The Dashboard shows verdicts on IPv6 sockets.** Its verdict column looked a
+  socket up by the connection table's spelling of its addresses, and verdicts
+  are kept under the kernel flow's, which has no brackets and writes an
+  IPv4-mapped address as plain IPv4. Every IPv6 and IPv4-mapped row read `–`
+  whatever its socket was doing, and a broken one sorted as healthy on a panel
+  ordered by concern. Those rows now show their verdicts.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to

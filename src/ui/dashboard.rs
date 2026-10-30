@@ -1073,9 +1073,7 @@ fn connection_rows(app: &App) -> Vec<ConnRow> {
         .iter()
         .filter(|c| c.state != "LISTEN" && c.state != "CLOSED" && !c.remote_addr.is_empty())
         .map(|c| {
-            let verdict = verdicts
-                .get(&(c.local_addr.as_str(), c.remote_addr.as_str()))
-                .copied();
+            let verdict = verdicts.for_row(c);
             ConnRow {
                 process: crate::collectors::connections::process_label(
                     c.process_name.as_deref(),
@@ -1937,7 +1935,134 @@ fn remote_host_only(addr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnose::detectors::SocketVerdict;
+    use crate::collectors::connections::Connection;
+    use crate::collectors::tcp_info::{normalize_endpoint, FlowMap, TcpInfo};
+    use crate::diagnose::detectors::{SocketVerdict, Thresholds};
+
+    /// A table and a kernel dump, and the diagnose pass that judges the dump's
+    /// sockets, as a tick leaves them. Every socket in the dump has a closed
+    /// receive window, so a verdict other than that came from somewhere else.
+    fn app_with_sockets(rows: Vec<Connection>, flows: &[(&str, &str)]) -> crate::app::App {
+        let info = TcpInfo {
+            rwnd: Some(0),
+            ..TcpInfo::default()
+        };
+        let flows: FlowMap = flows
+            .iter()
+            .map(|(local, remote)| {
+                let key = (normalize_endpoint(local), normalize_endpoint(remote));
+                (key, info)
+            })
+            .collect();
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.connection_collector.publish_for_test(rows);
+        app.tcp_info.publish_for_test(flows);
+        let mut sampler = std::mem::take(&mut app.diagnose.sampler);
+        sampler.sockets(&app, &Thresholds::default());
+        app.diagnose.sampler = sampler;
+        app
+    }
+
+    fn socket_row(process: &str, local: &str, remote: &str) -> Connection {
+        let mut c = crate::testutil::connections::synthetic_connections(1, 1).remove(0);
+        c.protocol = "TCP".into();
+        c.state = "ESTABLISHED".into();
+        c.process_name = Some(process.into());
+        c.local_addr = local.into();
+        c.remote_addr = remote.into();
+        c.evidence.observe();
+        c
+    }
+
+    /// The verdict column looked rows up as the table spells them, and a verdict
+    /// is kept as the kernel flow spells it, so only IPv4 rows ever found
+    /// theirs. A broken IPv6 socket read `–` and sorted as healthy, on the one
+    /// panel whose job is to say whether anything is wrong.
+    #[test]
+    fn rows_find_their_verdicts_in_every_address_spelling() {
+        let sockets = [
+            ("v4", "192.0.2.10:50000", "198.51.100.1:443"),
+            ("v6", "[2001:db8::10]:50001", "[2001:db8::1]:443"),
+            (
+                "mapped",
+                "[::ffff:192.0.2.10]:50002",
+                "[::ffff:198.51.100.2]:443",
+            ),
+            // macOS lsof's lone closing bracket.
+            ("lsof", "fe80::10]:50003", "fe80::1]:443"),
+        ];
+        let rows = sockets
+            .iter()
+            .map(|(process, local, remote)| socket_row(process, local, remote))
+            .collect();
+        let flows: Vec<(&str, &str)> = sockets.iter().map(|(_, l, r)| (*l, *r)).collect();
+        let app = app_with_sockets(rows, &flows);
+
+        let rows = connection_rows(&app);
+        assert_eq!(rows.len(), sockets.len());
+        for row in &rows {
+            assert_eq!(
+                row.verdict,
+                Some(SocketVerdict::ZeroWindow),
+                "{}",
+                row.process
+            );
+            assert_eq!(
+                row.concern,
+                widgets::socket_verdict_concern(SocketVerdict::ZeroWindow),
+                "{}",
+                row.process
+            );
+        }
+    }
+
+    /// A socket the kernel did not report has no verdict, however close its
+    /// addresses are to one it did: not the same ends swapped, a neighbouring
+    /// port, or the other spelling of another row's address.
+    #[test]
+    fn a_row_with_no_matching_socket_has_no_verdict() {
+        let rows = vec![
+            socket_row("judged-v4", "192.0.2.10:50000", "198.51.100.1:443"),
+            socket_row("judged-v6", "[2001:db8::10]:50001", "[2001:db8::1]:443"),
+            socket_row("swapped", "198.51.100.1:443", "192.0.2.10:50000"),
+            socket_row("other-port", "192.0.2.10:50009", "198.51.100.1:443"),
+            socket_row("other-peer", "[2001:db8::10]:50001", "[2001:db8::2]:443"),
+            socket_row("v6-swapped", "[2001:db8::1]:443", "[2001:db8::10]:50001"),
+            socket_row(
+                "mapped",
+                "[::ffff:192.0.2.10]:50002",
+                "[::ffff:198.51.100.1]:443",
+            ),
+            socket_row("listener", "[::]:443", "[::]:*"),
+        ];
+        let app = app_with_sockets(
+            rows,
+            &[
+                ("192.0.2.10:50000", "198.51.100.1:443"),
+                ("[2001:db8::10]:50001", "[2001:db8::1]:443"),
+                // A flow with no row lends its verdict to nothing.
+                ("192.0.2.10:50077", "198.51.100.7:443"),
+            ],
+        );
+
+        for row in connection_rows(&app) {
+            let want = row
+                .process
+                .starts_with("judged")
+                .then_some(SocketVerdict::ZeroWindow);
+            assert_eq!(row.verdict, want, "{}", row.process);
+        }
+
+        // With nothing judged at all, as on any view but Dense.
+        let rows = vec![socket_row(
+            "v6",
+            "[2001:db8::10]:50001",
+            "[2001:db8::1]:443",
+        )];
+        let app = app_with_sockets(rows, &[]);
+        assert_eq!(connection_rows(&app)[0].verdict, None);
+    }
 
     fn row(process: &str, verdict: Option<SocketVerdict>, rate: f64, retrans: u32) -> ConnRow {
         ConnRow {

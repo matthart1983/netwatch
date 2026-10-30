@@ -294,20 +294,22 @@ impl LiveSampler {
         Some(unix_secs(completed))
     }
 
-    /// The verdict each socket is currently carrying, by (local, remote), for
-    /// a surface that reads them across a whole table: built once, where a
-    /// lookup per row would format a key per row.
+    /// The verdict each socket is currently carrying, for a surface that reads
+    /// them across a whole table: built once, where a lookup per row would
+    /// format a key per row.
     ///
     /// Read by the surfaces that show a verdict column. They must not
     /// re-classify: `classify_socket` is cheap but the *age* of a verdict is
     /// not derivable from a single sample, and a column that disagreed with
     /// the Diagnose tab about what a socket is doing would be worse than no
     /// column at all.
-    pub fn socket_verdicts(&self) -> HashMap<(&str, &str), SocketVerdict> {
-        self.verdict_since
-            .iter()
-            .filter_map(|(key, (verdict, _))| Some((key.split_once(" → ")?, *verdict)))
-            .collect()
+    pub fn socket_verdicts(&self) -> SocketVerdicts<'_> {
+        SocketVerdicts(
+            self.verdict_since
+                .iter()
+                .filter_map(|(key, (verdict, _))| Some((key.split_once(" → ")?, *verdict)))
+                .collect(),
+        )
     }
 
     /// Apply a batch of readings to the store.
@@ -618,6 +620,23 @@ impl LiveSampler {
         self.verdict_since.retain(|k, _| live_keys.contains(k));
         self.retrans_history.retain(|k, _| live_keys.contains(k));
         out
+    }
+}
+
+/// Each socket's current verdict, keyed as the kernel flows are.
+pub struct SocketVerdicts<'a>(HashMap<(&'a str, &'a str), SocketVerdict>);
+
+impl SocketVerdicts<'_> {
+    /// The verdict on the socket this connection-table row describes. Rows
+    /// bracket IPv6 and spell IPv4-mapped addresses out, and the flows do
+    /// neither, so looking up a row's own spelling found nothing for those.
+    pub fn for_row(&self, conn: &Connection) -> Option<SocketVerdict> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let local = flow_spelling(&conn.local_addr);
+        let remote = flow_spelling(&conn.remote_addr);
+        self.0.get(&(&*local, &*remote)).copied()
     }
 }
 
