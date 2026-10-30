@@ -4,6 +4,7 @@ use crate::app::App;
 use crate::collectors::geo::is_private_ip;
 use crate::collectors::traceroute::TracerouteStatus;
 use crate::theme::Theme;
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
@@ -884,15 +885,6 @@ fn health_dot(rtt: Option<f64>, loss: f64, t: &Theme) -> (&'static str, Color) {
         Some(_) => ("●", t.status_error),
         None => ("○", t.text_muted),
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

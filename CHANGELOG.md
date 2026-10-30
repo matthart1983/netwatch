@@ -302,6 +302,39 @@ All notable changes to NetWatch will be documented in this file.
   The Timeline also stopped building a set of every connection's key on
   each tick. At 10,000 connections the tick's connection work fell from
   about 50 ms to about 35 ms at the median.
+- **Names with emoji or halfwidth katakana stay inside their column.** Lite
+  and Dense measured a name with unicode-width and cut it one character at
+  a time, and both disagree with what ratatui draws. A halfwidth sound mark
+  (ﾞ or ﾟ) takes a column on screen but counted as none: in Lite, a process
+  named with eight `ﾊﾟ` filled its 15-column field and the gap after it,
+  with no ellipsis. An emoji with its presentation selector, such as `❤️`
+  or `#️⃣`, counted as one column and drew two, so eight hearts were cut one
+  heart late and the ellipsis fell in the host column. A skin-tone emoji
+  such as `👍🏽` counted as four columns and drew two, so the name was cut
+  short, and the last hand could lose its skin tone. In the top border of
+  Dense's net box, an interface name with sound marks lost its end under
+  the `├` that closes it. Text is now measured and cut between the
+  graphemes ratatui lays out, by the columns it gives each one. That covers
+  Lite, Dense, the cuts in the full view's tables and labels and in the
+  footer's status message, which counted characters, and the check that
+  drops a box's right-hand text when it would cover the title. Plain ASCII
+  text is cut as before. A CJK or emoji name that a full-view table used to
+  clip at its column edge now ends in `…`, and a status message naming a
+  CJK process no longer runs off the right of the footer. Full-view tables
+  that pad their columns with spaces, such as Connections and Processes,
+  still count characters for the padding, so a CJK name there still pushes
+  the columns after it right. ratatui itself still places right-aligned
+  text one column too far right for each sound mark, and cuts off what
+  passes the edge.
+- **An emoji sequence that reached the screen unreplaced no longer hides
+  the text after it.** The last pass over each frame drops the characters
+  that could control the terminal or disguise text, the zero-width joiner
+  among them. A family emoji is three emoji joined into one 2-column cell.
+  With the joiners gone that cell held three emoji, 6 columns wide, and the
+  four cells after it were never sent to the terminal. The cell now keeps
+  the first emoji and its width. Names from packets, peers and other
+  processes have their joiners replaced with `·` before layout, so this
+  only hit text that missed that step.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to

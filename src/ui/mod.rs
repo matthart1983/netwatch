@@ -16,6 +16,7 @@ pub mod settings;
 pub mod sort_picker;
 pub mod stats;
 pub mod stream_context;
+pub mod text;
 pub mod timeline;
 pub mod topology;
 pub mod tree;
