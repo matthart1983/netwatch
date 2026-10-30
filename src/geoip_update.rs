@@ -197,23 +197,37 @@ fn update_one(
 ) -> Result<Outcome> {
     let path = dir.join(db.file_name());
     // Read in the worker too: this file is about to decide whether a download
-    // happens at all. One that no longer validates is not asked after, or
-    // the server would call it current until next month.
+    // happens at all. One that does not validate is fetched again, or the server
+    // would call it current. That catches the wrong database, a file cut short
+    // and one past its age, but the data check is one lookup: damage anywhere
+    // 8.8.8.8 does not reach still reads as current, until next month's file
+    // replaces it.
     let present = {
         let path = path.clone();
         confined(move || read_and_validate(db, &path, now))?.ok()
     };
-    let since = present
+    let mtime = present
         .as_ref()
         .and_then(|_| std::fs::metadata(&path).and_then(|m| m.modified()).ok());
+    let held = present
+        .as_ref()
+        .and_then(|checked| epoch_date(checked.build_epoch))
+        .map(|built| built.format("%Y-%m").to_string());
 
     let months = [month(now), previous_month(now)];
     for month in &months {
         let url = db.url(month);
+        // An mtime says nothing about which month a file holds: `cp` without
+        // `-p` makes October's file newer than November's, and the server would
+        // answer 304 for November. So only the month the file was built in is
+        // asked conditionally. DB-IP builds a file on the first of its month; if
+        // that ever slips, the cost is a download, not a stale file.
+        let since = mtime.filter(|_| held.as_ref() == Some(month));
         match fetch(&url, since).with_context(|| url.clone())? {
             Fetched::Missing => continue,
             Fetched::NotModified => {
                 return present
+                    .filter(|_| since.is_some())
                     .map(Outcome::AlreadyCurrent)
                     .ok_or_else(|| anyhow!("{url}: 304 to a request that was not conditional"));
             }
@@ -821,7 +835,7 @@ mod tests {
     fn not_modified_is_success() {
         let dir = TestDir::new();
         let now = at(2026, 11, 2);
-        let db = country(now);
+        let db = test_db::city("DBIP-Country-Lite", built(now, 1));
         let served = at(2026, 11, 1);
         update_one(Database::Country, &dir.0, now, &mut |_: &str, _| {
             Ok(Fetched::Body {
@@ -841,6 +855,140 @@ mod tests {
         };
         assert_eq!(checked.database_type, "DBIP-Country-Lite");
         assert_eq!(std::fs::read(dir.file(Database::Country)).unwrap(), before);
+    }
+
+    /// `cp` without `-p` gave last month's file a date later than this month's,
+    /// so asking with it got a 304 and the old data read as current for up to
+    /// 70 days. The date goes only to the URL for the month the file holds.
+    #[test]
+    fn since_goes_only_with_the_month_the_file_holds() {
+        let dir = TestDir::new();
+        let now = at(2026, 11, 21);
+        let path = dir.file(Database::Country);
+        let october = Utc.with_ymd_and_hms(2026, 10, 1, 1, 36, 12).unwrap();
+        std::fs::write(
+            &path,
+            test_db::city("DBIP-Country-Lite", october.timestamp() as u64),
+        )
+        .unwrap();
+        // As `cp` leaves it: written yesterday, so later than November's file.
+        let rewritten = SystemTime::from(at(2026, 11, 20));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(rewritten)
+            .unwrap();
+
+        // November comes down, because it is not asked conditionally.
+        let mut asked = Vec::new();
+        let november = test_db::city("DBIP-Country-Lite", built(now, 20));
+        let outcome = update_one(Database::Country, &dir.0, now, &mut |url: &str, since| {
+            asked.push((url.to_owned(), since));
+            // What Cloudflare answers for a date later than its file.
+            Ok(if since.is_some() {
+                Fetched::NotModified
+            } else {
+                body(&november)
+            })
+        })
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Updated(_)), "{outcome:?}");
+        assert_eq!(
+            asked,
+            [(Database::Country.url("2026-11"), None)],
+            "only this month, unconditionally"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), november);
+    }
+
+    /// With this month's file not out yet, the month the file does hold is the
+    /// one asked conditionally, and that is what "already current" rests on.
+    #[test]
+    fn the_previous_month_is_asked_conditionally_when_the_file_holds_it() {
+        let dir = TestDir::new();
+        let now = at(2026, 11, 1);
+        let path = dir.file(Database::Country);
+        let october = Utc.with_ymd_and_hms(2026, 10, 1, 1, 36, 12).unwrap();
+        std::fs::write(
+            &path,
+            test_db::city("DBIP-Country-Lite", october.timestamp() as u64),
+        )
+        .unwrap();
+        let served = SystemTime::from(at(2026, 10, 1));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(served)
+            .unwrap();
+        let mut asked = Vec::new();
+        let outcome = update_one(Database::Country, &dir.0, now, &mut |url: &str, since| {
+            asked.push((url.to_owned(), since));
+            Ok(if url.contains("2026-11") {
+                Fetched::Missing
+            } else {
+                Fetched::NotModified
+            })
+        })
+        .unwrap();
+        assert!(matches!(outcome, Outcome::AlreadyCurrent(_)), "{outcome:?}");
+        assert_eq!(
+            asked,
+            [
+                (Database::Country.url("2026-11"), None),
+                (Database::Country.url("2026-10"), Some(served)),
+            ]
+        );
+    }
+
+    /// A file two months old is asked about under neither month, so it cannot
+    /// read as current however recent its date looks.
+    #[test]
+    fn a_file_older_than_both_months_is_never_asked_conditionally() {
+        let dir = TestDir::new();
+        let now = at(2026, 11, 1);
+        let september = Utc.with_ymd_and_hms(2026, 9, 1, 1, 32, 45).unwrap();
+        std::fs::write(
+            dir.file(Database::Country),
+            test_db::city("DBIP-Country-Lite", september.timestamp() as u64),
+        )
+        .unwrap();
+        let mut asked = Vec::new();
+        let outcome = update_one(Database::Country, &dir.0, now, &mut |url: &str, since| {
+            asked.push((url.to_owned(), since));
+            Ok(if url.contains("2026-11") {
+                Fetched::Missing
+            } else {
+                body(&test_db::city("DBIP-Country-Lite", built(now, 20)))
+            })
+        })
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Updated(_)), "{outcome:?}");
+        assert!(asked.iter().all(|(_, since)| since.is_none()), "{asked:?}");
+    }
+
+    /// A 304 to a request that named no date says nothing about this file, even
+    /// a valid one.
+    #[test]
+    fn a_304_to_an_unconditional_request_is_a_failure() {
+        let dir = TestDir::new();
+        let now = at(2026, 11, 21);
+        // Built in October, so November goes out with no date.
+        let october = Utc.with_ymd_and_hms(2026, 10, 1, 1, 36, 12).unwrap();
+        std::fs::write(
+            dir.file(Database::Country),
+            test_db::city("DBIP-Country-Lite", october.timestamp() as u64),
+        )
+        .unwrap();
+        let error = update_one(Database::Country, &dir.0, now, &mut |_: &str, _| {
+            Ok(Fetched::NotModified)
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not conditional"),
+            "{error:#}"
+        );
     }
 
     /// A damaged file with a good date is not asked after, or the server would
