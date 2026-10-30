@@ -1,33 +1,49 @@
-//! Per-thread Linux filesystem enforcement using a prepared, pinned ruleset.
+//! Per-thread Linux enforcement using prepared, pinned rulesets. Every
+//! confined thread takes the filesystem layer. Parser and capture threads
+//! ([`roles`]) stack a second layer on it that denies TCP bind and connect,
+//! connecting to Unix sockets outside the thread's domain and, on a kernel
+//! with the erratum 2 fix, signalling outside it. Capture's layer also
+//! leaves it no write grant. Main and the network workers keep the network.
 //! Application worker entry points apply policy before processing; capture
-//! prepares its device first. Strict entry failure withholds processing.
-//! Main applies the same policy after resource startup. No network restrictions
-//! are installed, and macOS/Windows/FreeBSD have no filesystem backend.
+//! prepares its device first. Strict entry failure withholds processing, and
+//! strict requires the TCP deny (Landlock ABI 4, Linux 6.7). Main applies its
+//! policy after resource startup. macOS, Windows and FreeBSD have no backend.
 //!
-//! Selected capability removals are checked after each attempt. Best-effort
-//! retains CAP_NET_RAW; strict drops it, so later capture reopening may fail.
+//! Selected capability removals are checked after each attempt. Every
+//! confined thread drops CAP_NET_ADMIN, which nothing uses. A best-effort TUI
+//! keeps CAP_NET_RAW on main and the network workers so capture can reopen
+//! ([`CaptureAuthority`]); parser and capture threads drop it in every mode,
+//! and the daemon, the Diagnose CLI and strict drop it on every confined
+//! thread, so a later capture reopen fails there. Once main has entered,
+//! [`audit`] checks every thread of the process for either capability.
 //! Worker reports describe policy entry, not an exploit-proof process boundary.
-//! The eBPF SDK reader is disabled under an installed sandbox policy until it
-//! exposes a suitable entry hook. See docs/runtime-lifecycle.md for limitations.
+//! The eBPF SDK reader inherits the eBPF worker's policy but retains load
+//! capabilities. See docs/THREAT-MODEL.md for the remaining containment limits.
 
+pub mod audit;
 pub mod paths;
+pub mod roles;
 pub mod worker;
 
 #[cfg(target_os = "linux")]
 mod linux;
 
 pub use paths::SandboxPaths;
+pub use roles::Role;
 
 /// Sandbox enforcement mode, selected via CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// `--no-sandbox`: skip all enforcement. Escape hatch for debugging.
     Disabled,
-    /// Default. Attempt supported filesystem restrictions and report warnings
-    /// on degradation. Network restrictions are not installed in any mode.
+    /// Default. Attempt supported restrictions and report warnings when the
+    /// filesystem layer degrades. The parser layer takes what the kernel
+    /// offers without a warning.
     BestEffort,
     /// `--sandbox-strict`: callers abort on reported application warnings.
-    /// This does not establish worker confinement or successful capability drops.
+    /// Parser and capture entry warn unless TCP bind and connect are denied,
+    /// so strict needs Landlock ABI 4 (Linux 6.7). This does not establish
+    /// worker confinement or successful capability drops.
     Strict,
 }
 
@@ -48,6 +64,52 @@ impl Mode {
             "off" | "disabled" | "false" | "no" | "0" => Mode::Disabled,
             "strict" => Mode::Strict,
             _ => Mode::BestEffort,
+        }
+    }
+}
+
+/// Whether main and the network workers keep CAP_NET_RAW after capture has
+/// opened.
+///
+/// Capabilities are per thread, and every capture reopen (`c`, `i`,
+/// `Shift+R`) opens a new packet socket on a thread main starts, so keeping
+/// the ability to reopen means main keeps CAP_NET_RAW. Dropping it does not
+/// revoke the descriptor capture already holds, which can still capture and
+/// inject on every interface in the network namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureAuthority {
+    /// A best-effort TUI session, which reopens capture on a key press.
+    RetainForReopen,
+    /// Sessions that open capture once and never reopen it: the daemon,
+    /// `diagnose run` and `diagnose coverage`, and any strict session. Also
+    /// what a thread gets that enters before the session says which it is.
+    DropAfterOpen,
+}
+
+/// What a thread's entry left of CAP_NET_RAW, the capability every capture
+/// open needs. Reported per component as its capture authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetRaw {
+    /// Held before entry and verified absent after it.
+    Dropped,
+    /// Still held after entry. Main and the network workers keep it under
+    /// [`CaptureAuthority::RetainForReopen`]; anywhere else the report's
+    /// warnings say why the drop failed.
+    RetainedForReopen,
+    /// The thread never held it.
+    NotHeld,
+    /// No capability backend ran, off Linux or with the sandbox disabled.
+    #[default]
+    NotApplicable,
+}
+
+impl NetRaw {
+    pub fn label(self) -> &'static str {
+        match self {
+            NetRaw::Dropped => "dropped",
+            NetRaw::RetainedForReopen => "retained_for_reopen",
+            NetRaw::NotHeld => "not_held",
+            NetRaw::NotApplicable => "not_applicable",
         }
     }
 }
@@ -98,8 +160,20 @@ pub struct ModeReport {
 pub struct PlatformReport {
     /// Linux: Landlock ABI level actually enforced (0 = not applied).
     pub landlock_abi: u32,
-    /// Reserved for network restrictions; the current backend leaves this false.
+    /// Linux: connect(2) and bind(2) on TCP sockets denied on this thread by
+    /// its parser or capture layer. The network stays reachable: UDP, MPTCP,
+    /// a TCP Fast Open send and listen(2) on an unbound socket all get past
+    /// it (docs/THREAT-MODEL.md, item 4). Main and the network workers leave
+    /// this false.
     pub landlock_network_blocked: bool,
+    /// Linux: the layer this thread's role stacks on the filesystem one,
+    /// "parser" or "capture", whether or not the kernel enforced it. `None`
+    /// for main and the network workers.
+    pub landlock_layer: Option<&'static str>,
+    /// Linux: what that layer enforced on this kernel: `filesystem_write`
+    /// (capture only), `tcp_bind`, `tcp_connect`, `abstract_unix_socket`,
+    /// `signal` and `pathname_unix_socket`.
+    pub landlock_restrictions: Vec<&'static str>,
     /// Linux: capabilities present before removal and verified absent afterward.
     pub caps_dropped: Vec<String>,
     /// Effective capabilities still held after verified drop attempts.
@@ -109,6 +183,9 @@ pub struct PlatformReport {
     /// `caps_retained` so "still held because the policy kept it" cannot be
     /// read as "the drop failed".
     pub caps_retained_for_load: Vec<String>,
+    /// Linux: what this thread's entry did with CAP_NET_RAW. Which threads of
+    /// the process still hold it is process-wide, in [`audit`].
+    pub capture_authority: NetRaw,
     /// macOS: whether `sandbox_init_with_parameters` returned 0.
     pub macos_seatbelt: bool,
     /// Windows: whether the restricted-token + job-object pair applied.
@@ -127,7 +204,7 @@ impl Report {
                         parts.push(format!("Landlock ABI V{}", self.platform.landlock_abi));
                     }
                     if self.platform.landlock_network_blocked {
-                        parts.push("network blocked".into());
+                        parts.push("TCP connect and bind denied".into());
                     }
                     if !self.platform.caps_dropped.is_empty() {
                         parts.push(format!("{} caps dropped", self.platform.caps_dropped.len()));
@@ -151,13 +228,14 @@ impl Report {
     }
 }
 
-/// Apply restrictions to the calling thread. Current callers invoke this
-/// after App construction; this does not confine already-running workers.
+/// Apply main's restrictions to the calling thread. Current callers invoke
+/// this after App construction; this does not confine already-running
+/// workers.
 ///
 /// Returns the Report unconditionally. In `Mode::Strict`, callers should
 /// check `report.mode.warnings` and abort if non-empty.
 pub fn apply(mode: Mode, paths: &SandboxPaths) -> Report {
-    apply_retaining(mode, paths, Retain::Nothing)
+    apply_retaining(mode, paths, Retain::Nothing, Role::Main)
 }
 
 /// Capabilities a worker keeps through entry.
@@ -174,8 +252,8 @@ pub enum Retain {
     BpfLoad,
 }
 
-/// [`apply`], keeping the capabilities `retain` names.
-pub fn apply_retaining(mode: Mode, paths: &SandboxPaths, retain: Retain) -> Report {
+/// [`apply`] with `role`'s policy, keeping the capabilities `retain` names.
+pub fn apply_retaining(mode: Mode, paths: &SandboxPaths, retain: Retain, role: Role) -> Report {
     let mut report = Report::default();
 
     if matches!(mode, Mode::Disabled) {
@@ -185,11 +263,12 @@ pub fn apply_retaining(mode: Mode, paths: &SandboxPaths, retain: Retain) -> Repo
 
     #[cfg(target_os = "linux")]
     {
-        linux::apply(mode, paths, retain, &mut report);
+        let authority = worker::capture_authority();
+        linux::apply(mode, paths, retain, role, authority, &mut report);
     }
 
     #[cfg(not(target_os = "linux"))]
-    let _ = retain;
+    let _ = (retain, role);
 
     #[cfg(not(target_os = "linux"))]
     {
@@ -212,3 +291,6 @@ pub fn apply_retaining(mode: Mode, paths: &SandboxPaths, retain: Retain) -> Repo
 
     report
 }
+
+#[cfg(test)]
+mod threat_model_tests;

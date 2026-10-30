@@ -156,11 +156,13 @@ signal-hook = "0.3"
 nix = { version = "0.31", features = ["term", "signal"] }
 
 # Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
-# pcap + eBPF are up, then restrict filesystem and network via Landlock.
+# pcap + eBPF are up, then restrict via Landlock: filesystem, plus TCP deny on
+# parser threads. 0.4.7 is the first release that knows ABI 9, which the
+# parser layer's pathname Unix socket rule needs.
 # Both crates are Linux-only — the sandbox module's macOS/Windows paths
 # are stubs that report Disabled until Phase 2/3 land.
 [target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
+landlock = "0.4.7"
 caps = "0.5"
 
 [target.'cfg(windows)'.dependencies]

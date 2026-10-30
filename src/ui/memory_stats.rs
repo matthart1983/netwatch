@@ -45,6 +45,7 @@ impl Gauge {
 }
 
 fn gather(app: &App) -> Vec<Gauge> {
+    use crate::collectors::connections::MAX_CLOSED_HISTORY;
     use crate::collectors::egress::MAX_PROCESSES;
     use crate::collectors::network_intel::{MAX_TRACKED_BEACONS, MAX_TRACKED_IPS};
     use crate::collectors::packets::{
@@ -81,12 +82,17 @@ fn gather(app: &App) -> Vec<Gauge> {
     });
 
     // ── Connection timeline ──
+    // Active entries are never evicted, so only the closed ones are bounded.
+    const _: () = assert!(
+        MAX_CLOSED_HISTORY == 2_000,
+        "the note below names the bound"
+    );
     out.push(Gauge {
-        name: "connection timeline",
-        current: app.connection_timeline.tracked_len(),
-        cap: app.connection_timeline.tracked_cap(),
+        name: "connection timeline — closed",
+        current: app.connection_timeline.closed_len(),
+        cap: MAX_CLOSED_HISTORY,
         bytes: false,
-        note: "hard cap with O(n) index rebuild",
+        note: "active + last 2,000 closed",
     });
 
     // ── Network intel ──

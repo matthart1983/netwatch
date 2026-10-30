@@ -287,3 +287,18 @@ If you add a setting, update the `build_rows_count` and `full_roundtrip` tests.
 - Update `CHANGELOG.md` under `[Unreleased]` with a one-line description.
 - Run `cargo test && cargo fmt --check && cargo clippy --all-targets` before pushing.
 - If your change adds a new tab or setting, include a screenshot or description of the UI in the PR body.
+
+## Unsafe code policy
+
+Prefer safe standard-library or existing crate APIs to new unsafe code. Keep
+necessary unsafe at the platform or FFI boundary. Each unsafe block needs a
+`SAFETY:` comment explaining the concrete lifetime, alignment, initialization,
+size and ownership assumptions that make that operation valid. Unsafe functions
+need a `# Safety` contract; a safe wrapper must check every condition its caller
+can violate. Null checks alone do not establish pointer validity.
+
+Changes to an unsafe boundary require tests for malformed or short inputs where
+those can be supplied safely, and checks on every affected platform. State any
+platform that was only type-checked or reviewed by inspection. Do not claim all
+legacy sites already satisfy this policy; the remaining audit is tracked in the
+[threat model](docs/THREAT-MODEL.md).

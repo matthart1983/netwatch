@@ -241,8 +241,11 @@ pub struct SocketObs {
     pub ssthresh: Option<u32>,
     pub rwnd: Option<u32>,
     pub mss: Option<u32>,
-    pub tx_bps: f64,
-    pub rx_bps: f64,
+    /// This socket's rates, from its connection-table row. None when no row
+    /// matched it or the row has no rate yet: missing is not zero, which
+    /// would read as an idle socket.
+    pub tx_bps: Option<f64>,
+    pub rx_bps: Option<f64>,
     /// Seconds this socket has been in its current verdict.
     pub verdict_age_secs: u64,
 }
@@ -305,9 +308,9 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
     }
 
     // Bufferbloat: high rtt while *this* socket is the one sending. A high rtt
-    // on an idle socket is just a distant peer, and a socket with no rtt is
-    // not a bloated one.
-    if s.rtt_ms.is_some_and(|r| r >= t.socket_rtt_ms) && s.tx_bps > 0.0 {
+    // on an idle socket is just a distant peer, and a socket with no rtt, or
+    // no known rate, is not a bloated one.
+    if s.rtt_ms.is_some_and(|r| r >= t.socket_rtt_ms) && s.tx_bps.is_some_and(|tx| tx > 0.0) {
         return SocketVerdict::Bufferbloat;
     }
 
@@ -325,7 +328,9 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
         }
     }
 
-    if s.tx_bps == 0.0 && s.rx_bps == 0.0 {
+    // Idle only when both rates were measured at zero: a socket whose rates
+    // are unknown has not been seen to wait on its application.
+    if s.tx_bps == Some(0.0) && s.rx_bps == Some(0.0) {
         return SocketVerdict::AppLimited;
     }
 
@@ -2866,18 +2871,23 @@ fn socket_detection(
                     )
                     .weighted(2.0),
                 },
-                if s.tx_bps > 0.0 {
-                    CheckResult::pass(
+                match s.tx_bps {
+                    Some(tx) if tx > 0.0 => CheckResult::pass(
                         "rtt_tracks_this_socket_s_own_tx",
                         "rtt tracks this socket's own tx",
-                        format!("{} in flight while rtt is {rtt:.0}ms", rate(s.tx_bps)),
-                    )
-                } else {
-                    CheckResult::fail(
+                        format!("{} in flight while rtt is {rtt:.0}ms", rate(tx)),
+                    ),
+                    Some(_) => CheckResult::fail(
                         "rtt_tracks_this_socket_s_own_tx",
                         "rtt tracks this socket's own tx",
                         "socket is idle",
-                    )
+                    ),
+                    None => CheckResult::not_run(
+                        "rtt_tracks_this_socket_s_own_tx",
+                        "rtt tracks this socket's own tx",
+                        Availability::NotMeasured,
+                        "no connection row gave this socket's rate",
+                    ),
                 },
             ];
             let queue = if localised {
@@ -4052,8 +4062,8 @@ mod tests {
             ssthresh: Some(u32::MAX),
             rwnd: Some(64_000),
             mss: Some(1448),
-            tx_bps: 2.4e6,
-            rx_bps: 0.0,
+            tx_bps: Some(2.4e6),
+            rx_bps: Some(0.0),
             verdict_age_secs: 90,
         }
     }
@@ -4079,13 +4089,34 @@ mod tests {
     #[test]
     fn an_idle_socket_with_a_distant_peer_is_not_bloated() {
         let mut s = bloated_socket();
-        s.tx_bps = 0.0;
-        s.rx_bps = 0.0;
+        s.tx_bps = Some(0.0);
+        s.rx_bps = Some(0.0);
         s.retrans = Some(0);
         assert_eq!(
             classify_socket(&s, &Thresholds::default()),
             SocketVerdict::AppLimited,
             "high rtt with nothing in flight is just distance"
+        );
+    }
+
+    /// Review R4: a socket that no connection row matched has unknown rates.
+    /// That is neither the traffic a bloated queue needs nor the silence of
+    /// an idle socket.
+    #[test]
+    fn unknown_rates_are_neither_sending_nor_idle() {
+        let mut s = bloated_socket();
+        s.tx_bps = None;
+        s.rx_bps = None;
+        s.retrans = Some(0);
+        assert_eq!(
+            classify_socket(&s, &Thresholds::default()),
+            SocketVerdict::Ok
+        );
+        s.rx_bps = Some(0.0);
+        assert_eq!(
+            classify_socket(&s, &Thresholds::default()),
+            SocketVerdict::Ok,
+            "one rate measured at zero is not an idle socket"
         );
     }
 
