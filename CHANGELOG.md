@@ -320,6 +320,22 @@ All notable changes to NetWatch will be documented in this file.
   300 MiB, so a link there could keep that cleanup running for good or
   offer it files from outside. They now list a linked file but do not
   descend into a linked directory.
+- **The threat model states the limits of the Linux sandbox.** The 0.17.0
+  release notes overstated protection by saying a compromised parser cannot
+  read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.
+  Threads share memory and descriptors, the proc broker is outside Landlock,
+  and outbound networking remains unrestricted. Under the `setcap` line or
+  sudo, the default best-effort mode leaves CAP_NET_RAW on every confined
+  thread, the parser included, so capture can reopen, and every thread
+  shares the open capture descriptor: a compromised parser can open or use
+  raw sockets. Only `--sandbox-strict` drops CAP_NET_RAW, and it does not
+  close a descriptor already open. Root operation has limited containment.
+  The preferred Linux setup restricts a capability-enabled binary to a
+  dedicated group; policy and endpoint tables are checked in tests, and the
+  outbound inventory lists the trace to 1.1.1.1 that every TUI session runs
+  at startup. `netwatch doctor` said eBPF was disabled by the sandbox
+  policy, untrue since 0.32.2; it now says eBPF loads under the policy and
+  its reader keeps the load capabilities.
 - **WHOIS and online GeoIP look up global unicast addresses only.** Their
   private-address check compared the start of the text against a short
   list, so it let through local addresses written another way or in ranges

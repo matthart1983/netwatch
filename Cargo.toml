@@ -156,7 +156,8 @@ signal-hook = "0.3"
 nix = { version = "0.31", features = ["term", "signal"] }
 
 # Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
-# pcap + eBPF are up, then restrict filesystem and network via Landlock.
+# pcap + eBPF are up, then restrict filesystem access via Landlock.
+# Network access remains unrestricted.
 # Both crates are Linux-only — the sandbox module's macOS/Windows paths
 # are stubs that report Disabled until Phase 2/3 land.
 [target.'cfg(target_os = "linux")'.dependencies]

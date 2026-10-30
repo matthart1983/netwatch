@@ -702,8 +702,9 @@ impl App {
     }
 
     /// Start persistent workers through their policy entry boundaries.
-    /// Capture opens its resource before entering; the SDK source stays disabled
-    /// under sandbox policy because its internal reader has no entry hook.
+    /// Capture opens its resource before entering. eBPF loads inside the policy;
+    /// the SDK's reader inherits it but keeps the load capabilities, because it
+    /// has no entry hook of its own.
     pub(crate) fn start_workers(&mut self) {
         if self.workers_started {
             return;
@@ -1702,7 +1703,8 @@ where
     crate::runtime::bootstrap::prime_collectors(&mut app);
     // Kick off a one-shot traceroute so the topology view's ISP gateway hop
     // is populated without requiring the user to press T first.
-    app.traceroute_runner.run("1.1.1.1");
+    app.traceroute_runner
+        .run(crate::collectors::traceroute::STARTUP_TARGET);
 
     // Event loop design:
     //   1. Render  — draw current app state to the terminal

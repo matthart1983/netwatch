@@ -7,8 +7,8 @@
 //! Selected capability removals are checked after each attempt. Best-effort
 //! retains CAP_NET_RAW; strict drops it, so later capture reopening may fail.
 //! Worker reports describe policy entry, not an exploit-proof process boundary.
-//! The eBPF SDK reader is disabled under an installed sandbox policy until it
-//! exposes a suitable entry hook. See docs/runtime-lifecycle.md for limitations.
+//! The eBPF SDK reader inherits filesystem policy but retains load capabilities.
+//! See docs/THREAT-MODEL.md for the remaining containment limits.
 
 pub mod paths;
 pub mod worker;
@@ -212,3 +212,6 @@ pub fn apply_retaining(mode: Mode, paths: &SandboxPaths, retain: Retain) -> Repo
 
     report
 }
+
+#[cfg(test)]
+mod threat_model_tests;
