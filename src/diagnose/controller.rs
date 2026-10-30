@@ -426,6 +426,7 @@ impl App {
             return Ok("probing configured targets".into());
         }
         if row.rule == "tcp.bufferbloat_local" {
+            self.refuse_reference_test("load.idle_vs_loaded")?;
             let mut ctx = crate::diagnose::next_test::Context::new("1.1.1.1".parse().unwrap());
             ctx.loaded_rtt_delta_ms = self
                 .diagnose
@@ -439,6 +440,22 @@ impl App {
             return Ok("load test running: up to 25 MB upload to speed.cloudflare.com".into());
         }
         Err(row.next_action().into())
+    }
+
+    /// With `third_party_probes` off, no test that asks a public server starts,
+    /// by whichever key it was asked for.
+    fn refuse_reference_test(&self, test: &str) -> Result<(), String> {
+        use crate::diagnose::next_test;
+        match next_test::lookup(test) {
+            Some(spec) if spec.uses_reference && !self.user_config.third_party_probes => {
+                Err(format!(
+                    "{}, and this test {}",
+                    crate::collectors::health::PROBES_OFF,
+                    spec.does
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Start a discriminating test on an issue. Context is taken from what the
@@ -464,13 +481,7 @@ impl App {
             return Err("this incident has already closed".into());
         }
         let spec = next_test::lookup(test).ok_or_else(|| format!("no test named {test}"))?;
-        if spec.uses_reference && !self.user_config.third_party_probes {
-            return Err(format!(
-                "{}, and this test {}",
-                crate::collectors::health::PROBES_OFF,
-                spec.does
-            ));
-        }
+        self.refuse_reference_test(test)?;
         if !next_test::offered(issue, self.diagnose.capability)
             .iter()
             .any(|t| t.id == test)
@@ -968,6 +979,34 @@ mod tests {
         assert!(error.contains("third_party_probes"), "{error}");
     }
 
+    /// The load test connects to 1.1.1.1:443 and uploads to Cloudflare. It
+    /// starts from the coverage row, not from an issue, so it has its own way
+    /// in to close.
+    #[test]
+    fn coverage_t_will_not_start_the_load_test_with_the_probes_off() {
+        let mut app = probes_off();
+        let observations = crate::diagnose::live::LiveSampler::new()
+            .sample(&app, &app.diagnose.engine.settings().thresholds);
+        let base = app.diagnose.baselines.clone();
+        app.diagnose.engine.observe(&observations, &base);
+        let rules = &app.diagnose.engine.coverage().rules;
+        let at = rules
+            .iter()
+            .position(|r| r.rule == "tcp.bufferbloat_local")
+            .unwrap();
+        let row = &rules[at];
+        assert_eq!(
+            row.status,
+            crate::diagnose::coverage::Availability::NotMeasured
+        );
+        assert!(row.next_action().contains("third_party_probes"), "{row:?}");
+        app.diagnose.coverage_selected = at;
+        let error = app.start_coverage_test().unwrap_err();
+        assert!(error.contains("third_party_probes"), "{error}");
+        assert!(error.contains("1.1.1.1"), "{error}");
+        assert!(!app.diagnose.tests.any_running("coverage"));
+    }
+
     /// `dns.alt_resolver` asks 1.1.1.1, so it stays home with the switch off
     /// even when asked for by name; the local test beside it still runs.
     #[test]
@@ -983,12 +1022,12 @@ mod tests {
         });
         assert!(a_40ms_resolver_opens_an_issue(&mut app));
         let id = app.diagnose.engine.primary()[0].id.to_string();
-        let error = app
-            .start_diagnose_test(&id, "dns.alt_resolver")
-            .unwrap_err();
-        assert!(error.contains("third_party_probes"), "{error}");
-        assert!(error.contains("1.1.1.1"), "{error}");
-        assert!(!app.diagnose.tests.any_running(&id));
+        for test in ["dns.alt_resolver", "load.idle_vs_loaded"] {
+            let error = app.start_diagnose_test(&id, test).unwrap_err();
+            assert!(error.contains("third_party_probes"), "{test}: {error}");
+            assert!(error.contains("1.1.1.1"), "{test}: {error}");
+            assert!(!app.diagnose.tests.any_running(&id), "{test}");
+        }
     }
 
     /// The engine used to start with `Thresholds::default()` whatever the

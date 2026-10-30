@@ -152,10 +152,11 @@ fn threat_model_lists_every_outbound_endpoint() {
     assert_eq!(
         switched,
         [
+            "Explicit upload test",
             "Internet reachability",
             "Reference DNS",
             "STUN",
-            "Startup trace"
+            "Startup trace",
         ]
     );
 }

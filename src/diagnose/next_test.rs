@@ -195,7 +195,7 @@ pub const TESTS: &[TestSpec] = &[
     TestSpec {
         id: "load.idle_vs_loaded",
         question: "our uplink stays responsive under load",
-        does: "times connections while idle, then while uploading up to 25 MB to speed.cloudflare.com for 10 seconds",
+        does: "times connections to 1.1.1.1 while idle, then while uploading up to 25 MB to speed.cloudflare.com for 10 seconds",
         cost: Cost {
             secs: 15,
             bytes: 25_000_000,
@@ -203,7 +203,7 @@ pub const TESTS: &[TestSpec] = &[
             disruptive: true,
         },
         manual_only: true,
-        uses_reference: false,
+        uses_reference: true,
         expects: &[e("tcp.bufferbloat_remote", "receiver_queueing", true)],
     },
 ];
@@ -1395,7 +1395,11 @@ mod tests {
             .collect();
         assert_eq!(
             reference,
-            ["dns.alt_resolver", "path.internet_tracks_gateway"]
+            [
+                "dns.alt_resolver",
+                "path.internet_tracks_gateway",
+                "load.idle_vs_loaded",
+            ]
         );
     }
 

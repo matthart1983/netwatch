@@ -292,10 +292,11 @@ DNS resolution itself can contact the system resolver. Health checks and one
 startup trace run automatically; explicit experiments and WHOIS require their
 respective user actions.
 
-`third_party_probes = false` stops the rows below that name it, and the two
-Diagnose tests that ask 1.1.1.1 (`dns.alt_resolver` and
-`path.internet_tracks_gateway`). Their readings then show as not measured, and
-Diagnose opens no issue on them. It does not cover probes of the configured
+`third_party_probes = false` stops the rows below that name it, and the three
+Diagnose tests that ask 1.1.1.1 (`dns.alt_resolver`,
+`path.internet_tracks_gateway` and `load.idle_vs_loaded`, which is the upload
+test). Their readings then show as not measured, and Diagnose opens no issue on
+them. It does not cover probes of the configured
 resolver and gateway, or traffic the user starts or configures: `T`, `W`, `t` on a
 coverage row, Insights, remote, and `diagnose_probes.trace_refresh_secs`, whose
 default `trace_target` is 1.1.1.1. See
@@ -314,7 +315,7 @@ default `trace_target` is 1.1.1.1. See
 | STUN | stun.l.google.com:19302 and stun.cloudflare.com:3478; public mapping; off with third_party_probes = false |
 | Dual-stack experiments | 1.1.1.1:443, [2606:4700:4700::1111]:443, 8.8.8.8:443, [2001:4860:4860::8888]:443 |
 | Captive portal | http://connectivitycheck.gstatic.com/generate_204 and http://cp.cloudflare.com/generate_204 |
-| Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB |
+| Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB, timing connections to 1.1.1.1:443; off with third_party_probes = false |
 | WHOIS on W | https://rdap.org/ip/ and the registry it redirects to; on Connections the selected remote address; on Packets the selected packet's source and destination, your own public address included; private ranges are not sent |
 | Online GeoIP fallback | http://ip-api.com; peer address, cleartext; E2 will remove it |
 | Insights, opt-in | Configured Ollama-compatible /api/chat endpoint; network and packet summaries; an http:// endpoint off this host is sent to, and flagged cleartext_off_host in Diagnose, Settings and doctor |

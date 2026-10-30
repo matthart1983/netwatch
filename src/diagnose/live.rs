@@ -1665,6 +1665,10 @@ fn coverage_hints(
                 "gateway.unreachable",
                 "nothing beyond the gateway is probed, so a quiet router cannot be told from a dead one",
             ),
+            (
+                "tcp.bufferbloat_local",
+                "the load test times connections to 1.1.1.1 and uploads to Cloudflare",
+            ),
         ] {
             hints.insert(
                 rule.into(),

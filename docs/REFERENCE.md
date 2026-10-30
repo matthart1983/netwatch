@@ -922,15 +922,17 @@ as not measured, never as failed:
   empty until you press `T`.
 - `netwatch uptime` reports the connection as unknown rather than up. A gateway or DNS outage
   still counts.
-- Diagnose coverage shows `dns.hijack_suspect`, `nat.symmetric` and `gateway.unreachable` as not
-  measured, and none of them can open. Without a probe beyond the gateway, a router that drops
+- Diagnose coverage shows `dns.hijack_suspect`, `nat.symmetric`, `gateway.unreachable` and
+  `tcp.bufferbloat_local` as not measured, and the first three cannot open. Without a probe beyond the gateway, a router that drops
   ICMP and has no open TCP port looks the same as a dead one, so a dead gateway shows up as a
   failing resolver or a down link instead of `gateway.unreachable`.
-- `t` on an issue no longer picks `dns.alt_resolver` or `path.internet_tracks_gateway`, the two
-  tests that ask 1.1.1.1.
+- `dns.alt_resolver`, `path.internet_tracks_gateway` and `load.idle_vs_loaded`, the three tests
+  that ask 1.1.1.1, do not run. `t` on an issue picks another test, and `t` on the
+  `tcp.bufferbloat_local` coverage row says why it will not start the load test, which also
+  uploads to `speed.cloudflare.com`.
 
-Your configured resolver and gateway are still probed. What you start yourself still runs: `T`,
-`W`, `t` on a coverage row (experiments, the load test, a trace of `trace_target`), and periodic
+Your configured resolver and gateway are still probed. What else you start yourself still runs:
+`T`, `W`, `t` on a coverage row for the experiments or a trace of `trace_target`, and periodic
 traces if you set `diagnose_probes.trace_refresh_secs`. `trace_target` defaults to 1.1.1.1, so
 change it if you use those.
 

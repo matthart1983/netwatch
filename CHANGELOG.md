@@ -33,10 +33,12 @@ All notable changes to NetWatch will be documented in this file.
   `dns.hijack_suspect`, `nat.symmetric` and `gateway.unreachable` show as not
   measured and cannot open, so a router that answers nothing no longer raises
   a critical on a probe that was never sent. The cost is that a dead gateway
-  shows up as a failing resolver or a down link instead. `t` on an issue no
-  longer picks the two tests that ask 1.1.1.1. Your resolver and gateway are
-  still probed, and what you start yourself still runs: `T`, `W`, `t` on a
-  coverage row and periodic traces. docs/REFERENCE.md lists them.
+  shows up as a failing resolver or a down link instead. The three tests that
+  ask 1.1.1.1 do not run: `t` on an issue picks another, and `t` on the
+  coverage row refuses the load test, which also uploads to
+  speed.cloudflare.com. Your resolver and gateway are still probed, and what
+  else you start yourself still runs: `T`, `W`, `t` on the other coverage rows
+  and periodic traces. docs/REFERENCE.md lists them.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
