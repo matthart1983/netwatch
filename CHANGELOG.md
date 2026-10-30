@@ -421,12 +421,18 @@ All notable changes to NetWatch will be documented in this file.
   header length of 16 it read the ports out of the destination address. The
   DNS timing and the QUIC breakdown in the detail pane read the same bounded
   payload.
-- **The Dashboard shows verdicts on IPv6 sockets.** Its verdict column looked a
-  socket up by the connection table's spelling of its addresses, and verdicts
-  are kept under the kernel flow's, which has no brackets and writes an
-  IPv4-mapped address as plain IPv4. Every IPv6 and IPv4-mapped row read `–`
-  whatever its socket was doing, and a broken one sorted as healthy on a panel
-  ordered by concern. Those rows now show their verdicts.
+- **The Dashboard shows verdicts on IPv6 and device-bound sockets.** Its verdict
+  column looked a socket up by the connection table's spelling of its addresses,
+  and verdicts are kept under the kernel flow's, which has no brackets, writes
+  an IPv4-mapped address as plain IPv4 and names no device. Every IPv6 or
+  IPv4-mapped row, and every row `ss` marks with its device
+  (`[fe80::1]%eth0:443`, `192.0.2.1%eth0:443`), read `–` whatever its socket was
+  doing, and a broken one sorted as healthy on a panel ordered by concern. Those
+  rows now show their verdicts. Device-bound rows had the same miss in Diagnose,
+  which could not name their process or rates, and in Dense's TCP state, and
+  both now find them. Sockets that differ only by device share one entry in the
+  kernel dump, which could be either's, so when the table lists such a pair
+  neither row takes anything from it, and they show as unknown.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to

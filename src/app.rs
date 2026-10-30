@@ -839,13 +839,19 @@ impl App {
 
     /// Kernel TCP state for a flow, keyed the way the connection table renders
     /// addresses. `None` when the platform has no collector, when the dump
-    /// hasn't run yet, or when the flow simply isn't established — all three
-    /// render the same dim `--`, because all three mean "we don't know".
+    /// hasn't run yet, when the flow simply isn't established, or when another
+    /// row shares its endpoints on another device, so the flow may be that
+    /// row's — all of them render the same dim `--`, because all of them mean
+    /// "we don't know".
     pub fn tcp_info_for(
         &self,
         local: &str,
         remote: &str,
     ) -> Option<crate::collectors::tcp_info::TcpInfo> {
+        let conns = self.connection_collector.connections();
+        if crate::diagnose::live::scope_collides(&conns, local, remote) {
+            return None;
+        }
         self.tcp_info.get(local, remote)
     }
 

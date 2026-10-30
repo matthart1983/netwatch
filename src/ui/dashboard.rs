@@ -1068,7 +1068,7 @@ struct ConnRow {
 /// the full set with its folded listener row lives.
 fn connection_rows(app: &App) -> Vec<ConnRow> {
     let conns = app.connection_collector.connections();
-    let verdicts = app.diagnose.sampler.socket_verdicts();
+    let verdicts = app.diagnose.sampler.socket_verdicts(&conns);
     let mut rows: Vec<ConnRow> = conns
         .iter()
         .filter(|c| c.state != "LISTEN" && c.state != "CLOSED" && !c.remote_addr.is_empty())
@@ -1943,17 +1943,20 @@ mod tests {
     /// sockets, as a tick leaves them. Every socket in the dump has a closed
     /// receive window, so a verdict other than that came from somewhere else.
     fn app_with_sockets(rows: Vec<Connection>, flows: &[(&str, &str)]) -> crate::app::App {
+        let flows: Vec<(String, String)> = flows
+            .iter()
+            .map(|(local, remote)| (normalize_endpoint(local), normalize_endpoint(remote)))
+            .collect();
+        app_with_kernel_flows(rows, &flows)
+    }
+
+    /// [`app_with_sockets`], with flows spelled as the kernel dump spells them.
+    fn app_with_kernel_flows(rows: Vec<Connection>, flows: &[(String, String)]) -> crate::app::App {
         let info = TcpInfo {
             rwnd: Some(0),
             ..TcpInfo::default()
         };
-        let flows: FlowMap = flows
-            .iter()
-            .map(|(local, remote)| {
-                let key = (normalize_endpoint(local), normalize_endpoint(remote));
-                (key, info)
-            })
-            .collect();
+        let flows: FlowMap = flows.iter().map(|key| (key.clone(), info)).collect();
         let mut app =
             crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
         app.connection_collector.publish_for_test(rows);
@@ -2015,6 +2018,63 @@ mod tests {
                 row.process
             );
         }
+    }
+
+    /// A row `ss` marks with the device its socket is bound to, and the same
+    /// mark written inside the brackets. The flow names no device, and these
+    /// keys are spelled out because the spelling under test would otherwise
+    /// write them too.
+    #[test]
+    fn device_bound_rows_find_their_verdicts() {
+        let rows = vec![
+            socket_row("v6", "[fe80::10]%eth0:50001", "[fe80::1]:443"),
+            socket_row("v4", "192.0.2.10%eth0:50000", "198.51.100.1:443"),
+            socket_row("inner", "[fe80::20%eth0]:50002", "[fe80::2]:443"),
+        ];
+        let flows = [
+            ("fe80::10:50001", "fe80::1:443"),
+            ("192.0.2.10:50000", "198.51.100.1:443"),
+            ("fe80::20:50002", "fe80::2:443"),
+        ]
+        .map(|(l, r)| (l.to_string(), r.to_string()));
+        let app = app_with_kernel_flows(rows, &flows);
+        let rows = connection_rows(&app);
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(
+                row.verdict,
+                Some(SocketVerdict::ZeroWindow),
+                "{}",
+                row.process
+            );
+        }
+    }
+
+    /// The flow names no device, so it stands for both of these sockets, and
+    /// may describe either. Neither row takes a verdict from it, and Dense's
+    /// TCP state, read through the same spelling, says the same.
+    #[test]
+    fn rows_that_differ_only_by_device_take_no_verdict() {
+        let rows = vec![
+            socket_row("eth0", "[fe80::10]%eth0:50001", "[fe80::1]:443"),
+            socket_row("eth1", "[fe80::10]%eth1:50001", "[fe80::1]:443"),
+            socket_row("alone", "[fe80::20]%eth1:50002", "[fe80::2]:443"),
+        ];
+        let flows = [
+            ("fe80::10:50001", "fe80::1:443"),
+            ("fe80::20:50002", "fe80::2:443"),
+        ]
+        .map(|(l, r)| (l.to_string(), r.to_string()));
+        let app = app_with_kernel_flows(rows, &flows);
+        for row in connection_rows(&app) {
+            let want = (row.process == "alone").then_some(SocketVerdict::ZeroWindow);
+            assert_eq!(row.verdict, want, "{}", row.process);
+        }
+
+        let tcp = |local: &str, remote: &str| app.tcp_info_for(local, remote).is_some();
+        assert!(!tcp("[fe80::10]%eth0:50001", "[fe80::1]:443"));
+        assert!(!tcp("[fe80::10]%eth1:50001", "[fe80::1]:443"));
+        assert!(tcp("[fe80::20]%eth1:50002", "[fe80::2]:443"));
     }
 
     /// A socket the kernel did not report has no verdict, however close its
