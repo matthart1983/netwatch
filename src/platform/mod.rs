@@ -42,6 +42,20 @@ pub mod windows;
 /// recipe that copies a binary like that one.
 pub const LINUX_CAPTURE_FIX: &str = r#"b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b""#;
 
+/// A message ending in a chain of commands, as the refused-capture error does
+/// on Linux: what comes before the chain, and each command with its `&&`. A
+/// row broken inside a command pastes as a different command, so whatever
+/// draws this breaks only between them. `None` for a message that is all prose.
+pub fn fix_commands(message: &str) -> Option<(&str, Vec<&str>)> {
+    let (sentence, chain) = message.split_once(" — ")?;
+    chain.contains(" && ").then(|| {
+        (
+            sentence,
+            chain.split_inclusive(" && ").map(str::trim_end).collect(),
+        )
+    })
+}
+
 /// What [`capture_fix`] says on Windows. Named so doctor's Npcap wording can
 /// use it, and be tested, on every platform rather than only on Windows.
 pub const WINDOWS_CAPTURE_FIX: &str =

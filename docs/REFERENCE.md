@@ -754,7 +754,10 @@ echo "After logging in again, run $bin"
 
 When capture is refused, netwatch prints a shorter form of this for a binary it can change in
 place, such as a package's. Log in again after running it. A binary on a read-only store stops
-it at `chown` before anything is granted, and needs the recipe above:
+it at `chown` before anything is granted, and needs the recipe above. `netwatch doctor
+--check-capture` prints it with each command on its own row. The Dashboard and Packets headers
+draw it whole, or, when the terminal has too few rows or columns, point to doctor and to this
+section instead:
 
 ```bash
 b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b"

@@ -632,8 +632,11 @@ All notable changes to NetWatch will be documented in this file.
   messages now give `groupadd`, `usermod`, `chown root:netwatch`, `chmod 0750`
   and `setcap`, in that order. On Linux the capture error gives the same steps
   as one command, which finds the binary once, before `chmod` takes it away
-  from an account not yet in the group. The header on Dashboard and Packets
-  wraps that command between its steps instead of cutting it off. netwatch
+  from an account not yet in the group. The Dashboard and Packets headers draw
+  that command whole, breaking only between its steps. A terminal too short or
+  too narrow for that gets a pointer to `netwatch doctor --check-capture --json`
+  and REFERENCE.md instead, never part of the command, which at 50 columns
+  pasted as something else. netwatch
   changes no file itself, so a binary you already granted stays open to every
   account until you run the steps. The README now leads with this recipe and
   the systemd unit, and the container docs drop `--cap-add=NET_ADMIN`, which

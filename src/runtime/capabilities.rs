@@ -575,6 +575,20 @@ fn wrap(lines: &mut Vec<String>, value: &str) {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
+    // A fix's commands take a row each. This wraps by the column, and a row
+    // broken inside a command pastes as a different one.
+    match crate::platform::fix_commands(&clean) {
+        Some((sentence, commands)) => {
+            wrap_row(lines, sentence);
+            for command in commands {
+                wrap_row(lines, command);
+            }
+        }
+        None => wrap_row(lines, &clean),
+    }
+}
+
+fn wrap_row(lines: &mut Vec<String>, clean: &str) {
     let mut line = String::from("  ");
     for ch in clean.chars() {
         if unicode_width::UnicodeWidthStr::width(line.as_str())
@@ -1203,6 +1217,34 @@ mod tests {
             assert_eq!(cap.state, State::NotChecked, "{fine}");
             assert_eq!(cap.reason, "configuration_only", "{fine}");
         }
+    }
+    /// `--check-capture` prints the refused-capture error as text, and the
+    /// header's pointer sends people here. Wrapped by the column, a row ended
+    /// in `sudo groupadd -f net`, which pastes as a group named net.
+    #[test]
+    fn doctor_text_keeps_each_fix_command_on_a_row_of_its_own() {
+        let fix = crate::platform::LINUX_CAPTURE_FIX;
+        let mut snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        snapshot.put(
+            "capture",
+            State::Unavailable,
+            "capture_open_failed",
+            &format!("not permitted — {fix}"),
+            None,
+        );
+        let text = snapshot.text();
+        let rows: Vec<&str> = text.lines().map(str::trim).collect();
+        let at = rows.iter().position(|r| *r == "not permitted").unwrap();
+        for (i, command) in fix.split_inclusive(" && ").enumerate() {
+            assert_eq!(rows[at + 1 + i], command.trim_end(), "{text}");
+        }
+        // And the JSON, which the pointer names, holds the line as one string.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["detail"].as_str().is_some_and(|d| d.contains(fix))));
     }
     /// A completion stamp on a probe that was skipped is not a probe target
     /// answering, so doctor must not count it among the fresh ones.

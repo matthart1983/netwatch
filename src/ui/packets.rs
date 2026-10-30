@@ -69,23 +69,34 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     } else {
         (Constraint::Min(10), Constraint::Length(16))
     };
-    // The failure takes the verdict's row, and more when its fix wraps.
-    let header_rows = crate::ui::widgets::capture_failure(app).map_or(3, |error| {
-        2 + crate::ui::widgets::capture_failure_lines(&app.theme, &error, area.width).len() as u16
+    // The failure takes the verdict's row, and more for a fix that fits. Those
+    // rows come off the top before the layout runs, which could shrink a header
+    // and cut the fix short. The whole fix takes only rows the panes below can
+    // do without; anything shorter gets the pointer.
+    let spare = area.height.saturating_sub(2 + 1 + 10 + 16 + 3);
+    let failure_rows = crate::ui::widgets::capture_failure(app).map_or(0, |error| {
+        crate::ui::widgets::capture_failure_lines(&app.theme, &error, area.width, spare).len()
+            as u16
     });
+    let (header, area) = if failure_rows > 0 {
+        let (header, rest) = crate::ui::widgets::take_top(area, 2 + failure_rows);
+        (Some(header), rest)
+    } else {
+        (None, area)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_rows), // header
-            Constraint::Length(1),           // capture control strip
-            list_constraint,                 // packet list
-            detail_constraint,               // detail pane
-            Constraint::Length(3),           // footer
+            Constraint::Length(if header.is_some() { 0 } else { 3 }), // header
+            Constraint::Length(1),                                    // capture control strip
+            list_constraint,                                          // packet list
+            detail_constraint,                                        // detail pane
+            Constraint::Length(3),                                    // footer
         ])
         .split(area);
 
     let packets = app.packet_collector.get_packets();
-    render_header(f, app, chunks[0], packets.len());
+    render_header(f, app, header.unwrap_or(chunks[0]), packets.len());
     render_capture_strip(f, app, &packets, chunks[1]);
     render_packet_list(f, app, &packets, chunks[2]);
     if app.ui.stream_view_open {
@@ -238,8 +249,12 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
     if let Some(e) = crate::ui::widgets::capture_failure(app) {
         let line1 = crate::ui::widgets::build_header_line(app, Some(extra));
         let mut lines = vec![line1];
+        // The tab row above and the border below.
         lines.extend(crate::ui::widgets::capture_failure_lines(
-            &app.theme, &e, area.width,
+            &app.theme,
+            &e,
+            area.width,
+            area.height.saturating_sub(2),
         ));
         let header = Paragraph::new(lines).block(
             Block::default()

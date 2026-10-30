@@ -5495,30 +5495,125 @@ mod render_safety_tests {
         let row = banner(&mut app).expect("no capture banner on the dashboard");
         assert!(row.contains("capture off"), "{row}");
 
-        // The whole fix, however narrow the terminal: a command cut off before
-        // its last step fixes nothing. Each row breaks between whole commands.
+        // With the room for it, this platform's whole fix.
+        let rows = rows(&draw_at(&mut app, 200, 60));
+        let first = rows.iter().position(|r| r.contains("capture off")).unwrap();
+        let shown = failure_rows_from(&rows, first).join(" ");
+        assert!(shown.contains(crate::platform::capture_fix()), "{shown}");
+    }
+
+    fn draw_at(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_frame(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The failure's rows, from the first down to the header's border, trimmed.
+    fn failure_rows_from(rows: &[String], first: usize) -> Vec<&str> {
+        rows[first..]
+            .iter()
+            .take_while(|r| !r.starts_with('─'))
+            .map(|r| r.trim())
+            .collect()
+    }
+
+    /// All of the recipe, broken only between commands, or a pointer to it.
+    /// Through `draw_frame`, so these are the rows the header really gets: the
+    /// layout used to shrink it, leaving 2 of the 4 rows at 80x24, ending in
+    /// `sudo usermod -aG netwatch "$USER" &&`, and no failure at all on Packets
+    /// at 26 rows and under. Below 56 columns rows broke inside commands, and
+    /// pasting those ran `netwatch` inside `$(...)`. The Linux recipe on every
+    /// OS, as the rows do not depend on which OS printed them.
+    #[test]
+    fn a_refused_capture_draws_the_whole_fix_or_a_pointer_at_every_size() {
+        use crate::platform::{fix_commands, LINUX_CAPTURE_FIX};
+        use crate::ui::widgets::CAPTURE_FIX_POINTER;
+        let error = format!("not permitted — {LINUX_CAPTURE_FIX}");
+        let (_, commands) = fix_commands(&error).unwrap();
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        *app.packet_collector.error.lock().unwrap() = Some(error.clone());
+
+        let mut drew = std::collections::HashMap::new();
         for tab in [Tab::Dashboard, Tab::Packets] {
             app.ui.current_tab = tab;
-            for width in [80u16, 100, 120, 200, 400] {
-                let mut terminal = Terminal::new(TestBackend::new(width, 50)).unwrap();
-                terminal.draw(|f| draw_frame(f, &mut app)).unwrap();
-                let rows = rows(terminal.backend().buffer());
-                let first = rows
-                    .iter()
-                    .position(|r| r.contains("capture off"))
-                    .unwrap_or_else(|| panic!("{tab:?} at {width} shows no failure"));
-                let shown = rows[first..]
-                    .iter()
-                    .take_while(|r| !r.starts_with('─'))
-                    .map(|r| r.trim())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                assert!(
-                    shown.contains(crate::platform::capture_fix()),
-                    "{tab:?} at {width}:\n{}",
-                    rows[..8].join("\n")
-                );
+            for width in [
+                50u16, 56, 57, 58, 60, 70, 76, 77, 78, 80, 100, 120, 160, 200, 400,
+            ] {
+                for height in [
+                    10u16, 16, 20, 23, 24, 26, 27, 28, 30, 31, 33, 36, 37, 38, 40, 43, 50, 60,
+                ] {
+                    let rows = rows(&draw_at(&mut app, width, height));
+                    let at = format!("{tab:?} at {width}x{height}");
+                    let first = rows
+                        .iter()
+                        .position(|r| r.contains("capture off"))
+                        .unwrap_or_else(|| panic!("{at} shows no failure:\n{}", rows.join("\n")));
+                    let failure = failure_rows_from(&rows, first);
+                    let screen = rows.join("\n");
+                    let recipe = ["sudo ", "readlink", "setcap", "chown", "usermod"]
+                        .iter()
+                        .any(|word| screen.contains(word));
+                    if !recipe {
+                        assert!(
+                            failure.join(" ").contains(CAPTURE_FIX_POINTER),
+                            "{at} has neither the fix nor the pointer:\n{screen}"
+                        );
+                        drew.insert((tab, width, height), "pointer");
+                        continue;
+                    }
+                    assert!(
+                        failure[0].ends_with("not permitted. Run:"),
+                        "{at}:\n{screen}"
+                    );
+                    assert_eq!(
+                        failure[1..].join(" "),
+                        LINUX_CAPTURE_FIX,
+                        "{at} draws part of the fix:\n{screen}"
+                    );
+                    // Every row is whole commands, so it ends in a command's
+                    // `&&` or is the last.
+                    let mut next = commands.iter();
+                    for row in &failure[1..] {
+                        let mut row = *row;
+                        while !row.is_empty() {
+                            let command = next.next().expect("a command");
+                            row = row
+                                .strip_prefix(command)
+                                .unwrap_or_else(|| {
+                                    panic!("{at} breaks inside {command}:\n{screen}")
+                                })
+                                .trim_start();
+                        }
+                    }
+                    assert!(next.next().is_none(), "{at}");
+                    drew.insert((tab, width, height), "whole");
+                }
             }
+        }
+        // Under 10 rows nothing below the header can spare any, so the rule is
+        // only that none of the recipe shows.
+        for tab in [Tab::Dashboard, Tab::Packets] {
+            app.ui.current_tab = tab;
+            for width in [50u16, 80, 200] {
+                for height in 1u16..10 {
+                    let screen = rows(&draw_at(&mut app, width, height)).join("\n");
+                    for word in ["sudo ", "readlink", "setcap", "chown", "usermod"] {
+                        assert!(
+                            !screen.contains(word),
+                            "{tab:?} at {width}x{height}:\n{screen}"
+                        );
+                    }
+                }
+            }
+        }
+        // Neither branch is vacuous, and the sizes named in the review land
+        // where they should.
+        for tab in [Tab::Dashboard, Tab::Packets] {
+            assert_eq!(drew[&(tab, 80, 24)], "pointer", "{tab:?}");
+            assert_eq!(drew[&(tab, 50, 60)], "pointer", "{tab:?}");
+            assert_eq!(drew[&(tab, 50, 24)], "pointer", "{tab:?}");
+            assert_eq!(drew[&(tab, 200, 60)], "whole", "{tab:?}");
+            assert_eq!(drew[&(tab, 80, 60)], "whole", "{tab:?}");
         }
     }
 
