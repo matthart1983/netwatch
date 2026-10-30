@@ -1,8 +1,8 @@
 # NetWatch threat model
 
-This describes the 0.39 wave-1 implementation, including the capability and
-WHOIS fixes. It is a containment inventory, not a guarantee against arbitrary
-code execution. Linux non-root capability-based operation is preferred. Running
+This describes the 0.39 implementation so far: the wave-1 capability and WHOIS
+fixes, and the parser and capture roles. It is a containment inventory, not a
+guarantee against arbitrary code execution. Linux non-root capability-based operation is preferred. Running
 as root works, but containment is limited; the sandbox is defence in depth.
 See [the restricted-group setup](REFERENCE.md#running-without-sudo-linux) and
 [reporting policy](../SECURITY.md).
@@ -44,29 +44,50 @@ not isolated address spaces. The input inventory below names their implementatio
 
 ## Linux policy
 
-Landlock handles filesystem access only. The requested ABI is below; compatibility
-is best-effort, so this number alone does not establish the enforced kernel ABI.
-There are no Landlock TCP rules, Unix-socket resolution restrictions, signal or
-abstract-socket scopes, or seccomp filter in this implementation. See
-[ruleset construction](../src/sandbox/linux.rs#L391).
+Every confined thread takes a filesystem layer. Parser and capture threads stack
+a second layer on it; main and the network workers do not
+([roles](../src/sandbox/roles.rs#L47)). The network workers are reverse DNS,
+WHOIS, online GeoIP, health, traceroute, Insights, remote publishing, the three
+Diagnose probe workers and the runtime's blocking pool. Every other worker is a
+parser, and so is any worker name missing from the table. Main keeps the network
+because it starts network workers after its own entry, and a thread keeps every
+layer it inherits.
+
+The second layer has no rules, so it denies everything it handles. That is TCP
+bind and connect (`parser-net`, Linux 6.7), and connecting to an abstract Unix
+socket or signalling a process outside the thread's domain (`parser-scope`, Linux
+6.12). Signals are scoped only on a kernel that reports the erratum 2 fix. The
+layer also denies connecting to a pathname Unix socket (`parser-fs`, Linux 7.1).
+Capture's layer also handles every filesystem right and takes only the read rows
+of the grants table, so the capture thread can write nothing. Strict mode requires
+the TCP part and refuses to start below ABI 4; best-effort logs one line and runs
+without it. The other parts are taken where the kernel has them, so these numbers
+alone do not establish what a kernel enforced. There is no seccomp filter. See
+[ruleset construction](../src/sandbox/linux.rs#L466) and
+[layer entry](../src/sandbox/linux.rs#L682).
 
 ```text
 <!-- policy:abi -->
-V4
+filesystem: V4
+parser-net: V4
+parser-scope: V6
+parser-fs: ResolveUnix
 <!-- /policy:abi -->
 ```
 
 Capability removals are verified. The first row is dropped on ordinary confined
-threads, the second is additional in strict mode. The BPF load worker temporarily
-retains the third row; the unconfined proc broker retains only capabilities it
-started with from the fourth row. This is a deny-list, not a complete root
-allow-list. See [capability policy](../src/sandbox/linux.rs#L25) and
+threads, the second is additional in strict mode, and the third is additional on
+parser and capture threads in every mode. The BPF load worker temporarily retains
+the fourth row; the unconfined proc broker retains only capabilities it started
+with from the fifth row. This is a deny-list, not a complete root allow-list. See
+[capability policy](../src/sandbox/linux.rs#L45) and
 [broker entry](../src/sandbox/worker.rs#L1).
 
 ```text
 <!-- policy:caps -->
 default: CAP_BPF, CAP_PERFMON, CAP_SYS_ADMIN, CAP_SYS_RAWIO, CAP_SYS_MODULE, CAP_SYS_BOOT, CAP_SYS_TIME, CAP_SYS_PACCT, CAP_SYS_TTY_CONFIG, CAP_SYSLOG, CAP_WAKE_ALARM, CAP_BLOCK_SUSPEND, CAP_SYS_PTRACE, CAP_KILL, CAP_CHECKPOINT_RESTORE, CAP_IPC_OWNER, CAP_SETUID, CAP_SETGID, CAP_SETPCAP, CAP_SETFCAP, CAP_MKNOD, CAP_SYS_CHROOT, CAP_LINUX_IMMUTABLE, CAP_LEASE, CAP_MAC_ADMIN, CAP_MAC_OVERRIDE, CAP_AUDIT_CONTROL, CAP_AUDIT_WRITE, CAP_AUDIT_READ, CAP_NET_BROADCAST
 strict-extra: CAP_NET_RAW
+parser-extra: CAP_NET_RAW
 bpf-load: CAP_BPF, CAP_PERFMON, CAP_SYS_ADMIN
 proc-broker: CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH
 <!-- /policy:caps -->
@@ -82,8 +103,8 @@ allow read-file only; a write row allows every filesystem right the requested AB
 handles, so read access accompanies it. A row that names a file rather than a
 directory keeps only the file rights. The worker acceptance test checks the
 enforced result: a confined thread cannot open a file beneath the `/proc` read
-grant for writing. See [path collection](../src/sandbox/linux.rs#L283),
-[access per grant](../src/sandbox/linux.rs#L472) and
+grant for writing. See [path collection](../src/sandbox/linux.rs#L358),
+[access per grant](../src/sandbox/linux.rs#L616) and
 [path preparation](../src/sandbox/paths.rs#L1).
 
 ```text
@@ -133,25 +154,52 @@ write: /dev/null
    a process boundary ([worker](../src/sandbox/worker.rs#L1)).
 2. ProcBroker stays outside Landlock to scan procfs. Wave 1 limits its capabilities
    to ptrace and DAC read/search; it is still privileged
-   ([broker policy](../src/sandbox/linux.rs#L103)).
-3. The SDK reader inherits filesystem policy but keeps its creation-time load
-   capabilities; it has no separate entry hook
+   ([broker policy](../src/sandbox/linux.rs#L146)).
+3. The SDK reader inherits the eBPF worker's layers but keeps its creation-time
+   load capabilities; it has no separate entry hook
    ([eBPF startup](../src/ebpf/conn_tracker.rs#L130)).
-4. Outbound networking remains unrestricted. The policy does not stop data
-   exfiltration after code execution ([ruleset](../src/sandbox/linux.rs#L391)).
-5. Unix sockets and cross-process signalling have no Landlock scope restrictions
-   here ([ruleset](../src/sandbox/linux.rs#L391)).
+4. Only connect(2) and bind(2) on TCP sockets are denied, only on parser and
+   capture threads, and only from Linux 6.7. UDP, ICMP, SCTP and netlink sockets
+   stay open to those threads, and so does MPTCP, which falls back to TCP: on
+   Linux 7.1 an MPTCP socket on a parser thread connected to a plain TCP
+   listener. Two TCP calls get past the deny. A TCP Fast Open send (`sendto` or
+   `sendmsg` with `MSG_FASTOPEN`) opens a connection and delivers its data
+   without connect(2), and listen(2) on an unbound socket takes an ephemeral port
+   on every address without bind(2). Both work from a parser thread on Linux 7.1,
+   and a test fails if that changes
+   ([gap tests](../src/sandbox/linux.rs#L1122)). Accepting on a listener bound
+   before entry is not mediated either, which is how the metrics threads serve.
+   Main, the network workers and the proc broker have no network restriction,
+   and a parser running injected code can reach them through shared memory
+   (item 1) or use a socket another thread holds. The deny raises the cost of
+   exfiltration after code execution; it does not prevent it
+   ([layer](../src/sandbox/linux.rs#L501)).
+5. Unix sockets and signals are scoped on parser and capture threads only, and
+   only where the kernel has the feature: abstract sockets from Linux 6.12,
+   signals from 6.12 on a kernel that reports the erratum 2 fix, pathname sockets
+   from 7.1. Below 7.1 a parser thread can connect to the D-Bus system bus, and
+   as root it could ask systemd to start a command outside the sandbox. Main and
+   the network workers are not scoped on any kernel: the resolver, the clipboard
+   helpers and D-Bus clients need those sockets
+   ([layer](../src/sandbox/linux.rs#L501)).
 6. There is no syscall allow-list; filesystem restrictions are not seccomp
    ([backend](../src/sandbox/linux.rs#L1)).
 7. Root retains filesystem, scheduling and other capabilities. The new deny-list
    reduces authority but does not promise root containment. Previous wording that
    a compromised parser cannot read SSH keys was too broad: shared descriptors,
    other threads and privileged interfaces must also be considered
-   ([retained capabilities](../src/sandbox/linux.rs#L25)).
-8. Best-effort keeps CAP_NET_RAW so capture can reopen. Strict drops it, which can
-   make capture restart fail ([strict list](../src/sandbox/linux.rs#L82)).
-9. Configuration remains writable, so confinement does not make future startup
-   configuration immutable ([write grants](../src/sandbox/linux.rs#L349)).
+   ([retained capabilities](../src/sandbox/linux.rs#L45)).
+8. Parser and capture threads drop CAP_NET_RAW in every mode. Best-effort keeps
+   it on main and the network workers, because `c`, `i` and `Shift+R` reopen
+   capture on a new thread started from main; a parser running injected code can
+   still reach main's (item 1). Strict drops it on every confined thread, which
+   can make capture restart fail ([parser list](../src/sandbox/linux.rs#L130),
+   [strict list](../src/sandbox/linux.rs#L119)).
+9. Every confined thread but capture can write the configuration, so a
+   compromised parser can persist a setting such as `sandbox = "off"` for the
+   next start. The capture thread has no write grant
+   ([write grants](../src/sandbox/linux.rs#L427),
+   [capture layer](../src/sandbox/linux.rs#L487)).
 10. Subcommands returning before worker installation are outside this policy,
     including file-oriented operations ([dispatch](../src/main.rs#L20)).
 11. GeoIP downloading and parsing need separate review. The planned `netwatch
@@ -159,16 +207,18 @@ write: /dev/null
     protection (E2 below).
 12. macOS, Windows and FreeBSD have no NetWatch filesystem sandbox backend
     ([platform dispatch](../src/sandbox/mod.rs#L1)).
-13. Strict means required policy entry succeeds; it does not imply no network,
-    no privileged reader, or a separate parser process
+13. Strict means required policy entry succeeds, the parser TCP deny included; it
+    does not imply no network for main and the network workers, no privileged
+    reader, or a separate parser process
     ([worker startup](../src/sandbox/worker.rs#L1)).
 14. File capabilities on a world-executable binary let every local account invoke
     capture. Restrict execution to the intended group as in the setup recipe. The
     capture-error hint and the package install messages still give an in-place
     `setcap` line without that restriction (E3 below).
 
-Dropping CAP_NET_RAW does not revoke an already-open AF_PACKET descriptor. Such
-a descriptor retains layer-2 capture/injection authority in its network namespace.
+Capture drops CAP_NET_RAW on entry, but that does not revoke the AF_PACKET
+descriptor it opened before. Such a descriptor retains layer-2 capture/injection
+authority in its network namespace.
 Capture opens before policy entry; a dumpcap-style separate capture process is
 needed for a stronger boundary. This document does not claim an independent root
 capture acceptance test was performed. See
@@ -250,7 +300,7 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | A1 hostile files and log redaction | Separate wave-1 PR; not included here |
 | A2 selection leaking addresses to RDAP | Fixed: only W queues WHOIS |
 | A4 root capability deny-list and broker restriction | Included; full root allow-list deferred |
-| B1 parser TCP deny, scopes, ResolveUnix, no-write capture policy | Later 0.39 work |
+| B1 parser TCP deny, scopes, ResolveUnix, no-write capture policy, CAP_NET_RAW off parser threads | Included |
 | C1 capture authority and NET_ADMIN audit | Later 0.39 work |
 | D1 seccomp no-socket policy | Later 0.39 work |
 | E2 local GeoIP/update command | Later 0.39 work |

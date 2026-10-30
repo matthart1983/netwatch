@@ -23,14 +23,24 @@ fn threat_model_policy_tables_match_code() {
     assert_eq!(
         block("policy:caps"),
         format!(
-            "default: {}\nstrict-extra: {}\nbpf-load: {}\nproc-broker: {}",
+            "default: {}\nstrict-extra: {}\nparser-extra: {}\nbpf-load: {}\nproc-broker: {}",
             caps(linux::CAPS_TO_DROP_DEFAULT),
             caps(linux::CAPS_TO_DROP_STRICT),
+            caps(linux::CAPS_TO_DROP_PARSER),
             caps(linux::CAPS_FOR_BPF_LOAD),
             caps(linux::CAPS_FOR_PROC_BROKER)
         )
     );
-    assert_eq!(block("policy:abi"), format!("{:?}", linux::TARGET_ABI));
+    assert_eq!(
+        block("policy:abi"),
+        format!(
+            "filesystem: {:?}\nparser-net: {:?}\nparser-scope: {:?}\nparser-fs: {:?}",
+            linux::TARGET_ABI,
+            linux::PARSER_NET_ABI,
+            linux::PARSER_SCOPE_ABI,
+            linux::PARSER_FS
+        )
+    );
     let paths = SandboxPaths {
         config_dir: Some("<config>".into()),
         cache_dir: Some("<cache>".into()),
