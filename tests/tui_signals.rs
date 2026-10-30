@@ -216,11 +216,15 @@ fn signal(sig: Signal) -> impl FnOnce(&mut Pty) {
 #[test]
 fn a_removed_config_key_is_logged_once() {
     let fixture = Fixture::new();
-    fs::write(
-        fixture.0.join("config/netwatch/config.toml"),
-        "geoip_online = true\n",
-    )
-    .unwrap();
+    // macOS keeps its config under HOME, whatever XDG_CONFIG_HOME says.
+    for dir in ["config/netwatch", "Library/Application Support/netwatch"] {
+        fs::create_dir_all(fixture.0.join(dir)).unwrap();
+        fs::write(
+            fixture.0.join(dir).join("config.toml"),
+            "geoip_online = true\n",
+        )
+        .unwrap();
+    }
     let mut cmd = fixture.command();
     cmd.arg("--demo");
     let mut pty = Pty::spawn(cmd);
