@@ -34,6 +34,11 @@ pub struct TracerouteResult {
     pub reached: Option<bool>,
 }
 
+/// What every TUI session traces once at startup, demo included, so
+/// Topology's ISP hop is filled without a T press. Fixed:
+/// `diagnose_probes.trace_target` does not change it.
+pub const STARTUP_TARGET: &str = "1.1.1.1";
+
 pub struct TracerouteRunner {
     cancel: Mutex<crate::diagnose::probe_io::Cancel>,
     pub result: Arc<Mutex<TracerouteResult>>,

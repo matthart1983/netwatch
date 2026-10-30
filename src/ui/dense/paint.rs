@@ -28,7 +28,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use unicode_width::UnicodeWidthStr;
 
 use crate::graph::{fade_color, lerp, magnitude_ramp};
 use crate::theme::Theme;
@@ -272,7 +271,7 @@ pub fn panel(buf: &mut Buffer, area: Rect, t: &Theme, o: &PanelOpts) -> Rect {
 
 /// `┤ text ├` ending one rule cell short of the corner at `x1`.
 fn insert_right(buf: &mut Buffer, x1: u16, y: u16, text: &str, style: Style, border: Style) {
-    let w = text.width() as u16 + 4; // ┤ + space + text + space + ├
+    let w = crate::ui::text::width(text) as u16 + 4; // ┤ + space + text + space + ├
     if w + 2 > x1 {
         return;
     }
@@ -298,7 +297,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) -> u16 {
     }
     let max = (buf.area.right() - x) as usize;
     buf.set_stringn(x, y, s, max, style);
-    x + s.width() as u16
+    x + crate::ui::text::width(s) as u16
 }
 
 #[cfg(test)]
@@ -567,6 +566,32 @@ mod tests {
             },
         );
         assert_eq!(ch(&b, 7, 0), '╮', "corner survives");
+    }
+
+    /// `ﾟ` takes a cell of its own when ratatui draws it, though unicode-width
+    /// counts it as 0. Measured the unicode-width way, `put` returned 2 and
+    /// the next insert landed on the second `ﾊﾟ`.
+    #[test]
+    fn put_returns_the_column_ratatui_drew_to() {
+        let mut b = buf(10, 1);
+        assert_eq!(put(&mut b, 0, 0, "ﾊﾟﾊﾟ", Style::default()), 4);
+    }
+
+    #[test]
+    fn a_halfwidth_right_insert_stays_whole_inside_the_border() {
+        let t = crate::theme::by_name("dark");
+        let mut b = buf(20, 3);
+        panel(
+            &mut b,
+            Rect::new(0, 0, 20, 3),
+            &t,
+            &PanelOpts {
+                right: Some("ﾊﾟﾊﾟ"),
+                ..Default::default()
+            },
+        );
+        let top: String = (0..20).map(|x| b[(x, 0)].symbol()).collect();
+        assert!(top.ends_with("┤ ﾊﾟ ﾊﾟ  ├─╮"), "top border was {top:?}");
     }
 
     #[test]

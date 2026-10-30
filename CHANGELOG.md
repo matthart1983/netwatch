@@ -4,6 +4,22 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`netwatch daemon --metrics` exports the capture's packet counts.**
+  `netwatch_capture_packets_received_total` and
+  `netwatch_capture_packets_dropped_total` count the packets libpcap
+  received and dropped since the capture opened, and
+  `netwatch_capture_packets_decoded_total` the ones netwatch decoded. Frames
+  in a framing netwatch does not decode, the `Raw` rows in Packets, are not
+  counted as decoded, so on a Linux `any` capture or a tunnel that counter
+  stays at 0. Until now only the TUI showed capture drops, so on a dashboard
+  a daemon losing packets to a full kernel buffer looked the same as one
+  that saw every packet. The counters are 64-bit and keep counting past
+  libpcap's 32-bit wrap. While no capture is running, for example when the
+  daemon lacks permission to capture, they have no sample rather than a
+  zero. docs/observability-export.md lists them, and puts its table of
+  metric names, types and labels under the 1.0 compatibility promise.
+
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
   what they assume.** Six places that read the effective user ID, and three
@@ -42,6 +58,29 @@ All notable changes to NetWatch will be documented in this file.
   `collectors::packets::hex_dump` and `ascii_dump`. `PacketCollector::ring_bytes`
   and the hidden `StreamTracker::held_bytes`, `byte_budget` and
   `dropped_flows` are new. The library is not a stable interface.
+- **`--sandbox-strict` and `sandbox = "strict"` need Linux 6.7 or newer.**
+  Strict mode now requires the parser threads' TCP deny described under
+  Security, which needs Landlock ABI 4. On Linux 6.2 to 6.6, which passed strict
+  before, netwatch now refuses to start in strict mode and says the kernel
+  cannot deny TCP. Older kernels already failed strict. Best-effort runs on
+  any kernel as before and logs one line when the deny is unavailable.
+  `netwatch doctor --check-capture` now checks under the capture thread's
+  policy, so on those kernels it reports capture as unavailable in strict
+  mode, where it used to report it ready.
+- **The Timeline keeps every open connection and the last 2,000 that
+  closed.** Its limit of 2,000 counted open connections too, but dropped only
+  closed ones. On a host with 2,000 or more open connections, each one left
+  the Timeline on the tick it closed, so the tab showed no closed
+  connections at all. With fewer open, the closed ones to go first were the
+  ones that opened first, however recently they had closed. The limit now
+  counts closed connections alone and drops the ones that closed longest
+  ago. Open connections are never dropped. It drops at least 256 at a time,
+  so the Timeline is not reindexed on every tick that something closes, and
+  right after a drop it can hold as few as 1,745 closed connections. The
+  `M` overlay shows the closed count against 2,000. Library callers lose
+  `ConnectionTimeline::tracked_len` and `tracked_cap`, and gain
+  `ConnectionTimeline::closed_len`, `closed_trimmed` and `first_seen`, and
+  `ConnectionCollector::connections_with_generation`.
 
 ### Fixed
 - Dense view's connection and process sparklines now use their full width,
@@ -233,6 +272,84 @@ All notable changes to NetWatch will be documented in this file.
   in `summary.md` give the number of rows left out, and `connections.json`
   keeps its shape. The bundle's JSON files are also written through a
   buffer now; 50,000 rows took about 12 million write calls before.
+- **A connection poll on a busy Linux host takes about a quarter of the
+  time.** Each poll ran `ss -tunap`. The `-p` walks every process's open
+  files to name each socket's owner, and netwatch threw that name away for
+  the owner its own `/proc` scan found. Naming owners then read each
+  process's identity from `/proc` twice per socket, so a process holding
+  10,000 sockets was read 20,000 times a poll. With 10,000 loopback sockets
+  a poll took about 300 ms at the median on a 24-thread host, and now takes
+  about 80 ms. netwatch runs `ss -tuna`, and `netwatch doctor` names that
+  command. Each poll reads a process's identity once before looking up its
+  name and once after, and a socket recorded for an earlier process with
+  the same PID still loses its owner. A UDP socket with no peer is matched to
+  its captured stream through an index built once per poll, where each one
+  searched every stream before.
+- **Diagnose's socket check no longer takes 100 ms a tick on a busy host.**
+  In the Dense view and during `netwatch diagnose run`, Diagnose matches
+  each kernel TCP flow to its connection once a tick. It searched the whole
+  connection table for each flow, then checked every socket it remembered
+  against a list of the live ones, so its cost grew with the square of the
+  connection count. At 10,000 connections a pass took about 100 ms, and now
+  takes about 11 ms.
+- **Diagnose matches IPv6 sockets to their connections.** The kernel's TCP
+  flows spell an IPv6 endpoint `2001:db8::1:443` and the connection table
+  `[2001:db8::1]:443`, and Diagnose compared the two as text, so no IPv6
+  socket found its connection. It lost its process name, and its send and
+  receive rates read as zero, which classified a busy IPv6 socket as idle
+  and kept it from ever counting as bufferbloat. IPv4-mapped addresses such
+  as `[::ffff:192.0.2.1]:443` failed the same way. Both now match. A socket
+  that matches no connection, or whose connection has no rate yet, now has
+  unknown rates rather than zero: it is neither idle nor sending, and the
+  bufferbloat check that needs its rate says it was not measured. Episodes
+  record unknown rates as `null`.
+- **The tick does less work per connection.** Every read of the connection
+  table checked each row's age, and once any row was more than five seconds
+  old, it copied the whole table to blank the stale owners. A tick
+  and a frame each read the table several times. Now the table is checked
+  once per poll and copied at most once each time another row goes stale.
+  The Timeline also stopped building a set of every connection's key on
+  each tick. At 10,000 connections the tick's connection work fell from
+  about 50 ms to about 35 ms at the median.
+- **Names with emoji or halfwidth katakana stay inside their column.** Lite
+  and Dense measured a name with unicode-width and cut it one character at
+  a time, and both disagree with what ratatui draws. A halfwidth sound mark
+  (ﾞ or ﾟ) takes a column on screen but counted as none: in Lite, a process
+  named with eight `ﾊﾟ` filled its 15-column field and the gap after it,
+  with no ellipsis. An emoji with its presentation selector, such as `❤️`
+  or `#️⃣`, counted as one column and drew two, so eight hearts were cut one
+  heart late and the ellipsis fell in the host column. A skin-tone emoji
+  such as `👍🏽` counted as four columns and drew two, so the name was cut
+  short, and the last hand could lose its skin tone. In the top border of
+  Dense's net box, an interface name with sound marks lost its end under
+  the `├` that closes it. Text is now measured and cut between the
+  graphemes ratatui lays out, by the columns it gives each one. That covers
+  Lite, Dense, the cuts in the full view's tables and labels and in the
+  footer's status message, which counted characters, and the check that
+  drops a box's right-hand text when it would cover the title. Plain ASCII
+  text is cut as before. A CJK or emoji name that a full-view table used to
+  clip at its column edge now ends in `…`, and a status message naming a
+  CJK process no longer runs off the right of the footer. Full-view tables
+  that pad their columns with spaces, such as Connections and Processes,
+  still count characters for the padding, so a CJK name there still pushes
+  the columns after it right. ratatui itself still places right-aligned
+  text one column too far right for each sound mark, and cuts off what
+  passes the edge.
+- **An emoji sequence that reached the screen unreplaced no longer hides
+  the text after it.** The last pass over each frame drops the characters
+  that could control the terminal or disguise text, the zero-width joiner
+  among them. A family emoji is three emoji joined into one 2-column cell.
+  With the joiners gone that cell held three emoji, 6 columns wide, and the
+  four cells after it were never sent to the terminal. The cell now keeps
+  the first emoji and its width. Names from packets, peers and other
+  processes have their joiners replaced with `·` before layout, so this
+  only hit text that missed that step.
+- **`diagnose run --budget` rejects a huge minute count instead of
+  panicking.** `--budget 18446744073709551615m` overflowed the conversion to
+  seconds. A debug build panicked, and a release build wrapped around, so
+  some huge values landed back inside the 5 s to 10 min range and were
+  accepted. Every out-of-range budget now exits 3 with "budget must be
+  between 5s and 10m", including numbers too large to read at all.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -258,10 +375,12 @@ All notable changes to NetWatch will be documented in this file.
   CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
   memory, page cache included, through `/proc/kcore`, past every filesystem
   rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
-  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more, and keep 11 (10 in
-  strict mode): file access in the user's directories, resource limits and
-  scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
-  CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
+  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 23 more. In the TUI, main and
+  the network workers keep 10: file access in the user's directories,
+  resource limits and scheduling, a metrics port below 1024, and CAP_NET_RAW
+  to reopen capture. Parser and capture threads keep 9, without CAP_NET_RAW,
+  and so does every confined thread in strict mode, the daemon and the
+  Diagnose CLI. Root still owns most files, so under sudo the sandbox
   remains defence in depth, not containment. Losing CAP_SYS_PTRACE costs
   something under sudo on a kernel where Landlock does not enforce (older
   than 5.13, or Landlock missing from `lsm=`): confined threads can no
@@ -274,9 +393,9 @@ All notable changes to NetWatch will be documented in this file.
   process is named by the kernel's 15-character `comm` rather than its
   executable, and its connections have no owner on a poll that finds the
   latest process-attribution scan more than 5 seconds old. Where Landlock
-  enforces, it already refused those reads. Runs without elevation, with the
-  documented `setcap` line or under the systemd unit drop what they did
-  before.
+  enforces, it already refused those reads. Runs without elevation drop what
+  they did before, and so do runs with the documented `setcap` line or under
+  the systemd unit, apart from the CAP_NET_RAW change below.
 - **The process-attribution thread no longer keeps every capability
   netwatch started with.** It reads other processes' socket fds in `/proc`
   to name each connection's owner, so it runs outside the sandbox, and it
@@ -348,6 +467,96 @@ All notable changes to NetWatch will be documented in this file.
   `geoip_online` on, the line under the selected connection sent
   ip-api.com, in cleartext, the server name a TLS or QUIC connection had
   sent instead of its address. It now sends the address.
+- **The threat model states the limits of the Linux sandbox.** The 0.17.0
+  release notes overstated protection by saying a compromised parser cannot
+  read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.
+  Threads share memory and descriptors, the proc broker is outside Landlock,
+  and outbound networking was unrestricted. From this release parser threads
+  cannot connect or bind TCP sockets on Linux 6.7 or newer, which still
+  leaves them UDP and the other ways out listed below. Under the `setcap`
+  line or sudo, the default best-effort mode left CAP_NET_RAW on every
+  confined thread, the parser included, so capture could reopen, and only
+  `--sandbox-strict` dropped it. Parser and capture threads now drop it in
+  every mode, but that does not close a descriptor already open, and every
+  thread shares the open capture descriptor, so a compromised parser can
+  still capture and inject through it. Root operation has limited
+  containment.
+  The preferred Linux setup restricts a capability-enabled binary to a
+  dedicated group; policy and endpoint tables are checked in tests, and the
+  outbound inventory lists the trace to 1.1.1.1 that every TUI session runs
+  at startup. `netwatch doctor` said eBPF was disabled by the sandbox
+  policy, untrue since 0.32.2; it now says eBPF loads under the policy and
+  its reader keeps the load capabilities.
+- **Parser threads can no longer call `connect` or `bind` on a TCP
+  socket.** On Linux 6.7 or newer, the workers that read packets, files,
+  kernel tables or subprocess output now stack a second Landlock layer that
+  denies TCP bind and connect. Capture, the TLS keylog reader, the metrics
+  endpoint, eBPF and connections are among them. Before, a parser bug that
+  ran code could connect anywhere or listen on any port, as every confined
+  thread could. The metrics endpoint still answers scrapes, because
+  accepting a connection is neither. Where the kernel supports it, the same
+  layer also stops these threads connecting to abstract Unix sockets from
+  Linux 6.12 and to pathname Unix sockets such as D-Bus or nscd from 7.1.
+  From 6.12, on a kernel with the fix for Landlock erratum 2, it stops them
+  signalling processes outside their domain. Main keeps the network, and so
+  do the workers whose job is a connection: reverse DNS, WHOIS, GeoIP,
+  health, traceroute, Insights, remote publishing and the Diagnose probes.
+  A worker missing from the role table counts as a parser. UDP, ICMP and
+  MPTCP stay open to parser threads, and MPTCP falls back to TCP. Two TCP
+  calls also get past the deny, because Landlock checks only `connect` and
+  `bind`: a TCP Fast Open send (`sendto` with `MSG_FASTOPEN`) opens a
+  connection, and `listen` on an unbound socket takes a random port on
+  every address and accepts connections on it. So this makes sending data
+  out after code execution harder without preventing it. On older kernels
+  best-effort logs `parser network deny unavailable` once and runs as
+  before.
+- **Parser and capture threads drop CAP_NET_RAW in best-effort mode too.**
+  Under the `setcap` line or sudo, every confined thread kept CAP_NET_RAW
+  unless `--sandbox-strict` was given, so a compromised parser could open
+  raw and packet sockets and inject frames. Those threads now drop it
+  whenever the sandbox is on. Capture opens its device before it drops the
+  capability, and `c`, `i` and `Shift+R` reopen capture on a new thread, so
+  they keep working. Main and the network workers keep CAP_NET_RAW in a
+  best-effort TUI. The capture thread still holds the device it opened,
+  which can capture and inject on its interface.
+- **The capture thread can no longer write files.** It had every write
+  grant the other confined threads have, so a parser bug in it could
+  rewrite `config.toml`, for example to turn the sandbox off for the next
+  start. Its Landlock layer now allows reading only. Nothing in the capture
+  loop writes a file; exports and incident bundles are written by other
+  threads. The other confined threads can still write the configuration.
+- **With the sandbox on, the daemon and the Diagnose CLI hold no raw-socket
+  capability once capture has opened, and no thread keeps CAP_NET_ADMIN.**
+  Under the `setcap` line, sudo or the systemd unit, `netwatch daemon`,
+  `diagnose run` and `diagnose coverage` kept CAP_NET_RAW on the main
+  thread and the network workers for the whole session, though none of
+  them ever reopens capture. A thread running injected code could open raw
+  sockets, set `IP_TRANSPARENT` or `SO_MARK`, and hand the capability to
+  the commands it started through the Ambient set the systemd unit grants.
+  Run as root, every thread also kept CAP_NET_ADMIN, which nothing in
+  netwatch uses. Promiscuous capture opens with CAP_NET_RAW alone. Those
+  sessions now drop CAP_NET_RAW from main and the network workers after
+  capture opens, and in best-effort and strict mode every thread drops
+  CAP_NET_ADMIN, so `netwatch doctor --check-capture --json` under sudo no
+  longer lists it in `caps_retained`. The TUI keeps CAP_NET_RAW on main and
+  the network workers in best-effort mode, so `c`, `i` and `Shift+R` still
+  reopen capture. In strict mode they fail, as before. Once startup is
+  done, netwatch reads every thread's capability sets. If a thread still
+  holds CAP_NET_ADMIN, or CAP_NET_RAW in a session that drops it, netwatch
+  names the thread in a warning, and with `--sandbox-strict` refuses to
+  start. With `--no-sandbox` or `sandbox = "off"`, main and the workers
+  keep both capabilities, as before, and the audit warns about nothing.
+  None of this revokes the capture descriptor already open, which every
+  thread shares and which can still capture and inject on any interface in
+  its network namespace. In the daemon and the Diagnose CLI, on a host
+  whose `net.ipv4.ping_group_range` leaves out the user netwatch runs as,
+  the `ping` that health falls back to and the Diagnose PMTU probe now
+  fail, and health measures over TCP instead.
+
+### Dependencies
+- **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
+  sockets is Landlock ABI 9, which earlier releases of the crate do not
+  know. Cargo.lock already had 0.4.7, so nothing new is compiled.
 
 ### CI
 - **A Diagnose load test unit test no longer fails on a slow runner.**
@@ -356,6 +565,32 @@ All notable changes to NetWatch will be documented in this file.
   macOS runner sometimes missed, failing the run and cancelling the Linux
   and Windows jobs with it. The sampler now takes its clock as an argument,
   and the test gives it one that moves only when it is slept on.
+- **The sandbox tests catch a worker whose role changes by accident.** They
+  read the name every worker spawn site in `src` uses and fail on one the
+  role table does not list, so renaming a network worker can no longer turn
+  it into a parser unnoticed. A child test hides Landlock behind a seccomp
+  filter and checks that strict mode refuses a parser thread because it
+  cannot deny TCP. Another enters the capture role through the installed
+  policy and checks that it cannot write the configuration. The list of
+  capabilities each role drops is also checked without a user namespace,
+  which CI's runners refuse, so CI fails if CAP_NET_RAW leaves the parser
+  and capture threads' list.
+- **`cargo test` still passes on Linux 6.2 to 6.6.** Strict mode now refuses
+  parser threads there, so the strict worker acceptance test skips on those
+  kernels with a message, and the `/proc/net` fallback test, which needs no
+  TCP deny, runs in best-effort mode. Older kernels, and kernels without
+  Landlock, fail both tests as before.
+- **The capability tests cover capture authority.** Which capabilities
+  each role drops in each session and how the startup audit reads a
+  thread's status file are checked on the Linux runner, and which session
+  keeps CAP_NET_RAW on every runner. Where a user namespace can be made,
+  tests run as root in one: they enter each role, start a capture on a
+  missing interface, audit a thread holding CAP_NET_RAW, enter a network
+  worker before and after the session sets its capture authority, run
+  main's entry beside a thread that kept CAP_NET_RAW in best-effort and
+  strict mode, and check what the shutdown-deadline thread and the other
+  threads that never enter keep. CI's runners refuse user namespaces, so
+  those skip there.
 - **CI checks the connection table at 10,000 rows.** A generator builds
   connection tables shaped like a busy host's. In every run, a 10,000-row
   table must show its true count and scroll to its last row, and the
@@ -393,6 +628,17 @@ All notable changes to NetWatch will be documented in this file.
   segmentation-offload frames, or a view whose p99 frame time passes
   33 ms. It records decode rate, drops and CPU for every phase. A full run
   takes 75 minutes and `--smoke` five. No workflow runs it yet.
+- **The 10,000-socket poll and Diagnose's socket join are held to their
+  budgets.** `scale_poll_real_sockets` fails past 150 ms at the median,
+  times `NW_PERF_SLACK`, instead of printing it as pending.
+  `scale_diagnose_join` times the join of kernel flows to connection rows on
+  its own against the 2 ms budget, about 0.6 ms at 10,000 rows. It timed
+  Diagnose's whole socket pass against that budget before, which no change
+  to the join could meet; the pass is still printed, with no budget. The
+  Timeline churn test now expects the last 2,000 closed connections to stay.
+- **A test checks the metrics table in docs/observability-export.md
+  against the exporter.** It fails when a metric is added, renamed or given
+  another type without the table.
 
 ## [0.38.0] - 2026-10-25
 
