@@ -4,6 +4,7 @@ use crate::collectors::packets::{
     CapturedPacket, ExpertSeverity, FilterExpr, StreamDirection,
 };
 use crate::ui::stream_context;
+use crate::ui::text::truncate_end as truncate_info;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
@@ -456,15 +457,6 @@ fn preview_decrypted_bytes(bytes: &[u8], max_bytes: usize) -> String {
             }
             out
         }
-    }
-}
-
-fn truncate_info(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max - 1).collect();
-        format!("{}…", truncated)
     }
 }
 

@@ -13,6 +13,7 @@
 use crate::app::App;
 use crate::collectors::egress::{EgressDest, EgressProfile, Verdict};
 use crate::state::EgressSort;
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
@@ -843,14 +844,6 @@ fn verdict_style(t: &crate::theme::Theme, v: &Verdict, rollup: bool) -> (Color, 
         // A finding, not a gap — the policy said it was complete.
         Verdict::Undeclared => (t.status_error, v.label().to_string()),
         Verdict::NoPolicy => (t.text_muted, v.label().to_string()),
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
     }
 }
 

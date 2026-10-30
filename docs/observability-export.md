@@ -52,10 +52,30 @@ trusted network boundary.
 | `netwatch_dns_loss_ratio` | gauge | DNS packet loss (0–1) |
 | `netwatch_connections` | gauge | Tracked connections |
 | `netwatch_tcp_connections{state}` | gauge | TCP connections by state (`time_wait`, `close_wait`) |
+| `netwatch_capture_packets_received_total` | counter | Packets libpcap received |
+| `netwatch_capture_packets_dropped_total` | counter | Packets libpcap dropped because its kernel buffer was full, plus drops by the interface or driver |
+| `netwatch_capture_packets_decoded_total` | counter | Packets netwatch decoded. Frames in a framing it does not decode, listed in Packets as `Raw`, are not counted |
 | `netwatch_policy_violations_total{process}` | counter | Egress-policy violations per process (post-cooldown; only processes declared in `egress-policy.toml` can appear, so cardinality stays bounded) |
 
 Names and units follow Prometheus base-unit conventions (`_bytes`, `_seconds`,
 `_ratio`, `_total`).
+
+The three capture counters count from when the capture opened, and netwatch
+updates them once a second, when it polls libpcap. They have no sample while no capture is
+running, for example when the daemon lacks permission to capture, so alert on
+`absent(netwatch_capture_packets_received_total)` as well as on a rising
+`rate(netwatch_capture_packets_dropped_total[5m])`. libpcap's own counters are
+32-bit and wrap after about four billion packets; these are 64-bit and keep
+counting.
+
+netwatch decodes Ethernet framing, which libpcap uses for wired and Wi-Fi
+interfaces. A Linux `any` capture, a tunnel such as WireGuard, and loopback
+on macOS, the BSDs and Windows use other framings: their packets are listed
+in Packets as `Raw`, and the decoded count stays at 0. On Linux, libpcap
+counts each loopback packet twice, once sent and once received, but hands
+netwatch one copy. On `lo` the received count is therefore twice the decoded
+count, and an `any` capture counts its loopback traffic twice in the same
+way.
 
 ## Prometheus scrape config
 

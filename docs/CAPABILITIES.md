@@ -15,7 +15,7 @@ establish macOS or Windows runtime parity.
 | --- | --- | --- | --- | --- |
 | Interface/configuration collection | Linux system counters and network tools | macOS network tools | IP Helper API (adapters, DNS servers, counters, routes), with `ipconfig`/PowerShell/`route print` fallbacks | `getifaddrs` up-state, `netstat`/`ifconfig` |
 | Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required | Base-system libpcap/BPF; `/dev/bpf` access required |
-| Process attribution | Verified procfs socket ownership; eBPF hints require corroboration and are disabled in sandboxed runs | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified polling of the kernel socket tables through IP Helper; names from a process snapshot | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
+| Process attribution | Verified procfs socket ownership; eBPF hints require corroboration; the SDK reader inherits filesystem policy but retains load capabilities | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified polling of the kernel socket tables through IP Helper; names from a process snapshot | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
 | Process in PCAPNG packet comments | When two verified owner checks bracket the packet | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified |
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |
 | Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules | Shared detectors; absent TCP metrics limit socket rules |
@@ -71,8 +71,9 @@ legacy journal is not crash-durable.
 ## Security boundary
 
 The [sandbox reference](REFERENCE.md#landlock-sandbox-linux) documents current
-worker entry enforcement and exact file/dedicated-directory grants. The SDK eBPF
-source stays disabled under enabled policy until a reader hook is available.
+worker entry enforcement and exact file/dedicated-directory grants. eBPF loads
+inside the policy; the SDK reader inherits it but keeps the load capabilities
+until it has an entry hook of its own.
 Network access remains unrestricted. Linux tests cover actual lookup, Insights and
 keylog entries, keylog restart, export access, symlink replacement and strict entry
 rejection. Privileged capture/restart and cross-platform acceptance remain pending.
@@ -104,3 +105,5 @@ This audit checked [tab/config mapping](../src/config.rs),
 
 PR05 implements worker entry policy and Settings reporting. A broader runtime
 capability snapshot and a `doctor` command remain planned. See the [implementation progress](research/implementation-progress.md).
+
+The [threat model](THREAT-MODEL.md) details containment and privilege limits.

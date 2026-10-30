@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::{App, IfaceChangeKind, TimelineFilter};
 use crate::collectors::network_intel::{Alert, AlertSeverity};
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{prelude::*, widgets::Paragraph};
 
@@ -618,13 +619,4 @@ fn remote_host(addr: &str) -> String {
     } else {
         addr.to_string()
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }

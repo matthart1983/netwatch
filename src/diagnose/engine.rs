@@ -2323,8 +2323,8 @@ mod tests {
             ssthresh: Some(u32::MAX),
             rwnd: Some(64_000),
             mss: Some(1448),
-            tx_bps: 2.4e6,
-            rx_bps: 0.0,
+            tx_bps: Some(2.4e6),
+            rx_bps: Some(0.0),
             verdict_age_secs: 90,
         }
     }
@@ -4194,8 +4194,8 @@ mod tests {
             ssthresh: Some(u32::MAX),
             rwnd: Some(64_000),
             mss: Some(1448),
-            tx_bps: 2.4e6,
-            rx_bps: 0.0,
+            tx_bps: Some(2.4e6),
+            rx_bps: Some(0.0),
             verdict_age_secs: age,
         };
         let mut o = Observations {

@@ -5,6 +5,7 @@ use crate::collectors::traceroute::TracerouteStatus;
 use crate::sort::{
     apply_direction, cmp_case_insensitive, cmp_f64, cmp_ip_addr, SortColumn, TabSortState,
 };
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
@@ -1341,15 +1342,6 @@ fn format_duration_short(d: std::time::Duration) -> String {
     } else {
         format!("{}d", s / 86_400)
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {

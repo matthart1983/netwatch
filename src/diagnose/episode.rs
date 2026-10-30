@@ -2766,13 +2766,13 @@ mod tests {
                 ssthresh: None,
                 rwnd: Some(65_535),
                 mss: Some(1460),
-                tx_bps: 0.0,
-                rx_bps: 0.0,
+                tx_bps: Some(0.0),
+                rx_bps: Some(0.0),
                 verdict_age_secs: 0,
             });
         }
         obs.sockets[50].retrans = Some(3);
-        obs.sockets[50].tx_bps = 1_000.0;
+        obs.sockets[50].tx_bps = Some(1_000.0);
         obs.sockets[3].rwnd = Some(0);
         let zero_window = obs.sockets[3].clone();
         assert_ne!(classify_socket(&zero_window, &t), SocketVerdict::Ok);
@@ -2801,8 +2801,8 @@ mod tests {
             ssthresh: Some(u32::MAX),
             rwnd: Some(64_000),
             mss: Some(1448),
-            tx_bps: 2.4e6,
-            rx_bps: 0.0,
+            tx_bps: Some(2.4e6),
+            rx_bps: Some(0.0),
             verdict_age_secs: 90,
         };
         let mut settings = crate::diagnose::engine::Settings::default();
