@@ -688,6 +688,14 @@ fn gateway(app: &App) -> Option<GatewayObs> {
     let loss_pct = health.gateway_loss.pct()?;
     let icmp_ok = health.gateway_rtt_ms.is_some() && loss_pct < 100.0;
 
+    // A router that answers nothing is only a finding once something beyond
+    // it has failed to answer too. With `third_party_probes` off nothing
+    // beyond it is asked, so a quiet router would otherwise raise a critical
+    // that never clears, because a probe was skipped. No verdict either way.
+    if !icmp_ok && !app.health_prober.third_party_probes() {
+        return None;
+    }
+
     // Corroborating evidence for a gateway verdict, on the same footing:
     // unknown until the internet probe has run at least once.
     let internet_reachable = if health.internet_rtt_history.is_empty()
@@ -871,6 +879,107 @@ fn subnet_of(ip: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app with these probe readings, on a host with a gateway and a
+    /// resolver, whose prober just ran a cycle with no third-party probes.
+    fn probes_off_app(gateway: (Option<f64>, f64)) -> App {
+        use crate::collectors::health::{Loss, PROBES_OFF};
+        let mut app = App::prepare_with_config(crate::config::NetwatchConfig {
+            third_party_probes: false,
+            ..Default::default()
+        });
+        app.config_collector.config.gateway = Some("192.0.2.1".into());
+        app.config_collector.config.dns_servers = vec!["192.0.2.53".into()];
+        let mut status = (*app.health_prober.status()).clone();
+        let now = Instant::now();
+        let (gateway_rtt, gateway_loss) = gateway;
+        status.gateway_rtt_ms = gateway_rtt;
+        status.gateway_loss = Loss::Measured(gateway_loss);
+        status.gateway_rtt_history.push_back(gateway_rtt);
+        status.completed.gateway = Some(now);
+        status.completed.gateway_target = Some("192.0.2.1".into());
+        status.dns_rtt_ms = Some(4.0);
+        status.dns_loss = Loss::Measured(0.0);
+        status.dns_rtt_history.push_back(Some(4.0));
+        status.completed.dns = Some(now);
+        status.completed.dns_target = Some("192.0.2.53".into());
+        status.internet_loss = Loss::Unmeasured(PROBES_OFF);
+        status.completed.internet = Some(now);
+        app.health_prober.publish_for_test(status);
+        app
+    }
+
+    /// Everything Diagnose reads from the probes `third_party_probes = false`
+    /// skips: `gateway.unreachable` through the internet probe,
+    /// `dns.hijack_suspect` through the cross-check, `nat.symmetric` through
+    /// STUN. A skipped probe opens none of them, and none reads as measured.
+    #[test]
+    fn a_skipped_probe_opens_no_issue_and_counts_as_no_pass() {
+        use super::super::coverage::Availability;
+        use crate::collectors::health::PROBES_OFF;
+        // A router that answers nothing is what the internet probe exists to
+        // tell apart. Without it there is no verdict, in either direction.
+        let app = probes_off_app((None, 100.0));
+        let mut sampler = LiveSampler::new();
+        let observations = sampler.sample(&app, &Thresholds::default());
+        assert_eq!(observations.gateway, None);
+        assert_eq!(observations.dns.as_ref().unwrap().cross, None);
+        assert_eq!(observations.nat, None);
+
+        let mut app = app;
+        let base = app.diagnose.baselines.clone();
+        for _ in 0..5 {
+            let observations = sampler.sample(&app, &Thresholds::default());
+            app.diagnose.engine.observe_live_at(
+                &observations,
+                &base,
+                &sampler.completed,
+                Instant::now(),
+            );
+        }
+        for rule in ["gateway.unreachable", "dns.hijack_suspect", "nat.symmetric"] {
+            assert!(
+                !app.diagnose.engine.issues().iter().any(|i| i.rule == rule),
+                "{rule} opened on a probe that was skipped"
+            );
+            let row = app
+                .diagnose
+                .engine
+                .coverage()
+                .rules
+                .iter()
+                .find(|r| r.rule == rule)
+                .unwrap();
+            assert_eq!(row.status, Availability::NotMeasured, "{rule}");
+            assert!(row.reason.starts_with(PROBES_OFF), "{rule}: {}", row.reason);
+            assert!(row.next_action().contains("third_party_probes"), "{rule}");
+        }
+    }
+
+    /// A gateway that answers is still measured, with the corroboration left
+    /// unknown: neither reachable nor not.
+    #[test]
+    fn a_skipped_probe_leaves_an_answering_gateway_measured() {
+        let app = probes_off_app((Some(1.5), 0.0));
+        let observations = LiveSampler::new().sample(&app, &Thresholds::default());
+        let gateway = observations.gateway.expect("a measured gateway");
+        assert_eq!(gateway.rtt_ms, Some(1.5));
+        assert_eq!(gateway.internet_reachable, None);
+    }
+
+    /// With the switch on, nothing moves: an internet probe that has not
+    /// completed yet still leaves the finding standing, as a weaker one.
+    #[test]
+    fn a_quiet_gateway_is_still_observed_with_the_probes_on() {
+        let app = probes_off_app((None, 100.0));
+        let status = (*app.health_prober.status()).clone();
+        let mut app = App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.config_collector.config.gateway = Some("192.0.2.1".into());
+        app.config_collector.config.dns_servers = vec!["192.0.2.53".into()];
+        app.health_prober.publish_for_test(status);
+        let observations = LiveSampler::new().sample(&app, &Thresholds::default());
+        assert!(observations.gateway.is_some());
+    }
 
     #[test]
     fn link_speed_parses_megabits_and_rejects_unknown() {
@@ -1543,6 +1652,25 @@ fn coverage_hints(
             );
         }
         _ => {}
+    }
+    if !app.health_prober.third_party_probes() {
+        use crate::collectors::health::PROBES_OFF;
+        for (rule, what) in [
+            ("nat.symmetric", "no STUN mapping is requested"),
+            (
+                "dns.hijack_suspect",
+                "the resolver's answers are not compared with a reference",
+            ),
+            (
+                "gateway.unreachable",
+                "nothing beyond the gateway is probed, so a quiet router cannot be told from a dead one",
+            ),
+        ] {
+            hints.insert(
+                rule.into(),
+                (Availability::NotMeasured, format!("{PROBES_OFF}: {what}")),
+            );
+        }
     }
     if !app.user_config.diagnose_targets.is_empty()
         && app.user_config.diagnose_targets.iter().all(|t| !t.enabled)

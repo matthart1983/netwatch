@@ -490,7 +490,9 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   probe (your ISP or beyond) or DNS alone.
 - **Not monitored** is time when no netwatch was running, or a gap of more than three minutes in
   the log. It is never counted as up. Time when the internet probe could not be sent at all
-  (ICMP blocked and TCP/443 unanswered) is *unmeasured*, and is neither up nor down.
+  (ICMP blocked and TCP/443 unanswered) is *unmeasured*, and is neither up nor down. With
+  `third_party_probes = false` the probe is never sent, so all of it is unmeasured unless the
+  gateway or DNS is down, and the report has no uptime percentage to give.
 - **Uptime %** is up time over the time known to be up or down.
 
 `--json` and `--csv` carry the same outages for an ISP ticket or a chart. Both are versioned
@@ -895,6 +897,28 @@ full resolution.
 | `sandbox` | `"on"` | `on` `strict` `off` | Sandbox enforcement. `on` is best-effort, `strict` refuses to start if the platform backend can't apply it, `off` skips it. `--no-sandbox` and `--sandbox-strict` override for one run. Applies at next launch. See [the Landlock sandbox](#landlock-sandbox-linux). |
 | `record_uptime` | `true` | `true` `false` | Keep the local log [`netwatch uptime`](#uptime-report) reports from. Config-file only. |
 | `egress_violation_cooldown_secs` | `300` | seconds | How long before the same violating flow — one (process, destination, port) — warns again on egress policy drift. `0` warns on every refresh. Config-file only. |
+| `third_party_probes` | `true` | `true` `false` | Send the automatic probes that go to public servers. `false` stops them; see below. Config-file only, read at start. |
+
+`third_party_probes = false` stops four things: STUN to `stun.l.google.com` and
+`stun.cloudflare.com`, the `dns.google` cross-check against 1.1.1.1, the internet probe (ICMP,
+then TCP 443) to 1.1.1.1, and the trace each TUI start runs to 1.1.1.1. What they measured reads
+as not measured, never as failed:
+
+- The internet RTT reads `—`, and Dense shows its target as `off`. Topology's ISP box stays
+  empty until you press `T`.
+- `netwatch uptime` reports the connection as unknown rather than up. A gateway or DNS outage
+  still counts.
+- Diagnose coverage shows `dns.hijack_suspect`, `nat.symmetric` and `gateway.unreachable` as not
+  measured, and none of them can open. Without a probe beyond the gateway, a router that drops
+  ICMP and has no open TCP port looks the same as a dead one, so a dead gateway shows up as a
+  failing resolver or a down link instead of `gateway.unreachable`.
+- `t` on an issue no longer picks `dns.alt_resolver` or `path.internet_tracks_gateway`, the two
+  tests that ask 1.1.1.1.
+
+Your configured resolver and gateway are still probed. What you start yourself still runs: `T`,
+`W`, `t` on a coverage row (experiments, the load test, a trace of `trace_target`), and periodic
+traces if you set `diagnose_probes.trace_refresh_secs`. `trace_target` defaults to 1.1.1.1, so
+change it if you use those.
 
 ### Alerts
 
@@ -915,7 +939,7 @@ port_scan_window_secs = 30          # detection window
 |-----|---------|--------|--------------|
 | `insights_enabled` | `false` | `true` `false` | Adds an AI narrative block to the Diagnose tab. Opt-in — see [AI Insights](#ai-insights). |
 | `insights_model` | `"llama3.2"` | model name | Model for the Ollama or cloud endpoint. |
-| `insights_endpoint` | `"local"` | `local` or base URL | `local` means `http://localhost:11434`; anything else is used as a base URL. |
+| `insights_endpoint` | `"local"` | `local` or base URL | `local` means `http://localhost:11434`; anything else is used as a base URL. An `http://` URL on another host is marked `cleartext, off-host`; see [AI Insights](#ai-insights). |
 
 ---
 
@@ -935,6 +959,10 @@ it is not a serialized list of Diagnose issues.
 Enable via Settings (`,`) → AI Insights. `local` resolves to
 `http://localhost:11434`; a configured remote URL sends data to that host. A local
 endpoint alone does not guarantee local inference if its server forwards requests.
+With an `http://` URL on another host, the snapshot crosses the network unencrypted.
+netwatch still sends it, and says `cleartext, off-host` on the Diagnose page and the AI
+Endpoint row in Settings. `netwatch doctor` reports `insights` as degraded with reason
+`cleartext_off_host`.
 See [INSIGHTS.md](INSIGHTS.md) for setup, data disclosure and troubleshooting.
 
 ---

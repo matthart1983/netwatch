@@ -39,6 +39,9 @@ pub struct View<'a> {
     pub ai: Option<Ai>,
     /// Where the model is configured to live, for the failure message.
     pub endpoint: String,
+    /// The `third_party_probes` config key: whether a test that asks a public
+    /// server may be offered.
+    pub third_party_probes: bool,
     /// Transient status line (export path, applied confirmation, reconciliation).
     pub status: Option<&'a str>,
     /// Set when the engine is replaying a recorded scenario rather than
@@ -105,6 +108,21 @@ impl Ai {
     }
 }
 
+/// The line both Diagnose pages carry while Insights is on and sending in the
+/// clear to another machine. Requests go out every 15 seconds whether or not
+/// an issue is open, so it is not tied to the commentary block's state.
+fn cleartext_insights_line(view: &View) -> Option<Line<'static>> {
+    use crate::collectors::insights::{cleartext_off_host, CLEARTEXT_OFF_HOST};
+    (view.ai.is_some() && cleartext_off_host(&view.endpoint)).then(|| {
+        Line::from(Span::styled(
+            format!(
+                "{CLEARTEXT_OFF_HOST}: Insights sends DNS names, peer addresses and packet summaries unencrypted"
+            ),
+            Style::default().fg(view.theme.status_warn),
+        ))
+    })
+}
+
 impl<'a> View<'a> {
     /// The issue the cursor is on.
     pub fn current(&self) -> Option<&'a Issue> {
@@ -167,6 +185,7 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
         capability: app.diagnose.capability,
         ai,
         endpoint: app.user_config.insights_endpoint.clone(),
+        third_party_probes: app.user_config.third_party_probes,
         status: app
             .diagnose
             .journal
@@ -558,8 +577,13 @@ pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
     }
     if let Some(issue) = view.current() {
         if view.running_tests.is_empty()
-            && crate::diagnose::next_test::suggest(issue, view.capability, &issue.last_seen)
-                .is_some()
+            && crate::diagnose::next_test::suggest(
+                issue,
+                view.capability,
+                view.third_party_probes,
+                &issue.last_seen,
+            )
+            .is_some()
         {
             hints.push(hint("t", "run test"));
         }
@@ -943,6 +967,10 @@ fn render_nothing_open(f: &mut Frame, view: &View, area: Rect) {
             Span::styled(" shows which.", Style::default().fg(t.text_muted)),
         ]));
     }
+    quiet.extend(cleartext_insights_line(view).map(|mut line| {
+        line.spans.insert(0, Span::raw(" "));
+        line
+    }));
 
     let broken: Vec<_> = coverage
         .rules
@@ -1455,7 +1483,12 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
 
     // ── next test ────────────────────────────────────────────
     let runs = crate::diagnose::next_test::latest_runs(issue, &issue.last_seen);
-    let suggestion = crate::diagnose::next_test::suggest(issue, view.capability, &issue.last_seen);
+    let suggestion = crate::diagnose::next_test::suggest(
+        issue,
+        view.capability,
+        view.third_party_probes,
+        &issue.last_seen,
+    );
     if !view.running_tests.is_empty() || suggestion.is_some() || !runs.is_empty() {
         lines.push(section(t, "tests"));
         for run in &runs {
@@ -1644,6 +1677,7 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
                     .italic(),
             ),
         ]));
+        lines.extend(cleartext_insights_line(view));
         if let Some(n) = &ai.narrative {
             lines.push(Line::from(Span::styled(
                 n.clone(),
@@ -1829,6 +1863,7 @@ mod tests {
             capability: Capability::Root,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2028,6 +2063,7 @@ mod tests {
             capability: Capability::Root,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2106,6 +2142,7 @@ mod tests {
             capability: Capability::Root,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2148,6 +2185,7 @@ mod tests {
                 capability: Capability::Root,
                 ai: None,
                 endpoint: "local".to_string(),
+                third_party_probes: true,
                 status: None,
                 demo_banner: None,
                 running_tests: vec![],
@@ -2213,6 +2251,7 @@ mod tests {
                     capability: Capability::Root,
                     ai: None,
                     endpoint: "local".to_string(),
+                    third_party_probes: true,
                     status: None,
                     demo_banner: None,
                     running_tests: vec![],
@@ -2278,6 +2317,7 @@ mod tests {
             capability: Capability::None,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2372,6 +2412,64 @@ mod tests {
                 s.contains(expect),
                 "{status:?} should mention {expect:?}:\n{s}"
             );
+        }
+    }
+
+    /// Not only on a detail pane: requests keep going out with nothing open,
+    /// so the empty page has to say so too.
+    #[test]
+    fn a_cleartext_endpoint_shows_on_both_pages_whatever_the_model_is_doing() {
+        use crate::collectors::insights::InsightsStatus;
+        const WORDS: &str = "cleartext, off-host";
+        let (engine, baselines) = fixture::run();
+        let quiet = crate::diagnose::Engine::new(Box::new(crate::diagnose::engine::SystemClock));
+        for status in [
+            InsightsStatus::Idle,
+            InsightsStatus::Available,
+            InsightsStatus::OllamaUnavailable,
+        ] {
+            let on = |v: &mut View| {
+                v.ai = Some(Ai {
+                    status: status.clone(),
+                    narrative: None,
+                });
+                v.endpoint = "http://10.0.0.5:11434".into();
+            };
+            let open = draw_engine(&engine, &baselines, 150, 44, on);
+            assert!(
+                open.contains(WORDS),
+                "{status:?} with an issue open:\n{open}"
+            );
+            let empty = draw_engine(&quiet, &baselines, 150, 44, on);
+            assert!(
+                empty.contains(WORDS),
+                "{status:?} with nothing open:\n{empty}"
+            );
+        }
+        // Loopback, TLS, or the feature off: nothing to warn about, on either.
+        for mutate in [
+            (|v: &mut View| {
+                v.ai = Some(Ai {
+                    status: InsightsStatus::Idle,
+                    narrative: None,
+                });
+                v.endpoint = "http://127.0.0.1:11434".into();
+            }) as fn(&mut View),
+            |v: &mut View| {
+                v.ai = Some(Ai {
+                    status: InsightsStatus::Idle,
+                    narrative: None,
+                });
+                v.endpoint = "https://ollama.example.com".into();
+            },
+            |v: &mut View| v.endpoint = "http://10.0.0.5:11434".into(),
+        ] {
+            for s in [
+                draw_engine(&engine, &baselines, 150, 44, mutate),
+                draw_engine(&quiet, &baselines, 150, 44, mutate),
+            ] {
+                assert!(!s.contains(WORDS), "{s}");
+            }
         }
     }
 
@@ -2618,6 +2716,7 @@ mod tests {
                 capability: Capability::Root,
                 ai: None,
                 endpoint: "local".to_string(),
+                third_party_probes: true,
                 status: None,
                 demo_banner: None,
                 running_tests: vec![],
@@ -2672,6 +2771,7 @@ mod tests {
             capability: Capability::None,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],

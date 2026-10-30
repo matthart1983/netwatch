@@ -19,6 +19,24 @@ All notable changes to NetWatch will be documented in this file.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
+- **`third_party_probes = false` stops netwatch's automatic probes to public
+  servers.** Every TUI and daemon run sends STUN to Google and Cloudflare
+  about once a minute, asks 1.1.1.1 for `dns.google` and probes 1.1.1.1 with
+  ICMP and TCP 443 every probe cycle, and each TUI start traces 1.1.1.1.
+  Nothing could turn these off, which ruled netwatch out on an air-gapped or
+  privacy-minded host. The key defaults to `true`, so nothing changes unless
+  you set it. Set to `false`, none of those go out, and that holds across a
+  network change. What they measured reads as not measured, never as failed.
+  The internet RTT reads `—`, and `netwatch uptime` reports the connection as
+  unknown with no uptime percentage, though a gateway or DNS outage still
+  counts. Topology's ISP box stays empty until you press `T`. In Diagnose,
+  `dns.hijack_suspect`, `nat.symmetric` and `gateway.unreachable` show as not
+  measured and cannot open, so a router that answers nothing no longer raises
+  a critical on a probe that was never sent. The cost is that a dead gateway
+  shows up as a failing resolver or a down link instead. `t` on an issue no
+  longer picks the two tests that ask 1.1.1.1. Your resolver and gateway are
+  still probed, and what you start yourself still runs: `T`, `W`, `t` on a
+  coverage row and periodic traces. docs/REFERENCE.md lists them.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
@@ -594,6 +612,16 @@ All notable changes to NetWatch will be documented in this file.
   whose `net.ipv4.ping_group_range` leaves out the user netwatch runs as,
   the `ping` that health falls back to and the Diagnose PMTU probe now
   fail, and health measures over TCP instead.
+- **Insights now says when it sends in cleartext to another machine.** With
+  `insights_endpoint` set to an `http://` URL on another host, every request
+  carries DNS names, peer addresses and packet summaries across the network
+  unencrypted, and only docs/INSIGHTS.md said so. `--remote` refuses the same
+  setup unless told otherwise. The Diagnose page now carries a `cleartext,
+  off-host` line while Insights is on, whether or not an issue is open, the AI
+  Endpoint row in Settings leads with the same words, and `netwatch doctor`
+  reports `insights` as degraded with reason `cleartext_off_host`. netwatch
+  still sends: there is no new key, and Insights stays experimental. A
+  loopback address, `localhost` and `https://` carry no mark.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix

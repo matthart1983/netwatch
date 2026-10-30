@@ -656,7 +656,7 @@ impl App {
             interface_info,
             connection_collector,
             config_collector,
-            health_prober: HealthProber::new(),
+            health_prober: HealthProber::with_third_party_probes(user_config.third_party_probes),
             uptime: crate::uptime::Monitor::new(None),
             packet_collector,
             session_started_at: std::time::Instant::now(),
@@ -1652,6 +1652,16 @@ pub fn draw_frame(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Kick off a one-shot traceroute so the topology view's ISP gateway hop is
+/// populated without requiring the user to press T first. Its target is a
+/// public server, so `third_party_probes = false` leaves it to the T press.
+fn start_startup_trace(app: &App) {
+    if app.user_config.third_party_probes {
+        app.traceroute_runner
+            .run(crate::collectors::traceroute::STARTUP_TARGET);
+    }
+}
+
 // Backends name their own error type since ratatui 0.30; anyhow takes any of
 // them that can cross threads.
 pub async fn run<B: Backend>(
@@ -1703,10 +1713,7 @@ where
 
     // Initial data collection
     crate::runtime::bootstrap::prime_collectors(&mut app);
-    // Kick off a one-shot traceroute so the topology view's ISP gateway hop
-    // is populated without requiring the user to press T first.
-    app.traceroute_runner
-        .run(crate::collectors::traceroute::STARTUP_TARGET);
+    start_startup_trace(&app);
 
     // Event loop design:
     //   1. Render  — draw current app state to the terminal
@@ -3387,7 +3394,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('t') if app.ui.current_tab == Tab::Diagnose => {
             if let Some(id) = selected_issue_id(app) {
                 let suggestion = app.diagnose.engine.get(&id).and_then(|i| {
-                    crate::diagnose::next_test::suggest(i, app.diagnose.capability, &i.last_seen)
+                    crate::diagnose::next_test::suggest(
+                        i,
+                        app.diagnose.capability,
+                        app.user_config.third_party_probes,
+                        &i.last_seen,
+                    )
                 });
                 let status = match suggestion {
                     Some(s) => app
@@ -4384,6 +4396,21 @@ mod view_cycle_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The startup trace goes to a public server on every TUI start, so the
+    /// switch has to cover it. With it on, the same call starts a real trace,
+    /// which a test should not.
+    #[test]
+    fn the_startup_trace_waits_for_t_with_third_party_probes_off() {
+        use crate::collectors::traceroute::TracerouteStatus;
+        let app = super::App::prepare_with_config(crate::config::NetwatchConfig {
+            third_party_probes: false,
+            ..Default::default()
+        });
+        super::start_startup_trace(&app);
+        let result = app.traceroute_runner.result.lock().unwrap();
+        assert!(matches!(result.status, TracerouteStatus::Idle));
+    }
+
     #[test]
     fn preparing_an_app_does_not_start_capture_or_optional_workers() {
         let config = crate::config::NetwatchConfig {

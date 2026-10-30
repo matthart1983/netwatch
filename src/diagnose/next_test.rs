@@ -79,6 +79,9 @@ pub struct TestSpec {
     pub cost: Cost,
     /// Never suggested automatically; offered only when asked.
     pub manual_only: bool,
+    /// Sends traffic to the reference resolver, a public server, so
+    /// `third_party_probes = false` withholds it.
+    pub uses_reference: bool,
     pub expects: &'static [Expect],
 }
 
@@ -106,6 +109,7 @@ pub const TESTS: &[TestSpec] = &[
         does: "asks the same name of your resolver and of 1.1.1.1, three times each",
         cost: cheap(3),
         manual_only: false,
+        uses_reference: true,
         expects: &[
             e("dns.slow_resolver", "upstream_slow", true),
             e("dns.slow_resolver", "resolver_overloaded", true),
@@ -120,6 +124,7 @@ pub const TESTS: &[TestSpec] = &[
         does: "sends one query to your resolver over TCP port 53",
         cost: cheap(2),
         manual_only: false,
+        uses_reference: false,
         expects: &[
             e("dns.failing", "udp53_filtered", true),
             e("dns.failing", "resolver_down", false),
@@ -131,6 +136,7 @@ pub const TESTS: &[TestSpec] = &[
         does: "times a name your resolver has cached against one it has to look up",
         cost: cheap(3),
         manual_only: false,
+        uses_reference: false,
         expects: &[
             e("dns.slow_resolver", "upstream_slow", true),
             e("dns.slow_resolver", "resolver_overloaded", false),
@@ -143,6 +149,7 @@ pub const TESTS: &[TestSpec] = &[
         does: "asks your resolver for a random name that does not exist",
         cost: cheap(2),
         manual_only: false,
+        uses_reference: false,
         expects: &[
             e("dns.hijack_suspect", "interceptor", true),
             e("dns.hijack_suspect", "forged_records", false),
@@ -155,6 +162,7 @@ pub const TESTS: &[TestSpec] = &[
         does: "opens TCP connections to the gateway on ports 80, 443, 53 and 22",
         cost: cheap(4),
         manual_only: false,
+        uses_reference: false,
         expects: &[
             e("gateway.unreachable", "icmp_filtered", true),
             e("gateway.unreachable", "wrong_vlan_or_address_conflict", false),
@@ -166,6 +174,7 @@ pub const TESTS: &[TestSpec] = &[
         does: "times TCP connections to 1.1.1.1 and compares the rise with the gateway's",
         cost: cheap(3),
         manual_only: false,
+        uses_reference: true,
         expects: &[
             e("gateway.rtt_spike", "local_network_congested", true),
             e("gateway.rtt_spike", "gateway_loaded", false),
@@ -177,6 +186,7 @@ pub const TESTS: &[TestSpec] = &[
         does: "opens 20 TCP connections to the traced destination and counts the ones that never answer",
         cost: cheap(14),
         manual_only: false,
+        uses_reference: false,
         expects: &[
             e("path.high_loss", "hop_dropping", true),
             e("path.high_loss", "icmp_rate_limit", false),
@@ -193,6 +203,7 @@ pub const TESTS: &[TestSpec] = &[
             disruptive: true,
         },
         manual_only: true,
+        uses_reference: false,
         expects: &[e("tcp.bufferbloat_remote", "receiver_queueing", true)],
     },
 ];
@@ -304,8 +315,15 @@ pub fn offered(issue: &Issue, cap: Capability) -> Vec<&'static TestSpec> {
 }
 
 /// The next test worth running, if any separates causes still in contention
-/// and hasn't already answered within [`VALID_SECS`].
-pub fn suggest(issue: &Issue, cap: Capability, now: &str) -> Option<Suggestion> {
+/// and hasn't already answered within [`VALID_SECS`]. `t` runs what this
+/// picks without showing it first, so with `third_party_probes` off it must
+/// not pick a test that asks a public server.
+pub fn suggest(
+    issue: &Issue,
+    cap: Capability,
+    third_party_probes: bool,
+    now: &str,
+) -> Option<Suggestion> {
     let top = issue
         .causes
         .iter()
@@ -330,7 +348,10 @@ pub fn suggest(issue: &Issue, cap: Capability, now: &str) -> Option<Suggestion> 
 
     let mut best: Option<Suggestion> = None;
     for spec in offered(issue, cap) {
-        if spec.manual_only || answered.contains(&spec.id) {
+        if spec.manual_only
+            || answered.contains(&spec.id)
+            || (spec.uses_reference && !third_party_probes)
+        {
             continue;
         }
         let predictions: Vec<&Expect> = spec
@@ -1358,9 +1379,35 @@ mod tests {
         }
     }
 
+    /// `t` runs whatever this picks, without showing it first.
+    #[test]
+    fn with_third_party_probes_off_no_test_that_asks_the_reference_is_suggested() {
+        let now = "2026-09-15 10:00:10";
+        let on = suggest(&slow_resolver(), Capability::None, true, now).unwrap();
+        assert!(on.test.uses_reference, "{}", on.test.id);
+        let off = suggest(&slow_resolver(), Capability::None, false, now).unwrap();
+        assert!(!off.test.uses_reference, "{}", off.test.id);
+
+        let reference: Vec<_> = TESTS
+            .iter()
+            .filter(|t| t.uses_reference)
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            reference,
+            ["dns.alt_resolver", "path.internet_tracks_gateway"]
+        );
+    }
+
     #[test]
     fn with_everything_untested_the_best_separator_wins() {
-        let s = suggest(&slow_resolver(), Capability::None, "2026-09-15 10:00:10").unwrap();
+        let s = suggest(
+            &slow_resolver(),
+            Capability::None,
+            true,
+            "2026-09-15 10:00:10",
+        )
+        .unwrap();
         // alt_resolver separates 2 pairs for 3s; cached_vs_cold separates 2
         // pairs for 3s too — ties go to the cheaper, and both cost the same,
         // so the first listed wins.
@@ -1387,7 +1434,7 @@ mod tests {
         );
         let local = i.causes.iter().find(|c| c.id == "local_udp_path").unwrap();
         assert_eq!(local.checks.last().unwrap().passed, Some(false));
-        let s = suggest(&i, Capability::None, "2026-09-15 10:00:10").unwrap();
+        let s = suggest(&i, Capability::None, true, "2026-09-15 10:00:10").unwrap();
         assert_eq!(
             s.test.id, "dns.cached_vs_cold",
             "the remaining pair needs another test"
@@ -1446,7 +1493,7 @@ mod tests {
             "a retracted answer cannot keep ranking the cause"
         );
         assert_eq!(
-            suggest(&fresh, Capability::None, "2026-09-15 10:01:05")
+            suggest(&fresh, Capability::None, true, "2026-09-15 10:01:05")
                 .unwrap()
                 .test
                 .id,
@@ -1469,7 +1516,7 @@ mod tests {
         assert_eq!(latest_runs(&i, "2026-09-15 10:10:00").len(), 1);
         assert_eq!(latest_runs(&i, "2026-09-15 10:20:00").len(), 0);
         assert_eq!(
-            suggest(&i, Capability::None, "2026-09-15 10:20:00")
+            suggest(&i, Capability::None, true, "2026-09-15 10:20:00")
                 .unwrap()
                 .test
                 .id,
@@ -1490,7 +1537,7 @@ mod tests {
                 ),
             ],
         );
-        assert!(suggest(&strong, Capability::None, "2026-09-15 10:00:00").is_none());
+        assert!(suggest(&strong, Capability::None, true, "2026-09-15 10:00:00").is_none());
         let bloat = issue(
             "tcp.bufferbloat_remote",
             vec![
@@ -1498,7 +1545,7 @@ mod tests {
                 Cause::new("path_loss", "p", vec![]),
             ],
         );
-        assert!(suggest(&bloat, Capability::None, "2026-09-15 10:00:00").is_none());
+        assert!(suggest(&bloat, Capability::None, true, "2026-09-15 10:00:00").is_none());
         assert_eq!(
             offered(&bloat, Capability::None)[0].id,
             "load.idle_vs_loaded"

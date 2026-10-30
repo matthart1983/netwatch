@@ -286,7 +286,16 @@ const ROWS: &[Setting] = &[
         at: cursor::AI_ENDPOINT,
         label: "AI Endpoint",
         raw: |c| c.insights_endpoint.clone(),
-        show: None,
+        // Before the URL, like the GeoIP row, so a long one cannot push it
+        // out of view.
+        show: Some(|c| {
+            use crate::collectors::insights::{cleartext_off_host, CLEARTEXT_OFF_HOST};
+            if cleartext_off_host(&c.insights_endpoint) {
+                format!("{CLEARTEXT_OFF_HOST}: {}", c.insights_endpoint)
+            } else {
+                c.insights_endpoint.clone()
+            }
+        }),
         apply: |c, v| {
             c.insights_endpoint = v.to_string();
             Ok(())
@@ -696,6 +705,28 @@ mod tests {
         );
         cfg.geoip_online = false;
         assert_eq!(row.shown(&cfg), cfg.geoip_db);
+    }
+
+    #[test]
+    fn ai_endpoint_row_says_when_requests_go_out_in_cleartext() {
+        let row = &ROWS[cursor::AI_ENDPOINT];
+        let mut cfg = NetwatchConfig::default();
+        assert_eq!(row.shown(&cfg), "local");
+        cfg.insights_endpoint = "http://10.0.0.5:11434".into();
+        assert_eq!(
+            row.shown(&cfg),
+            "cleartext, off-host: http://10.0.0.5:11434"
+        );
+        // The edit box still gets the URL alone, or accepting it would save
+        // the label as the endpoint.
+        assert_eq!(
+            get_edit_value(&cfg, cursor::AI_ENDPOINT),
+            "http://10.0.0.5:11434"
+        );
+        for fine in ["http://127.0.0.1:11434", "https://ollama.example.com"] {
+            cfg.insights_endpoint = fine.into();
+            assert_eq!(row.shown(&cfg), fine);
+        }
     }
 
     /// `get_edit_value` numbered rows without the View row, so Enter on

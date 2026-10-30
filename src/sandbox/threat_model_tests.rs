@@ -138,6 +138,26 @@ fn threat_model_lists_every_outbound_endpoint() {
             "{service}: missing {endpoint}"
         );
     }
+    // The rows `third_party_probes = false` turns off say so, and no other
+    // row claims it.
+    let switched: Vec<&str> = {
+        let mut rows: Vec<&str> = rows
+            .iter()
+            .filter(|(_, words)| words.contains(&"third_party_probes"))
+            .map(|(service, _)| *service)
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(
+        switched,
+        [
+            "Internet reachability",
+            "Reference DNS",
+            "STUN",
+            "Startup trace"
+        ]
+    );
 }
 
 /// Whether a sentence names eBPF (or its SDK source) as switched off by the

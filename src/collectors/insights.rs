@@ -485,6 +485,31 @@ pub fn resolve_endpoint(endpoint: &str) -> &str {
     }
 }
 
+/// How the panel, Settings and doctor name [`cleartext_off_host`].
+pub const CLEARTEXT_OFF_HOST: &str = "cleartext, off-host";
+
+/// The endpoint is plain `http://` on something other than this host, so
+/// every request carries DNS names, peer addresses and packet summaries
+/// across the network unencrypted. `0.0.0.0` and `::` count as this host,
+/// where connecting to them either lands or fails. An endpoint that does not
+/// parse sends nothing.
+pub fn cleartext_off_host(endpoint: &str) -> bool {
+    use std::net::IpAddr;
+    let Ok(url) = url::Url::parse(resolve_endpoint(endpoint)) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    let ip = match url.host() {
+        Some(url::Host::Domain(name)) => return name.trim_end_matches('.') != "localhost",
+        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).to_canonical(),
+        None => return false,
+    };
+    !(ip.is_loopback() || ip.is_unspecified())
+}
+
 fn call_ollama(
     model: &str,
     endpoint: &str,
@@ -554,6 +579,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn non_loopback_http_is_flagged_cleartext() {
+        for off_host in [
+            "http://10.0.0.5:11434",
+            "http://192.168.1.20",
+            "http://ollama.lan:11434",
+            "HTTP://OLLAMA.LAN",
+            "http://203.0.113.9:11434/",
+            "http://[2001:db8::1]:11434",
+            // Not the loopback name, however close.
+            "http://localhost.evil.example",
+            "http://notlocalhost",
+        ] {
+            assert!(cleartext_off_host(off_host), "{off_host}");
+        }
+        for fine in [
+            "local",
+            "",
+            "http://localhost:11434",
+            "http://LOCALHOST:11434",
+            "http://localhost.:11434",
+            "http://127.0.0.1:11434",
+            "http://127.1:11434",
+            "http://127.8.8.8",
+            "http://[::1]:11434",
+            "http://[::ffff:127.0.0.1]:11434",
+            "http://0.0.0.0:11434",
+            "http://[::]:11434",
+            "https://ollama.example.com",
+            "https://10.0.0.5:11434",
+            // Requests to these fail before anything is sent.
+            "ollama.lan:11434",
+            "10.0.0.5:11434",
+            "not a url",
+        ] {
+            assert!(!cleartext_off_host(fine), "{fine}");
+        }
+    }
     use crate::collectors::connections::Connection;
     use crate::collectors::health::HealthStatus;
     use crate::collectors::packets::{CapturedPacket, ExpertSeverity};

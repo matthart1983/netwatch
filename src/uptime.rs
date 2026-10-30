@@ -1222,6 +1222,56 @@ mod tests {
         assert!(!m.is_recording());
     }
 
+    /// With `third_party_probes` off the internet hop is never asked. That is
+    /// an unknown connection, not an up one and not an outage, and the cycle
+    /// stamp must keep marking cycles or "no resolver counts as DNS failing"
+    /// would stop firing.
+    #[test]
+    fn a_switched_off_internet_probe_reads_as_unknown() {
+        use crate::collectors::health::PROBES_OFF;
+        let mut m = Monitor::new(None);
+        let mut status = (*crate::collectors::health::HealthProber::new().status()).clone();
+        let t0 = std::time::Instant::now();
+        status.internet_loss = Loss::Unmeasured(PROBES_OFF);
+        status.gateway_loss = Loss::Measured(0.0);
+        status.dns_loss = Loss::Measured(0.0);
+        for i in 0..5u64 {
+            let at = t0 + std::time::Duration::from_secs(i * 5);
+            status.completed.internet = Some(at);
+            status.completed.gateway = Some(at);
+            status.completed.dns = Some(at);
+            m.observe_at(&status, true, true, 1000 + i * 5);
+        }
+        assert!(matches!(m.connection(), Connection::Unknown), "unknown");
+
+        // Nothing but a missing resolver: still counted, by the same stamp.
+        let mut m = Monitor::new(None);
+        for i in 0..5u64 {
+            let at = t0 + std::time::Duration::from_secs(i * 5);
+            status.completed.internet = Some(at);
+            status.completed.gateway = Some(at);
+            m.observe_at(&status, true, false, 1000 + i * 5);
+        }
+        assert!(matches!(m.connection(), Connection::Down { .. }));
+
+        // And the report has no uptime figure to claim from it.
+        let records = vec![
+            Record::Start {
+                t: 0,
+                version: "x".into(),
+            },
+            hop(0, Hop::Gateway, HopState::Up),
+            hop(0, Hop::Dns, HopState::Up),
+            hop(0, Hop::Internet, HopState::Unknown),
+            Record::Stop { t: 100 },
+        ];
+        let report = report(records, 0, 100);
+        assert_eq!(report.summary.up_secs, 0);
+        assert_eq!(report.summary.down_secs, 0);
+        assert_eq!(report.summary.unknown_secs, 100);
+        assert_eq!(report.summary.uptime_pct, None);
+    }
+
     #[test]
     fn periods_parse() {
         assert_eq!(parse_period("7d").unwrap(), 7 * 86_400);

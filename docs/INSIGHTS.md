@@ -60,7 +60,12 @@ summary text, names and addresses can still be sensitive. There is no redaction
 profile for this prompt.
 
 The configured endpoint receives the snapshot. A remote URL sends it off-host;
-plain HTTP provides no transport encryption. A localhost URL only identifies the
+plain HTTP provides no transport encryption. Netwatch marks an `http://` endpoint
+that is not on this host as `cleartext, off-host`: a line on the Diagnose page,
+with or without an open issue, a label on the AI Endpoint row in Settings, and in
+`netwatch doctor`, `insights` as degraded with reason `cleartext_off_host`. It warns
+and still sends; there is no key to refuse. Loopback addresses, `localhost` and
+`https://` carry no mark. A localhost URL only identifies the
 first recipient: an Ollama-compatible server may forward inference to a cloud
 provider. Netwatch neither verifies local-only execution nor enforces a network
 boundary around the model server. Check that server's configuration and data
@@ -91,7 +96,8 @@ Turn AI Insights off in Settings or set `insights_enabled = false` before startu
 The app then stops feeding snapshots to the collector. Disabling does not recall
 requests already sent; a worker may finish an in-flight request or queued work
 before exiting. It does not stop Netwatch's other network activity, such as health
-probes or lookups.
+probes or lookups. `third_party_probes = false` stops the automatic probes to public
+servers; see the [configuration reference](REFERENCE.md#security).
 
 Implementation references: [snapshot and worker](../src/collectors/insights.rs),
 [commentary UI](../src/ui/diagnose.rs), [configuration](../src/config.rs).
