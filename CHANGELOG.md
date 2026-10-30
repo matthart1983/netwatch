@@ -35,7 +35,9 @@ All notable changes to NetWatch will be documented in this file.
   (`db_loaded`), `degraded` (`db_stale`, over 60 days old), `unavailable`
   (`db_unreadable`) or `disabled` (`not_configured`, with the command to run).
   The Settings rows show the database type and path, or the path that waits for
-  the next start.
+  the next start. When lookups answer with DB-IP's data, Settings and the
+  `geoip_db` detail carry its CC BY 4.0 attribution, judged by each file's own
+  `database_type` rather than its path.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check

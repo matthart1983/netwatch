@@ -404,14 +404,16 @@ fn format_bandwidth(bytes: u64) -> String {
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    let attribution = app.geo_cache.db_status().attribution();
+    // Wide enough for the attribution on one row, with its indent and borders.
     let popup_width = (area.width * 60 / 100)
-        .max(50)
+        .max(attribution.map_or(50, |line| line.len() as u16 + 4))
         .min(area.width.saturating_sub(4));
-    // +14 holds the rows below the settings, with one to spare: a blank, the
-    // sandbox row, up to three worker rows, the capability line, the
-    // connection-table row, the doctor hint, a blank, the status row, the
-    // footer and two borders.
-    let popup_height = (SETTINGS_COUNT as u16 + 14).min(area.height.saturating_sub(4));
+    // +15 holds the rows that are not settings, with one to spare: the
+    // attribution, a blank, the sandbox row, up to three worker rows, the
+    // capability line, the connection-table row, the doctor hint, a blank, the
+    // status row, the footer and two borders.
+    let popup_height = (SETTINGS_COUNT as u16 + 15).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -479,6 +481,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(value_display, value_style),
         ]));
+
+        // Under the GeoIP rows, so a short terminal cuts it off last. A terminal
+        // too narrow for the popup to hold it gets it on two rows.
+        if let (cursor::GEOIP_ASN_DB, Some(line)) = (i, attribution) {
+            let parts: Vec<&str> = if line.len() + 2 <= inner.width as usize {
+                vec![line]
+            } else {
+                line.split_inclusive(", ").collect()
+            };
+            for part in parts {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", part.trim_end()),
+                    Style::default().fg(app.theme.text_muted),
+                )));
+            }
+        }
     }
 
     // Sandbox enforcement state — read-only info row. Surfaces whether
@@ -746,6 +764,75 @@ mod tests {
             geoip_row("", &loaded("/geo/old.mmdb")),
             "(none) on next start"
         );
+    }
+
+    /// The rows of a drawn Settings overlay, in a session that opened a file
+    /// with this name and `database_type`.
+    fn drawn_with_database(name: &str, database_type: &str, width: u16) -> Vec<String> {
+        use crate::collectors::geo::test_db;
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = std::env::temp_dir().join(format!("nw-settings-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, test_db::city(database_type, 1_790_000_000)).unwrap();
+        let app = App::prepare_with_config(NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        buf.content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
+    /// DB-IP's data carries its attribution where the session shows what it
+    /// opened, wherever the file came from: here a name the download never
+    /// uses, in the narrowest popup and a wide one.
+    #[test]
+    fn settings_attributes_a_dbip_database() {
+        for width in [80, 120] {
+            let rows = drawn_with_database("own.mmdb", "DBIP-Country-Lite", width);
+            let at = |text: &str| rows.iter().position(|row| row.contains(text));
+            assert!(
+                at(crate::collectors::geo::DBIP_ATTRIBUTION).is_some(),
+                "{width} columns:\n{}",
+                rows.join("\n")
+            );
+            // Right under the rows it belongs to.
+            assert_eq!(
+                at(crate::collectors::geo::DBIP_ATTRIBUTION),
+                at("GeoIP ASN DB Path").map(|row| row + 1)
+            );
+        }
+    }
+
+    /// Too narrow for the popup to hold it on one row, none of it is cut off.
+    #[test]
+    fn settings_attribution_stays_whole_in_a_very_narrow_terminal() {
+        let rows = drawn_with_database("own.mmdb", "DBIP-Country-Lite", 60);
+        for part in ["IP geolocation by DB-IP (https://db-ip.com),", "CC BY 4.0"] {
+            assert!(
+                rows.iter().any(|row| row.contains(part)),
+                "{part}:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// A MaxMind file named as the download names its files is still MaxMind's.
+    #[test]
+    fn settings_does_not_attribute_another_database() {
+        for width in [80, 120] {
+            let rows = drawn_with_database("dbip-country-lite.mmdb", "GeoLite2-City", width);
+            let drawn = rows.join("\n");
+            assert!(drawn.contains("GeoLite2-City"), "{drawn}");
+            assert!(!drawn.contains("IP geolocation"), "{drawn}");
+            assert!(!drawn.contains("db-ip.com"), "{drawn}");
+        }
     }
 
     /// `get_edit_value` numbered rows without the View row, so Enter on

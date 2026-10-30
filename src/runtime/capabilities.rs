@@ -655,7 +655,11 @@ fn geoip_db_assessment(status: &DbStatus, now: SystemTime) -> Assessment {
         "netwatch geoip update refreshes the downloaded files; replace any you set yourself";
     let (city, city_age) = describe_db("Country/City", &status.city, now);
     let (asn, asn_age) = describe_db("ASN", &status.asn, now);
-    let detail = format!("{city}; {asn}");
+    // First, so doctor's text, which wraps by character, keeps the link whole.
+    let detail = match status.attribution() {
+        Some(line) => format!("{line}. {city}; {asn}"),
+        None => format!("{city}; {asn}"),
+    };
     let stale = [city_age, asn_age]
         .into_iter()
         .flatten()
@@ -1242,6 +1246,74 @@ mod tests {
             assert!(next.unwrap().contains("netwatch geoip update"));
         }
     }
+    /// What doctor reports for a file written to `name` with this
+    /// `database_type`, as it reads a real one.
+    fn geoip_db_for(name: &str, database_type: &str) -> Capability {
+        use crate::collectors::geo::test_db;
+        let dir = std::env::temp_dir().join(format!("nw-doctor-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        std::fs::write(&path, test_db::city(database_type, now.as_secs() as u32)).unwrap();
+        let config = NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&config);
+        let _ = std::fs::remove_dir_all(&dir);
+        snapshot.get("geoip_db").clone()
+    }
+    /// DB-IP's data carries its attribution wherever the file came from, here
+    /// a name the download would never use.
+    #[test]
+    fn geoip_db_detail_attributes_a_dbip_database() {
+        let geoip = geoip_db_for("own.mmdb", "DBIP-City-Lite");
+        assert_eq!(
+            (geoip.state, geoip.reason.as_str()),
+            (State::Ready, "db_loaded")
+        );
+        assert!(
+            geoip
+                .detail
+                .contains("IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0"),
+            "{}",
+            geoip.detail
+        );
+    }
+    /// A MaxMind file named as the download names its files is still MaxMind's.
+    #[test]
+    fn geoip_db_detail_does_not_attribute_another_database() {
+        let geoip = geoip_db_for("dbip-city-lite.mmdb", "GeoLite2-City");
+        assert_eq!(
+            (geoip.state, geoip.reason.as_str()),
+            (State::Ready, "db_loaded")
+        );
+        assert!(geoip.detail.contains("GeoLite2-City"), "{}", geoip.detail);
+        assert!(!geoip.detail.contains("IP geolocation"), "{}", geoip.detail);
+        assert!(!geoip.detail.contains("db-ip.com"), "{}", geoip.detail);
+    }
+    /// doctor's text wraps at 80 columns by character, so the line has to come
+    /// where a wrap cannot cut its link, stale or not.
+    #[test]
+    fn geoip_db_attribution_survives_text_wrapping() {
+        let now = SystemTime::now();
+        for age in [1, 61] {
+            let status = DbStatus {
+                city: loaded(age, now),
+                asn: DbFile::NotConfigured,
+            };
+            let (state, reason, detail, next) = geoip_db_assessment(&status, now);
+            let mut snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+            snapshot.put("geoip_db", state, reason, &detail, next);
+            let text = snapshot.text();
+            assert!(
+                text.lines()
+                    .any(|line| line
+                        .contains("IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0")),
+                "{text}"
+            );
+        }
+    }
     /// Without a Country or City database a session makes no lookup, so an
     /// ASN file alone does not count as loaded.
     #[test]
@@ -1254,6 +1326,7 @@ mod tests {
         let (state, reason, detail, _) = geoip_db_assessment(&status, now);
         assert_eq!((state, reason), (State::Disabled, "not_configured"));
         assert!(detail.contains("ASN: "), "{detail}");
+        assert!(!detail.contains("IP geolocation"), "{detail}");
     }
     #[test]
     fn online_geo_reports_removed() {

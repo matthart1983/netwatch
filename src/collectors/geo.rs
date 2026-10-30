@@ -38,6 +38,9 @@ enum GeoEntry {
 
 // ── MaxMind offline reader ─────────────────────────────────
 
+/// The attribution CC BY 4.0 asks of whatever shows DB-IP's data.
+pub const DBIP_ATTRIBUTION: &str = "IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0";
+
 /// What became of one database path. The database type and the error come
 /// from a file we did not write, so they are made safe to draw.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -64,11 +67,28 @@ pub struct DbStatus {
     pub asn: DbFile,
 }
 
+impl DbFile {
+    /// By the file's own `database_type`, because a path says nothing: a DB-IP
+    /// file can live anywhere, and a MaxMind one can have any name.
+    fn is_dbip(&self) -> bool {
+        matches!(self, DbFile::Loaded { database_type, .. } if database_type.starts_with("DBIP-"))
+    }
+}
+
 impl DbStatus {
     /// Open both files to see what a session would make of them. Reads each
     /// whole, so this is for a report, not for every frame.
     pub fn open(city_path: &str, asn_path: &str) -> Self {
         MaxMindReader::open(city_path, asn_path).1
+    }
+
+    /// The line to show beside these databases, if lookups answer with DB-IP's
+    /// data. A lookup starts from the Country or City file, so an ASN file with
+    /// none beside it shows nothing, and beside a MaxMind one it fills the
+    /// organisation names.
+    pub fn attribution(&self) -> Option<&'static str> {
+        let answers = matches!(self.city, DbFile::Loaded { .. });
+        (answers && (self.city.is_dbip() || self.asn.is_dbip())).then_some(DBIP_ATTRIBUTION)
     }
 }
 
@@ -665,6 +685,48 @@ mod tests {
             ("US", "Test Org")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only what a file says about itself counts. Its name does not, and an
+    /// ASN file that no lookup reaches puts nothing on screen to attribute.
+    #[test]
+    fn attribution_follows_the_database_type() {
+        let file = |database_type: &str| DbFile::Loaded {
+            path: "/geo/dbip-country-lite.mmdb".into(),
+            database_type: database_type.into(),
+            build_epoch: 1_790_000_000,
+        };
+        let status = |city, asn| DbStatus { city, asn };
+        let (dbip, asn_dbip) = (
+            file("DBIP-City-Lite"),
+            file("DBIP-ASN-Lite (compat=GeoLite2-ASN)"),
+        );
+        let maxmind = file("GeoLite2-City");
+        for attributed in [
+            status(dbip.clone(), DbFile::NotConfigured),
+            status(dbip.clone(), maxmind.clone()),
+            status(maxmind.clone(), asn_dbip.clone()),
+        ] {
+            assert_eq!(
+                attributed.attribution(),
+                Some(DBIP_ATTRIBUTION),
+                "{attributed:?}"
+            );
+        }
+        let unreadable = DbFile::Unreadable {
+            path: "/geo/dbip-city-lite.mmdb".into(),
+            error: "bad".into(),
+        };
+        for not in [
+            DbStatus::default(),
+            status(maxmind.clone(), DbFile::NotConfigured),
+            status(maxmind.clone(), file("GeoLite2-ASN")),
+            status(file("dbip-lowercase"), DbFile::NotConfigured),
+            status(DbFile::NotConfigured, asn_dbip.clone()),
+            status(unreadable, asn_dbip),
+        ] {
+            assert_eq!(not.attribution(), None, "{not:?}");
+        }
     }
 
     #[test]

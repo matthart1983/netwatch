@@ -530,8 +530,10 @@ directory and only that user can read them.
 The command name, `--city` and the exit codes are stable. The data source and the file location may
 change between releases, so a script should ask `netwatch doctor --json` what loaded rather than
 look for a file name. On Linux the download is read on a worker thread that cannot open TCP
-connections from Linux 6.7 on; see the [threat model](THREAT-MODEL.md). IP geolocation by DB-IP
-(https://db-ip.com), CC BY 4.0.
+connections from Linux 6.7 on; see the [threat model](THREAT-MODEL.md).
+
+IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0. Settings and `netwatch doctor` show that
+line whenever a loaded database says it is DB-IP's, wherever the file came from.
 
 ---
 

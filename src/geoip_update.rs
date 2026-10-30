@@ -20,8 +20,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Where the databases come from; [`Database::url`] adds the file name.
 pub const DOWNLOAD_BASE: &str = "https://download.db-ip.com/free/";
-/// The attribution CC BY 4.0 asks for.
-const ATTRIBUTION: &str = "IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0";
 
 /// The City database is about 60 MiB compressed, the others under 6 MiB.
 const MAX_COMPRESSED: u64 = 80 * 1024 * 1024;
@@ -159,7 +157,7 @@ pub fn command(city: bool) -> Result<()> {
         eprintln!("note: {partly}");
     }
     if failed < wanted.len() {
-        println!("{ATTRIBUTION}");
+        println!("{}", crate::collectors::geo::DBIP_ATTRIBUTION);
     }
     if updated > 0 {
         println!("restart netwatch to load it");
