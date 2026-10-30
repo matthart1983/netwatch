@@ -450,32 +450,39 @@ mod capture_fix_tests {
     /// clears file capabilities, so `setcap` has to come after it.
     #[test]
     fn the_packages_restrict_the_binary_before_granting_it() {
-        for (file, text, bin) in [
+        let spec = include_str!("../../packaging/rpm/netwatch.spec");
+        let between = |from: &str, to: &str| {
+            let rest = spec.split_once(from).unwrap().1;
+            rest.split_once(to).unwrap().0.to_string()
+        };
+        // Printed to whoever installed it, for their own shell, where `sudo`
+        // keeps `$USER` theirs. The description says "as root", where `$USER`
+        // in a `su -` shell is root, so it has to name the account instead.
+        let own_shell = r#"sudo usermod -aG netwatch "$USER""#;
+        for (file, text, bin, member) in [
             (
                 "debian/postinst",
-                include_str!("../../packaging/debian/postinst"),
+                include_str!("../../packaging/debian/postinst").to_string(),
                 "/usr/bin/netwatch",
+                own_shell,
             ),
             (
                 "rpm/post_install.sh",
-                include_str!("../../packaging/rpm/post_install.sh"),
+                include_str!("../../packaging/rpm/post_install.sh").to_string(),
                 "/usr/bin/netwatch",
+                own_shell,
             ),
             (
                 "rpm/netwatch.spec %post",
-                include_str!("../../packaging/rpm/netwatch.spec")
-                    .split_once("%post")
-                    .unwrap()
-                    .1,
+                between("%post", "%files"),
                 "/usr/bin/netwatch",
+                own_shell,
             ),
             (
                 "rpm/netwatch.spec %description",
-                include_str!("../../packaging/rpm/netwatch.spec")
-                    .split_once("%description")
-                    .unwrap()
-                    .1,
+                between("%description", "%prep"),
                 "%{_bindir}/netwatch",
+                "usermod -aG netwatch YOUR_USER",
             ),
         ] {
             let at = |line: String| {
@@ -483,7 +490,7 @@ mod capture_fix_tests {
                     .unwrap_or_else(|| panic!("{file} does not say {line:?}"))
             };
             let group = at("groupadd -f netwatch".to_string());
-            let member = at(r#"usermod -aG netwatch "$USER""#.to_string());
+            let member = at(member.to_string());
             let owner = at(format!("chown root:netwatch {bin}"));
             let mode = at(format!("chmod 0750 {bin}"));
             let grant = at(format!("setcap {CAPS} {bin}"));
@@ -492,6 +499,10 @@ mod capture_fix_tests {
                 "{file} gives the steps out of order"
             );
         }
+        assert!(
+            !between("%description", "%prep").contains("$USER"),
+            "the spec's as-root steps would add root to the group in a su - shell"
+        );
     }
 
     /// The line run by `sh` for an account not yet in the group, which is

@@ -34,9 +34,9 @@ diagnostic engine that learns a per-network baseline and opens an issue when
 that baseline breaks. Runs in a terminal and needs no configuration.
 
 Packet capture needs elevated access. Prefer to restrict the binary to a group
-and grant the capabilities to it, as root:
+and grant the capabilities to it, as root, naming the account that will run it:
   groupadd -f netwatch
-  usermod -aG netwatch "$USER"
+  usermod -aG netwatch YOUR_USER
   chown root:netwatch %{_bindir}/netwatch
   chmod 0750 %{_bindir}/netwatch
   setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' %{_bindir}/netwatch
