@@ -39,8 +39,8 @@ All notable changes to NetWatch will be documented in this file.
   until now a running session's per-thread results could not be read at all. The log's
   default filter now keeps `info` on `netwatch::sandbox` for this.
   `docs/doctor.md` says where each value can be read. Settings puts what it found on
-  rows of its own, such as `TCP denied on 13/13 parser workers`, so none of it runs
-  off the end of the popup.
+  rows of its own, such as `TCP denied on 13/13 parser workers`, and wraps them, so a
+  popup at 80 columns or wider shows all of it, given the height for every row.
 - **Doctor and Settings say `running as root: containment limited`** when netwatch
   runs as root. Root keeps most file access whatever the sandbox does, and
   `SECURITY.md` scopes sandbox escapes to non-root runs.

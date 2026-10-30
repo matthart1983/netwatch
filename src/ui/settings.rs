@@ -409,15 +409,137 @@ fn format_bandwidth(bytes: u64) -> String {
     }
 }
 
+/// One row of the sandbox detail in the popup.
+struct SandboxRow {
+    indent: usize,
+    text: String,
+    /// From the clause saying a root session's containment is limited.
+    root: bool,
+}
+
+/// The sandbox capability's detail as rows no wider than `inner`, because the popup
+/// does not wrap. The first clause stays in the settings' value column, `value`
+/// from the left, and the others take the whole width, because what a worker got
+/// or a root session lacks has to show in a narrow terminal too.
+fn sandbox_rows(detail: &str, inner: usize, value: usize) -> Vec<SandboxRow> {
+    let mut rows = Vec::new();
+    for (at, clause) in detail.split(" · ").enumerate() {
+        let (first, rest) = if at == 0 { (value, value) } else { (2, 4) };
+        let wrapped = wrap_words(
+            clause,
+            inner.saturating_sub(first),
+            inner.saturating_sub(rest),
+        );
+        for (line, text) in wrapped.into_iter().enumerate() {
+            rows.push(SandboxRow {
+                indent: if line == 0 { first } else { rest },
+                text,
+                root: clause.starts_with("running as root"),
+            });
+        }
+    }
+    rows
+}
+
+/// `text` broken at spaces into rows, the first `first` columns wide and the rest
+/// `rest`. A word too long for a row is cut between graphemes. The widths have a
+/// floor, so that a terminal narrower than the popup's own minimum still makes
+/// progress, though the popup cuts those rows off.
+fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<String> {
+    use crate::ui::text;
+    const FLOOR: usize = 8;
+    let rest = rest.max(FLOOR);
+    let mut limit = first.max(FLOOR);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for mut word in text.split_whitespace() {
+        loop {
+            let gap = usize::from(!row.is_empty());
+            if text::width(&row) + gap + text::width(word) <= limit {
+                if gap == 1 {
+                    row.push(' ');
+                }
+                row.push_str(word);
+                break;
+            }
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            } else {
+                // Alone on a row and still too long. A wide grapheme can leave
+                // nothing that fits, and it has to go somewhere.
+                let head = match text::prefix(word, limit) {
+                    "" => word.chars().next().map_or("", |c| &word[..c.len_utf8()]),
+                    head => head,
+                };
+                rows.push(head.to_string());
+                word = &word[head.len()..];
+                if word.is_empty() {
+                    limit = rest;
+                    break;
+                }
+            }
+            limit = rest;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let popup_width = (area.width * 60 / 100)
         .max(50)
         .min(area.width.saturating_sub(4));
-    // +19 holds the rows below the settings, with one to spare: a blank, the
-    // sandbox row and up to five rows of its detail, up to three worker rows,
-    // the capability line, the connection-table row, the doctor hint, a blank,
-    // the status row, the footer and two borders.
-    let popup_height = (SETTINGS_COUNT as u16 + 19).min(area.height.saturating_sub(4));
+    let label_width = 22;
+    // Sandbox enforcement state — read-only info rows. Surfaces whether
+    // Landlock / cap-drop / Seatbelt actually applied so users can
+    // confirm enforcement at runtime rather than trusting the README.
+    let capabilities = crate::runtime::capabilities::CapabilitySnapshot::live(app);
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    let sandbox_detail = sandbox_rows(
+        &capabilities.get("sandbox").detail,
+        inner_width,
+        label_width + 4,
+    );
+    // Up to three workers that warned, the capability line, and the connection
+    // table when it is not read from `ss`.
+    let mut notes: Vec<String> = crate::sandbox::worker::snapshot()
+        .iter()
+        .filter(|(_, s)| {
+            s.error.is_some()
+                || s.report
+                    .as_ref()
+                    .is_some_and(|r| !r.mode.warnings.is_empty())
+        })
+        .take(3)
+        .map(|(name, state)| {
+            let reason = state
+                .error
+                .clone()
+                .unwrap_or_else(|| state.report.as_ref().unwrap().mode.warnings.join("; "));
+            format!("{name}: {reason}")
+        })
+        .collect();
+    notes.push(capabilities.compact());
+    notes.extend(capabilities.connection_table_line());
+    let note_rows: Vec<(usize, String)> = notes
+        .iter()
+        .flat_map(|note| {
+            wrap_words(
+                note,
+                inner_width.saturating_sub(2),
+                inner_width.saturating_sub(4),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(line, text)| (if line == 0 { 2 } else { 4 }, text))
+        })
+        .collect();
+    // +8 holds the rest below the settings, with one to spare: a blank, the doctor
+    // hint, a blank, the status row, the footer and two borders.
+    let popup_height = (SETTINGS_COUNT + 8 + sandbox_detail.len() + note_rows.len()) as u16;
+    let popup_height = popup_height.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -438,7 +560,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, popup);
 
     let cfg = &app.user_config;
-    let label_width = 22;
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -481,61 +602,35 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    // Sandbox enforcement state — read-only info row. Surfaces whether
-    // Landlock / cap-drop / Seatbelt actually applied so users can
-    // confirm enforcement at runtime rather than trusting the README.
     lines.push(Line::raw(""));
-    let capabilities = crate::runtime::capabilities::CapabilitySnapshot::live(app);
-    let sandbox_detail = capabilities.get("sandbox").detail.clone();
-    let mut sandbox_clauses = sandbox_detail.split(" · ");
-    let sandbox_summary = sandbox_clauses.next().unwrap_or_default().to_string();
     let sandbox_color =
         if capabilities.get("sandbox").state == crate::runtime::capabilities::State::Ready {
             app.theme.status_good
         } else {
             app.theme.text_muted
         };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {:<width$}", "Sandbox", width = label_width + 2),
-            Style::default().fg(app.theme.brand),
-        ),
-        Span::styled(sandbox_summary, Style::default().fg(sandbox_color)),
-    ]));
-    // A row each, from the left edge: the popup does not wrap, and what a
-    // worker got or a root session lacks must show in a narrow terminal.
-    for clause in sandbox_clauses {
-        let color = if clause.starts_with("running as root") {
+    for (at, row) in sandbox_detail.into_iter().enumerate() {
+        let lead = if at == 0 {
+            Span::styled(
+                format!("  {:<width$}", "Sandbox", width = label_width + 2),
+                Style::default().fg(app.theme.brand),
+            )
+        } else {
+            Span::raw(" ".repeat(row.indent))
+        };
+        let color = if row.root {
             app.theme.status_warn
         } else {
             sandbox_color
         };
-        lines.push(Line::from(Span::styled(
-            format!("  {clause}"),
-            Style::default().fg(color),
-        )));
+        lines.push(Line::from(vec![
+            lead,
+            Span::styled(row.text, Style::default().fg(color)),
+        ]));
     }
 
-    for (name, state) in crate::sandbox::worker::snapshot()
-        .iter()
-        .filter(|(_, s)| {
-            s.error.is_some()
-                || s.report
-                    .as_ref()
-                    .is_some_and(|r| !r.mode.warnings.is_empty())
-        })
-        .take(3)
-    {
-        let reason = state
-            .error
-            .clone()
-            .unwrap_or_else(|| state.report.as_ref().unwrap().mode.warnings.join("; "));
-        lines.push(Line::raw(format!("  {name}: {reason}")));
-    }
-
-    lines.push(Line::raw(format!("  {}", capabilities.compact())));
-    if let Some(table) = capabilities.connection_table_line() {
-        lines.push(Line::raw(format!("  {table}")));
+    for (indent, text) in note_rows {
+        lines.push(Line::raw(format!("{}{text}", " ".repeat(indent))));
     }
     lines.push(Line::raw("  Setup details: netwatch doctor --json"));
 
@@ -978,7 +1073,7 @@ mod tests {
         }
         let mut app = App::prepare_with_config(NetwatchConfig::default());
         app.sandbox_report.mode.effective = Some("best-effort");
-        for width in [80, 120] {
+        for width in [80, 100, 120] {
             let rows = rows_at(&app, width);
             assert!(
                 rows.iter()
@@ -986,6 +1081,141 @@ mod tests {
                 "{width} columns:\n{}",
                 rows.join("\n")
             );
+        }
+    }
+
+    #[test]
+    fn wrap_words_breaks_at_spaces_and_keeps_every_word() {
+        let rows = |text, first, rest| wrap_words(text, first, rest);
+        assert_eq!(rows("one two three", 40, 40), ["one two three"]);
+        assert_eq!(rows("one two three", 7, 40), ["one two", "three"]);
+        assert_eq!(rows("one two three", 8, 5), ["one two", "three"]);
+        assert_eq!(rows("", 10, 10), [""]);
+        // A word longer than a row is cut, and nothing is lost.
+        assert_eq!(rows("abcdefghijkl mn", 8, 8), ["abcdefgh", "ijkl mn"]);
+        // Wide graphemes count as two columns.
+        assert_eq!(rows("界界界界界", 8, 8), ["界界界界", "界"]);
+        // The floor, for a terminal narrower than the popup's minimum.
+        assert_eq!(rows("one two", 0, 0), ["one two"]);
+    }
+
+    #[test]
+    fn sandbox_rows_fit_the_popup_at_each_width() {
+        let detail = "best-effort: Landlock fs ABI 3 (kernel 9), 31 caps dropped \
+                      · TCP denied on 13/13 parser workers \
+                      · CAP_NET_RAW kept on main to reopen capture (c, i, Shift+R) \
+                      · no-socket filter skipped: no syscall table for powerpc64 \
+                      · 25/25 worker entries verified \
+                      · running as root: containment limited";
+        // Inside the borders of the popup at 80, 100 and 120 columns.
+        for inner in [48, 58, 70] {
+            let rows = sandbox_rows(detail, inner, 26);
+            for row in &rows {
+                let used = row.indent + crate::ui::text::width(&row.text);
+                assert!(used <= inner, "{used} of {inner}: {}", row.text);
+            }
+            assert_eq!(rows[0].indent, 26);
+            let words: Vec<&str> = rows.iter().flat_map(|r| r.text.split(' ')).collect();
+            assert_eq!(
+                words.join(" "),
+                detail.replace(" · ", " "),
+                "{inner} columns lost a word"
+            );
+            let root: Vec<_> = rows.iter().filter(|r| r.root).collect();
+            assert_eq!(root.len(), 1, "{inner}");
+            assert_eq!(root[0].text, "running as root: containment limited");
+        }
+    }
+
+    /// `rows` as one line of words, with the popup's borders gone, so a clause
+    /// reads whole however it wrapped and is missing if a row cut it off.
+    fn popup_text(rows: &[String]) -> String {
+        let text: String = rows
+            .iter()
+            .flat_map(|row| row.chars().chain([' ']))
+            .map(|c| {
+                if ('\u{2500}'..='\u{257f}').contains(&c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// A best-effort TUI session's real clauses, the long ones included, from
+    /// workers that really entered. Every word has to show at each width.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_show_the_whole_sandbox_detail_at_80_100_and_120_columns() {
+        use crate::runtime::capabilities::CapabilitySnapshot;
+        use crate::sandbox::{worker, Mode, NetRaw, SandboxPaths};
+        const CHILD: &str = "NETWATCH_SETTINGS_DETAIL_TEST";
+        // Worker policy is process-wide, so install it in a child.
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::settings::tests::settings_show_the_whole_sandbox_detail_at_80_100_and_120_columns",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        worker::install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        worker::spawn("connections", || {}).join().unwrap();
+        worker::spawn("keylog", || {}).join().unwrap();
+        worker::spawn("traffic", || {}).join().unwrap();
+        let reader = "confined by inheritance: the SDK reader thread takes this worker's \
+                      Landlock layers, TCP deny included, but has no entry hook of its own";
+        worker::note("ebpf-reader", reader);
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.sandbox_report.mode.effective = Some("best-effort");
+        let platform = &mut app.sandbox_report.platform;
+        platform.landlock_abi = 3;
+        platform.landlock_kernel_abi = 9;
+        platform.caps_dropped = vec!["CAP_NET_ADMIN".into(); 31];
+        platform.capture_authority = NetRaw::RetainedForReopen;
+        let snapshot = CapabilitySnapshot::live(&app);
+        let detail = snapshot.get("sandbox").detail.clone();
+        for long in [
+            "best-effort: Landlock fs ABI 3 (kernel 9), 31 caps dropped",
+            "TCP denied on ",
+            "CAP_NET_RAW kept on main to reopen capture (c, i, Shift+R)",
+        ] {
+            assert!(detail.contains(long), "{long} is not in {detail}");
+        }
+        for width in [80, 100, 120] {
+            let rows = rows_at(&app, width);
+            let text = popup_text(&rows);
+            for clause in detail.split(" · ") {
+                assert!(
+                    text.contains(clause),
+                    "{width} columns cut off {clause:?}:\n{}",
+                    rows.join("\n")
+                );
+            }
+            // The rows below it wrap too and are still inside the popup.
+            for row in [
+                format!("ebpf-reader: {reader}"),
+                snapshot.compact(),
+                "Setup details: netwatch doctor --json".to_string(),
+            ] {
+                assert!(
+                    text.contains(&row),
+                    "{width} columns cut off {row:?}:\n{}",
+                    rows.join("\n")
+                );
+            }
         }
     }
 
