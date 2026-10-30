@@ -594,6 +594,17 @@ All notable changes to NetWatch will be documented in this file.
   whose `net.ipv4.ping_group_range` leaves out the user netwatch runs as,
   the `ping` that health falls back to and the Diagnose PMTU probe now
   fail, and health measures over TCP instead.
+- **The capture, keylog and metrics threads can no longer open a socket with
+  socket(2).** Landlock's TCP deny stops connect(2) and bind(2) on TCP sockets
+  only. A compromised parser could still open UDP, ICMP and netlink sockets, and
+  on Linux 7.1 an MPTCP socket reached a plain TCP listener past the deny. These
+  four workers now take a seccomp filter on Linux, on x86_64, aarch64 and armv5te,
+  that returns EPERM for socket(2). A build for another architecture skips it and
+  says so in the sandbox report, and a kernel that refuses it stops a strict start.
+  The filter does not cover the other parser threads, which start `ss`, `ip` and
+  `iw` and need netlink, or a socket opened earlier, or one made through io_uring.
+  `docs/THREAT-MODEL.md` lists those gaps. No new crate: the filter is about a
+  dozen hand-written BPF instructions.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix

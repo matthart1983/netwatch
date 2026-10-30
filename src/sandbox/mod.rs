@@ -27,6 +27,8 @@ pub mod worker;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod seccomp;
 
 pub use paths::SandboxPaths;
 pub use roles::Role;
@@ -42,8 +44,9 @@ pub enum Mode {
     BestEffort,
     /// `--sandbox-strict`: callers abort on reported application warnings.
     /// Parser and capture entry warn unless TCP bind and connect are denied,
-    /// so strict needs Landlock ABI 4 (Linux 6.7). This does not establish
-    /// worker confinement or successful capability drops.
+    /// so strict needs Landlock ABI 4 (Linux 6.7). A kernel refusing the
+    /// no-socket filter warns too, on an architecture that has it. This does
+    /// not establish worker confinement or successful capability drops.
     Strict,
 }
 
@@ -114,6 +117,34 @@ impl NetRaw {
     }
 }
 
+/// What became of a thread's no-socket filter ([`roles::no_sockets`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SocketFilter {
+    /// On the thread: socket(2) returns EPERM there and in what it starts.
+    Installed,
+    /// Skipped: this build's architecture has no syscall table. Not a warning,
+    /// so strict runs without it.
+    UnknownArch,
+    /// The kernel refused it. The report's warnings say why, and strict
+    /// refuses the entry.
+    Failed,
+    /// The thread's worker takes none, the sandbox is disabled or this is not
+    /// Linux.
+    #[default]
+    NotApplicable,
+}
+
+impl SocketFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            SocketFilter::Installed => "installed",
+            SocketFilter::UnknownArch => "unknown_arch",
+            SocketFilter::Failed => "failed",
+            SocketFilter::NotApplicable => "not_applicable",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,8 +203,11 @@ pub struct PlatformReport {
     pub landlock_layer: Option<&'static str>,
     /// Linux: what that layer enforced on this kernel: `filesystem_write`
     /// (capture only), `tcp_bind`, `tcp_connect`, `abstract_unix_socket`,
-    /// `signal` and `pathname_unix_socket`.
+    /// `signal` and `pathname_unix_socket`. Also `socket_create`, which is the
+    /// seccomp filter rather than Landlock, when it is on the thread.
     pub landlock_restrictions: Vec<&'static str>,
+    /// Linux: the no-socket filter, for the workers that take it.
+    pub socket_filter: SocketFilter,
     /// Linux: capabilities present before removal and verified absent afterward.
     pub caps_dropped: Vec<String>,
     /// Effective capabilities still held after verified drop attempts.
@@ -250,6 +284,19 @@ pub enum Retain {
     Nothing,
     /// CAP_BPF, CAP_PERFMON and the pre-5.8 CAP_SYS_ADMIN fallback.
     BpfLoad,
+}
+
+/// Take socket(2) from the calling thread and everything it starts, after
+/// its Landlock layers, and add the outcome to `report`. Only the Linux
+/// backend has this, and disabled mode installs nothing.
+pub fn deny_socket_create(mode: Mode, report: &mut Report) {
+    if matches!(mode, Mode::Disabled) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    seccomp::install(report);
+    #[cfg(not(target_os = "linux"))]
+    let _ = report;
 }
 
 /// [`apply`] with `role`'s policy, keeping the capabilities `retain` names.

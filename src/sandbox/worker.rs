@@ -278,6 +278,19 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
             .map(|e| e.raw_os_error().unwrap_or(-1));
         NET_PROBES.lock().unwrap().insert(name.into(), errno);
     }
+    // After those probes: the TCP probe's socket(2) has to work for it to show
+    // Landlock's deny.
+    let mut report = report;
+    if super::roles::no_sockets(name) {
+        super::deny_socket_create(p.mode, &mut report);
+    }
+    #[cfg(test)]
+    if std::env::var_os("NETWATCH_WORKER_NET_PROBE").is_some() {
+        SOCKET_PROBES
+            .lock()
+            .unwrap()
+            .insert(name.into(), probe_sockets());
+    }
     let allowed = !matches!(p.mode, Mode::Strict) || report.mode.warnings.is_empty();
     let mut components = crate::app::safe_lock(&p.components, "worker::enter");
     let earlier_error = components.get(name).and_then(|s| s.error.clone());
@@ -445,6 +458,36 @@ pub fn summary() -> String {
 static PROBES: Mutex<BTreeMap<String, bool>> = Mutex::new(BTreeMap::new());
 #[cfg(test)]
 static NET_PROBES: Mutex<BTreeMap<String, Option<i32>>> = Mutex::new(BTreeMap::new());
+/// The errno of socket(2) for UDP, MPTCP and netlink on each worker as it
+/// finished entry, or `None` for one that opened.
+#[cfg(test)]
+static SOCKET_PROBES: Mutex<BTreeMap<String, [Option<i32>; 3]>> = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+fn probe_sockets() -> [Option<i32>; 3] {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::libc;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        [
+            (libc::AF_INET, libc::SOCK_DGRAM, 0),
+            (libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_MPTCP),
+            (libc::AF_NETLINK, libc::SOCK_RAW, 0),
+        ]
+        .map(|(domain, kind, protocol)| {
+            // SAFETY: socket takes three integers and reads no memory of ours.
+            let fd = unsafe { libc::socket(domain, kind, protocol) };
+            if fd < 0 {
+                return std::io::Error::last_os_error().raw_os_error();
+            }
+            // SAFETY: socket just returned this descriptor and nothing else
+            // owns it.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            None
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    [None; 3]
+}
 /// What the thread that last called [`fail`] for each name held then.
 #[cfg(all(test, target_os = "linux"))]
 static FAILED_HOLDING: Mutex<BTreeMap<String, caps::CapsHashSet>> = Mutex::new(BTreeMap::new());
@@ -688,18 +731,31 @@ mod tests {
         std::io::Read::read_to_string(&mut scrape, &mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let net = NET_PROBES.lock().unwrap().clone();
-        for name in [
-            "keylog",
-            "metrics-listener",
-            "metrics-client",
-            "boundary-check",
-            "capture",
-        ] {
+        for name in ["keylog", "metrics-listener", "boundary-check", "capture"] {
             assert_eq!(
                 net.get(name),
                 Some(&Some(nix::libc::EACCES)),
                 "actual {name} worker could connect: {net:?}"
             );
+        }
+        // The last metrics-client served that scrape. It started on the
+        // listener's thread and inherited the filter, so its probe stops at
+        // socket(2), before Landlock's deny.
+        assert_eq!(
+            net.get("metrics-client"),
+            Some(&Some(nix::libc::EPERM)),
+            "{net:?}"
+        );
+        // The no-socket workers get EPERM for every family, and the parser
+        // threads without the filter do not.
+        let sockets = SOCKET_PROBES.lock().unwrap().clone();
+        let eperm = Some(nix::libc::EPERM);
+        for name in ["keylog", "metrics-listener", "metrics-client", "capture"] {
+            assert_eq!(sockets.get(name), Some(&[eperm; 3]), "{name}");
+        }
+        for name in ["connections", "whois"] {
+            let [udp, _, netlink] = sockets[name];
+            assert_eq!((udp, netlink), (None, None), "{name}");
         }
         // The online GeoIP worker is on its way out, so it is not held to
         // connecting here.
