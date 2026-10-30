@@ -140,7 +140,8 @@ mod tests {
             .filter(|&&(_, _, sockets)| sockets)
             .map(|&(name, _, _)| name)
             .collect();
-        assert_eq!(listed, filtered.join("\n"));
+        // `lines`, because a Windows checkout has CRLF endings.
+        assert_eq!(listed.lines().collect::<Vec<_>>(), filtered);
     }
 
     /// The name each `worker::` spawn, entry or relinquish call under `src`
