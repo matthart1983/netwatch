@@ -91,8 +91,12 @@ the machine. The result is the top-level `landlock` object, null off Linux:
 `lsm=` list), `not_built`, or `unknown` if the check could not ask. `errata` lists
 the fixes the kernel reports, by the numbers in the kernel's Landlock documentation.
 `tcp_bind` and `tcp_connect` are `denied`, `allowed` or `error`, for any other
-outcome. In a live session `parser_check` comes from a parser worker's entry report
+outcome. In a session's log `parser_check` comes from a parser worker's entry report
 and no connection is tried, so it says what the layer enforced.
+
+`protections` is empty and `tasks_holding_net_raw` is null in that report, because
+static doctor runs no session. [Where each value can be read](#where-each-value-can-be-read)
+says where those are.
 
 The `landlock` capability sums that up:
 
@@ -106,7 +110,9 @@ The `landlock` capability sums that up:
 | `disabled` | `sandbox_disabled` | The configuration turns the sandbox off. The object above still says what the kernel offers. |
 | `unavailable` | `platform_unsupported` | Not Linux. |
 
-Each entry in `protections` describes one thread:
+Each entry in `protections` describes one thread. Static doctor has none, and
+`--check-capture` has one, `capture-check`. A session's log has one for main and for
+each worker:
 
 | Field | Meaning |
 | --- | --- |
@@ -119,8 +125,9 @@ Each entry in `protections` describes one thread:
 
 The top-level `tasks_holding_net_raw` is process-wide, because capabilities are per
 thread and only a session has threads to audit. It lists `{tid, comm}` for each
-thread that held CAP_NET_RAW when startup audited the process. It is empty in a
-daemon session with the sandbox on, and null in doctor and off Linux.
+thread that held CAP_NET_RAW when startup audited the process. It is null in every
+`doctor` report, `--check-capture` included, and off Linux. A session's log has the
+real list, which is empty in a daemon session with the sandbox on.
 
 `network_restricted` stays false. It describes the whole process, and main and the
 network workers keep the network.
@@ -128,6 +135,35 @@ network workers keep the network.
 As root, the `sandbox` capability's detail and Settings say `running as root:
 containment limited`. Root still owns most files whatever the sandbox does, and
 [SECURITY.md](../SECURITY.md) scopes sandbox escapes to non-root runs.
+
+## Where each value can be read
+
+No command prints a running session's snapshot as JSON. `doctor` is a separate
+process and cannot see into one, so a session reports on itself in Settings and in
+its log:
+
+| Value | `doctor --json` | `doctor --json --check-capture` | Settings in a session | Session log | `scripts/capture-authority-audit.sh` |
+| --- | --- | --- | --- | --- | --- |
+| `landlock` object | The disposable thread's check | The same check | No | From a parser worker's entry report | No |
+| `landlock` capability | Yes | Yes | No | No | No |
+| `protections` | `[]` | One entry, `capture-check` | Totals only: `TCP denied on N/M parser workers`, `N/M worker entries verified`, and a row for up to three workers with a warning | `main`, and every worker that has started | No |
+| `tasks_holding_net_raw` | `null` | `null` | No | The list startup's audit found | Reads every task's four sets from `/proc/<pid>/task` itself, and holds the log's list to being empty |
+| CAP_NET_RAW on main | No | No | `CAP_NET_RAW kept on main` or `dropped once capture opened` | `capture_authority` on `main` | The same `/proc` read |
+| `socket_filter` | No | On `capture-check` | Only if skipped: `no-socket filter skipped` | On each worker | No |
+
+A daemon or TUI session writes the log line once, when its first health cycle has
+started its workers, five ticks in:
+
+```sh
+grep 'session protections' ~/.cache/netwatch/netwatch.log.* | tail -1 | sed 's/.*report=//' | jq .
+```
+
+It holds `landlock`, `protections` and `tasks_holding_net_raw`. It is `info` on the
+target `netwatch::sandbox`, which the default log filter keeps, so a `RUST_LOG` that
+leaves that target out drops it. A session that ends before those five ticks writes
+none. A worker that starts later, such as a Diagnose probe or an export, is not in it.
+The audit script needs a user namespace and runs a daemon of its own, so it checks
+this build rather than a session you already have.
 
 ## Output contract
 

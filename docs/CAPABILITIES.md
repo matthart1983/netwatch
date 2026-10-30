@@ -75,8 +75,9 @@ The [sandbox reference](REFERENCE.md#landlock-sandbox-linux) documents current
 worker entry enforcement and exact file/dedicated-directory grants. eBPF loads
 inside the policy; the SDK reader inherits it but keeps the load capabilities
 until it has an entry hook of its own.
-On Linux, network policy is per thread: the table above says which, and `netwatch
-doctor --json` says what this kernel enforced. Linux tests cover actual lookup,
+On Linux, network policy is per thread: the table above says which, `netwatch doctor
+--json` says what a parser thread gets on this kernel, and a session's log what each
+of its threads got. Linux tests cover actual lookup,
 Insights and keylog entries, keylog restart, export access, symlink replacement and
 strict entry rejection. Privileged capture/restart and cross-platform acceptance remain pending.
 Managed workers have a shared shutdown deadline; an in-flight blocking operation

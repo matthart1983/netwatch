@@ -1361,6 +1361,9 @@ impl App {
             if self.ui.view_mode == ViewMode::Dense {
                 self.tcp_info.update();
             }
+            // Every worker a tick starts has now started once, and
+            // `worker::spawn` returns only after its entry.
+            crate::runtime::bootstrap::log_protections(self);
         }
 
         self.tick_diagnose();

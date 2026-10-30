@@ -426,8 +426,12 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink |
   | Capture, keylog, metrics listener and client | Denied from Linux 6.7 | EPERM |
 
-  `netwatch doctor --json` reports the kernel's and the enforced Landlock ABI, and
-  each thread's `network_policy`. A kernel below Linux 6.7 runs best-effort without
+  `netwatch doctor --json` reports the kernel's ABI and what a parser thread enforces
+  on it. What each thread of a running session got, its `network_policy` included, is
+  in that session's log, and Settings has the totals; `doctor` shows `protections`
+  empty and `tasks_holding_net_raw` null
+  ([where each value can be read](doctor.md#where-each-value-can-be-read)). A kernel
+  below Linux 6.7 runs best-effort without
   the deny and refuses `--sandbox-strict`. A denied thread still has other routes:
   UDP, ICMP and netlink on threads with socket(2), any descriptor opened earlier, and
   the rest of the [threat model's list](THREAT-MODEL.md#what-containment-does-not-cover).

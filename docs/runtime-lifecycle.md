@@ -119,8 +119,10 @@ These API changes also apply to library consumers; eBPF smoke examples are updat
 
 “Authority” below describes resource requirements or inherited authority, not proof
 of its successful removal. Existing-thread confinement remains incomplete. Network
-policy is the role in [`sandbox/roles.rs`](../src/sandbox/roles.rs), and `netwatch
-doctor --json` reports what each thread got. A TCP deny needs Linux 6.7 and is not a
+policy is the role in [`sandbox/roles.rs`](../src/sandbox/roles.rs), and a session's
+log says what each thread got
+([where each value can be read](doctor.md#where-each-value-can-be-read)). A TCP deny
+needs Linux 6.7 and is not a
 wall: [the threat model](THREAT-MODEL.md#what-containment-does-not-cover) lists what
 gets past it.
 

@@ -7,7 +7,9 @@
 # v0/v1, starts the daemon capturing on v0, and reads /proc/<pid>/task. Passes when
 # no task holds CAP_NET_RAW or CAP_NET_ADMIN in any of its four sets and
 # /proc/<pid>/net/packet still lists a socket on v0: capture keeps the descriptor
-# it opened, and nothing can open another. Prints what it found either way.
+# it opened, and nothing can open another. Then it reads the line the session writes
+# to its own log about the same thing, and the two have to agree. Prints what it found
+# either way.
 #
 # tests/capture_authority.rs measures the same on threads it can reach into. This
 # is the same claim for the binary as shipped, its tokio runtime and logging
@@ -42,8 +44,8 @@ trap cleanup EXIT
 
 mkdir -p "$HOME_DIR/config/netwatch"
 printf 'capture_interface = "v0"\n' >"$HOME_DIR/config/netwatch/config.toml"
-HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/config" XDG_CACHE_HOME="$HOME_DIR/cache" \
-  XDG_STATE_HOME="$HOME_DIR/state" "$NETWATCH" daemon \
+env -u RUST_LOG HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/config" \
+  XDG_CACHE_HOME="$HOME_DIR/cache" XDG_STATE_HOME="$HOME_DIR/state" "$NETWATCH" daemon \
   >"$HOME_DIR/daemon.out" 2>&1 &
 DAEMON_PID=$!
 
@@ -105,4 +107,20 @@ if [ "$HOLDING" -ne 0 ] || [ "$PACKET_ON_V0" -eq 0 ]; then
   cat "$HOME_DIR/daemon.out" >&2
   exit 1
 fi
+
+# The daemon's own report comes after its first health cycle, a few ticks in.
+session_report() {
+  cat "$HOME_DIR/cache/netwatch/netwatch.log."* 2>/dev/null | grep 'session protections' || true
+}
+for _ in $(seq 1 100); do
+  [ -n "$(session_report)" ] && break
+  sleep 0.1
+done
+daemon_is_running
+REPORT="$(session_report)"
+if ! grep -q '"tasks_holding_net_raw":\[\]' <<<"$REPORT"; then
+  echo "FAIL: the session's log disagrees: ${REPORT:-no session protections line}" >&2
+  exit 1
+fi
+echo "session log: tasks_holding_net_raw empty, $(grep -o '"component":' <<<"$REPORT" | wc -l) protections, $(grep -o '"network_policy":"denied"' <<<"$REPORT" | wc -l) denied"
 echo "capture authority audit: pass"

@@ -29,8 +29,16 @@ All notable changes to NetWatch will be documented in this file.
   `landlock_not_built`, `self_test_failed`, `sandbox_disabled` or
   `platform_unsupported`. Each protection gains `landlock_kernel_abi`,
   `network_policy`, `landlock_restrictions`, `capture_authority` and
-  `socket_filter`, and a live snapshot gains `tasks_holding_net_raw`. All of this is
-  additive, and the JSON stays `schema_version` 1. Settings puts what it found on
+  `socket_filter`, and the snapshot gains `tasks_holding_net_raw`. All of this is
+  additive, and the JSON stays `schema_version` 1. `doctor` runs no session, so
+  `protections` is empty there, or the one capture check, and `tasks_holding_net_raw`
+  is null.
+- **A daemon or TUI session writes its sandbox report to its log.** Once, about five
+  ticks in, one `session protections` line gives each worker's protection and the
+  threads the startup audit found holding CAP_NET_RAW. No command prints these, so
+  until now a running session's per-thread results could not be read at all. The log's
+  default filter now keeps `info` on `netwatch::sandbox` for this.
+  `docs/doctor.md` says where each value can be read. Settings puts what it found on
   rows of its own, such as `TCP denied on 13/13 parser workers`, so none of it runs
   off the end of the popup.
 - **Doctor and Settings say `running as root: containment limited`** when netwatch

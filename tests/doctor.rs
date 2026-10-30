@@ -516,6 +516,110 @@ fn doctor_says_when_running_as_root() {
     assert!(detail.contains(NOTE), "{detail}");
 }
 
+fn namespace_with_loopback() -> bool {
+    Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--net",
+            "ip",
+            "link",
+            "set",
+            "lo",
+            "up",
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// `netwatch daemon` writes its sandbox report to its log once, which is where
+/// docs/doctor.md sends a reader for what no JSON command prints. Runs where it
+/// can make a network namespace, so its probes reach nothing, and the sandbox lab
+/// runs it there. Capture cannot open the missing interface, so this also shows
+/// what a worker that never entered reads.
+#[test]
+fn a_session_logs_its_sandbox_report_once() {
+    if !namespace_with_loopback() {
+        eprintln!("skipped: no user and network namespace with lo up");
+        return;
+    }
+    assert!(
+        include_str!("../docs/doctor.md").contains("grep 'session protections'"),
+        "docs/doctor.md no longer says how to find this line"
+    );
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("config/netwatch/config.toml"),
+        "refresh_rate_ms = 100\ncapture_interface = \"netwatch-missing\"\n",
+    )
+    .unwrap();
+    let program = std::ffi::OsStr::new(env!("CARGO_BIN_EXE_netwatch"));
+    let mut daemon = in_namespace(
+        &fixture,
+        r#"ip link set lo up && exec "$0" daemon"#,
+        program,
+    )
+    .env_remove("RUST_LOG")
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+    let logged = || -> Vec<String> {
+        let dir = fixture.0.join("cache/netwatch");
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("netwatch.log")
+            })
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter(|line| line.contains("session protections"))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while logged().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Long enough for several more health cycles at this tick rate.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let lines = logged();
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let report: serde_json::Value = lines[0]
+        .split_once("report=")
+        .and_then(|(_, json)| serde_json::from_str(json).ok())
+        .unwrap_or_else(|| panic!("{}", lines[0]));
+    assert_eq!(report["tasks_holding_net_raw"], serde_json::json!([]));
+    let protection = |name: &str| {
+        report["protections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["component"] == name)
+            .unwrap_or_else(|| panic!("no {name}: {report}"))
+    };
+    assert_eq!(protection("capture")["network_policy"], "not_entered");
+    assert_eq!(protection("main")["network_policy"], "allowed");
+    // A worker the first ticks start, not one startup does. It starts from a main
+    // that has dropped CAP_NET_RAW, so it never held it.
+    assert_eq!(protection("process-cpu")["capture_authority"], "not_held");
+    assert_eq!(protection("health")["network_policy"], "allowed");
+    if report["landlock"]["kernel_abi"].as_u64().unwrap() >= 4 {
+        assert_eq!(protection("connections")["network_policy"], "denied");
+        assert_eq!(report["landlock"]["parser_check"]["tcp_connect"], "denied");
+    }
+}
+
 /// A live daemon session, in this test's own process: the snapshot Settings
 /// reads. The harness's main thread started before the session and never
 /// enters, so it is the one thread the audit may name. Holding CAP_NET_RAW
@@ -534,19 +638,7 @@ fn live_snapshot_reports_capture_authority_and_tasks_holding_net_raw() {
             exe.as_os_str(),
         );
         command.env(CHILD, "1");
-        let probe = Command::new("unshare")
-            .args([
-                "--user",
-                "--map-root-user",
-                "--net",
-                "ip",
-                "link",
-                "set",
-                "lo",
-                "up",
-            ])
-            .output();
-        if !probe.is_ok_and(|o| o.status.success()) {
+        if !namespace_with_loopback() {
             eprintln!("skipped: no user and network namespace with lo up");
             return;
         }

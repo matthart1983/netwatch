@@ -63,8 +63,10 @@ Capture's layer also handles every filesystem right and takes only the read rows
 of the grants table, so the capture thread can write nothing. Strict mode requires
 the TCP part and refuses to start below ABI 4; best-effort logs one line and runs
 without it. The other parts are taken where the kernel has them, so these numbers
-alone do not establish what a kernel enforced; `netwatch doctor --json` reports
-that, per thread and for the kernel. See
+alone do not establish what a kernel enforced. `netwatch doctor --json` reports what
+a parser thread enforces on this kernel, and a running session's log says what each of
+its threads got ([where each value can be read](doctor.md#where-each-value-can-be-read)).
+See
 [ruleset construction](../src/sandbox/linux.rs#L466) and
 [layer entry](../src/sandbox/linux.rs#L682).
 

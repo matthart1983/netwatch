@@ -167,7 +167,8 @@ pub struct CapabilitySnapshot {
     #[serde(default)]
     pub landlock: Option<Landlock>,
     /// Process-wide, from the audit at startup. Null in doctor, which starts
-    /// no session to audit, and off Linux.
+    /// no session to audit, and off Linux. A session writes it to its log, which
+    /// is the only place to read it.
     #[serde(default)]
     pub tasks_holding_net_raw: Option<Vec<NetRawTask>>,
 }
@@ -362,6 +363,16 @@ impl CapabilitySnapshot {
             self.get("attribution").state.label(),
             self.get("sandbox").state.label()
         )
+    }
+    /// The sandbox part of a snapshot as one line of JSON, for the session log:
+    /// `landlock`, `protections` and `tasks_holding_net_raw`.
+    pub fn sandbox_json(&self) -> String {
+        serde_json::json!({
+            "landlock": self.landlock,
+            "protections": self.protections,
+            "tasks_holding_net_raw": self.tasks_holding_net_raw,
+        })
+        .to_string()
     }
     /// A line for Settings when the connection table is not read from `ss`,
     /// state first. It is a row of its own: appended to [`Self::compact`],
