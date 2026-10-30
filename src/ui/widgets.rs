@@ -629,6 +629,23 @@ pub fn capture_failure(app: &App) -> Option<String> {
         .filter(|_| !app.diagnose.is_demo())
 }
 
+/// `rows` off the top of `area`, and what is left. Taken before a [`Layout`]
+/// runs, so that rows the content depends on are rows the solver cannot shrink.
+pub fn take_top(area: Rect, rows: u16) -> (Rect, Rect) {
+    let rows = rows.min(area.height);
+    (
+        Rect {
+            height: rows,
+            ..area
+        },
+        Rect {
+            y: area.y + rows,
+            height: area.height - rows,
+            ..area
+        },
+    )
+}
+
 /// The header's capture-failure rows at `width`: what failed and, for a
 /// refused open, the fix (see [`crate::platform::capture_fix`]).
 ///

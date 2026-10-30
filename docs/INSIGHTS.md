@@ -61,8 +61,8 @@ profile for this prompt.
 
 The configured endpoint receives the snapshot. A remote URL sends it off-host;
 plain HTTP provides no transport encryption. Netwatch marks an `http://` endpoint
-that is not on this host as `cleartext, off-host`: a line on the Diagnose page,
-with or without an open issue, a label on the AI Endpoint row in Settings, and in
+that is not on this host as `cleartext, off-host`: a line under the verdict on the
+Diagnose page, with or without an open issue, a label on the AI Endpoint row in Settings, and in
 `netwatch doctor`, `insights` as degraded with reason `cleartext_off_host`. It warns
 and still sends; there is no key to refuse. An `http://` URL it cannot read as
 this host is marked too. Loopback addresses, `localhost` and `https://` carry no

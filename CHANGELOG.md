@@ -619,8 +619,8 @@ All notable changes to NetWatch will be documented in this file.
   carries DNS names, peer addresses and packet summaries across the network
   unencrypted, and only docs/INSIGHTS.md said so. `--remote` refuses the same
   setup unless told otherwise. The Diagnose page now carries a `cleartext,
-  off-host` line while Insights is on, whether or not an issue is open, the AI
-  Endpoint row in Settings leads with the same words, and `netwatch doctor`
+  off-host` line under the verdict while Insights is on, whatever the page
+  shows and however short the terminal, the AI Endpoint row in Settings leads with the same words, and `netwatch doctor`
   reports `insights` as degraded with reason `cleartext_off_host`. netwatch
   still sends: there is no new key, and Insights stays experimental. A
   loopback address, `localhost` and `https://` carry no mark.
