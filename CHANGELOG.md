@@ -113,7 +113,8 @@ All notable changes to NetWatch will be documented in this file.
   newest feature in force: 3 for main and the network workers, and 9 for parser and
   capture threads on Linux 7.1. Anything reading it for the kernel's version should
   read the new `landlock_kernel_abi`. A Landlock that cannot enforce now says why,
-  naming ENOSYS, EOPNOTSUPP or the ABI, rather than "present but not enforced".
+  naming ENOSYS or a seccomp profile, EOPNOTSUPP or the ABI, rather than "present but
+  not enforced".
   `network_restricted` stays false, because it describes the whole process.
 - **`caps_dropped` and `caps_retained` in doctor's protections hold different
   values.** They name each capability where they used to say `CAP_OTHER`. Under root

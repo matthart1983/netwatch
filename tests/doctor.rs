@@ -452,6 +452,30 @@ fn doctor_degrades_without_landlock() {
     );
 }
 
+/// The EPERM a container's seccomp profile can return. The landlock crate cannot
+/// tell that from a kernel without Landlock, so the reason stays and the wording
+/// has to allow for both.
+#[test]
+fn doctor_does_not_blame_the_kernel_for_a_seccomp_profile() {
+    let fixture = Fixture::new();
+    let mut command = fixture.command();
+    without_landlock(&mut command, nix::libc::EPERM);
+    let snapshot = static_snapshot(&mut command);
+    assert_eq!(
+        snapshot.landlock.as_ref().unwrap().availability,
+        "not_built"
+    );
+    let capability = snapshot.get("landlock");
+    assert_eq!(capability.reason, "landlock_not_built");
+    assert!(
+        capability.detail.contains("seccomp profile"),
+        "{}",
+        capability.detail
+    );
+    let next = capability.next_check.as_deref().unwrap_or_default();
+    assert!(next.contains("seccomp profile"), "{next}");
+}
+
 #[test]
 fn doctor_reports_landlock_not_enabled() {
     use netwatch::runtime::capabilities::State;

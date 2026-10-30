@@ -198,8 +198,9 @@ pub struct PlatformReport {
     pub landlock_abi: u32,
     /// Linux: the ABI the kernel reports, 0 without Landlock.
     pub landlock_kernel_abi: u32,
-    /// Linux: `available`, `not_enabled` or `not_built`. `None` before the
-    /// kernel has been asked, or when the layer could not be built to ask.
+    /// Linux: `available`, `not_enabled` or `not_built`, which a seccomp profile
+    /// blocking Landlock also reads as. `None` before the kernel has been asked, or
+    /// when the layer could not be built to ask.
     pub landlock_availability: Option<&'static str>,
     /// Linux: connect(2) and bind(2) on TCP sockets denied on this thread by
     /// its parser or capture layer. The network stays reachable: UDP, MPTCP,

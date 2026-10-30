@@ -768,7 +768,8 @@ fn kernel_abi(status: &LandlockStatus) -> u32 {
 }
 
 /// `available`, `not_enabled` (built in, left out of the boot's LSM list) or
-/// `not_built`.
+/// `not_built`. The crate maps every errno but EOPNOTSUPP to `NotImplemented`, so
+/// `not_built` is also a container's seccomp profile returning EPERM.
 fn availability(status: &LandlockStatus) -> &'static str {
     match status {
         LandlockStatus::Available { .. } => "available",
@@ -781,7 +782,9 @@ fn availability(status: &LandlockStatus) -> &'static str {
 fn not_enforced_reason(status: &LandlockStatus) -> String {
     match status {
         LandlockStatus::NotImplemented => {
-            "Landlock not enforced: this kernel has none (ENOSYS)".into()
+            "Landlock not enforced: this kernel has none (ENOSYS), or something such as a \
+             container's seccomp profile blocks it"
+                .into()
         }
         LandlockStatus::NotEnabled => {
             "Landlock not enforced: built in but not enabled at boot (EOPNOTSUPP)".into()
@@ -1313,6 +1316,7 @@ mod tests {
     fn not_enforced_names_the_reason() {
         let reason = not_enforced_reason(&LandlockStatus::NotImplemented);
         assert!(reason.contains("ENOSYS"), "{reason}");
+        assert!(reason.contains("seccomp profile"), "{reason}");
         let reason = not_enforced_reason(&LandlockStatus::NotEnabled);
         assert!(reason.contains("EOPNOTSUPP"), "{reason}");
         let reason = not_enforced_reason(&LandlockStatus::Available {

@@ -88,7 +88,9 @@ the machine. The result is the top-level `landlock` object, null off Linux:
 ```
 
 `availability` is `available`, `not_enabled` (built into the kernel, left out of its
-`lsm=` list), `not_built`, or `unknown` if the check could not ask. `errata` lists
+`lsm=` list), `not_built`, or `unknown` if the check could not ask. `not_built` also
+covers something such as a container's seccomp profile blocking Landlock's syscalls:
+the crate netwatch uses reads any errno but `EOPNOTSUPP` as a kernel without it. `errata` lists
 the fixes the kernel reports, by the numbers in the kernel's Landlock documentation.
 `tcp_bind` and `tcp_connect` are `denied`, `allowed` or `error`, for any other
 outcome. In a session's log `parser_check` comes from a parser worker's entry report
@@ -105,7 +107,7 @@ The `landlock` capability sums that up:
 | `ready` | `parser_network_denied` | The kernel denied a parser thread TCP bind and connect. |
 | `degraded` | `kernel_abi_below_4` | The kernel cannot deny TCP (Linux older than 6.7). Parser threads keep the network, and `--sandbox-strict` refuses to start. |
 | `unavailable` | `landlock_not_enabled` | Built in but not enabled at boot (`EOPNOTSUPP`). |
-| `unavailable` | `landlock_not_built` | The kernel has no Landlock (`ENOSYS`). |
+| `unavailable` | `landlock_not_built` | The kernel has no Landlock (`ENOSYS`), or something such as a container's seccomp profile blocks it. Netwatch cannot tell which. |
 | `unavailable` | `self_test_failed` | The kernel can deny TCP and the check did not see it do so. |
 | `disabled` | `sandbox_disabled` | The configuration turns the sandbox off. The object above still says what the kernel offers. |
 | `unavailable` | `platform_unsupported` | Not Linux. |

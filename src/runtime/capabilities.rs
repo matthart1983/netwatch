@@ -127,7 +127,9 @@ impl Protection {
 pub struct Landlock {
     /// The ABI the kernel reports, 0 without Landlock.
     pub kernel_abi: u32,
-    /// `available`, `not_enabled`, `not_built` or `unknown`.
+    /// `available`, `not_enabled`, `not_built` or `unknown`. `not_built` also
+    /// covers a seccomp profile blocking the syscalls with any errno but
+    /// EOPNOTSUPP: the landlock crate reports both the same way.
     pub availability: String,
     /// The errata the kernel reports fixed, by the numbers in the kernel's
     /// documentation.
@@ -756,8 +758,8 @@ fn landlock_capability(
             return (
                 State::Unavailable,
                 "landlock_not_built",
-                "This kernel has no Landlock (ENOSYS); parser threads keep the network".into(),
-                Some("Use a kernel built with CONFIG_SECURITY_LANDLOCK"),
+                "This kernel has no Landlock (ENOSYS), or something such as a container's seccomp profile blocks it; parser threads keep the network".into(),
+                Some("Use a kernel built with CONFIG_SECURITY_LANDLOCK, or allow syscalls 444-446 in the seccomp profile"),
             )
         }
         _ => {}
