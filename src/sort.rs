@@ -10,7 +10,7 @@ pub struct SortColumn {
     pub name: &'static str,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TabSortState {
     pub column: usize,
     pub ascending: bool,
@@ -18,9 +18,20 @@ pub struct TabSortState {
 
 // -- comparator helpers used by per-tab sort functions --
 
-/// Compare two "host:port" address strings by parsed IP octets, then port.
+/// A "host:port" address string as [`cmp_ip_addr`] orders it, for a sort that
+/// parses each address once rather than twice per comparison.
+///
+/// The variants are in sort order: wildcard or unparseable addresses before
+/// any real IP, and IPv4 before IPv6.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IpSortKey<'a> {
+    Unparsed(&'a str, u16),
+    V4([u8; 4], u16),
+    V6([u8; 16], u16),
+}
+
 /// Handles IPv4 ("1.2.3.4:80"), IPv6 ("[::1]:80"), and wildcard ("*:*").
-pub fn cmp_ip_addr(a: &str, b: &str) -> Ordering {
+pub fn ip_sort_key(s: &str) -> IpSortKey<'_> {
     fn parse_host_port(s: &str) -> (Option<IpAddr>, u16) {
         if s == "*:*" || s.is_empty() {
             return (None, 0);
@@ -52,21 +63,16 @@ pub fn cmp_ip_addr(a: &str, b: &str) -> Ordering {
         (s.parse::<IpAddr>().ok(), 0)
     }
 
-    let (ip_a, port_a) = parse_host_port(a);
-    let (ip_b, port_b) = parse_host_port(b);
+    match parse_host_port(s) {
+        (None, port) => IpSortKey::Unparsed(s, port),
+        (Some(IpAddr::V4(ip)), port) => IpSortKey::V4(ip.octets(), port),
+        (Some(IpAddr::V6(ip)), port) => IpSortKey::V6(ip.octets(), port),
+    }
+}
 
-    // None (wildcard/unparseable) sorts before any real IP
-    let ip_ord = match (ip_a, ip_b) {
-        (None, None) => a.cmp(b),
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(IpAddr::V4(a4)), Some(IpAddr::V4(b4))) => a4.octets().cmp(&b4.octets()),
-        (Some(IpAddr::V6(a6)), Some(IpAddr::V6(b6))) => a6.octets().cmp(&b6.octets()),
-        // IPv4 sorts before IPv6
-        (Some(IpAddr::V4(_)), Some(IpAddr::V6(_))) => Ordering::Less,
-        (Some(IpAddr::V6(_)), Some(IpAddr::V4(_))) => Ordering::Greater,
-    };
-    ip_ord.then_with(|| port_a.cmp(&port_b))
+/// Compare two "host:port" address strings by parsed IP octets, then port.
+pub fn cmp_ip_addr(a: &str, b: &str) -> Ordering {
+    ip_sort_key(a).cmp(&ip_sort_key(b))
 }
 
 /// Compare two bare IP address strings (no port) by parsed octets.
@@ -95,9 +101,41 @@ pub fn cmp_case_insensitive(a: &str, b: &str) -> Ordering {
     lower_ord.then_with(|| a.cmp(b))
 }
 
+/// A string as [`cmp_case_insensitive`] orders it, for a sort that lowers each
+/// string once rather than on every comparison. The lowered text is built from
+/// `char::to_lowercase`, as that comparison is, because `str::to_lowercase`
+/// also treats a word-final sigma specially and would order some names apart.
+pub fn case_insensitive_key(s: &str) -> (String, &str) {
+    (s.chars().flat_map(char::to_lowercase).collect(), s)
+}
+
 /// Compare two f64 values with total ordering (NaN sorts after infinity).
 pub fn cmp_f64(a: f64, b: f64) -> Ordering {
     a.total_cmp(&b)
+}
+
+/// An f64 as [`cmp_f64`] orders it, for use in a sort key.
+#[derive(Debug, Clone, Copy)]
+pub struct TotalF64(pub f64);
+
+impl PartialEq for TotalF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for TotalF64 {}
+
+impl PartialOrd for TotalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TotalF64 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        cmp_f64(self.0, other.0)
+    }
 }
 
 /// Apply sort direction: if descending, reverse the ordering.
@@ -106,5 +144,74 @@ pub fn apply_direction(ord: Ordering, ascending: bool) -> Ordering {
         ord
     } else {
         ord.reverse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The keys are what a cached sort compares in place of these functions,
+    /// so a pair must come out the same either way.
+    #[test]
+    fn sort_keys_order_as_their_comparators_do() {
+        let addrs = [
+            "",
+            "*:*",
+            "*:443",
+            "0.0.0.0:*",
+            "1.2.3.4",
+            "1.2.3.4:80",
+            "1.2.3.4:443",
+            "1.2.3.5:80",
+            "10.0.0.1:80",
+            "[::]:*",
+            "[::1]:80",
+            "[::1]:443",
+            "[2001:db8::1]:80",
+            "::1",
+            "example.com:80",
+            "example.com:443",
+            "not an address",
+        ];
+        for a in addrs {
+            for b in addrs {
+                assert_eq!(
+                    ip_sort_key(a).cmp(&ip_sort_key(b)),
+                    cmp_ip_addr(a, b),
+                    "{a} vs {b}"
+                );
+            }
+        }
+
+        // `Σ` lowers to `σ` a character at a time and to `ς` at a word's end
+        // through `str::to_lowercase`, and `ß` and `İ` change length.
+        let names = [
+            "", "curl", "Curl", "CURL", "curl2", "ΑΣ", "ας", "ασ", "ß", "SS", "İ", "i",
+        ];
+        for a in names {
+            for b in names {
+                assert_eq!(
+                    case_insensitive_key(a).cmp(&case_insensitive_key(b)),
+                    cmp_case_insensitive(a, b),
+                    "{a} vs {b}"
+                );
+            }
+        }
+
+        let rates = [
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            1.5,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for a in rates {
+            for b in rates {
+                assert_eq!(TotalF64(a).cmp(&TotalF64(b)), cmp_f64(a, b), "{a} vs {b}");
+            }
+        }
     }
 }

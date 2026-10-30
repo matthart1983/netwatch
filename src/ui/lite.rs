@@ -354,7 +354,9 @@ pub fn collect_talkers(app: &App) -> Vec<Talker> {
         let host_key = host_of(&c.remote_addr);
         // Prefer the SNI when DPI has it — `github.com` beats `140.82.121.4`.
         // There is no rDNS in netwatch, so without capture this stays an IP.
-        let display_host = sni_of(c).unwrap_or_else(|| host_key.clone());
+        let display_host = sni_of(c)
+            .map(str::to_string)
+            .unwrap_or_else(|| host_key.clone());
 
         let e = groups
             .entry((process.clone(), host_key.clone()))
@@ -425,10 +427,10 @@ fn host_of(addr: &str) -> String {
 ///
 /// `pub(crate)` so Dense resolves hostnames the same way — a table of bare
 /// IPs where the other views show names is the same data rendered worse.
-pub(crate) fn sni_of(c: &crate::collectors::connections::Connection) -> Option<String> {
+pub(crate) fn sni_of(c: &crate::collectors::connections::Connection) -> Option<&str> {
     use crate::dpi::AppProtocol::{Quic, Tls};
     match &c.app_protocol {
-        Some(Tls { sni: Some(s), .. }) | Some(Quic { sni: Some(s), .. }) => Some(s.clone()),
+        Some(Tls { sni: Some(s), .. }) | Some(Quic { sni: Some(s), .. }) => Some(s),
         _ => None,
     }
 }

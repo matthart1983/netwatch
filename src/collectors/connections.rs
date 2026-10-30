@@ -113,15 +113,20 @@ fn stream_protocol(p: &str) -> Option<StreamProtocol> {
 }
 
 fn parse_host_port(addr: &str) -> Option<(String, u16)> {
+    let (host, port) = split_host_port(addr)?;
+    Some((normalize_ip(host), port))
+}
+
+/// An address's host, as printed, and port.
+fn split_host_port(addr: &str) -> Option<(&str, u16)> {
     if addr.is_empty() || addr == "*:*" {
         return None;
     }
     // Bracketed IPv6: [::1]:8080
     if let Some(stripped) = addr.strip_prefix('[') {
         let bracket_end = stripped.find("]:")?;
-        let ip = normalize_ip(&stripped[..bracket_end]);
         let port: u16 = stripped[bracket_end + 2..].parse().ok()?;
-        return Some((ip, port));
+        return Some((&stripped[..bracket_end], port));
     }
     // Plain IPv4 or unbracketed IPv6 (ss sometimes prints the latter).
     // The last colon separates port from host.
@@ -131,7 +136,7 @@ fn parse_host_port(addr: &str) -> Option<(String, u16)> {
         return None;
     }
     let port: u16 = addr[colon + 1..].parse().ok()?;
-    Some((normalize_ip(host), port))
+    Some((host, port))
 }
 
 /// The address as packet capture reports it, so the row keys to its stream:
@@ -177,17 +182,32 @@ fn udp_app_protocols_by_local(
     by_local
 }
 
+/// Whether [`connection_stream_key`] finds a key for this row, so whether it
+/// could show a rate, without building one: a draw asks of every row.
+pub(crate) fn has_stream_key(conn: &Connection) -> bool {
+    stream_protocol(&conn.protocol).is_some()
+        && split_host_port(&conn.local_addr).is_some()
+        && split_host_port(&conn.remote_addr).is_some()
+}
+
 pub fn connection_stream_key(conn: &Connection) -> Option<(StreamKey, LocalSide)> {
-    let proto = stream_protocol(&conn.protocol)?;
-    let (l_ip, l_port) = parse_host_port(&conn.local_addr)?;
-    let (r_ip, r_port) = parse_host_port(&conn.remote_addr)?;
-    let key = StreamKey::new(proto, &l_ip, l_port, &r_ip, r_port);
-    let side = if key.addr_a == (l_ip, l_port) {
-        LocalSide::A
+    let protocol = stream_protocol(&conn.protocol)?;
+    let local = parse_host_port(&conn.local_addr)?;
+    let remote = parse_host_port(&conn.remote_addr)?;
+    // In the order `StreamKey::new` puts them, without copying them again.
+    let (addr_a, addr_b, side) = if local <= remote {
+        (local, remote, LocalSide::A)
     } else {
-        LocalSide::B
+        (remote, local, LocalSide::B)
     };
-    Some((key, side))
+    Some((
+        StreamKey {
+            protocol,
+            addr_a,
+            addr_b,
+        },
+        side,
+    ))
 }
 
 /// Holds the previous per-stream byte snapshot so we can compute rates.
@@ -965,18 +985,24 @@ impl ConnectionTimeline {
             tracked.is_active = false;
         }
 
+        // One key, rewritten for each row: nearly every row is already known,
+        // and needs no key of its own.
+        let mut key = ConnectionKey {
+            protocol: String::new(),
+            local_addr: String::new(),
+            remote_addr: String::new(),
+            pid: None,
+        };
         for conn in connections {
-            let key = ConnectionKey {
-                protocol: conn.protocol.clone(),
-                local_addr: conn.local_addr.clone(),
-                remote_addr: conn.remote_addr.clone(),
-                pid: conn.pid,
-            };
+            key.protocol.clone_from(&conn.protocol);
+            key.local_addr.clone_from(&conn.local_addr);
+            key.remote_addr.clone_from(&conn.remote_addr);
+            key.pid = conn.pid;
 
             if let Some(&idx) = self.known_keys.get(&key) {
                 let tracked = &mut self.tracked[idx];
                 tracked.last_seen = now;
-                tracked.state = conn.state.clone();
+                tracked.state.clone_from(&conn.state);
                 tracked.is_active = true;
             } else {
                 let idx = self.tracked.len();
@@ -988,7 +1014,7 @@ impl ConnectionTimeline {
                     last_seen: now,
                     is_active: true,
                 });
-                self.known_keys.insert(key, idx);
+                self.known_keys.insert(key.clone(), idx);
             }
         }
 
@@ -3844,6 +3870,39 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
         assert_eq!(key.addr_a, ("1.1.1.1".into(), 443));
         assert_eq!(key.addr_b, ("10.0.0.2".into(), 50000));
         assert_eq!(side, LocalSide::B);
+    }
+
+    #[test]
+    fn has_stream_key_agrees_with_connection_stream_key() {
+        let mut rows = crate::testutil::connections::synthetic_connections(200, 1);
+        for (local, remote, protocol) in [
+            ("*:*", "1.2.3.4:443", "TCP"),
+            ("", "1.2.3.4:443", "TCP"),
+            ("10.0.0.1:1", "*:443", "TCP"),
+            ("10.0.0.1:1", ":443", "TCP"),
+            ("10.0.0.1:1", "1.2.3.4", "UDP"),
+            ("10.0.0.1:1", "1.2.3.4:notaport", "TCP"),
+            ("10.0.0.1:1", "1.2.3.4:443", "ICMP"),
+            ("[::1]:1", "[::1]:443", "udp6"),
+            ("[::1]", "[::1]:443", "TCP"),
+            ("[::1]:1", "fe80::1]:443", "TCP"),
+        ] {
+            let mut row = rows[0].clone();
+            row.local_addr = local.into();
+            row.remote_addr = remote.into();
+            row.protocol = protocol.into();
+            rows.push(row);
+        }
+        for row in &rows {
+            assert_eq!(
+                has_stream_key(row),
+                connection_stream_key(row).is_some(),
+                "{} {} {}",
+                row.protocol,
+                row.local_addr,
+                row.remote_addr
+            );
+        }
     }
 
     #[test]

@@ -294,17 +294,20 @@ impl LiveSampler {
         Some(unix_secs(completed))
     }
 
-    /// The verdict this socket is currently carrying, if it has one.
+    /// The verdict each socket is currently carrying, by (local, remote), for
+    /// a surface that reads them across a whole table: built once, where a
+    /// lookup per row would format a key per row.
     ///
     /// Read by the surfaces that show a verdict column. They must not
     /// re-classify: `classify_socket` is cheap but the *age* of a verdict is
     /// not derivable from a single sample, and a column that disagreed with
     /// the Diagnose tab about what a socket is doing would be worse than no
     /// column at all.
-    pub fn verdict_for(&self, local: &str, remote: &str) -> Option<SocketVerdict> {
+    pub fn socket_verdicts(&self) -> HashMap<(&str, &str), SocketVerdict> {
         self.verdict_since
-            .get(&format!("{local} → {remote}"))
-            .map(|(v, _)| *v)
+            .iter()
+            .filter_map(|(key, (verdict, _))| Some((key.split_once(" → ")?, *verdict)))
+            .collect()
     }
 
     /// Apply a batch of readings to the store.

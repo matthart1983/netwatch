@@ -38,10 +38,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::collectors::connections::Connection;
 use crate::theme::Theme;
 use crate::ui::text::{self, truncate_end as truncate};
 use crate::ui::widgets::{format_bytes_rate, format_bytes_total};
 use paint::Ramps;
+use std::collections::{HashMap, VecDeque};
 
 // ── the grid ────────────────────────────────────────────────────────────────
 
@@ -667,6 +669,9 @@ struct IfRow {
     history: Vec<u64>,
 }
 
+/// `AppCaches::top_conn_history`: one rolling rate per (process, host).
+type TopConnHistory = HashMap<(String, String), VecDeque<u64>>;
+
 /// One row of the connection table.
 struct ConnRow {
     process: String,
@@ -687,49 +692,93 @@ struct ConnRow {
 }
 
 impl ConnRow {
-    /// A row nobody is talking on any more. Dims out rather than disappearing —
-    /// it is still a socket, it is just done. Linux and Windows spell states
-    /// as `ss` does (`TIME-WAIT`), macOS as lsof does (`TIME_WAIT`).
-    fn is_dead(&self) -> bool {
-        matches!(
-            self.state.as_str(),
-            "TIME_WAIT"
-                | "TIME-WAIT"
-                | "CLOSE_WAIT"
-                | "CLOSE-WAIT"
-                | "CLOSED"
-                | "FIN_WAIT1"
-                | "FIN_WAIT_1"
-                | "FIN-WAIT-1"
-                | "FIN_WAIT2"
-                | "FIN_WAIT_2"
-                | "FIN-WAIT-2"
-                | "LAST_ACK"
-                | "LAST-ACK"
-        )
+    fn new(history: &TopConnHistory, rank: &ConnRank) -> Self {
+        let c = rank.conn;
+        ConnRow {
+            process: rank.process.to_string(),
+            pid: c.pid,
+            host: rank.host.to_string(),
+            port: rank.port.to_string(),
+            proto: c.protocol.to_lowercase(),
+            rx_rate: c.rx_rate.unwrap_or(0.0),
+            tx_rate: c.tx_rate.unwrap_or(0.0),
+            rtt_ms: rtt_ms(c),
+            state: c.state.clone(),
+            retransmits: c.retransmits,
+            out_of_order: c.out_of_order,
+            app_proto: c
+                .app_protocol
+                .as_ref()
+                .map(|_| crate::ui::connections::render_app_protocol(&c.app_protocol)),
+            local: c.local_addr.clone(),
+            remote: c.remote_addr.clone(),
+            // The history cache is keyed by the *writer's* spelling of the
+            // host, brackets and all — use its own function rather than a
+            // second implementation that agrees only for IPv4.
+            history: history
+                .get(&(
+                    rank.process.to_string(),
+                    crate::app::top_conn_host(&c.remote_addr).to_string(),
+                ))
+                .map(|h| h.iter().copied().collect())
+                .unwrap_or_default(),
+        }
     }
 
-    /// The rate the table sorts on: the flow's recent average, not this tick's
-    /// reading.
-    ///
-    /// Sorting on the instantaneous rate makes the list dance. Two flows of
-    /// similar speed trade places every tick as their samples jitter, and
-    /// because the selection is an index rather than an identity, the detail
-    /// block above retargets to a different connection each time it happens —
-    /// measured at three swaps in five ticks with two active downloads.
-    ///
-    /// Averaging the last few samples is enough to settle it, and it is also
-    /// the more honest answer to "which flow is busiest": a single 250 ms
-    /// sample is noise, and the column header says `DOWN`, which is what this
-    /// history records.
-    fn sort_rate(&self) -> f64 {
-        const WINDOW: usize = 8;
-        if self.history.is_empty() {
-            return self.rx_rate;
-        }
-        let tail = &self.history[self.history.len().saturating_sub(WINDOW)..];
-        tail.iter().map(|v| *v as f64).sum::<f64>() / tail.len() as f64
+    /// See [`is_dead_state`].
+    fn is_dead(&self) -> bool {
+        is_dead_state(&self.state)
     }
+}
+
+/// Whether nobody is talking on a socket in this state any more. Dims out
+/// rather than disappearing — it is still a socket, it is just done. Linux and
+/// Windows spell states as `ss` does (`TIME-WAIT`), macOS as lsof does
+/// (`TIME_WAIT`).
+fn is_dead_state(state: &str) -> bool {
+    matches!(
+        state,
+        "TIME_WAIT"
+            | "TIME-WAIT"
+            | "CLOSE_WAIT"
+            | "CLOSE-WAIT"
+            | "CLOSED"
+            | "FIN_WAIT1"
+            | "FIN_WAIT_1"
+            | "FIN-WAIT-1"
+            | "FIN_WAIT2"
+            | "FIN_WAIT_2"
+            | "FIN-WAIT-2"
+            | "LAST_ACK"
+            | "LAST-ACK"
+    )
+}
+
+fn rtt_ms(c: &Connection) -> Option<f64> {
+    c.handshake_rtt_us.map(|us| us / 1000.0)
+}
+
+/// The rate the table sorts on: the flow's recent average, not this tick's
+/// reading.
+///
+/// Sorting on the instantaneous rate makes the list dance. Two flows of
+/// similar speed trade places every tick as their samples jitter, and
+/// because the selection is an index rather than an identity, the detail
+/// block above retargets to a different connection each time it happens —
+/// measured at three swaps in five ticks with two active downloads.
+///
+/// Averaging the last few samples is enough to settle it, and it is also
+/// the more honest answer to "which flow is busiest": a single 250 ms
+/// sample is noise, and the column header says `DOWN`, which is what this
+/// history records.
+fn sort_rate(history: Option<&VecDeque<u64>>, rx_rate: f64) -> f64 {
+    const WINDOW: usize = 8;
+    let Some(history) = history.filter(|h| !h.is_empty()) else {
+        return rx_rate;
+    };
+    let tail = history.iter().skip(history.len().saturating_sub(WINDOW));
+    let samples = history.len().min(WINDOW);
+    tail.map(|v| *v as f64).sum::<f64>() / samples as f64
 }
 
 fn collect_ifaces(app: &App) -> Vec<IfRow> {
@@ -772,9 +821,32 @@ fn collect_ifaces(app: &App) -> Vec<IfRow> {
     rows
 }
 
-fn collect_conns(app: &App) -> Vec<ConnRow> {
-    let conns = app.connection_collector.connections();
-    let mut rows: Vec<ConnRow> = conns
+/// A connection as the table ranks and groups it, borrowed from the snapshot.
+///
+/// A [`ConnRow`] copies a dozen strings and the row's history. Building one
+/// per connection, to draw the few dozen that fit, took most of a 10,000-row
+/// frame, so rows are ranked in this form and [`ConnRow::new`] runs for the
+/// ones on screen.
+struct ConnRank<'a> {
+    conn: &'a Connection,
+    process: &'a str,
+    /// The name the connection asked for, falling back to the address. Same
+    /// rule as Lite: an IP is what you show when you don't know better, not
+    /// what you show by default. The address has its brackets trimmed, not
+    /// the history cache's spelling: macOS lsof prints IPv6 as
+    /// `fe80::1]:1024`, so that key legitimately carries a stray `]` that
+    /// must not reach the screen.
+    host: &'a str,
+    port: &'a str,
+    /// See [`sort_rate`].
+    rate: f64,
+}
+
+/// `conns` as the table lists them, busiest first.
+fn rank_conns<'a>(history: &TopConnHistory, conns: &'a [Connection]) -> Vec<ConnRank<'a>> {
+    // One key, rewritten for each lookup, rather than two Strings a row.
+    let mut key = (String::new(), String::new());
+    let mut ranks: Vec<ConnRank> = conns
         .iter()
         .filter(|c| {
             c.state != "LISTEN"
@@ -785,55 +857,29 @@ fn collect_conns(app: &App) -> Vec<ConnRow> {
         })
         .map(|c| {
             let (addr_host, port) = split_host_port(&c.remote_addr);
-            let process = c.process_name.clone().unwrap_or_else(|| "—".into());
-            // The history cache is keyed by the *writer's* spelling of the
-            // host, brackets and all — use its own function rather than a
-            // second implementation that agrees only for IPv4.
-            let host_key = crate::app::top_conn_host(&c.remote_addr);
-            let history = app
-                .caches
-                .top_conn_history
-                .get(&(process.clone(), host_key.clone()))
-                .map(|h| h.iter().copied().collect())
-                .unwrap_or_default();
-            // Show the name the connection asked for, falling back to the
-            // address. Same rule as Lite: an IP is what you show when you
-            // don't know better, not what you show by default.
-            // Display uses the bracket-trimmed address, not the cache key:
-            // macOS lsof prints IPv6 as `fe80::1]:1024`, so the key legitimately
-            // carries a stray `]` that must not reach the screen.
-            let host = crate::ui::lite::sni_of(c).unwrap_or(addr_host);
-            ConnRow {
+            let process = c.process_name.as_deref().unwrap_or("—");
+            key.0.clear();
+            key.0.push_str(process);
+            key.1.clear();
+            key.1.push_str(crate::app::top_conn_host(&c.remote_addr));
+            ConnRank {
+                conn: c,
                 process,
-                pid: c.pid,
-                host,
+                host: crate::ui::lite::sni_of(c).unwrap_or(addr_host),
                 port,
-                proto: c.protocol.to_lowercase(),
-                rx_rate: c.rx_rate.unwrap_or(0.0),
-                tx_rate: c.tx_rate.unwrap_or(0.0),
-                rtt_ms: c.handshake_rtt_us.map(|us| us / 1000.0),
-                state: c.state.clone(),
-                retransmits: c.retransmits,
-                out_of_order: c.out_of_order,
-                app_proto: c
-                    .app_protocol
-                    .as_ref()
-                    .map(|_| crate::ui::connections::render_app_protocol(&c.app_protocol)),
-                local: c.local_addr.clone(),
-                remote: c.remote_addr.clone(),
-                history,
+                rate: sort_rate(history.get(&key), c.rx_rate.unwrap_or(0.0)),
             }
         })
         .collect();
-    rows.sort_by(|a, b| {
-        b.sort_rate()
-            .partial_cmp(&a.sort_rate())
+    ranks.sort_by(|a, b| {
+        b.rate
+            .partial_cmp(&a.rate)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.process.cmp(&b.process))
-            .then_with(|| a.host.cmp(&b.host))
-            .then_with(|| a.port.cmp(&b.port))
+            .then_with(|| a.process.cmp(b.process))
+            .then_with(|| a.host.cmp(b.host))
+            .then_with(|| a.port.cmp(b.port))
     });
-    rows
+    ranks
 }
 
 // ── grouped connection list ─────────────────────────────────────────────────
@@ -859,28 +905,26 @@ struct ConnRollup {
     dead: bool,
     /// Dominant state, so the STATE column says something for the group.
     state: String,
-    /// Members' sparklines summed, aligned at now.
-    history: Vec<u64>,
 }
 
-type ConnGroup = crate::ui::tree::Group<ConnRollup, ConnRow>;
+type ConnGroup<'a> = crate::ui::tree::Group<ConnRollup, ConnRank<'a>>;
 
 /// One line of the conns table.
 enum DenseRow<'a> {
     /// A process with several sockets: the rollup, foldable.
     Parent {
-        group: &'a ConnGroup,
+        group: &'a ConnGroup<'a>,
         collapsed: bool,
     },
     /// A process with exactly one socket: the socket itself. A header that
     /// reveals a single child is a keystroke to learn nothing.
     Solo {
-        group: &'a ConnGroup,
-        conn: &'a ConnRow,
+        group: &'a ConnGroup<'a>,
+        conn: &'a ConnRank<'a>,
     },
     Child {
-        group: &'a ConnGroup,
-        conn: &'a ConnRow,
+        group: &'a ConnGroup<'a>,
+        conn: &'a ConnRank<'a>,
     },
 }
 
@@ -893,7 +937,7 @@ impl<'a> DenseRow<'a> {
         }
     }
 
-    fn conn(&self) -> Option<&'a ConnRow> {
+    fn conn(&self) -> Option<&'a ConnRank<'a>> {
         match self {
             DenseRow::Solo { conn, .. } | DenseRow::Child { conn, .. } => Some(conn),
             DenseRow::Parent { .. } => None,
@@ -905,63 +949,69 @@ impl<'a> DenseRow<'a> {
     }
 }
 
-fn rollup(conns: &[ConnRow]) -> ConnRollup {
-    let pids: std::collections::BTreeSet<Option<u32>> = conns.iter().map(|c| c.pid).collect();
-    let hosts: std::collections::BTreeSet<&str> = conns.iter().map(|c| c.host.as_str()).collect();
+fn rollup(conns: &[ConnRank]) -> ConnRollup {
+    let pids: std::collections::BTreeSet<Option<u32>> = conns.iter().map(|c| c.conn.pid).collect();
+    let hosts: std::collections::BTreeSet<&str> = conns.iter().map(|c| c.host).collect();
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for c in conns {
-        *counts.entry(c.state.as_str()).or_insert(0) += 1;
+        *counts.entry(c.conn.state.as_str()).or_insert(0) += 1;
     }
     let state = counts
         .into_iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(s, _)| s.to_string())
         .unwrap_or_default();
-    // Histories all end at now; sum them aligned at the right edge. Every
-    // socket to a host carries the same cached history, one per (process,
-    // host) and already summed over those sockets, so each host counts once.
-    let mut hosts_summed = std::collections::HashSet::new();
-    let shared: Vec<&[u64]> = conns
-        .iter()
-        .filter(|c| hosts_summed.insert(crate::app::top_conn_host(&c.remote)))
-        .map(|c| c.history.as_slice())
-        .collect();
-    let len = shared.iter().map(|h| h.len()).max().unwrap_or(0);
-    let mut history = vec![0u64; len];
-    for h in shared {
-        let off = len - h.len();
-        for (i, v) in h.iter().enumerate() {
-            history[off + i] += v;
-        }
-    }
     ConnRollup {
         conns: conns.len(),
         pids: pids.len(),
         hosts: hosts.len(),
-        rx_rate: conns.iter().map(|c| c.rx_rate).sum(),
-        tx_rate: conns.iter().map(|c| c.tx_rate).sum(),
+        rx_rate: conns.iter().map(|c| c.conn.rx_rate.unwrap_or(0.0)).sum(),
+        tx_rate: conns.iter().map(|c| c.conn.tx_rate.unwrap_or(0.0)).sum(),
         rtt_ms: conns
             .iter()
-            .filter_map(|c| c.rtt_ms)
+            .filter_map(|c| rtt_ms(c.conn))
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
-        degraded: conns.iter().any(|c| c.retransmits > 0),
-        dead: conns.iter().all(|c| c.is_dead()),
+        degraded: conns.iter().any(|c| c.conn.retransmits > 0),
+        dead: conns.iter().all(|c| is_dead_state(&c.conn.state)),
         state,
-        history,
     }
 }
 
+/// Members' sparklines summed, aligned at now, for a header row on screen.
+/// Histories all end at now; sum them aligned at the right edge. Every socket
+/// to a host carries the same cached history, one per (process, host) and
+/// already summed over those sockets, so each host counts once.
+fn group_history(history: &TopConnHistory, group: &ConnGroup) -> Vec<u64> {
+    let hosts: std::collections::HashSet<&str> = group
+        .children
+        .iter()
+        .map(|c| crate::app::top_conn_host(&c.conn.remote_addr))
+        .collect();
+    let shared: Vec<&VecDeque<u64>> = hosts
+        .into_iter()
+        .filter_map(|host| history.get(&(group.key.clone(), host.to_string())))
+        .collect();
+    let len = shared.iter().map(|h| h.len()).max().unwrap_or(0);
+    let mut summed = vec![0u64; len];
+    for h in shared {
+        let off = len - h.len();
+        for (i, v) in h.iter().enumerate() {
+            summed[off + i] += v;
+        }
+    }
+    summed
+}
+
 /// Group the sorted rows by process, busiest group first.
-fn conn_groups(rows: Vec<ConnRow>) -> Vec<ConnGroup> {
-    let mut groups: Vec<ConnGroup> =
-        crate::ui::tree::group_by(rows, |c: &ConnRow| c.process.clone())
-            .into_iter()
-            .map(|(key, children)| ConnGroup {
-                key,
-                rollup: rollup(&children),
-                children,
-            })
-            .collect();
+fn conn_groups(rows: Vec<ConnRank>) -> Vec<ConnGroup> {
+    let mut groups: Vec<ConnGroup> = crate::ui::tree::group_by_str(rows, |c: &ConnRank| c.process)
+        .into_iter()
+        .map(|(key, children)| ConnGroup {
+            key: key.to_string(),
+            rollup: rollup(&children),
+            children,
+        })
+        .collect();
     groups.sort_by(|a, b| {
         (b.rollup.rx_rate + b.rollup.tx_rate)
             .partial_cmp(&(a.rollup.rx_rate + a.rollup.tx_rate))
@@ -973,7 +1023,10 @@ fn conn_groups(rows: Vec<ConnRow>) -> Vec<ConnGroup> {
 
 /// The visible rows, honouring fold state. Single definition of "what is
 /// row N" for the renderer and the key handlers.
-fn dense_rows<'a>(groups: &'a [ConnGroup], fold: &crate::ui::tree::FoldState) -> Vec<DenseRow<'a>> {
+fn dense_rows<'a>(
+    groups: &'a [ConnGroup<'a>],
+    fold: &crate::ui::tree::FoldState,
+) -> Vec<DenseRow<'a>> {
     let mut rows = Vec::new();
     for group in groups {
         if let [conn] = group.children.as_slice() {
@@ -996,7 +1049,9 @@ fn dense_rows<'a>(groups: &'a [ConnGroup], fold: &crate::ui::tree::FoldState) ->
 
 /// Rows the conns box currently lists, for clamping the cursor.
 pub fn visible_conn_count(app: &App) -> usize {
-    dense_rows(&conn_groups(collect_conns(app)), &app.ui.dense_collapsed).len()
+    let conns = app.connection_collector.connections();
+    let groups = conn_groups(rank_conns(&app.caches.top_conn_history, &conns));
+    dense_rows(&groups, &app.ui.dense_collapsed).len()
 }
 
 /// The process under the cursor, if its group folds — from a child row as
@@ -1004,7 +1059,8 @@ pub fn visible_conn_count(app: &App) -> usize {
 /// than a fold state that surfaces later when that process opens a second
 /// socket.
 pub fn selected_conn_group(app: &App) -> Option<String> {
-    let groups = conn_groups(collect_conns(app));
+    let conns = app.connection_collector.connections();
+    let groups = conn_groups(rank_conns(&app.caches.top_conn_history, &conns));
     let rows = dense_rows(&groups, &app.ui.dense_collapsed);
     let idx = app
         .ui
@@ -1018,7 +1074,8 @@ pub fn selected_conn_group(app: &App) -> Option<String> {
 /// Row index of `process`'s header, so a collapse can park the cursor on the
 /// row it just folded rather than on whatever slid up into its place.
 pub fn conn_header_index(app: &App, process: &str) -> Option<usize> {
-    let groups = conn_groups(collect_conns(app));
+    let conns = app.connection_collector.connections();
+    let groups = conn_groups(rank_conns(&app.caches.top_conn_history, &conns));
     dense_rows(&groups, &app.ui.dense_collapsed)
         .iter()
         .position(|r| matches!(r, DenseRow::Parent { group, .. } if group.key == process))
@@ -1031,21 +1088,23 @@ pub fn conn_header_index(app: &App, process: &str) -> Option<usize> {
 /// `fe80::1]:1024`, an IPv6 address with a closing bracket and no opening one.
 /// The first cut required the opening bracket, so those rows put the entire
 /// address in the host column and left the port blank.
-fn split_host_port(addr: &str) -> (String, String) {
-    let trim = |h: &str| h.trim_start_matches('[').trim_end_matches(']').to_string();
+fn split_host_port(addr: &str) -> (&str, &str) {
+    fn trim(h: &str) -> &str {
+        h.trim_start_matches('[').trim_end_matches(']')
+    }
 
     if let Some(i) = addr.rfind("]:") {
-        return (trim(&addr[..i]), addr[i + 2..].to_string());
+        return (trim(&addr[..i]), &addr[i + 2..]);
     }
     if let Some(i) = addr.rfind(':') {
         let (host, port) = (&addr[..i], &addr[i + 1..]);
         // Only split a bracketless address when the head is unambiguous —
         // otherwise `::1` would lose its last group to a "port".
         if !host.contains(':') && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-            return (trim(host), port.to_string());
+            return (trim(host), port);
         }
     }
-    (trim(addr), String::new())
+    (trim(addr), "")
 }
 
 // ── drawing helpers ─────────────────────────────────────────────────────────
@@ -1197,11 +1256,18 @@ fn render_full(f: &mut Frame, app: &App, area: Rect) {
     if shown(l.ifaces) {
         render_ifaces(f, app, t, &ramps, &l);
     }
+    // Ranked once, for the two boxes that read the table.
+    let conns = app.connection_collector.connections();
+    let ranks = if shown(l.health) || shown(l.conns) {
+        rank_conns(&app.caches.top_conn_history, &conns)
+    } else {
+        Vec::new()
+    };
     if shown(l.health) {
-        render_health(f, app, t, &ramps, &l);
+        render_health(f, app, t, &ramps, &l, &ranks);
     }
     if shown(l.conns) {
-        render_conns(f, app, t, &ramps, &l);
+        render_conns(f, app, t, &ramps, &l, ranks);
     }
 }
 
@@ -1692,22 +1758,28 @@ fn short_bits(bps: u64) -> String {
 
 // ── box 3: health ───────────────────────────────────────────────────────────
 
-fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) {
+fn render_health(
+    f: &mut Frame,
+    app: &App,
+    t: &Theme,
+    ramps: &Ramps,
+    l: &Layout,
+    ranks: &[ConnRank],
+) {
     let h = app.health_prober.status();
     let degraded = is_degraded(app);
     let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
-    let conns = collect_conns(app);
 
     // The design's fourth hop is "a configured peer". We don't have one, so the
     // slot goes to the slowest thing actually being talked to — same shape of
     // fact (a target, an RTT, a budget), and it's measured rather than assumed.
-    let slowest = conns
+    let slowest = ranks
         .iter()
-        .filter(|c| c.rtt_ms.is_some() && !c.is_dead())
+        .filter(|c| rtt_ms(c.conn).is_some() && !is_dead_state(&c.conn.state))
         .max_by(|a, b| {
-            a.rtt_ms
+            rtt_ms(a.conn)
                 .unwrap_or(0.0)
-                .partial_cmp(&b.rtt_ms.unwrap_or(0.0))
+                .partial_cmp(&rtt_ms(b.conn).unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -1765,9 +1837,9 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
         (
             "peer",
             slowest
-                .map(|c| c.host.clone())
+                .map(|c| c.host.to_string())
                 .unwrap_or_else(|| NA.to_string()),
-            slowest.and_then(|c| c.rtt_ms),
+            slowest.and_then(|c| rtt_ms(c.conn)),
             200.0,
         ),
     ];
@@ -1828,8 +1900,8 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
         faint,
     );
 
-    let retrans: u32 = conns.iter().map(|c| c.retransmits).sum();
-    let ooo: u32 = conns.iter().map(|c| c.out_of_order).sum();
+    let retrans: u32 = ranks.iter().map(|c| c.conn.retransmits).sum();
+    let ooo: u32 = ranks.iter().map(|c| c.conn.out_of_order).sum();
     let jitter = mean_sigma(&h.gateway_rtt_history).map(|(_, s)| s);
     let kv: [(&str, String, bool); 4] = [
         (
@@ -1896,8 +1968,16 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
 
 // ── box 4: conns ────────────────────────────────────────────────────────────
 
-fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) {
-    let groups = conn_groups(collect_conns(app));
+fn render_conns(
+    f: &mut Frame,
+    app: &App,
+    t: &Theme,
+    ramps: &Ramps,
+    l: &Layout,
+    ranks: Vec<ConnRank>,
+) {
+    let history = &app.caches.top_conn_history;
+    let groups = conn_groups(ranks);
     let rows = dense_rows(&groups, &app.ui.dense_collapsed);
     let conn_count: usize = groups.iter().map(|g| g.rollup.conns).sum();
     let sel = app
@@ -1958,7 +2038,7 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
         Some(DenseRow::Parent { group, .. }) => render_group_detail(f, t, group, l),
         Some(row) => {
             if let Some(c) = row.conn() {
-                render_detail(f, app, t, ramps, c, l);
+                render_detail(f, app, t, ramps, &ConnRow::new(history, c), l);
             }
         }
         None => {}
@@ -1970,10 +2050,12 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
         let y = l.row_conn_first + i as u16;
         let is_sel = page_start + i == sel;
         if let DenseRow::Parent { group, collapsed } = row {
-            render_group_row(f, t, ramps, l, group, *collapsed, is_sel, y);
+            let summed = group_history(history, group);
+            render_group_row(f, t, ramps, l, group, &summed, *collapsed, is_sel, y);
             continue;
         }
         let Some(c) = row.conn() else { continue };
+        let c = ConnRow::new(history, c);
         let child = matches!(row, DenseRow::Child { .. });
         let dead = c.is_dead();
         // The active row gets the band — the same `selection_bg` every other
@@ -2097,6 +2179,7 @@ fn render_group_row(
     ramps: &Ramps,
     l: &Layout,
     group: &ConnGroup,
+    history: &[u64],
     collapsed: bool,
     is_sel: bool,
     y: u16,
@@ -2125,7 +2208,7 @@ fn render_group_row(
         &group.key,
         fg(t.text_primary).add_modifier(Modifier::BOLD),
     );
-    let pid = &group.children[0].pid;
+    let pid = &group.children[0].conn.pid;
     cell(
         f,
         &l.conn_cols[conn_col::PID],
@@ -2178,10 +2261,10 @@ fn render_group_row(
         Style::default().fg(if r.dead { quiet } else { t.text_secondary }),
     );
     let spark = &l.conn_cols[conn_col::SPARK];
-    if r.dead || r.history.is_empty() {
+    if r.dead || history.is_empty() {
         paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
     } else {
-        let s = fit_conn_history(&r.history, spark.w as usize * 2);
+        let s = fit_conn_history(history, spark.w as usize * 2);
         let ramp = if r.degraded { &ramps.load } else { &ramps.down };
         paint::spark(f.buffer_mut(), spark.x, y, spark.w, &s, chart_max(&s), ramp);
     }
@@ -2211,7 +2294,7 @@ fn render_group_detail(f: &mut Frame, t: &Theme, group: &ConnGroup, l: &Layout) 
     let pids: Vec<String> = group
         .children
         .iter()
-        .filter_map(|c| c.pid)
+        .filter_map(|c| c.conn.pid)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .map(|p| p.to_string())
@@ -2249,7 +2332,7 @@ fn render_group_detail(f: &mut Frame, t: &Theme, group: &ConnGroup, l: &Layout) 
     let hosts: Vec<&str> = group
         .children
         .iter()
-        .map(|c| c.host.as_str())
+        .map(|c| c.host)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -2399,7 +2482,7 @@ fn render_detail(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, c: &ConnRow
         );
     }
     // The address, not `host`: that is the SNI name when there is one.
-    if let Some(geo) = app.geo_cache.lookup(&split_host_port(&c.remote).0) {
+    if let Some(geo) = app.geo_cache.lookup(split_host_port(&c.remote).0) {
         let label = if geo.city.is_empty() {
             geo.org.clone()
         } else {
@@ -2535,7 +2618,9 @@ fn render_compact(f: &mut Frame, app: &App, area: Rect) {
         dim,
     );
 
-    let rows = collect_conns(app);
+    let history = &app.caches.top_conn_history;
+    let conns = app.connection_collector.connections();
+    let rows = rank_conns(history, &conns);
     // Compact tracks the same selection as the full view, so `↑↓` moves
     // something here too — a `▶` pinned to row 0 while the arrows did nothing
     // was a marker that pointed at whatever happened to be sorted first.
@@ -2545,10 +2630,11 @@ fn render_compact(f: &mut Frame, app: &App, area: Rect) {
         .connection_scroll
         .min(rows.len().saturating_sub(1));
     let page_start = sel.saturating_sub(cl.rows as usize - 1);
-    let visible: Vec<&ConnRow> = rows
+    let visible: Vec<ConnRow> = rows
         .iter()
         .skip(page_start)
         .take(cl.rows as usize)
+        .map(|rank| ConnRow::new(history, rank))
         .collect();
     let foot_right = if rows.is_empty() {
         "0 of 0".to_string()
@@ -3244,75 +3330,48 @@ mod tests {
     /// silently retargets the detail block to another connection.
     #[test]
     fn sort_rate_ignores_single_tick_noise() {
-        let row = |hist: Vec<u64>, inst: f64| ConnRow {
-            process: "curl".into(),
-            pid: None,
-            host: "h".into(),
-            port: "443".into(),
-            proto: "tcp".into(),
-            rx_rate: inst,
-            tx_rate: 0.0,
-            rtt_ms: None,
-            state: "ESTABLISHED".into(),
-            retransmits: 0,
-            out_of_order: 0,
-            app_proto: None,
-            local: String::new(),
-            remote: String::new(),
-            history: hist,
-        };
+        let rate = |hist: Vec<u64>, inst: f64| sort_rate(Some(&VecDeque::from(hist)), inst);
 
         // Two flows of the same sustained speed, whose latest samples happen to
         // disagree, must not trade places on that alone.
         let steady = vec![1000u64; 8];
         let mut spiky = steady.clone();
         *spiky.last_mut().unwrap() = 4000;
-        let a = row(steady, 1000.0);
-        let b = row(spiky, 4000.0);
-        let ratio = b.sort_rate() / a.sort_rate();
+        let ratio = rate(spiky, 4000.0) / rate(steady, 1000.0);
         assert!(
             ratio < 1.5,
             "one hot sample moved the sort key by {ratio:.2}× — the row will jump"
         );
-        assert!(
-            b.rx_rate / a.rx_rate >= 4.0,
-            "the instantaneous rate really is 4× — that is what we are smoothing"
-        );
 
         // A genuinely faster flow must still sort above a slower one.
-        let fast = row(vec![50_000; 8], 50_000.0);
-        let slow = row(vec![1_000; 8], 1_000.0);
-        assert!(fast.sort_rate() > slow.sort_rate());
+        assert!(rate(vec![50_000; 8], 50_000.0) > rate(vec![1_000; 8], 1_000.0));
 
         // No history yet: fall back to what we have rather than sorting as zero.
-        assert_eq!(row(vec![], 1234.0).sort_rate(), 1234.0);
+        assert_eq!(rate(vec![], 1234.0), 1234.0);
+        assert_eq!(sort_rate(None, 1234.0), 1234.0);
+
+        // Only the window counts, however much history there is.
+        let mut old_burst = vec![1_000_000u64; 22];
+        old_burst.extend([10; 8]);
+        assert_eq!(rate(old_burst, 10.0), 10.0);
     }
 
     #[test]
     fn split_host_port_handles_every_form_the_platforms_print() {
-        assert_eq!(
-            split_host_port("1.2.3.4:443"),
-            ("1.2.3.4".into(), "443".into())
-        );
+        assert_eq!(split_host_port("1.2.3.4:443"), ("1.2.3.4", "443"));
         assert_eq!(
             split_host_port("[2606:4700::1111]:443"),
-            ("2606:4700::1111".into(), "443".into())
+            ("2606:4700::1111", "443")
         );
         // macOS lsof prints the closing bracket without the opening one.
         assert_eq!(
             split_host_port("fe80:16::145f:b7c7:8a9e:7fb7]:1024"),
-            ("fe80:16::145f:b7c7:8a9e:7fb7".into(), "1024".into())
+            ("fe80:16::145f:b7c7:8a9e:7fb7", "1024")
         );
-        assert_eq!(
-            split_host_port("example.com:8080"),
-            ("example.com".into(), "8080".into())
-        );
-        assert_eq!(
-            split_host_port("example.com"),
-            ("example.com".into(), "".into())
-        );
+        assert_eq!(split_host_port("example.com:8080"), ("example.com", "8080"));
+        assert_eq!(split_host_port("example.com"), ("example.com", ""));
         // A bare IPv6 must keep its last group instead of donating it to port.
-        assert_eq!(split_host_port("::1"), ("::1".into(), "".into()));
+        assert_eq!(split_host_port("::1"), ("::1", ""));
     }
 
     #[test]
@@ -3537,9 +3596,14 @@ mod group_tests {
 
     #[test]
     fn a_full_process_history_reaches_both_edges_at_every_width() {
-        let mut row = conn("curl", 1, "example.test", 1000.0, 0, "ESTABLISHED");
-        row.history = vec![1000; crate::app::TOP_CONN_HISTORY_LEN];
-        let groups = conn_groups(vec![row]);
+        let conns = [conn("curl", 1, "example.test", 1000.0, 0, "ESTABLISHED")];
+        let history = histories(&[(
+            "curl",
+            "example.test",
+            vec![1000; crate::app::TOP_CONN_HISTORY_LEN],
+        )]);
+        let groups = conn_groups(rank_conns(&history, &conns));
+        let summed = group_history(&history, &groups[0]);
         let theme = crate::theme::nord();
         let ramps = Ramps::from_theme(&theme);
         for width in [130, 160, 240, 400] {
@@ -3554,6 +3618,7 @@ mod group_tests {
                         &ramps,
                         &layout,
                         &groups[0],
+                        &summed,
                         true,
                         false,
                         layout.row_conn_first,
@@ -3571,24 +3636,87 @@ mod group_tests {
         }
     }
 
-    fn conn(process: &str, pid: u32, host: &str, rx: f64, retrans: u32, state: &str) -> ConnRow {
-        ConnRow {
-            process: process.into(),
-            pid: Some(pid),
-            host: host.into(),
-            port: "443".into(),
-            proto: "tcp".into(),
-            rx_rate: rx,
-            tx_rate: 0.0,
-            rtt_ms: Some(pid as f64),
+    fn conn(process: &str, pid: u32, host: &str, rx: f64, retrans: u32, state: &str) -> Connection {
+        Connection {
+            protocol: "TCP".into(),
+            local_addr: "10.0.0.2:1".into(),
+            remote_addr: format!("{host}:443"),
             state: state.into(),
+            pid: Some(pid),
+            process_name: Some(process.into()),
+            handshake_rtt_us: Some(pid as f64 * 1000.0),
+            rx_rate: Some(rx),
+            tx_rate: Some(0.0),
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: None,
             retransmits: retrans,
             out_of_order: 0,
-            app_proto: None,
-            local: "10.0.0.2:1".into(),
-            remote: format!("{host}:443"),
-            history: vec![1; 3],
         }
+    }
+
+    fn histories(entries: &[(&str, &str, Vec<u64>)]) -> TopConnHistory {
+        entries
+            .iter()
+            .map(|(process, host, samples)| {
+                (
+                    (process.to_string(), host.to_string()),
+                    samples.iter().copied().collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Rows rank by the same keys in either form: the rate, then what a full
+    /// row shows as process, host and port, keeping table order past those.
+    #[test]
+    fn ranks_order_rows_as_full_rows_would_sort() {
+        let mut conns = crate::testutil::connections::synthetic_connections(600, 9);
+        for (i, c) in conns.iter_mut().enumerate() {
+            c.rx_rate = (i % 3 == 0).then_some((i % 5) as f64 * 10.0);
+        }
+        let history = histories(&[
+            ("proc-001", "198.18.0.1", vec![500; 12]),
+            ("proc-001", "198.18.0.2", vec![0; 2]),
+        ]);
+        let ranks = rank_conns(&history, &conns);
+
+        let unsorted: Vec<ConnRank> = conns
+            .iter()
+            .map(|c| {
+                let (host, port) = split_host_port(&c.remote_addr);
+                ConnRank {
+                    conn: c,
+                    process: c.process_name.as_deref().unwrap_or("—"),
+                    host: crate::ui::lite::sni_of(c).unwrap_or(host),
+                    port,
+                    rate: 0.0,
+                }
+            })
+            .collect();
+        let mut full: Vec<ConnRow> = unsorted
+            .iter()
+            .filter(|r| {
+                let remote = &r.conn.remote_addr;
+                r.conn.state != "LISTEN"
+                    && !remote.starts_with('*')
+                    && !remote.starts_with("0.0.0.0")
+            })
+            .map(|r| ConnRow::new(&history, r))
+            .collect();
+        let rate = |r: &ConnRow| sort_rate(Some(&r.history.iter().copied().collect()), r.rx_rate);
+        full.sort_by(|a, b| {
+            rate(b)
+                .partial_cmp(&rate(a))
+                .unwrap()
+                .then_with(|| a.process.cmp(&b.process))
+                .then_with(|| a.host.cmp(&b.host))
+                .then_with(|| a.port.cmp(&b.port))
+        });
+
+        let ranked: Vec<&str> = ranks.iter().map(|r| r.conn.local_addr.as_str()).collect();
+        let sorted: Vec<&str> = full.iter().map(|r| r.local.as_str()).collect();
+        assert_eq!(ranked, sorted);
     }
 
     /// One socket is a row; several are a header with foldable children.
@@ -3596,12 +3724,18 @@ mod group_tests {
     /// key handlers, so it is the one to pin.
     #[test]
     fn a_solo_process_is_a_row_and_a_busy_one_is_a_tree() {
-        let groups = conn_groups(vec![
+        let conns = [
             conn("curl", 1, "a", 5.0, 0, "ESTABLISHED"),
             conn("claude", 2, "b", 3.0, 0, "ESTABLISHED"),
             conn("claude", 2, "c", 4.0, 2, "ESTABLISHED"),
             conn("claude", 3, "c", 1.0, 0, "TIME_WAIT"),
+        ];
+        let history = histories(&[
+            ("curl", "a", vec![1; 3]),
+            ("claude", "b", vec![1; 3]),
+            ("claude", "c", vec![1; 3]),
         ]);
+        let groups = conn_groups(rank_conns(&history, &conns));
         // Busiest group first: claude sums to 8 against curl's 5.
         assert_eq!(groups[0].key, "claude");
 
@@ -3633,7 +3767,11 @@ mod group_tests {
         assert_eq!(r.rtt_ms, Some(2.0), "best rtt, not first");
         assert_eq!(r.state, "ESTABLISHED", "dominant state");
         // b and c once each: the two sockets to c share c's history.
-        assert_eq!(r.history, vec![2, 2, 2], "sparklines summed");
+        assert_eq!(
+            group_history(&history, &groups[0]),
+            vec![2, 2, 2],
+            "sparklines summed"
+        );
     }
 
     /// The cache keeps one history per (process, host), already summed over
@@ -3642,19 +3780,21 @@ mod group_tests {
     /// sparkline disagreed with its own DOWN.
     #[test]
     fn a_host_history_counts_once_however_many_sockets_share_it() {
-        let mut rows: Vec<ConnRow> = (0..5)
-            .map(|_| {
-                let mut c = conn("curl", 1, "10.1.1.1", 20.0, 0, "ESTABLISHED");
-                c.history = vec![100, 100];
-                c
-            })
+        let mut conns: Vec<Connection> = (0..5)
+            .map(|_| conn("curl", 1, "10.1.1.1", 20.0, 0, "ESTABLISHED"))
             .collect();
-        let mut big = conn("curl", 1, "10.2.2.2", 400.0, 0, "ESTABLISHED");
-        big.history = vec![0, 400];
-        rows.push(big);
-        let r = &conn_groups(rows)[0].rollup;
-        assert_eq!(r.rx_rate, 500.0);
-        assert_eq!(r.history, vec![100, 500], "the newest sample matches DOWN");
+        conns.push(conn("curl", 1, "10.2.2.2", 400.0, 0, "ESTABLISHED"));
+        let history = histories(&[
+            ("curl", "10.1.1.1", vec![100, 100]),
+            ("curl", "10.2.2.2", vec![0, 400]),
+        ]);
+        let groups = conn_groups(rank_conns(&history, &conns));
+        assert_eq!(groups[0].rollup.rx_rate, 500.0);
+        assert_eq!(
+            group_history(&history, &groups[0]),
+            vec![100, 500],
+            "the newest sample matches DOWN"
+        );
     }
 
     /// A closing socket dims however its platform spells the state, and a
@@ -3666,7 +3806,7 @@ mod group_tests {
                 crate::ui::widgets::state_label(s).as_str(),
                 "time-wait" | "close-wait" | "closed" | "fin-wait-1" | "fin-wait-2" | "last-ack"
             );
-            assert_eq!(conn("p", 1, "h", 0.0, 0, s).is_dead(), closing, "{s}");
+            assert_eq!(is_dead_state(s), closing, "{s}");
         }
     }
 }

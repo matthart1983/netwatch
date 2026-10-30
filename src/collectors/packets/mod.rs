@@ -27,6 +27,8 @@ const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024; // 2 MB per reassembled stream
                                                  // insert). Stream u32 indices are never reused, so evicted indices stay invalid.
 pub(crate) const MAX_STREAMS: usize = 1024;
 pub(crate) const STREAM_EVICT_BATCH: usize = 256;
+/// The most flows the tracker holds, so the most connections rates can cover.
+pub(crate) const MAX_TRACKED_FLOWS: usize = MAX_STREAMS + STREAM_EVICT_BATCH;
 /// Most bytes all streams may hold between them: payloads, decrypted
 /// plaintext, QUIC CRYPTO and HTTP/3 buffers, per-segment overhead and each
 /// flow's DPI label. The per-stream and stream-count caps alone let a peer
@@ -663,6 +665,13 @@ impl StreamTracker {
     #[doc(hidden)]
     pub fn dropped_flows(&self) -> u64 {
         self.dropped_flows
+    }
+
+    /// Whether the tracker holds about as many flows as it will keep, so a
+    /// connection beyond [`MAX_TRACKED_FLOWS`] goes without a rate. It stays
+    /// true between sweeps, each of which leaves [`MAX_STREAMS`] + 1.
+    pub fn at_capacity(&self) -> bool {
+        self.all_streams.len() >= MAX_STREAMS
     }
 
     /// Where an eviction sweep brings `held_bytes` down to, 7/8 of the budget.
@@ -2176,10 +2185,20 @@ impl PacketCollector {
     /// Returns the packet's id.
     #[cfg(test)]
     pub(crate) fn ingest_frame_for_test(&self, data: &[u8]) -> Option<u64> {
+        self.ingest_captured_frame_for_test(data, None)
+    }
+
+    /// [`Self::ingest_frame_for_test`], for a frame of a running capture.
+    #[cfg(test)]
+    pub(crate) fn ingest_captured_frame_for_test(
+        &self,
+        data: &[u8],
+        capture: Option<export::CaptureMetadata>,
+    ) -> Option<u64> {
         let frame = Frame {
             data,
             ethernet: true,
-            capture: None,
+            capture,
         };
         let pkt = decode_and_track(frame, &self.counter, &self.dns_cache, &self.stream_tracker)?;
         let id = pkt.id;
@@ -5666,6 +5685,11 @@ mod tests {
         let mut tracker = StreamTracker::new();
         let high_water = (MAX_STREAMS + STREAM_EVICT_BATCH) as u64;
         for i in 0..high_water {
+            assert_eq!(
+                tracker.at_capacity(),
+                i as usize >= MAX_STREAMS,
+                "{i} flows"
+            );
             track_on(&mut tracker, 40_000 + i as u16, b"", i);
         }
         assert_eq!(tracker.all_streams.len() as u64, high_water);
@@ -5674,6 +5698,7 @@ mod tests {
         track_on(&mut tracker, 40_000 + high_water as u16, b"", high_water);
         assert_eq!(tracker.all_streams.len(), MAX_STREAMS + 1);
         assert_eq!(tracker.dropped_flows(), STREAM_EVICT_BATCH as u64);
+        assert!(tracker.at_capacity(), "a sweep does not end the capacity");
 
         // Close to the byte budget nothing is dropped yet. Past it, the
         // sweep drops the oldest flow and leaves the tracker under 7/8 of

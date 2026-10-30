@@ -1,16 +1,18 @@
 use crate::app::{App, AttributionStatus, ConnectionGroup, ConnectionStateFilter};
 use crate::collectors::connections::AttributionSource;
-use crate::collectors::connections::Connection;
+use crate::collectors::connections::{has_stream_key, Connection};
+use crate::collectors::packets::MAX_TRACKED_FLOWS;
 use crate::collectors::traceroute::TracerouteStatus;
-use crate::sort::{
-    apply_direction, cmp_case_insensitive, cmp_f64, cmp_ip_addr, SortColumn, TabSortState,
-};
+use crate::sort::{case_insensitive_key, ip_sort_key, SortColumn, TabSortState, TotalF64};
 use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Width of the state column. `state_label` guarantees every state name fits,
 /// so nothing in this column is ever truncated.
@@ -39,33 +41,44 @@ pub const DEFAULT_SORT: TabSortState = TabSortState {
 // chip+group toolbar replaces the visible header but `s:Sort` still opens
 // the picker for fine-grained ordering when group is None.
 
-pub fn sort(
-    conns: &mut [crate::collectors::connections::Connection],
-    column: usize,
-    ascending: bool,
-) {
+/// Order `order`, indices into `conns`, by a column of [`COLUMNS`]. A cached
+/// key per row, not a comparator: lowering strings and parsing addresses twice
+/// per comparison was most of a 10,000-row frame. The sort is stable, so rows
+/// that tie keep their order in either direction.
+fn sort_by_column(order: &mut [usize], conns: &[Connection], column: usize, ascending: bool) {
+    fn by<K: Ord>(order: &mut [usize], ascending: bool, key: impl Fn(usize) -> K) {
+        if ascending {
+            order.sort_by_cached_key(|&i| key(i));
+        } else {
+            order.sort_by_cached_key(|&i| Reverse(key(i)));
+        }
+    }
     let col_name = COLUMNS.get(column).map(|c| c.name).unwrap_or("");
-    conns.sort_by(|a, b| {
-        let ord = match col_name {
-            "Process" => cmp_case_insensitive(
-                a.process_name.as_deref().unwrap_or(""),
-                b.process_name.as_deref().unwrap_or(""),
-            ),
-            "PID" => a.pid.cmp(&b.pid),
-            "Proto" => cmp_case_insensitive(&a.protocol, &b.protocol),
-            "State" => cmp_case_insensitive(&a.state, &b.state),
-            "Local Address" => cmp_ip_addr(&a.local_addr, &b.local_addr),
-            "Remote Address" => cmp_ip_addr(&a.remote_addr, &b.remote_addr),
-            "Down/Up" => {
-                let total = |c: &crate::collectors::connections::Connection| {
-                    c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0)
-                };
-                cmp_f64(total(a), total(b))
-            }
-            _ => std::cmp::Ordering::Equal,
-        };
-        apply_direction(ord, ascending)
-    });
+    match col_name {
+        "Process" => by(order, ascending, |i| {
+            case_insensitive_key(conns[i].process_name.as_deref().unwrap_or(""))
+        }),
+        "PID" => by(order, ascending, |i| conns[i].pid),
+        "Proto" => by(order, ascending, |i| {
+            case_insensitive_key(&conns[i].protocol)
+        }),
+        "State" => by(order, ascending, |i| case_insensitive_key(&conns[i].state)),
+        "Local Address" => by(order, ascending, |i| ip_sort_key(&conns[i].local_addr)),
+        "Remote Address" => by(order, ascending, |i| ip_sort_key(&conns[i].remote_addr)),
+        "Down/Up" => by(order, ascending, |i| {
+            TotalF64(conns[i].rx_rate.unwrap_or(0.0) + conns[i].tx_rate.unwrap_or(0.0))
+        }),
+        _ => {}
+    }
+}
+
+/// [`sort_by_column`] on the rows themselves.
+#[cfg(test)]
+pub fn sort(conns: &mut [Connection], column: usize, ascending: bool) {
+    let mut order: Vec<usize> = (0..conns.len()).collect();
+    sort_by_column(&mut order, conns, column, ascending);
+    let sorted: Vec<Connection> = order.iter().map(|&i| conns[i].clone()).collect();
+    conns.clone_from_slice(&sorted);
 }
 
 /// Layout constraints for the Connections tab. Kept as a function so the
@@ -104,11 +117,16 @@ pub(crate) fn compute_window_top(selected: usize, total: usize, visible_rows: us
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let chunks = layout_chunks(area);
+    // One view and one row list for the whole frame. A poll can publish
+    // between two reads, and the table and the detail strip would then
+    // describe different rows.
+    let view = current_view(app);
+    let rows = view.rows(&app.ui.connection_collapsed);
 
-    render_header(f, app, chunks[0]);
-    render_chip_row(f, app, chunks[1]);
-    render_connection_table(f, app, chunks[2]);
-    render_detail_strip(f, app, chunks[3]);
+    render_header(f, app, &view, chunks[0]);
+    render_chip_row(f, app, &view, chunks[1]);
+    render_connection_table(f, app, &view, &rows, chunks[2]);
+    render_detail_strip(f, app, &rows, chunks[3]);
     render_footer(f, app, chunks[4]);
 
     if app.ui.traceroute_view_open {
@@ -141,11 +159,9 @@ fn count_states(conns: &[Connection]) -> StateCounts {
     c
 }
 
-fn render_chip_row(f: &mut Frame, app: &App, area: Rect) {
+fn render_chip_row(f: &mut Frame, app: &App, view: &ConnView, area: Rect) {
     let t = &app.theme;
-    let conns = app.connection_collector.connections();
-    let counts = count_states(&conns);
-    drop(conns);
+    let counts = &view.counts;
 
     let chips: [(ConnectionStateFilter, usize); 4] = [
         (ConnectionStateFilter::All, counts.all),
@@ -193,16 +209,10 @@ fn render_chip_row(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(vec![row1, Line::from("")]), area);
 }
 
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let conns = app.connection_collector.connections();
-    let total = conns.len();
-    let filter = active_connection_filter(app);
-    let shown = if let Some(f) = filter.as_deref() {
-        conns.iter().filter(|c| matches_filter(c, f)).count()
-    } else {
-        total
-    };
-    drop(conns);
+fn render_header(f: &mut Frame, app: &App, view: &ConnView, area: Rect) {
+    let total = view.conns.len();
+    let filter = view.text_filter.as_deref();
+    let shown = view.text_matches;
 
     let mut extra = vec![Span::raw("  ")];
     if filter.is_some() {
@@ -212,7 +222,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ));
         extra.push(Span::raw("  "));
         extra.push(Span::styled(
-            format!("filter: {}", filter.as_deref().unwrap_or("")),
+            format!("filter: {}", filter.unwrap_or("")),
             Style::default().fg(app.theme.key_hint),
         ));
     } else {
@@ -250,12 +260,12 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     crate::ui::widgets::render_attribution_header(f, app, area, extra);
 }
 
-fn active_connection_filter(app: &App) -> Option<String> {
+fn active_connection_filter(app: &App) -> Option<&str> {
     if let Some(ref f) = app.ui.connection_filter_active {
-        return Some(f.clone());
+        return Some(f);
     }
     if app.ui.connection_filter_input && !app.ui.connection_filter_text.is_empty() {
-        return Some(app.ui.connection_filter_text.clone());
+        return Some(&app.ui.connection_filter_text);
     }
     None
 }
@@ -488,59 +498,6 @@ fn app_protocol_color(
     }
 }
 
-pub(crate) fn filtered_sorted_conns(app: &App) -> Vec<Connection> {
-    let mut conns: Vec<Connection> = (*app.connection_collector.connections()).clone();
-
-    // Chip-based state filter
-    conns.retain(|c| app.ui.connection_state_filter.matches(&c.state));
-
-    // Free-text filter (slash mode)
-    if let Some(ref f) = active_connection_filter(app) {
-        conns.retain(|c| matches_filter(c, f));
-    }
-
-    // Group/sort: process keeps process-grouped, remote groups by host, none sorts by RX desc
-    match app.ui.connection_group {
-        ConnectionGroup::Process => {
-            conns.sort_by(|a, b| {
-                cmp_case_insensitive(
-                    a.process_name.as_deref().unwrap_or("~"),
-                    b.process_name.as_deref().unwrap_or("~"),
-                )
-                .then_with(|| {
-                    let ar = a.rx_rate.unwrap_or(0.0);
-                    let br = b.rx_rate.unwrap_or(0.0);
-                    cmp_f64(ar, br).reverse()
-                })
-                .then_with(|| a.remote_addr.cmp(&b.remote_addr))
-            });
-        }
-        ConnectionGroup::Remote => {
-            conns.sort_by(|a, b| {
-                let ah = host_only(&a.remote_addr);
-                let bh = host_only(&b.remote_addr);
-                cmp_case_insensitive(&ah, &bh)
-                    .then_with(|| a.remote_addr.cmp(&b.remote_addr))
-                    .then_with(|| {
-                        cmp_case_insensitive(
-                            a.process_name.as_deref().unwrap_or("~"),
-                            b.process_name.as_deref().unwrap_or("~"),
-                        )
-                    })
-            });
-        }
-        ConnectionGroup::None => {
-            // Apply sort_states-driven sort or default RX desc
-            let sort_state = app.ui.sort_states.get(&crate::app::Tab::Connections);
-            let col = sort_state.map(|s| s.column).unwrap_or(0);
-            let asc = sort_state.map(|s| s.ascending).unwrap_or(true);
-            sort(&mut conns, col, asc);
-        }
-    }
-
-    conns
-}
-
 // ── Grouped tree ────────────────────────────────────────────────────────
 //
 // `group: process` and `group: remote` used to be sort orders wearing the
@@ -575,7 +532,8 @@ pub struct ConnRollup {
     pub kernel_attributed: bool,
 }
 
-pub type ConnGroup = crate::ui::tree::Group<ConnRollup, Connection>;
+/// A group's children are indices into the view's table.
+pub type ConnGroup = crate::ui::tree::Group<ConnRollup, usize>;
 
 /// One line of the Connections table.
 pub enum ConnRow<'a> {
@@ -588,14 +546,33 @@ pub enum ConnRow<'a> {
     },
 }
 
-/// The connection list in whatever shape the current group mode implies.
+/// The connection list in whatever shape the current group mode implies, for
+/// one table under one set of filters.
 ///
 /// Owns its data so the borrowed row list can be derived from it repeatedly —
 /// the renderer, the mouse handler and the key handlers all need the same
-/// numbering, and recomputing it independently is how they drift apart.
+/// numbering, and recomputing it independently is how they drift apart. It
+/// holds the table and indices into it, with no copy of a row, and
+/// [`current_view`] builds it once per table.
 pub struct ConnView {
+    generation: u64,
+    state_filter: ConnectionStateFilter,
+    text_filter: Option<String>,
+    group: ConnectionGroup,
+    sort: Option<TabSortState>,
+    conns: Arc<Vec<Connection>>,
     pub groups: Vec<ConnGroup>,
-    pub flat: Vec<Connection>,
+    /// Row indices in display order, under `group: none`.
+    pub flat: Vec<usize>,
+    /// The chip row's counts: the whole table, whichever chip is active.
+    counts: StateCounts,
+    /// Rows the text filter matches, whichever chip is active.
+    text_matches: usize,
+    /// How many rows could show a rate, when that is more than the capture's
+    /// stream tracker can follow; see [`StreamTracker::at_capacity`].
+    ///
+    /// [`StreamTracker::at_capacity`]: crate::collectors::packets::StreamTracker::at_capacity
+    rate_flows_over_cap: Option<usize>,
 }
 
 /// The most common *named* state in a group, and how many share it.
@@ -604,7 +581,7 @@ pub struct ConnView {
 /// make "" the winner and the cell would render as a bare `11/13` — a
 /// fraction of nothing. Only named states compete; a group with none at all
 /// says so with an em-dash.
-fn dominant_state(conns: &[Connection]) -> (String, usize) {
+fn dominant_state(conns: &[&Connection]) -> (String, usize) {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for c in conns.iter().filter(|c| !c.state.is_empty()) {
         *counts.entry(c.state.as_str()).or_insert(0) += 1;
@@ -616,22 +593,21 @@ fn dominant_state(conns: &[Connection]) -> (String, usize) {
         .unwrap_or_else(|| ("—".to_string(), conns.len()))
 }
 
-fn rollup(key_is_process: bool, conns: &[Connection]) -> ConnRollup {
-    let facets: std::collections::BTreeSet<String> = if key_is_process {
-        conns
-            .iter()
-            .filter_map(|c| c.pid.map(|p| p.to_string()))
-            .collect()
+fn rollup(key_is_process: bool, conns: &[&Connection]) -> ConnRollup {
+    let facets = if key_is_process {
+        let pids: BTreeSet<u32> = conns.iter().filter_map(|c| c.pid).collect();
+        pids.len()
     } else {
-        conns
+        let names: BTreeSet<&str> = conns
             .iter()
-            .map(|c| c.process_name.clone().unwrap_or_else(|| "—".into()))
-            .collect()
+            .map(|c| c.process_name.as_deref().unwrap_or("—"))
+            .collect();
+        names.len()
     };
     let (state, state_count) = dominant_state(conns);
     ConnRollup {
         conns: conns.len(),
-        facets: facets.len(),
+        facets,
         rx_rate: conns.iter().filter_map(|c| c.rx_rate).sum(),
         tx_rate: conns.iter().filter_map(|c| c.tx_rate).sum(),
         rtt_us: conns
@@ -651,51 +627,107 @@ fn rollup(key_is_process: bool, conns: &[Connection]) -> ConnRollup {
     }
 }
 
-/// Build the current view: grouped into a tree, or flat under `group: none`.
-pub fn build_view(app: &App) -> ConnView {
-    let conns = filtered_sorted_conns(app);
-    let group_mode = app.ui.connection_group;
-    if matches!(group_mode, ConnectionGroup::None) {
-        return ConnView {
-            groups: Vec::new(),
-            flat: conns,
-        };
+/// The view of the current table under the current filters: the one every
+/// reader of the tab goes through. It is built when the table or a filter, the
+/// group mode or the sort has changed since the last call, and otherwise the
+/// last one comes back. Fold state is not part of it: a fold changes which
+/// rows [`ConnView::rows`] lists, not the view they come from.
+pub fn current_view(app: &App) -> Arc<ConnView> {
+    let (generation, conns) = app.connection_collector.connections_with_generation();
+    let mut cached = crate::app::safe_lock(&app.caches.conn_view, "connections::current_view");
+    if let Some(view) = cached.as_ref().filter(|v| v.is_current(generation, app)) {
+        return Arc::clone(view);
     }
-    let key_is_process = matches!(group_mode, ConnectionGroup::Process);
-    let buckets = crate::ui::tree::group_by(conns, |c: &Connection| {
-        if key_is_process {
-            c.process_name.clone().unwrap_or_else(|| "—".into())
-        } else {
-            host_only(&c.remote_addr)
-        }
-    });
-    // `filtered_sorted_conns` already ordered by the group key then by rate,
-    // so first-seen bucket order is the order the user asked for; only the
-    // rollup-level ranking is left, and busiest-first is what a rate column
-    // is for.
-    let mut groups: Vec<ConnGroup> = buckets
-        .into_iter()
-        .map(|(key, children)| ConnGroup {
-            key,
-            rollup: rollup(key_is_process, &children),
-            children,
-        })
-        .collect();
-    groups.sort_by(|a, b| {
-        cmp_f64(
-            a.rollup.rx_rate + a.rollup.tx_rate,
-            b.rollup.rx_rate + b.rollup.tx_rate,
-        )
-        .reverse()
-        .then_with(|| cmp_case_insensitive(&a.key, &b.key))
-    });
-    ConnView {
-        groups,
-        flat: Vec::new(),
-    }
+    let view = Arc::new(ConnView::build(app, generation, conns));
+    *cached = Some(Arc::clone(&view));
+    view
 }
 
 impl ConnView {
+    fn is_current(&self, generation: u64, app: &App) -> bool {
+        self.generation == generation
+            && self.state_filter == app.ui.connection_state_filter
+            && self.group == app.ui.connection_group
+            && self.sort == connections_sort(app)
+            && self.text_filter.as_deref() == active_connection_filter(app)
+    }
+
+    /// The table grouped into a tree, or flat under `group: none`.
+    fn build(app: &App, generation: u64, conns: Arc<Vec<Connection>>) -> Self {
+        let state_filter = app.ui.connection_state_filter;
+        let text_filter = active_connection_filter(app);
+        let group = app.ui.connection_group;
+        let sort = connections_sort(app);
+
+        let mut text_matches = 0;
+        let mut order: Vec<usize> = Vec::with_capacity(conns.len());
+        for (i, c) in conns.iter().enumerate() {
+            if text_filter.is_none_or(|f| matches_filter(c, f)) {
+                text_matches += 1;
+                if state_filter.matches(&c.state) {
+                    order.push(i);
+                }
+            }
+        }
+
+        // Process keeps process-grouped, remote groups by host, none follows
+        // the sort picker.
+        match group {
+            ConnectionGroup::Process => order.sort_by_cached_key(|&i| {
+                let c = &conns[i];
+                (
+                    case_insensitive_key(c.process_name.as_deref().unwrap_or("~")),
+                    Reverse(TotalF64(c.rx_rate.unwrap_or(0.0))),
+                    c.remote_addr.as_str(),
+                )
+            }),
+            ConnectionGroup::Remote => order.sort_by_cached_key(|&i| {
+                let c = &conns[i];
+                (
+                    case_insensitive_key(host_only(&c.remote_addr)),
+                    c.remote_addr.as_str(),
+                    case_insensitive_key(c.process_name.as_deref().unwrap_or("~")),
+                )
+            }),
+            ConnectionGroup::None => {
+                let column = sort.map(|s| s.column).unwrap_or(0);
+                let ascending = sort.map(|s| s.ascending).unwrap_or(true);
+                sort_by_column(&mut order, &conns, column, ascending);
+            }
+        }
+
+        let (groups, flat) = if matches!(group, ConnectionGroup::None) {
+            (Vec::new(), order)
+        } else {
+            (group_rows(&conns, order, group), Vec::new())
+        };
+
+        // Only a full tracker can leave a row without a rate for want of room,
+        // so an empty one costs a lock and no walk of the table.
+        let at_capacity = crate::app::safe_lock(
+            &app.packet_collector.stream_tracker,
+            "connections::view_rates",
+        )
+        .at_capacity();
+        let rate_flows_over_cap = at_capacity
+            .then(|| conns.iter().filter(|c| has_stream_key(c)).count())
+            .filter(|&flows| flows > MAX_TRACKED_FLOWS);
+
+        Self {
+            generation,
+            state_filter,
+            text_filter: text_filter.map(str::to_string),
+            group,
+            sort,
+            counts: count_states(&conns),
+            text_matches,
+            rate_flows_over_cap,
+            groups,
+            flat,
+            conns,
+        }
+    }
+
     /// The visible rows, honouring fold state. Single source of truth for
     /// "what is row N" — renderer and input handlers both go through it.
     pub fn rows(&self, fold: &crate::ui::tree::FoldState) -> Vec<ConnRow<'_>> {
@@ -703,7 +735,9 @@ impl ConnView {
             return self
                 .flat
                 .iter()
-                .map(|conn| ConnRow::Conn { conn })
+                .map(|&i| ConnRow::Conn {
+                    conn: &self.conns[i],
+                })
                 .collect();
         }
         crate::ui::tree::flatten(&self.groups, fold)
@@ -712,10 +746,74 @@ impl ConnView {
                 crate::ui::tree::Row::Parent { group, collapsed } => {
                     ConnRow::Parent { group, collapsed }
                 }
-                crate::ui::tree::Row::Child { item, .. } => ConnRow::Conn { conn: item },
+                crate::ui::tree::Row::Child { item, .. } => ConnRow::Conn {
+                    conn: &self.conns[*item],
+                },
             })
             .collect()
     }
+}
+
+/// A view built from scratch, to check [`current_view`] against.
+#[cfg(test)]
+pub(crate) fn fresh_view_for_test(app: &App) -> ConnView {
+    let (generation, conns) = app.connection_collector.connections_with_generation();
+    ConnView::build(app, generation, conns)
+}
+
+fn connections_sort(app: &App) -> Option<TabSortState> {
+    app.ui
+        .sort_states
+        .get(&crate::app::Tab::Connections)
+        .copied()
+}
+
+/// `order`'s rows bucketed by process or remote host. `order` is sorted by
+/// the group key then by rate, so first-seen bucket order is the order the user
+/// asked for; only the rollup-level ranking is left, and busiest-first is what
+/// a rate column is for.
+fn group_rows(conns: &[Connection], order: Vec<usize>, mode: ConnectionGroup) -> Vec<ConnGroup> {
+    let key_is_process = matches!(mode, ConnectionGroup::Process);
+    let buckets = crate::ui::tree::group_by_str(order, |&i| {
+        let c = &conns[i];
+        if key_is_process {
+            c.process_name.as_deref().unwrap_or("—")
+        } else {
+            host_only(&c.remote_addr)
+        }
+    });
+    let mut members: Vec<&Connection> = Vec::new();
+    let mut groups: Vec<ConnGroup> = buckets
+        .into_iter()
+        .map(|(key, children)| {
+            members.clear();
+            members.extend(children.iter().map(|&i| &conns[i]));
+            ConnGroup {
+                key: key.to_string(),
+                rollup: rollup(key_is_process, &members),
+                children,
+            }
+        })
+        .collect();
+    groups.sort_by_cached_key(|g| {
+        let (lowered, key) = case_insensitive_key(&g.key);
+        (
+            Reverse(TotalF64(g.rollup.rx_rate + g.rollup.tx_rate)),
+            lowered,
+            key.to_string(),
+        )
+    });
+    groups
+}
+
+/// The row under the cursor, in `rows`: the same one the table highlights.
+fn selected_row<'r, 'a>(app: &App, rows: &'r [ConnRow<'a>]) -> Option<&'r ConnRow<'a>> {
+    rows.get(
+        app.ui
+            .scroll
+            .connection_scroll
+            .min(rows.len().saturating_sub(1)),
+    )
 }
 
 /// The connection under the cursor, or `None` when a group header is selected.
@@ -724,14 +822,9 @@ impl ConnView {
 /// whois, drill to packets, the detail strip — resolves through here, so a
 /// parent row can never be mistaken for the first connection beneath it.
 pub fn selected_connection(app: &App) -> Option<Connection> {
-    let view = build_view(app);
+    let view = current_view(app);
     let rows = view.rows(&app.ui.connection_collapsed);
-    let idx = app
-        .ui
-        .scroll
-        .connection_scroll
-        .min(rows.len().saturating_sub(1));
-    match rows.get(idx)? {
+    match selected_row(app, &rows)? {
         ConnRow::Conn { conn } => Some((*conn).clone()),
         ConnRow::Parent { .. } => None,
     }
@@ -739,7 +832,7 @@ pub fn selected_connection(app: &App) -> Option<Connection> {
 
 /// The group key under the cursor, from a parent row or any of its children.
 pub fn selected_group_key(app: &App) -> Option<String> {
-    let view = build_view(app);
+    let view = current_view(app);
     if view.groups.is_empty() {
         return None;
     }
@@ -759,7 +852,7 @@ pub fn selected_group_key(app: &App) -> Option<String> {
 
 /// Number of visible rows, for clamping scroll against what is on screen.
 pub fn visible_row_count(app: &App) -> usize {
-    build_view(app).rows(&app.ui.connection_collapsed).len()
+    current_view(app).rows(&app.ui.connection_collapsed).len()
 }
 
 /// Compact geo string for the Connections GEO column. Prefers
@@ -783,23 +876,28 @@ fn format_geo_cell(app: &App, host: &str) -> String {
     }
 }
 
-fn host_only(addr: &str) -> String {
+fn host_only(addr: &str) -> &str {
     if let Some(stripped) = addr.strip_prefix('[') {
         if let Some(end) = stripped.find("]:") {
-            return format!("[{}]", &stripped[..end]);
+            // Through the closing bracket: the `[` and the `]` are one byte each.
+            return &addr[..end + 2];
         }
     }
     if let Some(colon) = addr.rfind(':') {
-        addr[..colon].to_string()
+        &addr[..colon]
     } else {
-        addr.to_string()
+        addr
     }
 }
 
-fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
+fn render_connection_table(
+    f: &mut Frame,
+    app: &App,
+    view: &ConnView,
+    rows: &[ConnRow],
+    area: Rect,
+) {
     let t = &app.theme;
-    let view = build_view(app);
-    let rows = view.rows(&app.ui.connection_collapsed);
     let conn_count = if view.groups.is_empty() {
         view.flat.len()
     } else {
@@ -822,6 +920,16 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         _ => None,
     };
 
+    // In the border row for the same reason: past ~120 columns the header line
+    // has no room left for it.
+    let rates = view.rate_flows_over_cap.map(|flows| {
+        format!(
+            " rates: {} of {} flows ",
+            widgets::format_count(MAX_TRACKED_FLOWS),
+            widgets::format_count(flows)
+        )
+    });
+
     let title_right = if view.groups.is_empty() {
         format!(" {conn_count} shown  group: none ")
     } else {
@@ -843,18 +951,14 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         .title(
             Line::from(
                 attribution_warning
-                    .map(|w| {
-                        vec![
-                            Span::styled(w, Style::default().fg(t.status_warn).bold()),
-                            Span::styled(title_right.clone(), Style::default().fg(t.brand).bold()),
-                        ]
-                    })
-                    .unwrap_or_else(|| {
-                        vec![Span::styled(
-                            title_right.clone(),
-                            Style::default().fg(t.brand).bold(),
-                        )]
-                    }),
+                    .map(|w| Span::styled(w, Style::default().fg(t.status_warn).bold()))
+                    .into_iter()
+                    .chain(rates.map(|r| Span::styled(r, Style::default().fg(t.status_warn))))
+                    .chain([Span::styled(
+                        title_right,
+                        Style::default().fg(t.brand).bold(),
+                    )])
+                    .collect::<Vec<_>>(),
             )
             .alignment(Alignment::Right),
         );
@@ -1217,7 +1321,7 @@ fn render_conn_row(
                         .map(|(_, p)| p.to_string())
                         .unwrap_or_default();
                     if port.is_empty() {
-                        format!("    {:<28}", truncate(&host, 28))
+                        format!("    {:<28}", truncate(host, 28))
                     } else {
                         format!("    :{port:<27}")
                     }
@@ -1238,7 +1342,7 @@ fn render_conn_row(
 
     if app.ui.show_geo {
         let host = host_only(&conn.remote_addr);
-        let geo_str = format_geo_cell(app, &host);
+        let geo_str = format_geo_cell(app, host);
         spans.push(Span::styled(
             format!(" {:<12}", truncate(&geo_str, 12)),
             Style::default().fg(t.status_info),
@@ -1320,13 +1424,8 @@ fn connection_age(app: &App, conn: &Connection) -> String {
         remote_addr: conn.remote_addr.clone(),
         pid: conn.pid,
     };
-    let tracked = app
-        .connection_timeline
-        .tracked
-        .iter()
-        .find(|t| t.key == key);
-    match tracked {
-        Some(t) => format_duration_short(t.first_seen.elapsed()),
+    match app.connection_timeline.first_seen(&key) {
+        Some(first_seen) => format_duration_short(first_seen.elapsed()),
         None => "—".to_string(),
     }
 }
@@ -1344,20 +1443,9 @@ fn format_duration_short(d: std::time::Duration) -> String {
     }
 }
 
-fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
+fn render_detail_strip(f: &mut Frame, app: &App, rows: &[ConnRow], area: Rect) {
     let t = &app.theme;
-    let view = build_view(app);
-    let rows = view.rows(&app.ui.connection_collapsed);
-    let selected_idx = app
-        .ui
-        .scroll
-        .connection_scroll
-        .min(rows.len().saturating_sub(1));
-    let selected = if rows.is_empty() {
-        None
-    } else {
-        rows.get(selected_idx)
-    };
+    let selected = selected_row(app, rows);
 
     let title_left = match selected {
         Some(ConnRow::Conn { conn: c }) => {
@@ -1588,7 +1676,7 @@ fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) 
 
     // RX history: try app.caches.top_conn_history keyed by (process, host) — same key the dashboard uses
     let proc = conn.process_name.clone().unwrap_or_else(|| "—".into());
-    let host = host_only(&conn.remote_addr);
+    let host = host_only(&conn.remote_addr).to_string();
     let key = (proc, host);
 
     let hdr_area = Rect {
@@ -1963,11 +2051,36 @@ mod tests {
 
     // ── Grouped tree ────────────────────────────────────────────────────
 
-    fn group_of(key: &str, conns: Vec<Connection>, by_process: bool) -> ConnGroup {
-        ConnGroup {
-            key: key.into(),
-            rollup: rollup(by_process, &conns),
-            children: conns,
+    /// A view of `flat` under `group: none`, or of `groups` as given.
+    fn view_of(flat: Vec<Connection>, groups: Vec<(&str, Vec<Connection>)>) -> ConnView {
+        let mut conns = flat;
+        let flat: Vec<usize> = (0..conns.len()).collect();
+        let groups = groups
+            .into_iter()
+            .map(|(key, children)| {
+                let refs: Vec<&Connection> = children.iter().collect();
+                let rollup = rollup(true, &refs);
+                let start = conns.len();
+                conns.extend(children);
+                ConnGroup {
+                    key: key.into(),
+                    rollup,
+                    children: (start..conns.len()).collect(),
+                }
+            })
+            .collect();
+        ConnView {
+            generation: 0,
+            state_filter: ConnectionStateFilter::All,
+            text_filter: None,
+            group: ConnectionGroup::Process,
+            sort: None,
+            counts: count_states(&conns),
+            text_matches: conns.len(),
+            rate_flows_over_cap: None,
+            conns: Arc::new(conns),
+            groups,
+            flat,
         }
     }
 
@@ -1984,7 +2097,7 @@ mod tests {
         b.pid = Some(11);
         b.rx_rate = Some(50.0);
         b.handshake_rtt_us = Some(2000.0);
-        let r = rollup(true, &[a, b]);
+        let r = rollup(true, &[&a, &b]);
         assert_eq!(r.conns, 2);
         assert_eq!(r.facets, 2, "two distinct pids");
         assert_eq!(r.rx_rate, 150.0);
@@ -2001,7 +2114,7 @@ mod tests {
         let a = conn("curl", "ESTABLISHED", "1.2.3.4:443");
         let mut b = conn("curl", "ESTABLISHED", "5.6.7.8:443");
         b.retransmits = 3;
-        assert!(rollup(true, &[a, b]).degraded);
+        assert!(rollup(true, &[&a, &b]).degraded);
     }
 
     /// UDP rows carry an empty state. Counting them would make "" the winner
@@ -2010,33 +2123,31 @@ mod tests {
     fn dominant_state_ignores_stateless_rows() {
         let udp = conn("chrome", "", "*:*");
         let tcp = conn("chrome", "ESTABLISHED", "1.2.3.4:443");
-        let (state, n) = dominant_state(&[udp.clone(), udp.clone(), udp.clone(), tcp]);
+        let (state, n) = dominant_state(&[&udp, &udp, &udp, &tcp]);
         assert_eq!(state, "ESTABLISHED");
         assert_eq!(n, 1, "1 of 4 has a named state");
 
         // All stateless: say so rather than emitting an empty cell.
-        let (state, n) = dominant_state(&[udp.clone(), udp]);
+        let (state, n) = dominant_state(&[&udp, &udp]);
         assert_eq!(state, "—");
         assert_eq!(n, 2);
     }
 
     #[test]
     fn rows_emit_a_header_then_its_children_and_fold_hides_only_children() {
-        let groups = vec![
-            group_of(
-                "claude",
-                vec![
-                    conn("claude", "ESTABLISHED", "1.2.3.4:443"),
-                    conn("claude", "ESTABLISHED", "5.6.7.8:443"),
-                ],
-                true,
-            ),
-            group_of("gh", vec![conn("gh", "ESTABLISHED", "9.9.9.9:443")], true),
-        ];
-        let view = ConnView {
-            groups,
-            flat: Vec::new(),
-        };
+        let view = view_of(
+            Vec::new(),
+            vec![
+                (
+                    "claude",
+                    vec![
+                        conn("claude", "ESTABLISHED", "1.2.3.4:443"),
+                        conn("claude", "ESTABLISHED", "5.6.7.8:443"),
+                    ],
+                ),
+                ("gh", vec![conn("gh", "ESTABLISHED", "9.9.9.9:443")]),
+            ],
+        );
 
         let rows = view.rows(&crate::ui::tree::FoldState::new(false));
         assert_eq!(rows.len(), 5);
@@ -2058,13 +2169,13 @@ mod tests {
     /// would be strictly worse, so it must not grow headers.
     #[test]
     fn ungrouped_view_has_no_header_rows() {
-        let view = ConnView {
-            groups: Vec::new(),
-            flat: vec![
+        let view = view_of(
+            vec![
                 conn("a", "ESTABLISHED", "1.1.1.1:443"),
                 conn("b", "ESTABLISHED", "2.2.2.2:443"),
             ],
-        };
+            Vec::new(),
+        );
         let rows = view.rows(&crate::ui::tree::FoldState::new(false));
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| matches!(r, ConnRow::Conn { .. })));
@@ -2075,14 +2186,10 @@ mod tests {
     /// act on the wrong flow. A header must resolve to no connection at all.
     #[test]
     fn a_header_row_is_not_a_connection() {
-        let view = ConnView {
-            groups: vec![group_of(
-                "claude",
-                vec![conn("claude", "ESTABLISHED", "1.2.3.4:443")],
-                true,
-            )],
-            flat: Vec::new(),
-        };
+        let view = view_of(
+            Vec::new(),
+            vec![("claude", vec![conn("claude", "ESTABLISHED", "1.2.3.4:443")])],
+        );
         let rows = view.rows(&crate::ui::tree::FoldState::new(false));
         assert!(
             !matches!(rows[0], ConnRow::Conn { .. }),
@@ -2092,6 +2199,233 @@ mod tests {
             ConnRow::Conn { conn } => assert_eq!(conn.remote_addr, "1.2.3.4:443"),
             ConnRow::Parent { .. } => panic!("row 1 should be the connection"),
         }
+    }
+
+    /// A table with what sorting has to get right: names that differ only in
+    /// case, rows with no owner beside owners named as the placeholders are,
+    /// rates that tie, addresses of each family and none.
+    fn awkward_table() -> Vec<Connection> {
+        let mut rows = crate::testutil::connections::synthetic_connections(1_500, 5);
+        for (i, row) in rows.iter_mut().enumerate() {
+            match i % 9 {
+                0 => row.process_name = row.process_name.take().map(|n| n.to_uppercase()),
+                1 => row.process_name = None,
+                2 => row.process_name = Some("~".into()),
+                3 => row.process_name = Some("—".into()),
+                4 => row.process_name = Some("Σας".into()),
+                _ => {}
+            }
+            row.rx_rate = (i % 3 != 0).then_some((i % 4) as f64 * 100.0);
+            row.tx_rate = (i % 5 != 0).then_some((i % 2) as f64 * 100.0);
+            match i % 31 {
+                0 => row.remote_addr = "*:*".into(),
+                1 => row.remote_addr = String::new(),
+                2 => row.remote_addr = "example.com:443".into(),
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    fn column_cmp(column: &str, a: &Connection, b: &Connection) -> std::cmp::Ordering {
+        use crate::sort::{cmp_case_insensitive, cmp_f64, cmp_ip_addr};
+        let total = |c: &Connection| c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0);
+        match column {
+            "Process" => cmp_case_insensitive(
+                a.process_name.as_deref().unwrap_or(""),
+                b.process_name.as_deref().unwrap_or(""),
+            ),
+            "PID" => a.pid.cmp(&b.pid),
+            "Proto" => cmp_case_insensitive(&a.protocol, &b.protocol),
+            "State" => cmp_case_insensitive(&a.state, &b.state),
+            "Local Address" => cmp_ip_addr(&a.local_addr, &b.local_addr),
+            "Remote Address" => cmp_ip_addr(&a.remote_addr, &b.remote_addr),
+            "Down/Up" => cmp_f64(total(a), total(b)),
+            _ => unreachable!("{column} has no comparator here"),
+        }
+    }
+
+    /// The cached keys stand in for these comparators, so each column has to
+    /// come out in the order they give it, ties included, in both directions.
+    #[test]
+    fn each_column_sorts_as_its_comparator_does() {
+        let table = awkward_table();
+        for (i, column) in COLUMNS.iter().enumerate() {
+            for ascending in [true, false] {
+                let mut got = table.clone();
+                sort(&mut got, i, ascending);
+                let mut want = table.clone();
+                want.sort_by(|a, b| {
+                    crate::sort::apply_direction(column_cmp(column.name, a, b), ascending)
+                });
+                let locals = |rows: &[Connection]| -> Vec<String> {
+                    rows.iter().map(|c| c.local_addr.clone()).collect()
+                };
+                assert_eq!(locals(&got), locals(&want), "{} {ascending}", column.name);
+            }
+        }
+    }
+
+    /// What grouping came to when the rows were sorted by comparators and
+    /// grouped by owned keys: each group's key and its children, in order.
+    fn grouped_by_comparators(
+        conns: &[Connection],
+        by_process: bool,
+    ) -> Vec<(String, Vec<String>)> {
+        use crate::sort::{cmp_case_insensitive, cmp_f64};
+        let mut sorted: Vec<&Connection> = conns.iter().collect();
+        sorted.sort_by(|a, b| {
+            if by_process {
+                cmp_case_insensitive(
+                    a.process_name.as_deref().unwrap_or("~"),
+                    b.process_name.as_deref().unwrap_or("~"),
+                )
+                .then_with(|| cmp_f64(a.rx_rate.unwrap_or(0.0), b.rx_rate.unwrap_or(0.0)).reverse())
+                .then_with(|| a.remote_addr.cmp(&b.remote_addr))
+            } else {
+                cmp_case_insensitive(host_only(&a.remote_addr), host_only(&b.remote_addr))
+                    .then_with(|| a.remote_addr.cmp(&b.remote_addr))
+                    .then_with(|| {
+                        cmp_case_insensitive(
+                            a.process_name.as_deref().unwrap_or("~"),
+                            b.process_name.as_deref().unwrap_or("~"),
+                        )
+                    })
+            }
+        });
+        let mut groups = crate::ui::tree::group_by(sorted, |c: &&Connection| {
+            if by_process {
+                c.process_name.clone().unwrap_or_else(|| "—".into())
+            } else {
+                host_only(&c.remote_addr).to_string()
+            }
+        });
+        let rate = |g: &(String, Vec<&Connection>)| -> f64 {
+            let rx: f64 = g.1.iter().filter_map(|c| c.rx_rate).sum();
+            let tx: f64 = g.1.iter().filter_map(|c| c.tx_rate).sum();
+            rx + tx
+        };
+        groups.sort_by(|a, b| {
+            cmp_f64(rate(a), rate(b))
+                .reverse()
+                .then_with(|| cmp_case_insensitive(&a.0, &b.0))
+        });
+        groups
+            .into_iter()
+            .map(|(key, children)| {
+                let locals = children.iter().map(|c| c.local_addr.clone()).collect();
+                (key, locals)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn groups_come_out_as_the_comparators_ordered_them() {
+        let table = awkward_table();
+        for (mode, by_process) in [
+            (ConnectionGroup::Process, true),
+            (ConnectionGroup::Remote, false),
+        ] {
+            let mut app =
+                crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+            app.ui.connection_group = mode;
+            app.connection_collector.publish_for_test(table.clone());
+            let view = fresh_view_for_test(&app);
+            let got: Vec<(String, Vec<String>)> = view
+                .groups
+                .iter()
+                .map(|g| {
+                    let locals = g
+                        .children
+                        .iter()
+                        .map(|&i| view.conns[i].local_addr.clone())
+                        .collect();
+                    (g.key.clone(), locals)
+                })
+                .collect();
+            assert_eq!(got, grouped_by_comparators(&view.conns, by_process));
+        }
+    }
+
+    #[test]
+    fn host_only_keeps_the_brackets_and_drops_the_port() {
+        assert_eq!(host_only("1.2.3.4:443"), "1.2.3.4");
+        assert_eq!(host_only("[2001:db8::1]:443"), "[2001:db8::1]");
+        assert_eq!(host_only("[::1]"), "[:");
+        assert_eq!(host_only("example.com"), "example.com");
+        assert_eq!(host_only(""), "");
+    }
+
+    fn table_title(app: &crate::app::App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        terminal.draw(|f| render(f, app, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let table = layout_chunks(buffer.area)[2];
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, table.y)].symbol())
+            .collect()
+    }
+
+    /// Flows numbered `flows` in the capture's stream tracker.
+    fn track_flows(app: &crate::app::App, flows: std::ops::Range<usize>) {
+        use crate::collectors::packets::StreamProtocol;
+        let mut tracker = app.packet_collector.stream_tracker.lock().unwrap();
+        for i in flows {
+            let src = format!("10.0.{}.{}", i / 256, i % 256);
+            tracker.track_packet(
+                &src,
+                12345,
+                "1.2.3.4",
+                80,
+                StreamProtocol::Tcp,
+                b"",
+                i as u64,
+                "t",
+                None,
+                None,
+                i as u64,
+            );
+        }
+    }
+
+    /// The table has more flows than the tracker will follow, so most rows
+    /// have no rate for a reason that is not "idle". Only then does it say so.
+    #[test]
+    fn the_table_says_when_rates_cover_only_some_flows() {
+        use crate::collectors::packets::{MAX_STREAMS, MAX_TRACKED_FLOWS};
+        let rows = crate::testutil::connections::synthetic_connections(2_000, 5);
+        let flows = rows.iter().filter(|c| has_stream_key(c)).count();
+        assert!(flows > MAX_TRACKED_FLOWS && flows < rows.len());
+        let note = format!("rates: 1,280 of {} flows", widgets::format_count(flows));
+
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.connection_collector.publish_for_test(rows.clone());
+        assert!(!table_title(&app).contains("rates:"), "an idle tracker");
+
+        track_flows(&app, 0..MAX_STREAMS - 1);
+        app.connection_collector.publish_for_test(rows.clone());
+        assert!(!table_title(&app).contains("rates:"), "room for one more");
+
+        track_flows(&app, MAX_STREAMS - 1..MAX_STREAMS);
+        // Read once per table: the next poll brings it.
+        assert!(!table_title(&app).contains("rates:"), "the same table");
+        app.connection_collector.publish_for_test(rows.clone());
+        let title = table_title(&app);
+        assert!(title.contains(&note), "{title}");
+
+        // In every group mode, whichever filters narrow the rows on screen:
+        // the note is about the table.
+        app.ui.connection_group = ConnectionGroup::None;
+        app.ui.connection_filter_active = Some("proc-01".into());
+        let title = table_title(&app);
+        assert!(title.contains(&note), "{title}");
+
+        // A table the tracker can cover has nothing to say, however full it is.
+        let few: Vec<Connection> = rows.iter().take(MAX_TRACKED_FLOWS).cloned().collect();
+        app.connection_collector.publish_for_test(few);
+        assert!(!table_title(&app).contains("rates:"), "few enough rows");
     }
 
     #[test]

@@ -1068,14 +1068,14 @@ struct ConnRow {
 /// the full set with its folded listener row lives.
 fn connection_rows(app: &App) -> Vec<ConnRow> {
     let conns = app.connection_collector.connections();
+    let verdicts = app.diagnose.sampler.socket_verdicts();
     let mut rows: Vec<ConnRow> = conns
         .iter()
         .filter(|c| c.state != "LISTEN" && c.state != "CLOSED" && !c.remote_addr.is_empty())
         .map(|c| {
-            let verdict = app
-                .diagnose
-                .sampler
-                .verdict_for(&c.local_addr, &c.remote_addr);
+            let verdict = verdicts
+                .get(&(c.local_addr.as_str(), c.remote_addr.as_str()))
+                .copied();
             ConnRow {
                 process: crate::collectors::connections::process_label(
                     c.process_name.as_deref(),

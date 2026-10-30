@@ -19,6 +19,13 @@ All notable changes to NetWatch will be documented in this file.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
+- **The Connections table says when rates cover only some of its flows, and
+  the Timeline says when it has lost closed connections.** The capture follows
+  at most 1,280 flows, so on a host with more than that, many rows had no rate
+  for want of room, which looked the same as a connection with no traffic. Once
+  the stream tracker is full and the table holds more flows than it can follow,
+  the table's title reads `rates: 1,280 of N flows`. Once the Timeline has
+  evicted closed connections, its events title reads `closed: last 2,000`.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
@@ -82,6 +89,24 @@ All notable changes to NetWatch will be documented in this file.
   `ConnectionTimeline::tracked_len` and `tracked_cap`, and gain
   `ConnectionTimeline::closed_len`, `closed_trimmed` and `first_seen`, and
   `ConnectionCollector::connections_with_generation`.
+- **The Connections tab, the Dense view and the UI tick keep up at 10,000
+  connections.** Each Connections frame copied and sorted the whole table twice,
+  and each scroll key once more, so at 10,000 rows a frame took about 40 to
+  100 ms at the median, and a key about 18 to 28 ms. The tab now builds one
+  view per table, from the table's generation, the filters, the group mode and
+  the sort, and the table, detail strip, chips, header, scroll keys, mouse and
+  folding all read that view. The order of the rows is unchanged. The table and
+  the detail strip come from one view per frame, so a poll that lands
+  mid-draw can no longer make them describe different rows. Dense ranks rows
+  without copying them and builds full rows only for those on screen. On the
+  reference machine at 10,000 rows, Connections frames take about 6 to 10 ms
+  at the median, a scroll key under 0.1 ms, a Dense frame about 5 ms, down from
+  about 23, and a tick's connection work about 9 to 14 ms, down from 26 to 32.
+  That tick figure is with no capture running. With one, each poll is also
+  kept for PCAPNG annotations, and it is about 18 ms. Library callers lose
+  `ui::connections::build_view` and `sort` and `LiveSampler::verdict_for`, and
+  gain `ui::connections::current_view`, `LiveSampler::socket_verdicts` and
+  `StreamTracker::at_capacity`. `ConnView` and `ConnGroup` now hold row indices.
 
 ### Fixed
 - **One bad value in config.toml no longer throws the whole file away.** A
@@ -681,6 +706,11 @@ All notable changes to NetWatch will be documented in this file.
 - **A test checks the metrics table in docs/observability-export.md
   against the exporter.** It fails when a metric is added, renamed or given
   another type without the table.
+- **The 10,000-row budgets for Connections and Dense frames, the scroll key
+  and the tick's connection work are enforced.** They were pending on the
+  Connections view cache. The scale tests also time Connections frames with a
+  full stream tracker and Dashboard frames with socket verdicts against the
+  frame budget, and print a tick with a capture running, with no budget.
 
 ## [0.38.0] - 2026-10-25
 
