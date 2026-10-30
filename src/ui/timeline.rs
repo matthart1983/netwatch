@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use crate::app::{App, IfaceChangeKind, TimelineFilter};
-use crate::collectors::connections::MAX_CLOSED_HISTORY;
 use crate::collectors::network_intel::{Alert, AlertSeverity};
 use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
@@ -486,11 +485,12 @@ fn render_events(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
         .collect();
 
     // The list of closed connections stops at the bound, so a window longer
-    // than that history does not hold everything that closed in it.
+    // than that history does not hold everything that closed in it. What it
+    // holds, not the bound: a sweep takes a batch and leaves fewer.
     let closed = if app.connection_timeline.closed_trimmed() {
         format!(
             "  closed: last {}",
-            widgets::format_count(MAX_CLOSED_HISTORY)
+            widgets::format_count(app.connection_timeline.closed_len())
         )
     } else {
         String::new()
@@ -635,6 +635,7 @@ fn remote_host(addr: &str) -> String {
 #[cfg(test)]
 mod closed_note_tests {
     use super::*;
+    use crate::collectors::connections::MAX_CLOSED_HISTORY;
     use crate::testutil::connections::synthetic_connections;
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -663,9 +664,11 @@ mod closed_note_tests {
         assert!(!app.connection_timeline.closed_trimmed());
         assert!(!screen(&app).contains("closed:"));
 
+        // One past the bound sweeps a batch, so it holds fewer than the bound.
         app.connection_timeline.update(&rows);
         app.connection_timeline.update(&[]);
         assert!(app.connection_timeline.closed_trimmed());
-        assert!(screen(&app).contains("closed: last 2,000"));
+        assert_eq!(app.connection_timeline.closed_len(), 1_745);
+        assert!(screen(&app).contains("closed: last 1,745"));
     }
 }

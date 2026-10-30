@@ -959,7 +959,7 @@ impl ConnectionTimeline {
     }
 
     /// Closed entries held, at most [`MAX_CLOSED_HISTORY`], for the `M`
-    /// debug overlay.
+    /// debug overlay and the Timeline's title.
     pub fn closed_len(&self) -> usize {
         self.closed
     }

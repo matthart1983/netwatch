@@ -1,7 +1,6 @@
 use crate::app::{App, AttributionStatus, ConnectionGroup, ConnectionStateFilter};
 use crate::collectors::connections::AttributionSource;
 use crate::collectors::connections::{has_stream_key, Connection};
-use crate::collectors::packets::MAX_TRACKED_FLOWS;
 use crate::collectors::traceroute::TracerouteStatus;
 use crate::sort::{case_insensitive_key, ip_sort_key, SortColumn, TabSortState, TotalF64};
 use crate::ui::text::truncate_end as truncate;
@@ -560,6 +559,7 @@ pub struct ConnView {
     text_filter: Option<String>,
     group: ConnectionGroup,
     sort: Option<TabSortState>,
+    capturing: bool,
     conns: Arc<Vec<Connection>>,
     pub groups: Vec<ConnGroup>,
     /// Row indices in display order, under `group: none`.
@@ -568,11 +568,8 @@ pub struct ConnView {
     counts: StateCounts,
     /// Rows the text filter matches, whichever chip is active.
     text_matches: usize,
-    /// How many rows could show a rate, when that is more than the capture's
-    /// stream tracker can follow; see [`StreamTracker::at_capacity`].
-    ///
-    /// [`StreamTracker::at_capacity`]: crate::collectors::packets::StreamTracker::at_capacity
-    rate_flows_over_cap: Option<usize>,
+    /// See [`rate_coverage`].
+    rate_coverage: Option<(usize, usize)>,
 }
 
 /// The most common *named* state in a group, and how many share it.
@@ -649,6 +646,7 @@ impl ConnView {
             && self.state_filter == app.ui.connection_state_filter
             && self.group == app.ui.connection_group
             && self.sort == connections_sort(app)
+            && self.capturing == app.packet_collector.is_capturing()
             && self.text_filter.as_deref() == active_connection_filter(app)
     }
 
@@ -702,16 +700,8 @@ impl ConnView {
             (group_rows(&conns, order, group), Vec::new())
         };
 
-        // Only a full tracker can leave a row without a rate for want of room,
-        // so an empty one costs a lock and no walk of the table.
-        let at_capacity = crate::app::safe_lock(
-            &app.packet_collector.stream_tracker,
-            "connections::view_rates",
-        )
-        .at_capacity();
-        let rate_flows_over_cap = at_capacity
-            .then(|| conns.iter().filter(|c| has_stream_key(c)).count())
-            .filter(|&flows| flows > MAX_TRACKED_FLOWS);
+        let capturing = app.packet_collector.is_capturing();
+        let rate_coverage = capturing.then(|| rate_coverage(app, &conns)).flatten();
 
         Self {
             generation,
@@ -719,9 +709,10 @@ impl ConnView {
             text_filter: text_filter.map(str::to_string),
             group,
             sort,
+            capturing,
             counts: count_states(&conns),
             text_matches,
-            rate_flows_over_cap,
+            rate_coverage,
             groups,
             flat,
             conns,
@@ -759,6 +750,30 @@ impl ConnView {
 pub(crate) fn fresh_view_for_test(app: &App) -> ConnView {
     let (generation, conns) = app.connection_collector.connections_with_generation();
     ConnView::build(app, generation, conns)
+}
+
+/// How many of the table's flows have a rate, and how many could, when the
+/// running capture has dropped flows for want of room and some have none.
+///
+/// A dropped flow's byte counts go with it, whether a count or a byte limit
+/// dropped it, so its row has no rate, which looks the same as a flow with no
+/// traffic. With no drop there is nothing to tell apart, and an empty tracker
+/// costs a lock and no walk of the table.
+fn rate_coverage(app: &App, conns: &[Connection]) -> Option<(usize, usize)> {
+    let dropped = crate::app::safe_lock(
+        &app.packet_collector.stream_tracker,
+        "connections::rate_coverage",
+    )
+    .session_dropped_flows();
+    if dropped == 0 {
+        return None;
+    }
+    let (mut rated, mut flows) = (0, 0);
+    for c in conns.iter().filter(|c| has_stream_key(c)) {
+        flows += 1;
+        rated += usize::from(c.rx_rate.is_some() || c.tx_rate.is_some());
+    }
+    (rated < flows).then_some((rated, flows))
 }
 
 fn connections_sort(app: &App) -> Option<TabSortState> {
@@ -922,10 +937,10 @@ fn render_connection_table(
 
     // In the border row for the same reason: past ~120 columns the header line
     // has no room left for it.
-    let rates = view.rate_flows_over_cap.map(|flows| {
+    let rates = view.rate_coverage.map(|(rated, flows)| {
         format!(
             " rates: {} of {} flows ",
-            widgets::format_count(MAX_TRACKED_FLOWS),
+            widgets::format_count(rated),
             widgets::format_count(flows)
         )
     });
@@ -2075,9 +2090,10 @@ mod tests {
             text_filter: None,
             group: ConnectionGroup::Process,
             sort: None,
+            capturing: false,
             counts: count_states(&conns),
             text_matches: conns.len(),
-            rate_flows_over_cap: None,
+            rate_coverage: None,
             conns: Arc::new(conns),
             groups,
             flat,
@@ -2389,43 +2405,160 @@ mod tests {
         }
     }
 
-    /// The table has more flows than the tracker will follow, so most rows
-    /// have no rate for a reason that is not "idle". Only then does it say so.
+    /// Enough new flows past the tracker's limits to make it sweep.
+    fn sweep_the_tracker(app: &crate::app::App, numbered_from: usize) {
+        use crate::collectors::packets::{MAX_STREAMS, STREAM_EVICT_BATCH};
+        track_flows(
+            app,
+            numbered_from..numbered_from + MAX_STREAMS + STREAM_EVICT_BATCH + 1,
+        );
+        let tracker = app.packet_collector.stream_tracker.lock().unwrap();
+        assert!(tracker.session_dropped_flows() > 0);
+    }
+
+    /// A table whose flows have no rate, but for the first `rated`.
+    fn table_with_rates(rated: usize) -> (Vec<Connection>, usize) {
+        let mut rows = crate::testutil::connections::synthetic_connections(2_000, 5);
+        let mut flows = 0;
+        for row in &mut rows {
+            let rate = has_stream_key(row) && flows < rated;
+            row.rx_rate = rate.then_some(1.0);
+            row.tx_rate = rate.then_some(1.0);
+            flows += usize::from(has_stream_key(row));
+        }
+        (rows, flows)
+    }
+
+    /// The note counts the rows that have a rate. The tracker's own count says
+    /// nothing about them: it may hold flows the table no longer lists.
     #[test]
-    fn the_table_says_when_rates_cover_only_some_flows() {
-        use crate::collectors::packets::{MAX_STREAMS, MAX_TRACKED_FLOWS};
-        let rows = crate::testutil::connections::synthetic_connections(2_000, 5);
-        let flows = rows.iter().filter(|c| has_stream_key(c)).count();
-        assert!(flows > MAX_TRACKED_FLOWS && flows < rows.len());
-        let note = format!("rates: 1,280 of {} flows", widgets::format_count(flows));
+    fn the_note_counts_the_table_flows_that_have_a_rate() {
+        let (rows, flows) = table_with_rates(431);
+        let note = format!("rates: 431 of {} flows", widgets::format_count(flows));
 
         let mut app =
             crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector.mark_capturing_for_test();
         app.connection_collector.publish_for_test(rows.clone());
-        assert!(!table_title(&app).contains("rates:"), "an idle tracker");
+        assert!(!table_title(&app).contains("rates:"), "nothing dropped");
 
-        track_flows(&app, 0..MAX_STREAMS - 1);
+        // A full tracker that has dropped nothing has nothing to report.
+        track_flows(&app, 0..1_280);
         app.connection_collector.publish_for_test(rows.clone());
-        assert!(!table_title(&app).contains("rates:"), "room for one more");
+        assert!(!table_title(&app).contains("rates:"), "full, none dropped");
 
-        track_flows(&app, MAX_STREAMS - 1..MAX_STREAMS);
+        sweep_the_tracker(&app, 2_000);
         // Read once per table: the next poll brings it.
         assert!(!table_title(&app).contains("rates:"), "the same table");
         app.connection_collector.publish_for_test(rows.clone());
         let title = table_title(&app);
         assert!(title.contains(&note), "{title}");
 
-        // In every group mode, whichever filters narrow the rows on screen:
-        // the note is about the table.
+        // Whichever filters narrow the rows on screen: the note is about the
+        // table.
         app.ui.connection_group = ConnectionGroup::None;
         app.ui.connection_filter_active = Some("proc-01".into());
         let title = table_title(&app);
         assert!(title.contains(&note), "{title}");
 
-        // A table the tracker can cover has nothing to say, however full it is.
-        let few: Vec<Connection> = rows.iter().take(MAX_TRACKED_FLOWS).cloned().collect();
-        app.connection_collector.publish_for_test(few);
-        assert!(!table_title(&app).contains("rates:"), "few enough rows");
+        // Every flow with a rate, there is nothing to say.
+        let (rows, flows) = table_with_rates(usize::MAX);
+        assert!(flows > 0);
+        app.connection_collector.publish_for_test(rows);
+        assert!(!table_title(&app).contains("rates:"), "all rated");
+    }
+
+    /// The byte budget can drop flows long before the flow count is reached,
+    /// and a row's rate goes with its flow either way.
+    #[test]
+    fn the_note_shows_when_the_byte_budget_drops_flows() {
+        use crate::collectors::connections::connection_stream_key;
+        let app = crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector.mark_capturing_for_test();
+        let mut rows = crate::testutil::connections::synthetic_connections(2_000, 5);
+
+        let snapshot = {
+            let mut tracker = app.packet_collector.stream_tracker.lock().unwrap();
+            tracker.set_byte_budget_for_test(1 << 20);
+            let payload = [0u8; 16 * 1024];
+            for (i, row) in rows.iter().enumerate() {
+                if let Some((key, _)) = connection_stream_key(row) {
+                    tracker.track_packet(
+                        &key.addr_a.0,
+                        key.addr_a.1,
+                        &key.addr_b.0,
+                        key.addr_b.1,
+                        key.protocol,
+                        &payload,
+                        i as u64,
+                        "t",
+                        None,
+                        None,
+                        i as u64,
+                    );
+                }
+            }
+            assert!(tracker.session_dropped_flows() > 0);
+            tracker.snapshot_bytes()
+        };
+        assert!(snapshot.len() < 1_024, "{} flows held", snapshot.len());
+
+        // As the poll leaves them: a rate for each flow the tracker still has.
+        let (mut rated, mut flows) = (0, 0);
+        for row in &mut rows {
+            let tracked = connection_stream_key(row).map(|(key, _)| snapshot.contains_key(&key));
+            flows += usize::from(tracked.is_some());
+            let tracked = tracked == Some(true);
+            rated += usize::from(tracked);
+            row.rx_rate = tracked.then_some(1.0);
+            row.tx_rate = tracked.then_some(1.0);
+        }
+        assert!(rated > 0 && rated < flows);
+        app.connection_collector.publish_for_test(rows);
+        let title = table_title(&app);
+        let note = format!(
+            "rates: {} of {} flows",
+            widgets::format_count(rated),
+            widgets::format_count(flows)
+        );
+        assert!(title.contains(&note), "{title}");
+    }
+
+    /// Streams outlive a stopped capture. They say nothing about a capture
+    /// that is not running, or one that has only just started.
+    #[test]
+    fn the_note_is_about_the_running_capture() {
+        let (rows, _) = table_with_rates(431);
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector.mark_capturing_for_test();
+        sweep_the_tracker(&app, 0);
+        app.connection_collector.publish_for_test(rows.clone());
+        assert!(table_title(&app).contains("rates: 431 of"), "running");
+
+        // Stopping is seen at once, with no new table.
+        app.packet_collector.stop_capture();
+        assert!(!table_title(&app).contains("rates:"), "stopped");
+        app.connection_collector.publish_for_test(rows.clone());
+        assert!(!table_title(&app).contains("rates:"), "stopped, new table");
+
+        // A restart keeps the streams and has followed nothing yet.
+        app.packet_collector.start_session_for_test();
+        app.packet_collector.mark_capturing_for_test();
+        app.connection_collector.publish_for_test(rows.clone());
+        assert!(!table_title(&app).contains("rates:"), "restarted");
+
+        sweep_the_tracker(&app, 5_000);
+        app.connection_collector.publish_for_test(rows.clone());
+        assert!(
+            table_title(&app).contains("rates: 431 of"),
+            "dropping again"
+        );
+
+        // `X` empties the tracker.
+        app.packet_collector.clear();
+        app.connection_collector.publish_for_test(rows);
+        assert!(!table_title(&app).contains("rates:"), "cleared");
     }
 
     #[test]

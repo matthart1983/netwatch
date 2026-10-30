@@ -35,7 +35,7 @@ use crate::app::{draw_frame, handle_key, App, ConnectionGroup, Tab, ViewMode};
 use crate::collectors::attribution::MAX_MATCH_AGE;
 use crate::collectors::connections::{Connection, ConnectionTimeline, MAX_CLOSED_HISTORY};
 use crate::collectors::packets::export::CaptureMetadata;
-use crate::collectors::packets::{StreamProtocol, MAX_TRACKED_FLOWS};
+use crate::collectors::packets::{StreamProtocol, MAX_STREAMS, STREAM_EVICT_BATCH};
 use crate::collectors::tcp_info::{normalize_endpoint, FlowMap, TcpInfo};
 use crate::config::NetwatchConfig;
 use crate::diagnose::live::rows_by_endpoints;
@@ -295,10 +295,11 @@ impl Host {
         self
     }
 
-    /// Track as many flows as the capture's stream tracker holds.
+    /// Track more flows than the running capture's stream tracker holds.
     fn fill_stream_tracker(&self) {
+        self.app.packet_collector.mark_capturing_for_test();
         let mut tracker = self.app.packet_collector.stream_tracker.lock().unwrap();
-        for i in 0..MAX_TRACKED_FLOWS {
+        for i in 0..=MAX_STREAMS + STREAM_EVICT_BATCH {
             let src = format!("10.0.{}.{}", i / 256, i % 256);
             tracker.track_packet(
                 &src,
@@ -314,7 +315,7 @@ impl Host {
                 i as u64,
             );
         }
-        assert!(tracker.at_capacity());
+        assert!(tracker.session_dropped_flows() > 0);
     }
 
     /// Publish the table again with fresh evidence, as the next poll would.
@@ -683,8 +684,8 @@ fn scale_connections_frames() {
             report.record(&format!("frame/connections/{mode}"), n, samples, budget);
         }
 
-        // A capture has filled the stream tracker, so each new table also
-        // counts the rows that could show a rate.
+        // A capture has overflowed the stream tracker, so each new table also
+        // counts the rows that have a rate and that could.
         host.fill_stream_tracker();
         host.app.ui.connection_group = ConnectionGroup::Process;
         host.app.ui.connection_filter_active = None;

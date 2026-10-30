@@ -20,12 +20,14 @@ All notable changes to NetWatch will be documented in this file.
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
 - **The Connections table says when rates cover only some of its flows, and
-  the Timeline says when it has lost closed connections.** The capture follows
-  at most 1,280 flows, so on a host with more than that, many rows had no rate
-  for want of room, which looked the same as a connection with no traffic. Once
-  the stream tracker is full and the table holds more flows than it can follow,
-  the table's title reads `rates: 1,280 of N flows`. Once the Timeline has
-  evicted closed connections, its events title reads `closed: last 2,000`.
+  the Timeline says when it has lost closed connections.** A running capture
+  drops the flows it has seen least recently once it passes 1,280 flows or its
+  byte budget, and a dropped flow's row has no rate, which looked the same as a
+  connection with no traffic. Once the running capture has dropped a flow, and
+  while some rows have no rate, the table's title reads `rates: M of N flows`:
+  M rows with a rate, of the N that could have one. Once the Timeline has
+  evicted closed connections, its events title reads `closed: last N`, with the
+  number it still holds.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
@@ -106,7 +108,8 @@ All notable changes to NetWatch will be documented in this file.
   kept for PCAPNG annotations, and it is about 18 ms. Library callers lose
   `ui::connections::build_view` and `sort` and `LiveSampler::verdict_for`, and
   gain `ui::connections::current_view`, `LiveSampler::socket_verdicts` and
-  `StreamTracker::at_capacity`. `ConnView` and `ConnGroup` now hold row indices.
+  `StreamTracker::session_dropped_flows`. `ConnView` and `ConnGroup` now hold
+  row indices.
 
 ### Fixed
 - **One bad value in config.toml no longer throws the whole file away.** A
