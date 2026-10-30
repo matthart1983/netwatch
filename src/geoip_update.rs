@@ -10,6 +10,7 @@
 //! The command name, `--city` and the exit codes are stable. The provider,
 //! its URLs and the file locations are not, which leaves room to move if
 //! DB-IP changes them.
+use crate::collectors::geo::epoch_date;
 use crate::config::NetwatchConfig;
 use crate::sandbox::{worker, Mode, SandboxPaths};
 use anyhow::{anyhow, bail, Context, Result};
@@ -23,7 +24,7 @@ pub const DOWNLOAD_BASE: &str = "https://download.db-ip.com/free/";
 
 /// The City database is about 60 MiB compressed, the others under 6 MiB.
 const MAX_COMPRESSED: u64 = 80 * 1024 * 1024;
-const MAX_DECOMPRESSED: u64 = 256 * 1024 * 1024;
+const MAX_DECOMPRESSED: u64 = crate::collectors::geo::MAX_DATABASE_BYTES;
 /// DB-IP publishes monthly, and the month's file can be a day late, so a good
 /// download can be two months old. Past this the provider has stopped
 /// publishing or someone is replaying an old file.
@@ -177,9 +178,7 @@ pub fn command(city: bool) -> Result<()> {
 }
 
 fn describe(path: &Path, checked: &Checked) -> String {
-    let built = i64::try_from(checked.build_epoch)
-        .ok()
-        .and_then(|epoch| DateTime::from_timestamp(epoch, 0))
+    let built = epoch_date(checked.build_epoch)
         .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
     format!(
         "{} ({}, built {built})",
@@ -263,9 +262,8 @@ fn fetch(
         .timeout_recv_body(Some(BODY_TIMEOUT))
         .build()
         .header("Accept-Encoding", "identity");
-    if let Some(since) = since {
-        let since = DateTime::<Utc>::from(since).format("%a, %d %b %Y %H:%M:%S GMT");
-        request = request.header("If-Modified-Since", since.to_string());
+    if let Some(since) = since.and_then(http_date) {
+        request = request.header("If-Modified-Since", since);
     }
     let response = match request.call() {
         Ok(response) => response,
@@ -297,7 +295,10 @@ fn fetch(
         .get("Last-Modified")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
-        .map(SystemTime::from);
+        .and_then(|at| {
+            let secs = u64::try_from(at.timestamp()).ok()?;
+            UNIX_EPOCH.checked_add(Duration::from_secs(secs))
+        });
     let gzip = response
         .into_body()
         .into_with_config()
@@ -307,6 +308,14 @@ fn fetch(
         gzip,
         last_modified,
     })
+}
+
+/// A file's mtime as an HTTP date, or `None` where chrono cannot represent it:
+/// some filesystems hold a date its `From<SystemTime>` panics on.
+fn http_date(at: SystemTime) -> Option<String> {
+    let secs = at.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let at = epoch_date(secs)?;
+    Some(at.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
 }
 
 /// Run `work` on a `geoip-update` worker and return what it returned. Strict
@@ -363,10 +372,7 @@ fn gunzip(gzip: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn read_and_validate(db: Database, path: &Path, now: DateTime<Utc>) -> Result<Checked> {
-    if std::fs::metadata(path)?.len() > MAX_DECOMPRESSED {
-        bail!("over the {MAX_DECOMPRESSED} byte limit");
-    }
-    validate(db, &std::fs::read(path)?, now)
+    validate(db, &crate::collectors::geo::read_database(path)?, now)
 }
 
 /// Is this the database that was asked for, recent, and able to answer?
@@ -474,8 +480,8 @@ mod tests {
         encoder.finish().unwrap()
     }
 
-    fn built(now: DateTime<Utc>, days_ago: i64) -> u32 {
-        (now.timestamp() - days_ago * 86_400) as u32
+    fn built(now: DateTime<Utc>, days_ago: i64) -> u64 {
+        (now.timestamp() - days_ago * 86_400) as u64
     }
 
     fn country(now: DateTime<Utc>) -> Vec<u8> {
@@ -631,6 +637,85 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), old);
+    }
+
+    /// A date this far out fits `SystemTime` but not chrono. It is a file that
+    /// fails its checks, not a panic on the worker.
+    #[test]
+    fn an_out_of_range_build_epoch_is_rejected() {
+        let dir = TestDir::new();
+        let now = at(2026, 11, 2);
+        for epoch in [9_000_000_000_000, u64::MAX] {
+            let db = test_db::city("DBIP-Country-Lite", epoch);
+            let error = update_one(Database::Country, &dir.0, now, &mut |_: &str, _| {
+                Ok(body(&db))
+            })
+            .unwrap_err();
+            assert!(!format!("{error:#}").contains("panicked"), "{error:#}");
+            assert!(dir.names().is_empty());
+        }
+    }
+
+    /// Some filesystems keep an mtime chrono cannot represent, and chrono's
+    /// conversion panicked on the main thread for it.
+    #[test]
+    fn an_mtime_chrono_cannot_represent_is_not_sent() {
+        assert_eq!(
+            http_date(UNIX_EPOCH + Duration::from_secs(1_790_818_572)).as_deref(),
+            Some("Thu, 01 Oct 2026 01:36:12 GMT")
+        );
+        assert_eq!(
+            http_date(UNIX_EPOCH + Duration::from_secs(9_000_000_000_000)),
+            None
+        );
+        assert_eq!(http_date(UNIX_EPOCH - Duration::from_secs(1)), None);
+    }
+
+    /// A Last-Modified from a hostile server is not converted unchecked, and a
+    /// missing date is the same as none: the file takes its build date.
+    #[test]
+    fn an_unusable_last_modified_is_ignored() {
+        for date in ["Fri, 01 Jan 1960 00:00:00 GMT", "not a date"] {
+            let (url, server) = serve(response(
+                &format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nLast-Modified: {date}"),
+                b"ok",
+            ));
+            let fetched = fetch(crate::http::agent(), false, &url, None).unwrap();
+            let Fetched::Body { last_modified, .. } = fetched else {
+                panic!("{fetched:?}");
+            };
+            assert_eq!(last_modified, None, "{date}");
+            server.join().unwrap();
+        }
+    }
+
+    /// A FIFO left where a database goes held the update forever, as it did
+    /// doctor. It does not validate, so the download replaces it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_place_of_a_database_is_replaced() {
+        let dir = TestDir::new();
+        let now = at(2026, 11, 2);
+        let path = dir.file(Database::Country);
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = dir.0.clone();
+        std::thread::spawn(move || {
+            let outcome = update_one(Database::Country, &target, now, &mut |_: &str, since| {
+                assert_eq!(since, None);
+                Ok(body(&country(now)))
+            });
+            let _ = tx.send(outcome.map_err(|error| format!("{error:#}")));
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the update did not return");
+        assert!(matches!(outcome, Ok(Outcome::Updated(_))), "{outcome:?}");
+        assert!(std::fs::metadata(&path).unwrap().is_file());
     }
 
     /// A database with nothing to say about 8.8.8.8 has the wrong shape.

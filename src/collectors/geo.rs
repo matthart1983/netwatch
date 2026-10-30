@@ -1,4 +1,6 @@
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::lru::BoundedLru;
@@ -37,6 +39,10 @@ enum GeoEntry {
 }
 
 // ── MaxMind offline reader ─────────────────────────────────
+
+/// The largest database file netwatch reads. It holds the whole file in memory,
+/// and DB-IP's largest free one is 127 MiB.
+pub(crate) const MAX_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The attribution CC BY 4.0 asks of whatever shows DB-IP's data.
 pub const DBIP_ATTRIBUTION: &str = "IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0";
@@ -92,12 +98,54 @@ impl DbStatus {
     }
 }
 
+/// Seconds since the epoch as a date, or `None` where chrono cannot represent
+/// them. A `build_epoch` is a u64 from a file we did not write, and chrono's
+/// `From<SystemTime>` panics on one that `SystemTime` holds and it does not.
+pub(crate) fn epoch_date(secs: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(i64::try_from(secs).ok()?, 0)
+}
+
+/// Read a database file whole. Only a regular file under the limit is read:
+/// opening a FIFO blocks until something writes to it, and `/dev/zero` never
+/// ends, on a path taken from the config or the cache directory.
+pub(crate) fn read_database(path: &Path) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let over = |bytes: u64| {
+        std::io::Error::other(format!(
+            "{bytes} bytes is over the {MAX_DATABASE_BYTES} byte limit"
+        ))
+    };
+    if metadata.len() > MAX_DATABASE_BYTES {
+        return Err(over(metadata.len()));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)?
+        .take(MAX_DATABASE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DATABASE_BYTES {
+        return Err(over(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
 fn open_database(path: &str) -> (Option<maxminddb::Reader<Vec<u8>>>, DbFile) {
     use crate::ui::sanitize::display_owned;
     if path.is_empty() {
         return (None, DbFile::NotConfigured);
     }
-    match maxminddb::Reader::open_readfile(path) {
+    let opened = read_database(Path::new(path))
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| maxminddb::Reader::from_source(bytes).map_err(|error| error.to_string()))
+        .and_then(|reader| {
+            let epoch = reader.metadata().build_epoch;
+            epoch_date(epoch)
+                .map(|_| reader)
+                .ok_or_else(|| format!("build_epoch {epoch} is out of range"))
+        });
+    match opened {
         Ok(reader) => {
             let file = DbFile::Loaded {
                 path: path.to_owned(),
@@ -110,7 +158,7 @@ fn open_database(path: &str) -> (Option<maxminddb::Reader<Vec<u8>>>, DbFile) {
             None,
             DbFile::Unreadable {
                 path: path.to_owned(),
-                error: display_owned(error.to_string()),
+                error: display_owned(error),
             },
         ),
     }
@@ -442,7 +490,7 @@ pub(crate) mod test_db {
         out
     }
 
-    fn build(data: &[u8], database_type: &str, build_epoch: u32) -> Vec<u8> {
+    fn build(data: &[u8], database_type: &str, build_epoch: u64) -> Vec<u8> {
         // One node, 24-bit records. A record past the node count points into
         // the data section, which starts 16 bytes after the tree:
         // 1 + 16 + offset 0.
@@ -450,7 +498,7 @@ pub(crate) mod test_db {
         db.extend_from_slice(&[0; 16]);
         db.extend_from_slice(data);
         db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
-        let epoch = [&[0x04, 0x02][..], &build_epoch.to_be_bytes()].concat(); // uint64
+        let epoch = [&[0x08, 0x02][..], &build_epoch.to_be_bytes()].concat(); // uint64
         let database_type = text(database_type);
         let metadata: [(&str, &[u8]); 9] = [
             ("binary_format_major_version", &[0xA1, 2]), // uint16
@@ -472,7 +520,7 @@ pub(crate) mod test_db {
     }
 
     /// Every address is in Ashburn, United States.
-    pub(crate) fn city(database_type: &str, build_epoch: u32) -> Vec<u8> {
+    pub(crate) fn city(database_type: &str, build_epoch: u64) -> Vec<u8> {
         // {city: {names: {en: "Ashburn"}},
         //  country: {iso_code: "US", names: {en: "United States"}}}
         let mut data = vec![0xE2];
@@ -494,7 +542,7 @@ pub(crate) mod test_db {
     }
 
     /// Every address is in AS 42, "Test Org".
-    pub(crate) fn asn(database_type: &str, build_epoch: u32) -> Vec<u8> {
+    pub(crate) fn asn(database_type: &str, build_epoch: u64) -> Vec<u8> {
         let mut data = vec![0xE2];
         data.extend(text("autonomous_system_number"));
         data.extend_from_slice(&[0xC1, 42]); // uint32
@@ -653,6 +701,84 @@ mod tests {
             status
         );
         assert_eq!(DbStatus::open("", ""), DbStatus::default());
+    }
+
+    /// A file in a fresh directory, for the status a session would make of it.
+    fn status_of(write: impl FnOnce(&Path)) -> DbFile {
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.mmdb");
+        write(&path);
+        let status = DbStatus::open(path.to_str().unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+        status.city
+    }
+
+    /// The date fits `SystemTime` but not chrono, whose conversion panics. That
+    /// took doctor and every session down with exit 101 on one hand-made file.
+    #[test]
+    fn an_out_of_range_build_epoch_is_unreadable() {
+        for epoch in [9_000_000_000_000, i64::MAX as u64, u64::MAX] {
+            let file = status_of(|path| {
+                std::fs::write(path, test_db::city("DBIP-Country-Lite", epoch)).unwrap()
+            });
+            let DbFile::Unreadable { error, .. } = &file else {
+                panic!("{epoch}: {file:?}");
+            };
+            assert!(error.contains("build_epoch"), "{epoch}: {error}");
+        }
+        // Far off but representable is only a strange date.
+        let far = status_of(|path| {
+            std::fs::write(path, test_db::city("DBIP-Country-Lite", 8_000_000_000_000)).unwrap()
+        });
+        assert!(matches!(far, DbFile::Loaded { .. }), "{far:?}");
+    }
+
+    /// Opening a FIFO blocks until something writes to it, which held doctor
+    /// forever, and `/dev/zero` never ends. The thread is so a regression fails
+    /// here rather than hanging the run.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_is_not_regular_is_unreadable_without_being_read() {
+        let opened = |path: String| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(DbStatus::open(&path, "").city);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("reading it did not return")
+        };
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo.mmdb");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        for path in [fifo.to_str().unwrap(), "/dev/zero", dir.to_str().unwrap()] {
+            let file = opened(path.to_owned());
+            let DbFile::Unreadable { error, .. } = &file else {
+                panic!("{path}: {file:?}");
+            };
+            assert_eq!(error, "not a regular file", "{path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_unreadable_without_being_read() {
+        // Sparse, so this costs nothing, and too big to read by accident.
+        let file = status_of(|path| {
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(MAX_DATABASE_BYTES + 1)
+                .unwrap()
+        });
+        let DbFile::Unreadable { error, .. } = &file else {
+            panic!("{file:?}");
+        };
+        assert!(error.contains("limit"), "{error}");
     }
 
     #[test]

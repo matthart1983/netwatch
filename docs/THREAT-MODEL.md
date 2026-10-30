@@ -275,7 +275,7 @@ performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 | I6 eBPF events | B2/B7, [tracker](../src/ebpf/conn_tracker.rs#L1) |
 | I7 Interface/OS API data | B2, [platform](../src/platform/mod.rs#L1) |
 | I8 TLS keylog | B3/B5, exact configured file grant above |
-| I9 GeoIP databases | B3, exact city/ASN file grants above; [reader](../src/collectors/geo.rs#L1) |
+| I9 GeoIP databases | B3, exact city/ASN file grants above; regular files up to 256 MiB; [reader](../src/collectors/geo.rs#L1) |
 | I10 Configuration | B3/B5, [config](../src/config.rs#L1) |
 | I11 Episode JSON/gzip | B3/B4, [episodes](../src/diagnose/episode.rs#L1); A1 hardening pending |
 | I12 Uptime history | B3/B4, [uptime](../src/uptime.rs#L1); A1 hardening pending |

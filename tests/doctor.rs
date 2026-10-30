@@ -151,6 +151,178 @@ fn a_junk_geoip_db_is_unreadable_and_static_doctor_stays_offline() {
         std::io::ErrorKind::WouldBlock
     );
 }
+/// A one-record MaxMind database with this `build_epoch`, by hand: one
+/// search-tree node whose two records both point at the data record.
+fn mmdb(build_epoch: u64) -> Vec<u8> {
+    fn text(s: &str) -> Vec<u8> {
+        [&[0x40 | s.len() as u8][..], s.as_bytes()].concat()
+    }
+    let mut db = vec![0, 0, 17, 0, 0, 17];
+    db.extend_from_slice(&[0; 16]);
+    db.push(0xE1);
+    db.extend(text("country"));
+    db.push(0xE1);
+    db.extend(text("iso_code"));
+    db.extend(text("US"));
+    db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
+    let epoch = [&[0x08, 0x02][..], &build_epoch.to_be_bytes()].concat(); // uint64
+    let database_type = text("DBIP-Country-Lite");
+    let metadata: [(&str, &[u8]); 9] = [
+        ("binary_format_major_version", &[0xA1, 2]), // uint16
+        ("binary_format_minor_version", &[0xA0]),
+        ("build_epoch", &epoch),
+        ("database_type", &database_type),
+        ("description", &[0xE0]), // empty map
+        ("ip_version", &[0xA1, 6]),
+        ("languages", b"\x01\x04\x42en"), // array of one string
+        ("node_count", &[0xC1, 1]),       // uint32
+        ("record_size", &[0xA1, 24]),
+    ];
+    db.push(0xE0 | metadata.len() as u8);
+    for (key, value) in metadata {
+        db.extend(text(key));
+        db.extend_from_slice(value);
+    }
+    db
+}
+impl Fixture {
+    fn set_geoip_db(&self, path: &std::path::Path) {
+        let config = netwatch::config::NetwatchConfig {
+            geoip_db: path.display().to_string(),
+            ..Default::default()
+        };
+        fs::write(
+            self.0.join("config/netwatch/config.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+    }
+    /// The `geoip_db` capability from `netwatch doctor --json`. Fails, rather
+    /// than hanging the run, if doctor does not come back.
+    fn geoip_db(&self) -> netwatch::runtime::capabilities::Capability {
+        use std::process::Stdio;
+        let mut child = self
+            .command()
+            .args(["doctor", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("doctor did not return");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot: netwatch::runtime::capabilities::CapabilitySnapshot =
+            serde_json::from_slice(&output.stdout).unwrap();
+        snapshot.get("geoip_db").clone()
+    }
+}
+/// A date that fits `SystemTime` but not chrono made doctor exit 101.
+#[test]
+fn an_out_of_range_build_epoch_is_unreadable_and_not_a_panic() {
+    use netwatch::runtime::capabilities::State;
+    let fixture = Fixture::new();
+    let path = fixture.0.join("far.mmdb");
+    for epoch in [9_000_000_000_000, u64::MAX] {
+        fs::write(&path, mmdb(epoch)).unwrap();
+        fixture.set_geoip_db(&path);
+        let geoip = fixture.geoip_db();
+        assert_eq!(geoip.state, State::Unavailable, "{epoch}");
+        assert_eq!(geoip.reason, "db_unreadable", "{epoch}");
+    }
+    // The same file with a real date loads, so the file was not the problem.
+    fs::write(&path, mmdb(1_790_818_572)).unwrap();
+    assert_ne!(fixture.geoip_db().reason, "db_unreadable");
+}
+/// The daemon took the same panic while starting up. In a network namespace,
+/// so its probes stay on this host. Skips where it cannot make one.
+#[test]
+fn the_daemon_survives_an_out_of_range_build_epoch() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("far.mmdb");
+    fs::write(&path, mmdb(9_000_000_000_000)).unwrap();
+    fixture.set_geoip_db(&path);
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--net",
+            "timeout",
+            "-s",
+            "TERM",
+        ])
+        .args(["3", env!("CARGO_BIN_EXE_netwatch"), "daemon"]);
+    for (key, value) in fixture.command().get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let Ok(output) = command.output() else {
+        eprintln!("skipped: no unshare");
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("unshare failed") || stderr.contains("unshare:") {
+        eprintln!("skipped: no user and network namespace: {stderr}");
+        return;
+    }
+    // 124 is timeout stopping a daemon that was still running.
+    assert_ne!(output.status.code(), Some(101), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+/// Doctor never opened this file before `geoip_db` existed, so a FIFO hung it
+/// and a device read until memory ran out.
+#[test]
+fn a_geoip_db_that_is_not_a_regular_file_is_unreadable() {
+    use netwatch::runtime::capabilities::State;
+    let fixture = Fixture::new();
+    let fifo = fixture.0.join("fifo.mmdb");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    for path in [fifo.as_path(), std::path::Path::new("/dev/zero")] {
+        fixture.set_geoip_db(path);
+        let geoip = fixture.geoip_db();
+        assert_eq!(geoip.state, State::Unavailable, "{}", path.display());
+        assert_eq!(geoip.reason, "db_unreadable", "{}", path.display());
+        assert!(
+            geoip.detail.contains("not a regular file"),
+            "{}",
+            geoip.detail
+        );
+    }
+}
+#[test]
+fn an_oversized_geoip_db_is_unreadable() {
+    use netwatch::runtime::capabilities::State;
+    let fixture = Fixture::new();
+    let path = fixture.0.join("big.mmdb");
+    // Sparse, so this costs nothing.
+    fs::File::create(&path)
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
+    fixture.set_geoip_db(&path);
+    let geoip = fixture.geoip_db();
+    assert_eq!(geoip.state, State::Unavailable);
+    assert_eq!(geoip.reason, "db_unreadable");
+    assert!(geoip.detail.contains("limit"), "{}", geoip.detail);
+}
 /// An empty `geoip_db` looks where `netwatch geoip update` puts its files,
 /// and with nothing there suggests the command. Junk is enough to show which
 /// file a session would open.

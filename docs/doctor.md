@@ -78,7 +78,8 @@ the log records the fallback and why. `geoip_db` reads the databases a session
 would open. It is `ready` (`db_loaded`) when they open, `degraded` (`db_stale`)
 when one was built over 60 days ago, `unavailable` (`db_unreadable`) when the
 Country or City file does not open, and `degraded` (`db_unreadable`) when only the
-ASN file does not. With no Country or City database it is `disabled`
+ASN file does not. A file does not open when it is not a regular file, is over
+256 MiB, is not a MaxMind database, or has a build date out of range. With no Country or City database it is `disabled`
 (`not_configured`), and `next_check` suggests `netwatch geoip update`. When
 lookups answer with DB-IP's data, judged by each file's own `database_type`, the
 `detail` starts with `IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0`. A

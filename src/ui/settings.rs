@@ -789,6 +789,29 @@ mod tests {
             .collect()
     }
 
+    /// Settings redraws the live capability snapshot, which is how a date chrono
+    /// cannot represent took the TUI down. The session reports the file instead.
+    #[test]
+    fn an_out_of_range_build_epoch_draws_as_unreadable() {
+        use crate::collectors::geo::test_db;
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = std::env::temp_dir().join(format!("nw-settings-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("far.mmdb");
+        std::fs::write(&path, test_db::city("DBIP-Country-Lite", 9_000_000_000_000)).unwrap();
+        let app = App::prepare_with_config(NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!app.geo_cache.has_offline_db());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        let drawn: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(drawn.contains("unreadable: "), "{drawn}");
+    }
+
     /// DB-IP's data carries its attribution where the session shows what it
     /// opened, wherever the file came from: here a name the download never
     /// uses, in the narrowest popup and a wide one.

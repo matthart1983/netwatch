@@ -635,8 +635,7 @@ fn describe_db(what: &str, file: &DbFile, now: SystemTime) -> (String, Option<Du
             build_epoch,
         } => {
             let built = UNIX_EPOCH.checked_add(Duration::from_secs(*build_epoch));
-            let date = built
-                .map(chrono::DateTime::<chrono::Utc>::from)
+            let date = crate::collectors::geo::epoch_date(*build_epoch)
                 .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
             (
                 format!("{what}: {database_type} built {date}, {path}"),
@@ -1254,7 +1253,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        std::fs::write(&path, test_db::city(database_type, now.as_secs() as u32)).unwrap();
+        std::fs::write(&path, test_db::city(database_type, now.as_secs())).unwrap();
         let config = NetwatchConfig {
             geoip_db: path.to_str().unwrap().to_owned(),
             ..Default::default()
@@ -1262,6 +1261,49 @@ mod tests {
         let snapshot = CapabilitySnapshot::configured(&config);
         let _ = std::fs::remove_dir_all(&dir);
         snapshot.get("geoip_db").clone()
+    }
+    /// What doctor reports for a file holding `bytes`.
+    fn geoip_db_of(bytes: &[u8]) -> Capability {
+        let dir = std::env::temp_dir().join(format!("nw-doctor-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.mmdb");
+        std::fs::write(&path, bytes).unwrap();
+        let config = NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&config);
+        let _ = std::fs::remove_dir_all(&dir);
+        snapshot.get("geoip_db").clone()
+    }
+    /// This date fits `SystemTime` but not chrono, and chrono's conversion
+    /// panicked here: doctor and daemon exited 101, and the TUI left the
+    /// alternate screen the same way, on one hand-made file.
+    #[test]
+    fn geoip_db_with_an_out_of_range_build_epoch_is_unreadable() {
+        use crate::collectors::geo::test_db;
+        for epoch in [9_000_000_000_000, u64::MAX] {
+            let geoip = geoip_db_of(&test_db::city("DBIP-Country-Lite", epoch));
+            assert_eq!(geoip.state, State::Unavailable, "{epoch}");
+            assert_eq!(geoip.reason, "db_unreadable", "{epoch}");
+            assert!(geoip.detail.contains("build_epoch"), "{}", geoip.detail);
+        }
+    }
+    /// The wording itself must not panic on a value that reached it some other
+    /// way, and says nothing about a date it cannot state.
+    #[test]
+    fn describing_an_out_of_range_date_does_not_panic() {
+        let now = SystemTime::now();
+        for build_epoch in [9_000_000_000_000, u64::MAX] {
+            let file = DbFile::Loaded {
+                path: "/geo/db.mmdb".into(),
+                database_type: "DBIP-Country-Lite".into(),
+                build_epoch,
+            };
+            let (text, age) = describe_db("Country/City", &file, now);
+            assert!(text.contains("built ?"), "{text}");
+            assert_eq!(age, None);
+        }
     }
     /// DB-IP's data carries its attribution wherever the file came from, here
     /// a name the download would never use.
