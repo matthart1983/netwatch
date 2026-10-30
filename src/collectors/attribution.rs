@@ -188,7 +188,7 @@ impl FlowRegistry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TableSource {
-    /// `ss -tunap`, from iproute2.
+    /// `ss -tuna`, from iproute2.
     Ss,
     /// The kernel's `/proc/net/{tcp,tcp6,udp,udp6}` tables, read directly
     /// because `ss` was missing or failed.
