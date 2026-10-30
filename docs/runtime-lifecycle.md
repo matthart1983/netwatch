@@ -71,7 +71,7 @@ are private owned config/cache/state directories, dedicated exports/scratch and
 writable grants. Exports now go to the platform cache directory's
 `netwatch/exports` subtree (normally `~/.cache/netwatch/exports` on Linux).
 
-Validation includes an isolated-process test at the real GeoIP, WHOIS, reverse-DNS,
+Validation includes an isolated-process test at the real WHOIS, reverse-DNS,
 Insights and keylog worker entries, keylog restart/read access, allowed exports,
 forbidden sentinel reads, post-preparation symlink replacement and injected strict
 entry failure. These are Linux filesystem boundary tests, not a hostile-parser
@@ -97,19 +97,20 @@ strict raw-authority loss prevents unsandboxed capture reopen retries.
 
 `App::prepare()` launches no application background workers. It still performs
 synchronous platform discovery, reads configuration/state/journals, takes the Linux
-process-attribution snapshot and opens configured MaxMind databases. Synchronous
+process-attribution snapshot and opens the GeoIP databases. Synchronous
 platform discovery can invoke system commands; prepare is not a no-I/O API.
 
 `start_workers()` is idempotent at the application level. It starts reverse DNS,
-optional Insights, configured keylog polling, ambient capture, platform attribution,
-GeoIP and WHOIS. It attaches attribution caches to the existing connection collector
+optional Insights, configured keylog polling, ambient capture, platform attribution
+and WHOIS. It attaches attribution caches to the existing connection collector
 so the prepared Linux process snapshot is retained. Its `workers_started` flag
 records that startup was requested, not that resources or confinement are ready.
 Both TUI and daemon still start these workers before applying the sandbox.
 
-`GeoCache::new/with_mmdb`, `WhoisCache::new`, `DnsCache::new` and
-`InsightsCollector::new` now prepare channels and state only. Call `start()` before
-expecting queued requests to be processed. Cache clones share one start gate.
+`WhoisCache::new`, `DnsCache::new` and `InsightsCollector::new` now prepare channels
+and state only. Call `start()` before expecting queued requests to be processed. Cache
+clones share one start gate. `GeoCache` has no worker: it answers from the databases
+opened in prepare, on the calling thread.
 Settings changes construct and explicitly start a replacement Insights collector.
 Terminal worker creation is named `EventHandler::start`; eBPF activation is named
 `ConnTracker::start` because its SDK cannot currently prepare without starting.
@@ -133,7 +134,6 @@ of its successful removal. Existing-thread confinement remains incomplete.
 | PKTAP / `platform::pktap::spawn` (macOS) | Capture resource and kernel attribution metadata; requires capture authority | Platform capture facilities | Explicit app startup | `PktapHandle` stop/join; startup errors reported separately; no macOS sandbox backend |
 | eBPF SDK reader / `EventSource::new` (inside `ConnTracker::start`) | Loads/attaches programs, opens ring buffers and starts dependency reader; BPF authority needed | Embedded object/system BPF resources | Explicit app start; dependency constructor is internally active | SDK signals shutdown and detaches reader on drop; no preparation/enforcement hook |
 | eBPF attribution drain / `ConnTracker::start` | Receives SDK events and updates bounded cache | No application files needed after startup | After SDK reader has already started | Tracker stop flag and join; spawn errors currently converted to absent join rather than readiness failure |
-| GeoIP / `GeoCache::start` | Online HTTP fallback requests/responses; offline database opened in prepare | Configured MaxMind files, resolver/runtime paths | Explicit app start, shared gate | Sender disconnect; queued requests may drain; detached, no cancellation/join |
 | WHOIS / `WhoisCache::start` | Lookup requests and external command/remote text | Lookup executable and resolver paths | Explicit app start, shared gate | Sender disconnect; queued requests may drain; detached, no cancellation/join |
 | Insights / `InsightsCollector::start` | Network-summary prompt and model HTTP response | Resolver/TLS runtime paths | Explicit app start and settings replacement | Sender disconnect; in-flight/queued work may finish; request timeout 30s, no join |
 | Terminal events / `EventHandler::start` | Crossterm terminal input and ticks | Terminal descriptors | TUI after sandbox call | Receiver drop eventually makes send fail; detached; no explicit stop/join |
@@ -179,7 +179,7 @@ Regression tests cover preparing an app with capture/keylog/Insights configured
 without activating those workers, retaining queued cache/analysis requests until
 explicit start, and starting each clone-shared lookup worker only once. These tests
 consume their synthetic requests before starting workers so they do not send DNS,
-WHOIS, GeoIP or model requests. Capture failure/restart checks use a nonexistent
+WHOIS or model requests. Capture failure/restart checks use a nonexistent
 Linux interface and never acquire a live capture handle.
 
 PR05 still owns policy application before processing, readiness/failure messages,

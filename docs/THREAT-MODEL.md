@@ -34,7 +34,7 @@ collector, UI, persistence and optional outbound-service interfaces; see
 | T2 Local unprivileged user | Process names, local traffic, accessible files |
 | T3 File supplier | Episodes, databases, keylogs and configuration |
 | T4 Network intermediary | DNS replies and unauthenticated HTTP services |
-| T5 Remote service | WHOIS, GeoIP, Insights or ingestion responses |
+| T5 Remote service | WHOIS, GeoIP downloads, Insights or ingestion responses |
 | T6 Dependency/build compromise | Crates, actions, tool downloads, release credentials |
 | T7 Already-root attacker | Outside the host-protection promise |
 
@@ -48,8 +48,8 @@ not isolated address spaces. The input inventory below names their implementatio
 Every confined thread takes a filesystem layer. Parser and capture threads stack
 a second layer on it; main and the network workers do not
 ([roles](../src/sandbox/roles.rs#L47)). The network workers are reverse DNS,
-WHOIS, online GeoIP, health, traceroute, Insights, remote publishing, the three
-Diagnose probe workers and the runtime's blocking pool. Every other worker is a
+WHOIS, health, traceroute, Insights, remote publishing, the three Diagnose probe
+workers and the runtime's blocking pool. Every other worker is a
 parser, and so is any worker name missing from the table. Main keeps the network
 because it starts network workers after its own entry, and a thread keeps every
 layer it inherits.
@@ -316,7 +316,6 @@ require their respective user actions. See
 | Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB |
 | WHOIS on W | https://rdap.org/ip/ and the registry it redirects to; on Connections the selected remote address; on Packets the selected packet's source and destination, your own public address included; private ranges are not sent |
 | GeoIP update | https://download.db-ip.com/free/ ; only when `netwatch geoip update` runs; HTTPS only, no redirects; the file name and date, no addresses |
-| Online GeoIP fallback | http://ip-api.com; peer address, cleartext; E2 will remove it |
 | Insights, opt-in | Configured Ollama-compatible /api/chat endpoint; network and packet summaries |
 | Remote, opt-in | Configured ingestion endpoint; metrics; HTTPS unless explicitly allowed insecure |
 | Other probes | Configured resolver, gateway, trace/PMTU targets; targets and traffic depend on configuration |
@@ -346,7 +345,7 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | C1 capture authority and NET_ADMIN audit | Included |
 | D1 seccomp no-socket policy | Later 0.39 work |
 | C2 `netwatch geoip update`, downloads parsed on a parser thread | Included |
-| E2 removing the online GeoIP fallback | Later 0.39 work |
+| E2 online GeoIP fallback | Removed: lookups read local files, and `geoip_online` is ignored |
 | E3 capture-error hint and package messages still setcap a world-executable binary | Later 0.39 work |
 | E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Later 0.39 work |
 | F1 doctor reports actual containment | Later 0.39 work |

@@ -144,6 +144,31 @@ fn threat_model_lists_every_outbound_endpoint() {
     }
 }
 
+/// The online GeoIP lookup is gone, and so is its provider's name, from the
+/// code and from everything that describes the current behaviour. The
+/// changelog keeps its history.
+#[test]
+fn nothing_names_the_removed_geoip_service() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Assembled, so this file does not match itself.
+    let name = concat!("ip-", "api");
+    let mut pending = vec![
+        root.join("src"),
+        root.join("docs"),
+        root.join("README.md"),
+        root.join("SECURITY.md"),
+    ];
+    let mut found = Vec::new();
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+        } else if std::fs::read_to_string(&path).is_ok_and(|text| text.contains(name)) {
+            found.push(path);
+        }
+    }
+    assert!(found.is_empty(), "{found:?}");
+}
+
 /// Whether a sentence names eBPF (or its SDK source) as switched off by the
 /// sandbox, in either order. Untrue since 0.32.2, when the load moved
 /// inside the policy (`ebpf/conn_tracker.rs`).

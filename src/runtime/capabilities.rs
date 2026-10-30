@@ -202,30 +202,28 @@ impl CapabilitySnapshot {
         );
         let (state, reason, detail, next) = geoip_db_assessment(geoip, SystemTime::now());
         snapshot.put("geoip_db", state, reason, &detail, next);
-        for (id, enabled, detail) in [
-            (
-                "online_geo",
-                config.geoip_online,
-                "Online GeoIP configured (ip-api.com, cleartext HTTP); endpoint not contacted",
-            ),
-            (
-                "insights",
-                config.insights_enabled,
-                "Insights configured; endpoint not contacted",
-            ),
-        ] {
-            snapshot.put(
-                id,
-                if enabled {
-                    State::NotChecked
-                } else {
-                    State::Disabled
-                },
-                "configuration_only",
-                detail,
-                Some("Review external-service settings before live use"),
-            );
-        }
+        snapshot.put(
+            "online_geo",
+            State::Disabled,
+            "removed",
+            if config.geoip_online {
+                "Online GeoIP was removed in 0.39; geoip_online in config.toml is ignored"
+            } else {
+                "Online GeoIP was removed in 0.39; lookups stay on this machine"
+            },
+            Some("netwatch geoip update"),
+        );
+        snapshot.put(
+            "insights",
+            if config.insights_enabled {
+                State::NotChecked
+            } else {
+                State::Disabled
+            },
+            "configuration_only",
+            "Insights configured; endpoint not contacted",
+            Some("Review external-service settings before live use"),
+        );
         snapshot.put(
             "whois",
             State::NotChecked,
@@ -473,17 +471,6 @@ impl CapabilitySnapshot {
                 component.error,
             ));
         }
-        snapshot.put(
-            "online_geo",
-            if app.user_config.geoip_online {
-                State::NotChecked
-            } else {
-                State::Disabled
-            },
-            "live_configuration",
-            "Live online lookup setting (ip-api.com, cleartext HTTP); per-request outcomes not tracked here",
-            None,
-        );
         for id in ["whois", "reverse_dns"] {
             snapshot.put(
                 id,
@@ -1269,14 +1256,19 @@ mod tests {
         assert!(detail.contains("ASN: "), "{detail}");
     }
     #[test]
-    fn online_geo_is_labelled_cleartext() {
-        let config = NetwatchConfig {
-            geoip_online: true,
-            ..Default::default()
-        };
-        let snapshot = CapabilitySnapshot::configured(&config);
-        assert_eq!(snapshot.get("online_geo").state, State::NotChecked);
-        assert!(snapshot.get("online_geo").detail.contains("cleartext"));
+    fn online_geo_reports_removed() {
+        for geoip_online in [false, true] {
+            let config = NetwatchConfig {
+                geoip_online,
+                ..Default::default()
+            };
+            let snapshot = CapabilitySnapshot::configured(&config);
+            let online = snapshot.get("online_geo");
+            assert_eq!(online.state, State::Disabled);
+            assert_eq!(online.reason, "removed");
+            assert_eq!(online.detail.contains("is ignored"), geoip_online);
+            assert_eq!(online.next_check.as_deref(), Some("netwatch geoip update"));
+        }
     }
     /// Since 0.32.2 eBPF loads inside the sandbox policy, so the default
     /// configuration must not report it switched off by that policy.

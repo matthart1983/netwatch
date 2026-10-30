@@ -611,6 +611,19 @@ All notable changes to NetWatch will be documented in this file.
   whose `net.ipv4.ping_group_range` leaves out the user netwatch runs as,
   the `ping` that health falls back to and the Diagnose PMTU probe now
   fail, and health measures over TCP instead.
+- **netwatch no longer sends peer addresses to a third party for GeoIP.**
+  With `geoip_online = true` and no working database, every public peer address
+  a connection or packet touched went to ip-api.com over cleartext HTTP, where
+  anyone on the path could read which hosts you talk to and rewrite the answer.
+  Its free tier has no HTTPS, so this could not be made private. The lookup, its
+  worker thread and the parser are gone. A config that sets `geoip_online` still
+  loads; the setting is ignored, the log warns once per start, `netwatch doctor`
+  reports `online_geo` as `disabled` (`removed`), and the next save from Settings
+  drops the key. The GeoIP column stays empty until you run `netwatch geoip
+  update`. Organisation names now come from DB-IP's
+  `autonomous_system_organization`, so an egress policy's `allow_asn` entries
+  written for ip-api or MaxMind names (`CLOUDFLARENET`) need DB-IP's
+  (`Cloudflare, Inc.`) if you switch.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
@@ -698,6 +711,9 @@ All notable changes to NetWatch will be documented in this file.
 - **A test checks the metrics table in docs/observability-export.md
   against the exporter.** It fails when a metric is added, renamed or given
   another type without the table.
+- **Two GeoIP checks.** `geoip_update_live`, ignored by default, runs
+  `netwatch geoip update` against DB-IP by hand at release, and a unit test fails
+  if the removed service's name comes back in the code or the docs.
 
 ## [0.38.0] - 2026-10-25
 

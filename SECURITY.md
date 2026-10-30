@@ -71,4 +71,6 @@ metrics endpoint to the internet deliberately).
   unless you have a reason not to.
 
 See the [threat model](docs/THREAT-MODEL.md) for per-thread privileges, outbound
-traffic, unsupported boundaries and planned hardening.
+traffic, unsupported boundaries and planned hardening, and [what netwatch sends
+off this machine](docs/REFERENCE.md#what-netwatch-sends-off-this-machine) for
+what leaves the host and when.

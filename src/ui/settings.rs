@@ -453,11 +453,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             format!("◀ {} ▶", row.shown(cfg))
         } else if i == cursor::GEOIP_DB {
             let (wanted, _) = cfg.geoip_paths();
-            let status = app.geo_cache.db_status();
-            match geoip_online_row(status, cfg.geoip_online) {
-                Some(online) => online,
-                None => geoip_row(&wanted, &status.city),
-            }
+            geoip_row(&wanted, &app.geo_cache.db_status().city)
         } else if i == cursor::GEOIP_ASN_DB {
             let (_, wanted) = cfg.geoip_paths();
             geoip_row(&wanted, &app.geo_cache.db_status().asn)
@@ -607,26 +603,13 @@ fn geoip_row(wanted: &str, opened: &DbFile) -> String {
         return format!("{} on next start", or_placeholder(wanted, "(none)"));
     }
     match opened {
-        DbFile::NotConfigured => "(none)".into(),
+        DbFile::NotConfigured => "(none): run netwatch geoip update".into(),
         DbFile::Unreadable { path, .. } => format!("unreadable: {path}"),
         DbFile::Loaded {
             path,
             database_type,
             ..
         } => format!("{database_type}: {path}"),
-    }
-}
-
-/// With `geoip_online` on, lookups go to ip-api.com, which has no HTTPS on its
-/// free tier, whenever no database answers: none is set, or the one set failed
-/// to open. Say so where geo is set, and before the path.
-fn geoip_online_row(status: &crate::collectors::geo::DbStatus, online: bool) -> Option<String> {
-    match (&status.city, online) {
-        (DbFile::NotConfigured, true) => Some("ip-api.com (cleartext)".into()),
-        (DbFile::Unreadable { path, .. }, true) => {
-            Some(format!("ip-api.com (cleartext), unreadable: {path}"))
-        }
-        _ => None,
     }
 }
 
@@ -719,31 +702,6 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
 
-    #[test]
-    fn geoip_db_row_says_when_lookups_go_out_in_cleartext() {
-        use crate::collectors::geo::DbStatus;
-        let mut status = DbStatus::default();
-        assert_eq!(geoip_online_row(&status, false), None);
-        assert_eq!(
-            geoip_online_row(&status, true).as_deref(),
-            Some("ip-api.com (cleartext)")
-        );
-        // A database that fails to open sends every lookup to ip-api.com too,
-        // so a set path is no reason to drop the label.
-        status.city = DbFile::Unreadable {
-            path: "/usr/share/GeoIP/GeoLite2-City.mmdb".into(),
-            error: "bad".into(),
-        };
-        assert_eq!(
-            geoip_online_row(&status, true).as_deref(),
-            Some("ip-api.com (cleartext), unreadable: /usr/share/GeoIP/GeoLite2-City.mmdb")
-        );
-        assert_eq!(geoip_online_row(&status, false), None);
-        // One that opened answers every lookup itself.
-        status.city = loaded("/geo/db.mmdb");
-        assert_eq!(geoip_online_row(&status, true), None);
-    }
-
     fn loaded(path: &str) -> DbFile {
         DbFile::Loaded {
             path: path.into(),
@@ -754,7 +712,10 @@ mod tests {
 
     #[test]
     fn geoip_row_says_which_database_is_loaded() {
-        assert_eq!(geoip_row("", &DbFile::NotConfigured), "(none)");
+        assert_eq!(
+            geoip_row("", &DbFile::NotConfigured),
+            "(none): run netwatch geoip update"
+        );
         assert_eq!(
             geoip_row("/geo/db.mmdb", &loaded("/geo/db.mmdb")),
             "DBIP-Country-Lite: /geo/db.mmdb"

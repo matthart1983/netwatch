@@ -36,10 +36,10 @@ fn static_doctor_does_not_contact_configured_services_or_write_state() {
     let config = netwatch::config::NetwatchConfig {
         insights_enabled: true,
         insights_endpoint: endpoint.clone(),
-        geoip_online: true,
         ..Default::default()
     };
-    let raw = toml::to_string(&config).unwrap();
+    // Written by hand: it is read from an old file, never saved to one.
+    let raw = format!("geoip_online = true\n{}", toml::to_string(&config).unwrap());
     fs::write(fixture.0.join("config/netwatch/config.toml"), &raw).unwrap();
     let output = fixture
         .command()
@@ -68,6 +68,7 @@ fn static_doctor_does_not_contact_configured_services_or_write_state() {
         snapshot.get("capture").state,
         netwatch::runtime::capabilities::State::NotChecked
     );
+    assert_eq!(snapshot.get("online_geo").reason, "removed");
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

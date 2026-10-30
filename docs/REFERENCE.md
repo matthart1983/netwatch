@@ -369,9 +369,12 @@ allow_sni   = ["*.google.com", "*.gstatic.com"]   # exact or *.wildcard (incl. a
 allow_ports = [443]
 
 [process.node]
-allow_asn = ["CLOUDFLARENET"]                     # fallback when a flow has no SNI
+allow_asn = ["Cloudflare, Inc."]                  # fallback when a flow has no SNI
 allow_ip  = ["203.0.113.9"]                        # for a raw-IP dest with no name at all
 ```
+
+`allow_asn` matches the organisation name in the ASN database you load, so a name from another
+database does not carry over: MaxMind's `CLOUDFLARENET` is DB-IP's `Cloudflare, Inc.`.
 
 Rules are expressed in terms a firewall can't write — `process → {SNI, ASN, IP, port}` —
 because the flow already carries the owning process (eBPF/proc attribution) and the
@@ -826,6 +829,26 @@ Variables named `NETWATCH_*` that are not listed here are test hooks and may cha
 
 ---
 
+## What netwatch sends off this machine
+
+GeoIP lookups read local files, so the GeoIP column sends nothing anywhere. This is what does
+leave the host. The [threat model](THREAT-MODEL.md#outbound-inventory) lists the same
+destinations, and a test holds it to the code.
+
+| What | When | Where it goes | What it carries |
+|------|------|---------------|-----------------|
+| Reference DNS query | Automatically, in the TUI and the daemon | 1.1.1.1 | A query for `dns.google` |
+| Internet reachability | Automatically, in the TUI and the daemon | 1.1.1.1, with a TCP fallback on port 443 | A probe, no data |
+| STUN | Automatically, in the TUI and the daemon | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | A binding request, which reveals your public address to them |
+| Startup trace | Every TUI start | 1.1.1.1 | TTL-limited packets |
+| Health probes | Automatically, in the TUI and the daemon | Your gateway and the configured resolver | ICMP echoes and DNS queries |
+| Reverse DNS | Automatically, for addresses in this host's own connections | The system resolver | The addresses it looks up |
+| WHOIS | Only when you press `W` | `rdap.org` and the registry it redirects to | On Connections the selected remote address, on Packets the selected packet's two addresses; private ranges are not sent |
+| Diagnose experiments | When you run them | The defaults in the [threat model](THREAT-MODEL.md#outbound-inventory), or targets you configure | Probes; the upload test sends up to 25 MB of filler |
+| GeoIP download | Only when you run `netwatch geoip update` | `download.db-ip.com`, HTTPS only | The file names and dates it asks for, no addresses |
+| Insights, opt-in | When `insights_enabled` is on | The endpoint you configure | Network and packet summaries |
+| Remote, opt-in | With `--remote` or `NETWATCH_REMOTE_URL` | The URL you give | Metrics; HTTPS unless you allow otherwise |
+
 ## Configuration
 
 NetWatch runs with zero setup — every key below has a working default, and the file doesn't
@@ -914,9 +937,9 @@ full resolution.
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `show_geo` | `true` | `true` `false` | Show the GeoIP column in Connections. |
-| `geoip_db` | `""` | file path | A City or Country `.mmdb`, DB-IP's or MaxMind's. Empty uses what [`netwatch geoip update`](#geoip-databases) downloaded, if anything; see `geoip_online` for the fallback. |
+| `geoip_db` | `""` | file path | A City or Country `.mmdb`, DB-IP's or MaxMind's. Empty uses what [`netwatch geoip update`](#geoip-databases) downloaded, if anything. Lookups never leave this machine. |
 | `geoip_asn_db` | `""` | file path | An ASN `.mmdb`, DB-IP's or MaxMind's, for organisation names. Empty uses what `netwatch geoip update` downloaded, if anything. |
-| `geoip_online` | `false` | `true` `false` | Fall back to `http://ip-api.com` when `geoip_db` is empty or fails to open. Off by default: enabling it sends every public peer IP to a third party over cleartext HTTP, with no per-host opt-out, and anyone on the path can read the lookups and change the answers. ip-api.com offers HTTPS only on its paid tier, so there is no encrypted option. With this on, Settings shows the GeoIP DB Path as `ip-api.com (cleartext)`, or as `ip-api.com (cleartext) if unreadable:` and the path when `geoip_db` is set. |
+| `geoip_online` | removed | | Removed in 0.39: it sent peer addresses to a third party in cleartext. A config that sets it still loads, the setting is ignored, and the log says so once per start. The next save from Settings drops it. Run [`netwatch geoip update`](#geoip-databases) instead. |
 
 ### Security
 
@@ -981,7 +1004,7 @@ and the [Diagnose rule coverage](diagnostic-coverage.md).
 | Connections | 2s | `lsof` + PKTAP | `/proc/net/tcp` + eBPF kprobe |
 | Health probes | Every 5 ticks | Gateway/internet ICMP, DNS queries | Gateway/internet ICMP, DNS queries |
 | Packets | Real-time | libpcap (BPF) | libpcap |
-| GeoIP | On-demand | `.mmdb` / ip-api.com | `.mmdb` / ip-api.com |
+| GeoIP | On-demand | Local `.mmdb` files | Local `.mmdb` files |
 
 ```
 Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders

@@ -620,11 +620,6 @@ mod tests {
         }
         let capture = snapshot()["capture"].report.clone().unwrap();
         assert_eq!(capture.platform.landlock_layer, Some("capture"));
-        // Online lookups are opt-in (off by default, see `geoip_online` in
-        // NetwatchConfig); force them on here so the geoip worker actually
-        // spawns and this test still covers its sandbox entry.
-        let geo = crate::collectors::geo::GeoCache::with_mmdb_and_online("", "", true);
-        geo.start();
         let whois = crate::collectors::whois::WhoisCache::new();
         whois.start();
         let mut packet = crate::collectors::packets::PacketCollector::new();
@@ -655,7 +650,7 @@ mod tests {
         let mut ai =
             crate::collectors::insights::InsightsCollector::new("unused", "http://127.0.0.1:1");
         ai.start();
-        for name in ["geoip", "whois", "reverse-dns", "keylog", "insights"] {
+        for name in ["whois", "reverse-dns", "keylog", "insights"] {
             assert_eq!(
                 PROBES.lock().unwrap().get(name),
                 Some(&true),
@@ -701,8 +696,6 @@ mod tests {
                 "actual {name} worker could connect: {net:?}"
             );
         }
-        // The online GeoIP worker is on its way out, so it is not held to
-        // connecting here.
         for name in ["whois", "reverse-dns", "insights"] {
             assert_eq!(
                 net.get(name),

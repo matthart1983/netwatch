@@ -1,8 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use super::lru::BoundedLru;
 
@@ -10,11 +7,6 @@ use super::lru::BoundedLru;
 /// looks up every public peer on every tick, and an LRU smaller than the set
 /// it cycles through evicts each entry before it is asked for again.
 const GEO_CACHE_MAX: usize = 16_384;
-
-/// Online lookups queued for the worker at most. A lookup that finds the
-/// queue full is dropped and asked again on a later lookup. The worker
-/// answers one every 1.4 s, so a full queue is six minutes of work.
-const GEO_QUEUE_MAX: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct GeoInfo {
@@ -25,8 +17,7 @@ pub struct GeoInfo {
 }
 
 impl GeoInfo {
-    /// Every field comes from a database file or an HTTP reply we did not
-    /// write (ip-api is cleartext, so anyone on path writes it), so each is
+    /// Every field comes from a database file we did not write, so each is
     /// made safe to draw on the way in.
     fn new(country_code: String, country: String, city: String, org: String) -> Self {
         use crate::ui::sanitize::display_owned;
@@ -43,7 +34,6 @@ impl GeoInfo {
 enum GeoEntry {
     Resolved(GeoInfo),
     Failed,
-    Pending,
 }
 
 // ── MaxMind offline reader ─────────────────────────────────
@@ -184,12 +174,6 @@ pub struct GeoCache {
     cache: Arc<Mutex<BoundedLru<IpAddr, GeoEntry>>>,
     mmdb: Arc<Option<MaxMindReader>>,
     db_status: Arc<DbStatus>,
-    online_tx: std_mpsc::SyncSender<IpAddr>,
-    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<IpAddr>>>>,
-    /// Opt-in: without it, an IP with no offline DB hit simply has no geo
-    /// info rather than being sent to ip-api.com. See `geoip_online` in
-    /// `NetwatchConfig` for why this defaults to off.
-    online_enabled: bool,
 }
 
 impl Default for GeoCache {
@@ -199,79 +183,26 @@ impl Default for GeoCache {
 }
 
 impl GeoCache {
-    /// No offline DB, no online fallback — used by tests and any caller
-    /// that hasn't opted into `geoip_online`.
+    /// No database, so no lookup answers. Used by tests.
     pub fn new() -> Self {
         Self::with_mmdb("", "")
     }
 
-    /// No online fallback. Prefer `with_mmdb_and_online` when wiring up a
-    /// real config that may have `geoip_online` set.
+    /// Lookups answered from these files and nowhere else. An address no file
+    /// answers for has no geo info. Empty or unreadable paths are in
+    /// [`Self::db_status`].
     pub fn with_mmdb(city_path: &str, asn_path: &str) -> Self {
-        Self::with_mmdb_and_online(city_path, asn_path, false)
-    }
-
-    pub fn with_mmdb_and_online(city_path: &str, asn_path: &str, online_enabled: bool) -> Self {
         let (reader, status) = MaxMindReader::open(city_path, asn_path);
-        Self::with_reader(reader, status, online_enabled)
+        Self::with_reader(reader, status)
     }
 
-    fn with_reader(reader: MaxMindReader, status: DbStatus, online_enabled: bool) -> Self {
+    fn with_reader(reader: MaxMindReader, status: DbStatus) -> Self {
         let has_db = reader.city_reader.is_some();
-        let mmdb = Arc::new(if has_db { Some(reader) } else { None });
-
-        let (tx, rx) = std_mpsc::sync_channel::<IpAddr>(GEO_QUEUE_MAX);
-        let cache = Arc::new(Mutex::new(BoundedLru::new(GEO_CACHE_MAX)));
-
         Self {
-            online_enabled,
-            cache,
-            mmdb,
+            cache: Arc::new(Mutex::new(BoundedLru::new(GEO_CACHE_MAX))),
+            mmdb: Arc::new(if has_db { Some(reader) } else { None }),
             db_status: Arc::new(status),
-            online_tx: tx,
-            pending_rx: Arc::new(Mutex::new(Some(rx))),
         }
-    }
-
-    /// Start the prepared lookup worker once, shared across cache clones.
-    /// Construction only opens local resources and creates a request channel.
-    pub fn start(&self) -> bool {
-        let Some(rx) = self.pending_rx.lock().unwrap().take() else {
-            return false;
-        };
-        if !self.online_enabled {
-            // `lookup()` never sends on this channel when online lookups are
-            // disabled, so there is nothing for a worker to do — `rx` drops
-            // here. `pending_rx` was still taken above, so a second `start()`
-            // call correctly reports "already started" either way.
-            return true;
-        }
-        let resolver_cache = Arc::clone(&self.cache);
-
-        // Online fallback thread (ip-api.com) — only needed without a local DB
-        crate::sandbox::worker::spawn("geoip", move || {
-            let now = Instant::now();
-            let mut last_request = now.checked_sub(Duration::from_millis(1500)).unwrap_or(now);
-            while let Some(ip) = crate::sandbox::worker::receive(&rx) {
-                let elapsed = last_request.elapsed();
-                if elapsed < Duration::from_millis(1400) {
-                    thread::sleep(Duration::from_millis(1400) - elapsed);
-                }
-                last_request = Instant::now();
-
-                if crate::sandbox::worker::stopping() {
-                    break;
-                }
-                let result = lookup_geo_online(ip);
-                let mut c = resolver_cache.lock().unwrap();
-                match result {
-                    Some(info) => c.put(ip, GeoEntry::Resolved(info)),
-                    None => c.put(ip, GeoEntry::Failed),
-                }
-            }
-        });
-
-        true
     }
 
     pub fn has_offline_db(&self) -> bool {
@@ -292,46 +223,24 @@ impl GeoCache {
             match cache.get(&addr) {
                 Some(GeoEntry::Resolved(info)) => return Some(info.clone()),
                 Some(GeoEntry::Failed) => return None,
-                Some(GeoEntry::Pending) => return None,
                 None => {}
             }
         }
 
-        // Try offline MaxMind DB (instant, no rate limit)
-        if let Some(ref reader) = *self.mmdb {
-            let result = reader.lookup(addr);
-            let mut cache = self.cache.lock().unwrap();
-            match result {
-                Some(info) => {
-                    cache.put(addr, GeoEntry::Resolved(info.clone()));
-                    return Some(info);
-                }
-                None => {
-                    cache.put(addr, GeoEntry::Failed);
-                    return None;
-                }
-            }
-        }
-
-        // Fall back to online lookup (async via background thread) — opt-in
-        // only. Without a local DB and without this, an IP just has no geo
-        // info rather than being sent to ip-api.com.
-        if !self.online_enabled {
-            return None;
-        }
+        // No database, no answer. Nothing leaves this machine for a lookup.
+        let reader = (*self.mmdb).as_ref()?;
+        let result = reader.lookup(addr);
         let mut cache = self.cache.lock().unwrap();
-        match self.online_tx.try_send(addr) {
-            Ok(()) => cache.put(addr, GeoEntry::Pending),
-            // Queue full: record nothing, so the next lookup asks again.
-            Err(std_mpsc::TrySendError::Full(_)) => {}
-            // Worker gone: nothing will answer, so record the address as
-            // failed and log it once rather than on every later lookup.
-            Err(e @ std_mpsc::TrySendError::Disconnected(_)) => {
+        match result {
+            Some(info) => {
+                cache.put(addr, GeoEntry::Resolved(info.clone()));
+                Some(info)
+            }
+            None => {
                 cache.put(addr, GeoEntry::Failed);
-                tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
+                None
             }
         }
-        None
     }
 }
 
@@ -488,44 +397,12 @@ pub fn is_private_ip(ip: &str) -> bool {
         || ip.starts_with("239.") // multicast v4
 }
 
-/// Cleartext because it has to be: ip-api.com serves HTTPS only on its paid
-/// tier. Anyone on the path sees which peers are looked up and can rewrite
-/// the answer. That is why `geoip_online` is off by default, and why doctor,
-/// Settings and the config reference call it cleartext.
-fn lookup_geo_online(ip: IpAddr) -> Option<GeoInfo> {
-    let url = format!(
-        "http://ip-api.com/json/{}?fields=status,country,countryCode,city,org,as",
-        ip
-    );
-    let body = crate::http::get_text(&url).ok()?;
-    parse_ip_api(&body)
-}
-
-fn parse_ip_api(body: &str) -> Option<GeoInfo> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-
-    if v.get("status")?.as_str()? != "success" {
-        return None;
-    }
-
-    Some(GeoInfo::new(
-        v.get("countryCode")?.as_str()?.to_string(),
-        v.get("country")?.as_str()?.to_string(),
-        v.get("city")?.as_str().unwrap_or("").to_string(),
-        v.get("org")
-            .or_else(|| v.get("as"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-    ))
-}
-
 #[cfg(test)]
 impl GeoCache {
     /// A cache whose database puts every address in Ashburn, United States,
     /// for tests outside this module.
     pub(crate) fn every_address_us_for_test() -> Self {
-        Self::with_reader(tests::every_address_us(), DbStatus::default(), false)
+        Self::with_reader(tests::every_address_us(), DbStatus::default())
     }
 }
 
@@ -709,54 +586,23 @@ mod tests {
         assert!(cache.lookup("—").is_none());
     }
 
+    /// Without a database an address has no geo info, and nothing is recorded
+    /// or sent for it. There is no worker, queue or other path off this machine
+    /// to send it down, and this file holds no client to build one with.
     #[test]
-    fn geocache_no_db_returns_none_first_call() {
-        let cache = GeoCache::new();
-        // No DB and online lookups off (the default): nothing is queued,
-        // this just returns None.
-        assert!(cache.lookup("8.8.8.8").is_none());
-        assert!(cache
-            .pending_rx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .try_recv()
-            .is_err());
-    }
-
-    #[test]
-    fn geocache_online_disabled_by_default_does_not_queue() {
-        // Same IP, both constructors: without opting in, ip-api.com never
-        // sees a request queued for it.
+    fn lookup_never_queues_online() {
         for cache in [GeoCache::new(), GeoCache::with_mmdb("", "")] {
             assert!(cache.lookup("8.8.8.8").is_none());
-            assert!(cache
-                .pending_rx
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .try_recv()
-                .is_err());
+            assert_eq!(cache.cache.lock().unwrap().len(), 0);
         }
-    }
-
-    #[test]
-    fn geocache_online_opt_in_queues_the_lookup() {
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        assert!(cache.lookup("8.8.8.8").is_none());
-        assert_eq!(
-            cache
-                .pending_rx
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .try_recv()
-                .unwrap(),
-            IpAddr::from([8, 8, 8, 8])
-        );
+        let unreadable = GeoCache::with_mmdb("/nonexistent/path.mmdb", "");
+        assert!(unreadable.lookup("8.8.8.8").is_none());
+        assert_eq!(unreadable.cache.lock().unwrap().len(), 0);
+        // Assembled, so this test does not match itself.
+        let source = include_str!("geo.rs");
+        for client in [concat!("crate::", "http"), concat!("ureq", "::")] {
+            assert!(!source.contains(client), "{client}");
+        }
     }
 
     #[test]
@@ -825,21 +671,17 @@ mod tests {
     fn with_mmdb_bad_path_falls_back() {
         let cache = GeoCache::with_mmdb("/nonexistent.mmdb", "/also-bad.mmdb");
         assert!(!cache.has_offline_db());
-        // Should still work via online fallback path
         assert!(cache.lookup("192.168.1.1").is_none()); // private
     }
 
     #[test]
-    fn ip_api_control_characters_are_replaced() {
-        let body = serde_json::json!({
-            "status": "success",
-            "countryCode": "AU",
-            "country": "Aus\u{202E}tralia",
-            "city": "Syd\u{1b}]52;c;AAAA\u{7}",
-            "org": "Evil\u{FEFF}Net",
-        })
-        .to_string();
-        let info = parse_ip_api(&body).unwrap();
+    fn control_characters_are_replaced() {
+        let info = GeoInfo::new(
+            "AU".into(),
+            "Aus\u{202E}tralia".into(),
+            "Syd\u{1b}]52;c;AAAA\u{7}".into(),
+            "Evil\u{FEFF}Net".into(),
+        );
         assert_eq!(info.country_code, "AU");
         assert_eq!(info.country, "Aus·tralia");
         assert_eq!(info.city, "Syd·]52;c;AAAA·");
@@ -857,21 +699,11 @@ mod tests {
         }
     }
 
-    /// What the online worker would be handed next, drained.
-    fn queued(cache: &GeoCache) -> Vec<String> {
-        let rx = cache.pending_rx.lock().unwrap();
-        rx.as_ref()
-            .unwrap()
-            .try_iter()
-            .map(|ip| ip.to_string())
-            .collect()
-    }
-
     /// The offline path inserted with no eviction at all, so a long-running
     /// host with a database kept every distinct peer it ever saw.
     #[test]
     fn offline_cache_stays_bounded() {
-        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default());
         assert!(cache.has_offline_db());
         for i in 0..100_000u32 {
             let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
@@ -886,7 +718,7 @@ mod tests {
     /// went back to the database.
     #[test]
     fn ten_thousand_peers_stay_cached() {
-        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default());
         let peers: Vec<IpAddr> = (0..10_000u32)
             .map(|i| IpAddr::from(Ipv4Addr::from(0x0800_0000 + i)))
             .collect();
@@ -897,81 +729,19 @@ mod tests {
         assert!(peers.iter().all(|peer| c.contains_key(peer)));
     }
 
-    /// The online queue had no limit, and a pending entry the cache evicted
-    /// was queued again on the next tick's lookup, so with more peers than
-    /// cache entries every tick queued every peer behind a worker that
-    /// answers one every 1.4 s.
-    #[test]
-    fn a_full_online_queue_drops_the_request_and_records_nothing() {
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        let peers: Vec<String> = (0..10_000u32)
-            .map(|i| Ipv4Addr::from(0x0800_0000 + i).to_string())
-            .collect();
-        // Two ticks: the second queues nothing new.
-        for _ in 0..2 {
-            for peer in &peers {
-                assert!(cache.lookup(peer).is_none());
-            }
-        }
-        assert_eq!(cache.cache.lock().unwrap().len(), GEO_QUEUE_MAX);
-        assert_eq!(queued(&cache).len(), GEO_QUEUE_MAX);
-        // With room again, a dropped request is asked for on its next lookup.
-        let dropped = peers.last().unwrap();
-        cache.lookup(dropped);
-        assert_eq!(queued(&cache), [dropped.as_str()]);
-    }
-
-    /// Once the worker has gone, after a panic or at shutdown while the UI
-    /// still ticks, a lookup that records nothing tries the send again next
-    /// time. The egress view looks up every public peer on every tick, so
-    /// that was an error in the log per peer per tick.
-    #[test]
-    fn a_gone_worker_is_logged_once_per_address() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tracing_subscriber::layer::{Context, SubscriberExt};
-
-        struct Count(Arc<AtomicUsize>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
-            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let events = Arc::new(AtomicUsize::new(0));
-        let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&events)));
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        drop(cache.pending_rx.lock().unwrap().take());
-        tracing::subscriber::with_default(subscriber, || {
-            for _tick in 0..10 {
-                for i in 0..100u32 {
-                    let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
-                    assert!(cache.lookup(&ip).is_none());
-                }
-            }
-        });
-        assert_eq!(events.load(Ordering::Relaxed), 100);
-    }
-
     #[test]
     fn v4_mapped_and_plain_share_one_entry() {
-        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default());
         assert!(cache.lookup("8.8.8.8").is_some());
         assert!(cache.lookup("::ffff:8.8.8.8").is_some());
         assert!(cache.lookup("[::ffff:8.8.8.8]").is_some());
         assert_eq!(cache.cache.lock().unwrap().len(), 1);
-
-        // Online, the mapped form is asked for once, as the IPv4 address.
-        let online = GeoCache::with_mmdb_and_online("", "", true);
-        online.lookup("::ffff:8.8.8.8");
-        online.lookup("8.8.8.8");
-        assert_eq!(queued(&online), ["8.8.8.8"]);
     }
 
     #[test]
     fn non_global_addresses_are_never_looked_up() {
         // Every address is in the fake database, so None means skipped.
-        let offline = GeoCache::with_reader(every_address_us(), DbStatus::default(), false);
-        let online = GeoCache::with_mmdb_and_online("", "", true);
+        let offline = GeoCache::with_reader(every_address_us(), DbStatus::default());
         for ip in [
             "::ffff:192.168.1.5",
             "::ffff:10.0.0.1",
@@ -1029,10 +799,8 @@ mod tests {
             "not-an-ip",
         ] {
             assert!(offline.lookup(ip).is_none(), "{ip}");
-            online.lookup(ip);
         }
         assert_eq!(offline.cache.lock().unwrap().len(), 0);
-        assert!(queued(&online).is_empty());
 
         for ip in [
             "8.8.8.8",
@@ -1062,32 +830,5 @@ mod tests {
         ] {
             assert!(offline.lookup(ip).is_some(), "{ip}");
         }
-    }
-}
-
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-
-    #[test]
-    fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
-        // Online lookups must be opted into for this to exercise the
-        // worker-sharing path at all (see geo.rs's `online_enabled` gate).
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        cache.lookup("8.8.8.8");
-        assert_eq!(
-            cache
-                .pending_rx
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .try_recv()
-                .unwrap(),
-            IpAddr::from([8, 8, 8, 8])
-        );
-        let clone = cache.clone();
-        assert!(clone.start());
-        assert!(!cache.start());
     }
 }
