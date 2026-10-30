@@ -2,9 +2,9 @@
 //!
 //! Two tests run with the rest of the suite: a 10,000-row table renders its
 //! true count and every row can be scrolled to, and the timeline keeps every
-//! active entry when 10,000 are active and some close. Two more check the
-//! timings below: each timed frame follows a tick, and a missed `Pending`
-//! budget fails unless `NW_PERF_STRICT=0`.
+//! active entry, and the last 2,000 that closed, when 10,000 are active and
+//! some close. Two more check the timings below: each timed frame follows a
+//! tick, and a missed `Pending` budget fails unless `NW_PERF_STRICT=0`.
 //!
 //! The rest are timings, `#[ignore]`d and named `scale_*`, for a release
 //! build:
@@ -14,15 +14,16 @@
 //! ```
 //!
 //! They time frames on a 200x50 terminal, the scroll key, the UI tick's
-//! connection consumers and Diagnose's socket join on synthetic tables
-//! ([`crate::testutil::connections`]), and on Linux a real poll of 1,000,
-//! 5,000 and 25,000 loopback TCP pairs. Each case prints one `SCALE` line,
-//! which `scripts/scale-bench.sh` turns into a table. `NW_SCALE_ROWS=10000`
-//! runs one size.
+//! connection consumers, and Diagnose's socket join and the socket pass
+//! around it, on synthetic tables ([`crate::testutil::connections`]), and on
+//! Linux a real poll of 1,000, 5,000 and 25,000 loopback TCP pairs. Each
+//! case prints one `SCALE` line, which `scripts/scale-bench.sh` turns into a
+//! table. `NW_SCALE_ROWS=10000` runs one size.
 //!
 //! Budgets apply at 10,000 rows only and are multiplied by `NW_PERF_SLACK`
 //! (1 on the reference machine, 3 in CI). The 2,000 and 50,000 rows are
-//! printed but not judged; 50,000 has to work, not to be fast. A budget
+//! printed but not judged; 50,000 has to work, not to be fast. Diagnose's
+//! whole socket pass is printed at every size and has no budget. A budget
 //! today's code misses is `Pending` on the branch expected to meet it, and
 //! that branch makes it `Enforced`. A missed `Pending` budget fails like any
 //! other, so the command above, like a release candidate's run, passes only
@@ -31,23 +32,24 @@
 
 use crate::app::{draw_frame, handle_key, App, ConnectionGroup, Tab, ViewMode};
 use crate::collectors::attribution::MAX_MATCH_AGE;
-use crate::collectors::connections::{Connection, ConnectionTimeline};
+use crate::collectors::connections::{Connection, ConnectionTimeline, MAX_CLOSED_HISTORY};
 use crate::collectors::tcp_info::{normalize_endpoint, FlowMap, TcpInfo};
 use crate::config::NetwatchConfig;
+use crate::diagnose::live::rows_by_endpoints;
 use crate::sort::TabSortState;
 use crate::testutil::connections::synthetic_connections;
 use crate::ui::connections::{build_view, selected_connection, ConnRow, COLUMNS};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// The size the budgets are for.
 const BUDGET_ROWS: usize = 10_000;
 
-/// Branches expected to meet the budgets today's code misses.
+/// The branch expected to meet the budgets today's code misses.
 const VIEW_CACHE: &str = "perf/conn-view-cache";
-const POLL_10K: &str = "perf/conn-poll-10k";
 
 #[derive(Clone, Copy)]
 enum Stat {
@@ -83,9 +85,9 @@ const TOPOLOGY_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const TIMELINE_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const SCROLL_KEY: Budget = budget(Stat::P99, 5.0, Gate::Pending(VIEW_CACHE));
 const TICK_CONSUMERS: Budget = budget(Stat::P50, 15.0, Gate::Pending(VIEW_CACHE));
-const DIAGNOSE_JOIN: Budget = budget(Stat::P50, 2.0, Gate::Pending(POLL_10K));
+const DIAGNOSE_JOIN: Budget = budget(Stat::P50, 2.0, Gate::Enforced);
 #[cfg(target_os = "linux")]
-const POLL: Budget = budget(Stat::P50, 150.0, Gate::Pending(POLL_10K));
+const POLL: Budget = budget(Stat::P50, 150.0, Gate::Enforced);
 
 fn sizes() -> Vec<usize> {
     match std::env::var("NW_SCALE_ROWS") {
@@ -152,18 +154,11 @@ impl Report {
         }
     }
 
-    fn record(&mut self, case: &str, n: usize, mut samples: Vec<Duration>, budget: Budget) {
-        samples.sort();
-        let ms = |d: Duration| d.as_secs_f64() * 1e3;
-        // Nearest rank: the smallest sample at or above the fraction q.
-        let rank = |q: f64| {
-            let i = (samples.len() as f64 * q).ceil() as usize;
-            ms(samples[i.clamp(1, samples.len()) - 1])
-        };
-        let (p50, p99) = (rank(0.50), rank(0.99));
+    fn record(&mut self, case: &str, n: usize, samples: Vec<Duration>, budget: Budget) {
+        let times = Times::of(samples);
         let (stat, measured) = match budget.stat {
-            Stat::P50 => ("p50", p50),
-            Stat::P99 => ("p99", p99),
+            Stat::P50 => ("p50", times.p50),
+            Stat::P99 => ("p99", times.p99),
         };
         let limit = budget.ms * self.slack;
         let within = measured <= limit;
@@ -185,11 +180,12 @@ impl Report {
                 format!("over{owner}")
             }
         };
-        println!(
-            "SCALE case={case} rows={n} p50_ms={p50:.2} p99_ms={p99:.2} max_ms={:.2} iters={} budget={stat}<={limit:.1}ms status={status}",
-            ms(*samples.last().unwrap()),
-            samples.len(),
-        );
+        times.print(case, n, &format!("{stat}<={limit:.1}ms"), &status);
+    }
+
+    /// Print a case that has no budget, unjudged at every size.
+    fn show(&self, case: &str, n: usize, samples: Vec<Duration>) {
+        Times::of(samples).print(case, n, "none", "unjudged");
     }
 
     fn finish(self) {
@@ -199,6 +195,40 @@ impl Report {
             self.slack,
             u8::from(self.strict),
             self.over.join("\n")
+        );
+    }
+}
+
+/// One case's samples, in milliseconds.
+struct Times {
+    p50: f64,
+    p99: f64,
+    max: f64,
+    iters: usize,
+}
+
+impl Times {
+    fn of(mut samples: Vec<Duration>) -> Self {
+        samples.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        // Nearest rank: the smallest sample at or above the fraction q.
+        let rank = |q: f64| {
+            let i = (samples.len() as f64 * q).ceil() as usize;
+            ms(samples[i.clamp(1, samples.len()) - 1])
+        };
+        Self {
+            p50: rank(0.50),
+            p99: rank(0.99),
+            max: ms(*samples.last().unwrap()),
+            iters: samples.len(),
+        }
+    }
+
+    /// The case's `SCALE` line, which `scripts/scale-bench.sh` reads.
+    fn print(&self, case: &str, n: usize, budget: &str, status: &str) {
+        println!(
+            "SCALE case={case} rows={n} p50_ms={:.2} p99_ms={:.2} max_ms={:.2} iters={} budget={budget} status={status}",
+            self.p50, self.p99, self.max, self.iters,
         );
     }
 }
@@ -245,8 +275,8 @@ impl Host {
 
     /// Publish the table again with fresh evidence, as the next poll would.
     /// Rows older than `MAX_MATCH_AGE` show as unattributed, and
-    /// `connections()` copies the whole table on every call to say so, which
-    /// is not the cost being measured. A kernel dump older than 30 s is
+    /// `connections()` copies the whole table when they go stale to say so,
+    /// which is not the cost being measured. A kernel dump older than 30 s is
     /// ignored by Diagnose.
     fn publish(&mut self) {
         for row in &mut self.rows {
@@ -339,6 +369,26 @@ fn kernel_flows(rows: &[Connection]) -> FlowMap {
             (key, info)
         })
         .collect()
+}
+
+/// Diagnose's join of kernel flows to connection-table rows, as
+/// `LiveSampler::sockets` makes it: the table, its index of rows by
+/// endpoints, and a lookup for each flow. Returns how many flows found a row.
+fn diagnose_join(app: &App) -> usize {
+    let flows = app.tcp_info.snapshot();
+    let conns = app.connection_collector.connections();
+    let by_endpoints = rows_by_endpoints(&conns);
+    flows
+        .keys()
+        .filter_map(|(local, remote)| {
+            by_endpoints
+                .get(&(
+                    Cow::Borrowed(local.as_str()),
+                    Cow::Borrowed(remote.as_str()),
+                ))
+                .copied()
+        })
+        .count()
 }
 
 /// One diagnose socket pass, as `tick_diagnose` runs it.
@@ -527,12 +577,12 @@ fn timeline_churn_with_10k_active() {
         .collect();
     assert_eq!(active, open, "an active connection was evicted");
 
-    // The 2,000 cap counts active entries, so with 10,000 active every
-    // closed one is evicted on the tick it closes and the Timeline shows no
-    // closed history at all. perf/conn-poll-10k keeps the last 2,000 closed
-    // and changes this to `3_000.min(2_000)`.
+    // The bound is on closed history alone: however many are active, the
+    // last 2,000 that closed stay.
     let closed = timeline.tracked.iter().filter(|t| !t.is_active).count();
-    assert_eq!(closed, 0);
+    assert_eq!(closed, 3_000.min(MAX_CLOSED_HISTORY));
+    assert_eq!(timeline.closed_len(), closed);
+    assert!(timeline.closed_trimmed());
 }
 
 #[test]
@@ -664,6 +714,9 @@ fn scale_tick_consumers() {
     report.finish();
 }
 
+/// The 2 ms budget is the join's. The whole pass also builds an observation
+/// and keys its verdict history for each flow, which costs several times the
+/// join at 10,000 rows, and is printed with no budget.
 #[test]
 #[ignore = "release-build timing; see the module docs"]
 fn scale_diagnose_join() {
@@ -671,12 +724,20 @@ fn scale_diagnose_join() {
     for n in sizes() {
         let mut host = Host::new(n).with_kernel_flows();
         let flows = host.app.tcp_info.snapshot().len();
+        // Every flow is one of the table's established rows, bracketed IPv6
+        // ones included, so every flow finds its row.
+        assert_eq!(diagnose_join(&host.app), flows);
+        let samples = host.time(iterations(n), |app| {
+            diagnose_join(app);
+        });
+        report.record("diagnose/join", n, samples, DIAGNOSE_JOIN);
+
         assert_eq!(diagnose_sockets(&mut host.app), flows);
         let iters = if n > BUDGET_ROWS { 5 } else { 30 };
         let samples = host.time(iters, |app| {
             diagnose_sockets(app);
         });
-        report.record("diagnose/sockets", n, samples, DIAGNOSE_JOIN);
+        report.show("diagnose/sockets", n, samples);
     }
     report.finish();
 }

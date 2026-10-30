@@ -126,12 +126,12 @@ impl Panel {
         let text: usize = self
             .title
             .iter()
-            .map(|s| s.content.chars().count())
+            .map(|s| crate::ui::text::width(&s.content))
             .sum::<usize>();
         let badge = self
             .badge
             .as_ref()
-            .map(|n| n.chars().count() + 3)
+            .map(|n| crate::ui::text::width(n) + 3)
             .unwrap_or(0);
         // A leading space, the badge chip, then the title, then a space.
         if text == 0 && badge == 0 {
@@ -146,7 +146,7 @@ impl Panel {
         let text: usize = self
             .meta
             .iter()
-            .map(|s| s.content.chars().count())
+            .map(|s| crate::ui::text::width(&s.content))
             .sum::<usize>();
         if text == 0 {
             0
@@ -521,18 +521,12 @@ pub fn build_header_line(app: &App, extra: Option<Vec<Span<'static>>>) -> Line<'
     Line::from(spans)
 }
 
-/// Truncate to `max_chars` columns, marking the cut with `…`.
+/// Truncate to `max_cols` columns, marking the cut with `…`.
 ///
 /// Shared so a label that does not fit shortens the same way everywhere
 /// instead of each call site inventing its own cut.
-pub fn ellipsise(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    truncated.push('…');
-    truncated
+pub fn ellipsise(text: &str, max_cols: usize) -> String {
+    crate::ui::text::truncate_end(text, max_cols)
 }
 
 /// The verdict line that sits under the tab bar on every tab.
@@ -956,7 +950,7 @@ pub fn socket_verdict_concern(v: crate::diagnose::detectors::SocketVerdict) -> u
 fn hint_width(hints: &[Hint]) -> usize {
     hints
         .iter()
-        .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
+        .map(|(k, l)| crate::ui::text::width(k) + 1 + crate::ui::text::width(l))
         .sum::<usize>()
         + hints.len().saturating_sub(1) * 2
 }
@@ -1003,7 +997,7 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Hi
     });
     let toast_width = toast
         .as_ref()
-        .map(|(s, _, _)| s.chars().count() + 4)
+        .map(|(s, _, _)| crate::ui::text::width(s) + 4)
         .unwrap_or(0);
 
     // `1 +` for the leading space. Never drop the tab's own first hint — a
@@ -1015,7 +1009,10 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Hi
     let mut spans = vec![Span::raw(" ")];
     spans.extend(hint_spans(t, &hints));
 
-    let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let left_width: usize = spans
+        .iter()
+        .map(|s| crate::ui::text::width(&s.content))
+        .sum();
     if let Some((text, glyph, color)) = toast {
         if avail > left_width + toast_width {
             spans.push(Span::raw(" ".repeat(avail - left_width - toast_width)));
@@ -1222,6 +1219,30 @@ mod tests {
         assert!(wide.contains("21 active"), "{wide:?}");
     }
 
+    /// A CJK title takes two columns a char. Counted in chars, this one left
+    /// room for metadata that then covered its last character.
+    #[test]
+    fn a_wide_title_is_measured_in_columns() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let t = crate::theme::by_name("dark");
+        let mut terminal = Terminal::new(TestBackend::new(28, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                Panel::new("接続一覧接続一覧").meta("12 active").render(
+                    f,
+                    &t,
+                    Rect::new(0, 0, 28, 3),
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let top: String = (0..28).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(buf[(16, 0)].symbol(), "覧", "{top:?}");
+        assert!(!top.contains("active"), "{top:?}");
+    }
+
     /// Verdict chips take the colour of the verdict's *severity*, not a
     /// per-category colour. `app-limited` is a socket working exactly as
     /// intended; `bufferbloat` is why someone opened the screen.
@@ -1320,6 +1341,32 @@ mod tests {
             hint("↑↓", "issue"),
             "the tab's own first key is the last to go"
         );
+    }
+
+    /// The egress toast names a process, and a CJK name takes two columns a
+    /// char. Counted in chars, the toast was placed one column too far right
+    /// for each of them and ran off the edge, and a long one was cut at 72
+    /// chars, not 72 columns, so it lost its end with no `…`.
+    #[test]
+    fn a_wide_toast_ends_inside_the_footer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::prepare_with_config(crate::config::NetwatchConfig::default());
+        for (name, end) in [
+            ("firefox-esr", "remove  "),
+            ("接続監視接", "remove  "),
+            (&*"接続監視".repeat(10), "…  "),
+        ] {
+            app.ui.export_status = Some(format!("{name} has no rule to remove"));
+            let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
+            terminal
+                .draw(|f| render_footer(f, &app, f.area(), Vec::new()))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let row: String = (0..100).map(|x| buf[(x, 1)].symbol()).collect();
+            assert!(row.ends_with(end), "{name}: {row:?}");
+        }
     }
 
     /// The brand span is what the click hit-test measures the bar from, so its

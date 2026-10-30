@@ -55,9 +55,11 @@ Component entry outcomes and selected retained capabilities are recorded; Settin
 shows verified-entry counts and up to three failure/degradation reasons. Earlier
 unverified entries remain visible rather than being overwritten by later success.
 
-The SDK-owned eBPF reader is disabled whenever sandbox policy is enabled, with
-socket polling fallback and an attribution reason. No SDK patch or helper is
-claimed. PKTAP now uses the entry wrapper; macOS best-effort continues with an
+Since 0.32.2 eBPF loads inside the sandbox policy: its worker enters holding the
+load capabilities, loads, then drops them. The SDK-owned reader thread inherits that
+filesystem policy but keeps the load capabilities, because it has no entry hook;
+the residual is recorded against the `ebpf-reader` component. No SDK patch or helper
+is claimed. PKTAP now uses the entry wrapper; macOS best-effort continues with an
 explicit unavailable-backend report, and strict preflight rejects unsupported OSes.
 
 Linux filesystem rules are built once against opened objects and cloned for worker

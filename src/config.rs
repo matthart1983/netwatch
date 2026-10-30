@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// User-facing persistent configuration, stored as `netwatch/config.toml`
 /// under the platform config directory (`dirs::config_dir()`): `~/.config` on
@@ -279,6 +279,64 @@ impl Default for AlertConfig {
 
 // ── Persistence ────────────────────────────────────────────
 
+/// Why a config.toml that exists was not loaded. A missing file is not an
+/// error: it means the defaults.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// The file is there but could not be read: no permission, a directory,
+    /// a symlink to nothing, or bytes that are not UTF-8.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// Not valid TOML, or a value of the wrong type. `source` names the line,
+    /// column and key and quotes the line. `position` is the 1-based line and
+    /// column alone, for a report that must not echo the file. Boxed, as
+    /// toml's error would make every `Result` holding this one large.
+    Parse {
+        path: PathBuf,
+        position: Option<(usize, usize)>,
+        source: Box<toml::de::Error>,
+    },
+}
+
+impl ConfigError {
+    pub fn path(&self) -> &Path {
+        match self {
+            ConfigError::Read { path, .. } | ConfigError::Parse { path, .. } => path,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Read { path, source } => {
+                write!(f, "cannot read {}: {source}", path.display())
+            }
+            // toml's message ends in a newline.
+            ConfigError::Parse { path, source, .. } => write!(
+                f,
+                "invalid config {}: {}",
+                path.display(),
+                source.to_string().trim_end()
+            ),
+        }
+    }
+}
+
+// The message already carries the cause, so `source()` stays `None`: anyhow
+// would otherwise print it twice.
+impl std::error::Error for ConfigError {}
+
+/// The 1-based line and column of byte `at`, counting characters as toml does.
+fn line_column(text: &str, at: usize) -> (usize, usize) {
+    let before = text.get(..at).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    (line, column)
+}
+
 impl NetwatchConfig {
     /// Path to `netwatch/config.toml` under the platform config dir
     /// (`~/.config` on Linux, `~/Library/Application Support` on macOS,
@@ -287,17 +345,44 @@ impl NetwatchConfig {
         dirs::config_dir().map(|d| d.join("netwatch").join("config.toml"))
     }
 
-    /// Load from disk, falling back to defaults for any missing field.
-    pub fn load() -> Self {
-        let Some(path) = Self::path() else {
-            return Self::default();
+    /// Load from disk. No file means the defaults, and a key the file leaves
+    /// out keeps its default. A file that is there but cannot be read or
+    /// parsed is an error rather than the defaults: falling back would drop
+    /// every setting in it, `sandbox = "strict"` and `record_uptime = false`
+    /// included, over one bad value.
+    pub fn load() -> Result<Self, ConfigError> {
+        match Self::path() {
+            Some(path) => Self::load_from(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// [`load`](Self::load) from `path` rather than the platform location.
+    pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            // Nothing at the path at all. A symlink to a missing file is
+            // something, and an error.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(path).is_err() =>
+            {
+                return Ok(Self::default());
+            }
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.into(),
+                    source,
+                })
+            }
         };
-        let Ok(contents) = fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        let mut cfg: Self = toml::from_str(&contents).unwrap_or_default();
+        let mut cfg: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: path.into(),
+            position: source.span().map(|span| line_column(&contents, span.start)),
+            source: Box::new(source),
+        })?;
         cfg.validate();
-        cfg
+        Ok(cfg)
     }
 
     /// Clamp and normalise fields that may arrive out of range from a hand-edited
@@ -333,11 +418,24 @@ impl NetwatchConfig {
     pub fn save(&self) -> anyhow::Result<()> {
         let path =
             Self::path().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
+        self.save_to(&path)
+    }
+
+    /// [`save`](Self::save) to `path`. A file already there that does not
+    /// load is left alone, by Settings and `--generate-config` alike: it holds
+    /// settings nothing has read, such as a hand edit made while netwatch ran.
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        if let Err(e) = Self::load_from(path) {
+            return Err(anyhow::Error::new(e).context(format!(
+                "{} does not load; not overwriting it",
+                path.display()
+            )));
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        fs::write(&path, contents)?;
+        fs::write(path, contents)?;
         Ok(())
     }
 }
@@ -691,6 +789,158 @@ consecutive_n = 5
         assert_eq!(loaded.refresh_rate_ms, 750);
         assert!(loaded.show_geo); // default
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory of its own for one test, so tests running in parallel
+    /// never share a config file and none of them sets an env var.
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "netwatch_config_{name}_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn load_from_a_missing_file_gives_the_defaults() {
+        let dir = scratch("missing");
+        let cfg = NetwatchConfig::load_from(&dir.join("config.toml")).unwrap();
+        assert_eq!(cfg.sandbox, "on");
+        assert!(cfg.record_uptime);
+        // Nor does a missing parent directory make it an error.
+        NetwatchConfig::load_from(&dir.join("absent/config.toml")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_a_partial_file_keeps_the_other_defaults() {
+        let dir = scratch("partial");
+        let path = dir.join("config.toml");
+        fs::write(&path, "sandbox = 'strict'\nrefresh_rate_ms = 50\n").unwrap();
+        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.sandbox, "strict");
+        // Clamped by `validate`, as before.
+        assert_eq!(cfg.refresh_rate_ms, 100);
+        assert!(cfg.record_uptime);
+        assert_eq!(cfg.default_tab, "dashboard");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_invalid_toml_names_the_path_line_and_column() {
+        let dir = scratch("syntax");
+        let path = dir.join("config.toml");
+        fs::write(&path, "sandbox = 'strict'\nshow_geo = tru\n").unwrap();
+        let err = NetwatchConfig::load_from(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Parse {
+                    position: Some((2, 12)),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.path(), path);
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("line 2, column 12"), "{message}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The case the review reproduced: one value of the wrong type used to
+    /// discard the whole file, so a strict sandbox came up best-effort and
+    /// uptime recording came back on.
+    #[test]
+    fn load_from_a_wrong_type_is_an_error_not_the_defaults() {
+        let dir = scratch("wrong_type");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "sandbox = 'strict'\nrecord_uptime = false\nrefresh_rate_ms = 'oops'\n",
+        )
+        .unwrap();
+        let err = NetwatchConfig::load_from(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Parse {
+                    position: Some((3, 19)),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("refresh_rate_ms"), "{message}");
+        assert!(message.contains("expected u64"), "{message}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_an_unreadable_file_is_an_error() {
+        let dir = scratch("unreadable");
+        // A directory where the file should be is unreadable on every
+        // platform, root included, where a mode of 000 is not.
+        let path = dir.join("config.toml");
+        fs::create_dir(&path).unwrap();
+        let err = NetwatchConfig::load_from(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Read { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("cannot read {}: ", path.display())),
+            "{err}"
+        );
+
+        let path = dir.join("latin1.toml");
+        fs::write(&path, b"theme = \"caf\xe9\"\n").unwrap();
+        let err = NetwatchConfig::load_from(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Read { .. }), "{err:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dotfiles manager's link to a file that has gone is a config the user
+    /// meant to have, not a missing one.
+    #[cfg(unix)]
+    #[test]
+    fn load_from_a_dangling_symlink_is_an_error() {
+        let dir = scratch("dangling");
+        let path = dir.join("config.toml");
+        std::os::unix::fs::symlink(dir.join("gone.toml"), &path).unwrap();
+        let err = NetwatchConfig::load_from(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Read { .. }), "{err:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_to_leaves_a_file_that_does_not_load_alone() {
+        let dir = scratch("save");
+        let path = dir.join("netwatch/config.toml");
+        let cfg = NetwatchConfig {
+            theme: "nord".into(),
+            ..Default::default()
+        };
+
+        // No file yet: written, parent directory included.
+        cfg.save_to(&path).unwrap();
+        assert_eq!(NetwatchConfig::load_from(&path).unwrap().theme, "nord");
+
+        // A valid file is replaced, as Settings has always done.
+        fs::write(&path, "theme = 'ocean'\n").unwrap();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(NetwatchConfig::load_from(&path).unwrap().theme, "nord");
+
+        // One that does not load is not.
+        let broken = "sandbox = 'strict'\nrefresh_rate_ms = 'oops'\n";
+        fs::write(&path, broken).unwrap();
+        let err = NetwatchConfig::default().save_to(&path).unwrap_err();
+        assert!(err.to_string().contains("not overwriting"), "{err:#}");
+        assert!(format!("{err:#}").contains("refresh_rate_ms"), "{err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
         let _ = fs::remove_dir_all(&dir);
     }
 }

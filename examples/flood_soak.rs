@@ -242,13 +242,11 @@ fn live(opts: &Options) -> Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
     eprintln!("lab home: {}", home.display());
-    // `load` falls back to defaults on a parse error, which would run the
-    // soak on settings the lab did not write.
+    // Missing, the file would load as the defaults, and the soak would run
+    // on settings the lab did not write.
     let path = NetwatchConfig::path().context("no config directory")?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("the lab writes {}", path.display()))?;
-    toml::from_str::<NetwatchConfig>(&text).with_context(|| format!("{}", path.display()))?;
-    let mut config = NetwatchConfig::load();
+    ensure!(path.is_file(), "the lab writes {}", path.display());
+    let mut config = NetwatchConfig::load_from(&path)?;
     let interface = opts.interface.clone().unwrap_or_default();
     config.capture_interface = interface.clone();
     if let Some(db) = &opts.geoip_db {

@@ -30,8 +30,15 @@ Before 0.38, every Windows host with a `wpcap.dll` reported `not_checked`
 with `npcap_present_unloaded`, including the two `unavailable` cases above.
 
 Missing or malformed configuration is reported explicitly; malformed content and
-configured endpoint credentials are not echoed. Configuration defaults are used
-where needed to describe the remaining checks. An enabled feature is not evidence
+configured endpoint credentials are not echoed. A configuration file that cannot
+be read or parsed makes `config` `unavailable`, with reason `config_unreadable` or
+`config_invalid`. Its detail names the file and, for a parse error, the line and
+column; starting `netwatch` prints the full parse error, which quotes the line.
+Live sessions refuse to start on such a file, and doctor still completes and exits
+successfully. Configuration defaults are used where needed to describe the
+remaining checks, except that `--check-capture` does not open capture: `capture`
+is `not_checked` with reason `config_not_loaded`, because the defaults could check
+a weaker sandbox mode than the one configured. An enabled feature is not evidence
 that its backend works.
 
 ## Optional capture check

@@ -232,8 +232,10 @@ mod tests {
             // Do not acquire the pty as a controlling terminal: macOS revokes
             // its slave when the session leader exits, preventing the parent
             // from checking restoration with tcgetattr after that exit.
-            // SAFETY: setsid is async-signal-safe, which is all
-            // that may run between fork and exec, and touches only the child.
+            // SAFETY: the hook runs in the child between fork and exec, where
+            // only async-signal-safe calls may run. setsid is one, touching
+            // only the child, and nix turns its errno into an io::Error with
+            // `from_raw_os_error`, which does not allocate.
             unsafe {
                 cmd.pre_exec(|| {
                     nix::unistd::setsid()?;

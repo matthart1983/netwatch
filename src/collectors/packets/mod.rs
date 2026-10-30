@@ -1571,8 +1571,9 @@ pub struct CaptureStats {
 struct CaptureTotals {
     received: u64,
     dropped: u64,
-    /// Packets that reached the list. Taken at the poll rather than live, so
-    /// it describes the same moment as the libpcap counts.
+    /// Frames the dissectors decoded, which leaves out the `Raw` rows of a
+    /// framing they do not read. Taken at the poll rather than live, so it
+    /// describes the same moment as the libpcap counts.
     decoded: u64,
 }
 
@@ -1600,7 +1601,8 @@ impl CaptureStats {
 
     /// Fold one `pcap_stats` reading into the totals. `last` is the previous
     /// reading, all zeroes when the capture starts, and becomes this one.
-    /// `decoded` is how many packets the list has taken since the start.
+    /// `decoded` is how many frames the dissectors have decoded since the
+    /// start.
     fn record_poll(&self, last: &mut pcap::Stat, reading: pcap::Stat, decoded: u64, elapsed: f64) {
         *crate::app::safe_lock(&self.observed_at, "packets::stats_poll") =
             Some(std::time::Instant::now());
@@ -1622,6 +1624,18 @@ impl CaptureStats {
             },
             Ordering::Relaxed,
         );
+    }
+
+    /// [`Self::record_poll`] for tests outside this module, a second after
+    /// the last poll.
+    #[cfg(test)]
+    pub(crate) fn record_poll_for_test(
+        &self,
+        last: &mut pcap::Stat,
+        reading: pcap::Stat,
+        decoded: u64,
+    ) {
+        self.record_poll(last, reading, decoded, 1.0);
     }
 
     /// Zeroed when a capture starts, so the numbers describe this run rather
@@ -1917,6 +1931,11 @@ impl PacketCollector {
             let mut cap = match prepare_capture(&interface, bpf.as_deref()) {
                 Ok(cap) => cap,
                 Err(message) => {
+                    // This thread never enters, and until it returns it holds
+                    // what main held when it started it, CAP_NET_RAW
+                    // included. Recording the failure lets startup go on to
+                    // audit every thread, so give them up first.
+                    crate::sandbox::worker::relinquish("capture");
                     // A cancelled generation must not overwrite a newer start's error.
                     if !capturing.load(Ordering::SeqCst) {
                         return;
@@ -1953,13 +1972,11 @@ impl PacketCollector {
                 dropped: 0,
                 if_dropped: 0,
             };
-            let first_id = *crate::app::safe_lock(&counter, "packets::stats_poll");
+            let mut decoded = 0;
 
             while capturing.load(Ordering::Relaxed) {
                 if last_poll.elapsed() >= STATS_POLL {
                     if let Ok(s) = cap.stats() {
-                        let decoded = crate::app::safe_lock(&counter, "packets::stats_poll")
-                            .saturating_sub(first_id);
                         let elapsed = last_poll.elapsed().as_secs_f64();
                         stats.record_poll(&mut last_reading, s, decoded, elapsed);
                     }
@@ -1998,8 +2015,13 @@ impl PacketCollector {
                                 ethernet,
                                 capture,
                             };
-                            if let Some(parsed) = decode_and_track(frame, &counter, &dns, &tracker)
-                            {
+                            if let Some(parsed) = decode_track_and_count(
+                                frame,
+                                &mut decoded,
+                                &counter,
+                                &dns,
+                                &tracker,
+                            ) {
                                 // A packet that used up the stream indices
                                 // comes back under the tracker's new session,
                                 // and every packet after it takes that one.
@@ -2112,7 +2134,7 @@ impl PacketCollector {
     }
 
     /// Packets libpcap received and dropped since the capture started, and
-    /// how many of them reached the list, as of the last poll (once a
+    /// how many of them the dissectors decoded, as of the last poll (once a
     /// second). Monotonic within a capture; libpcap's own counters wrap.
     pub fn capture_totals(&self) -> (u64, u64, u64) {
         let totals = self.stats.totals();
@@ -2163,6 +2185,14 @@ impl PacketCollector {
         let id = pkt.id;
         flush_to_ring(&self.packets, &self.ring_bytes, &mut vec![pkt]);
         Some(id)
+    }
+
+    /// Report a capture as open without opening one, for tests of what a
+    /// running capture exports.
+    #[cfg(test)]
+    pub(crate) fn mark_capturing_for_test(&self) {
+        self.capturing.store(true, Ordering::SeqCst);
+        self.ready.store(true, Ordering::SeqCst);
     }
 
     /// Bytes for a seeded packet: something that reads like the protocol in
@@ -2650,6 +2680,25 @@ fn decode_and_track(
         parsed.stream_index = Some(idx);
         parsed.app_protocol = app_proto;
         parsed.decrypted_plaintext = decrypted;
+    }
+    Some(parsed)
+}
+
+/// [`decode_and_track`] for the capture thread, adding one to `decoded` for
+/// each frame the dissectors read. A frame in another framing is listed as
+/// `Raw` but not counted, so on Linux `any` or a tunnel `decoded` stays at 0
+/// while the list grows.
+fn decode_track_and_count(
+    frame: Frame<'_>,
+    decoded: &mut u64,
+    counter: &Arc<Mutex<u64>>,
+    dns: &DnsCache,
+    tracker: &Mutex<StreamTracker>,
+) -> Option<CapturedPacket> {
+    let ethernet = frame.ethernet;
+    let parsed = decode_and_track(frame, counter, dns, tracker)?;
+    if ethernet {
+        *decoded += 1;
     }
     Some(parsed)
 }
@@ -3867,6 +3916,32 @@ mod tests {
         })
         .unwrap();
         assert!(empty.raw_bytes.is_empty());
+    }
+
+    /// The daemon exports the count as
+    /// `netwatch_capture_packets_decoded_total`. A `Raw` row is listed but
+    /// not decoded, and an Ethernet frame the dissectors drop is neither.
+    #[test]
+    fn only_frames_the_dissectors_read_count_as_decoded() {
+        let counter = Arc::new(Mutex::new(0));
+        let (dns, tracker) = (DnsCache::new(), Mutex::new(StreamTracker::new()));
+        let mut unknown_ethertype = UDP_FRAME;
+        unknown_ethertype[12..14].copy_from_slice(&[0x88, 0xb5]);
+        let mut decoded = 0;
+        for (data, ethernet) in [
+            (&UDP_FRAME[..], true),
+            (&UDP_FRAME[14..], false),
+            (&unknown_ethertype[..], true),
+        ] {
+            let frame = Frame {
+                data,
+                ethernet,
+                capture: None,
+            };
+            decode_track_and_count(frame, &mut decoded, &counter, &dns, &tracker);
+        }
+        assert_eq!(decoded, 1);
+        assert_eq!(*counter.lock().unwrap(), 2, "the Raw row is listed");
     }
 
     // ── format_mac ──────────────────────────────────────────
@@ -6773,6 +6848,46 @@ mod lifecycle_tests {
             10,
         );
         assert_eq!((ladder.total, ladder.position), (3, Some(3)));
+    }
+
+    /// A capture thread whose device fails to open returns without
+    /// entering. It starts with what main holds, and recording the failure
+    /// lets startup's audit run while the thread may still be alive, so the
+    /// thread must hold nothing by then.
+    #[test]
+    fn capture_prepare_failure_drops_before_return() {
+        if !crate::sandbox::audit::as_root_in_user_namespace(
+            "collectors::packets::lifecycle_tests::capture_prepare_failure_drops_before_return",
+        ) {
+            return;
+        }
+        crate::sandbox::worker::install(
+            crate::sandbox::Mode::BestEffort,
+            crate::sandbox::SandboxPaths::default(),
+        )
+        .unwrap();
+        let mut collector = PacketCollector::new();
+        collector.start_capture("netwatch-pr04-nonexistent-interface", None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while collector.capturing.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        collector.stop_capture();
+        assert!(collector.get_error().is_some());
+        let held = crate::sandbox::worker::held_at_failure("capture").unwrap();
+        for cap in [
+            caps::Capability::CAP_NET_RAW,
+            caps::Capability::CAP_NET_ADMIN,
+        ] {
+            assert!(
+                !held.contains(&cap),
+                "{cap} held when the failure was recorded"
+            );
+        }
+        // The thread that started it keeps what it had.
+        assert!(
+            caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_NET_RAW).unwrap()
+        );
     }
 
     #[test]

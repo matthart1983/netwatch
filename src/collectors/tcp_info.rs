@@ -345,6 +345,8 @@ fn collect() -> std::io::Result<FlowMap> {
     let mut map = FlowMap::new();
     for family in [2u8, 10u8] {
         // AF_INET, AF_INET6
+        // SAFETY: socket takes three integers and reads no memory of ours;
+        // the descriptor it returns is checked below.
         let fd = unsafe {
             nix::libc::socket(
                 nix::libc::AF_NETLINK,
@@ -355,6 +357,9 @@ fn collect() -> std::io::Result<FlowMap> {
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: `fd` is the socket just created, checked non-negative above
+        // and owned by nothing else, so `sock` takes sole ownership and
+        // closes it once.
         let mut sock = unsafe { std::fs::File::from_raw_fd(fd) };
 
         // nlmsghdr + inet_diag_req_v2
@@ -528,6 +533,9 @@ fn collect() -> std::io::Result<FlowMap> {
     let mut len: usize = 0;
     // Sized first, then fetched — the table changes between the two calls, so
     // the buffer is over-allocated a little and the walk is length-driven.
+    // SAFETY: `name` is a CString that outlives the call. A null `oldp` with
+    // a live `oldlenp` asks only for the size, which is written to `len`, and
+    // a null `newp` with length 0 sets nothing.
     let rc = unsafe {
         nix::libc::sysctlbyname(
             name.as_ptr(),
@@ -542,6 +550,9 @@ fn collect() -> std::io::Result<FlowMap> {
     }
     len += len / 8;
     let mut buf = vec![0u8; len];
+    // SAFETY: `buf` holds `len` writable bytes, since it was allocated from
+    // `len` on the line above. sysctlbyname writes at most `len` bytes into
+    // it and stores the count written back in `len`. `name` is as above.
     let rc = unsafe {
         nix::libc::sysctlbyname(
             name.as_ptr(),
