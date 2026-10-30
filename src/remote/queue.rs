@@ -112,14 +112,18 @@ impl Backoff {
     }
 
     /// Record a failure and return the delay to wait before the next attempt.
-    /// `entropy` provides jitter (full jitter: uniform in `[0, capped]`).
+    /// `entropy` provides jitter (full jitter: uniform in `[0, capped]`). It
+    /// must be uniform over all of `u64`: it picks its point in proportion,
+    /// so 0 waits nothing and `u64::MAX` waits the whole ceiling.
     pub fn fail(&mut self, entropy: u64) -> Duration {
         let capped = self.capped_ceiling();
         self.attempt = self.attempt.saturating_add(1);
-        // Full jitter: random point in [0, capped].
-        let ceil_nanos = capped.as_nanos().max(1) as u64;
-        let jittered = entropy % ceil_nanos;
-        Duration::from_nanos(jittered)
+        // Scaled rather than reduced modulo the ceiling: entropy drawn from a
+        // narrower range than the ceiling's, such as the sub-second
+        // nanoseconds this once took, would keep every delay inside it.
+        let ceil_nanos = capped.as_nanos().min(u64::MAX as u128);
+        let jittered = (entropy as u128 * (ceil_nanos + 1)) >> 64;
+        Duration::from_nanos(jittered as u64)
     }
 
     /// The current (un-jittered) backoff ceiling for the next attempt.
@@ -221,6 +225,30 @@ mod tests {
             let d = b.fail(huge);
             assert!(d <= Duration::from_secs(60));
         }
+    }
+
+    /// Review R5: every delay up to the ceiling is reachable. Full entropy
+    /// waits each ceiling in turn, doubling from the base to the cap, no
+    /// entropy waits nothing, and half waits half.
+    #[test]
+    fn delays_reach_each_ceiling_up_to_the_cap() {
+        let ms = Duration::from_millis;
+        let mut b = Backoff::new(ms(500), Duration::from_secs(60));
+        let full: Vec<Duration> = (0..10).map(|_| b.fail(u64::MAX)).collect();
+        assert_eq!(
+            full,
+            [500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000].map(ms)
+        );
+
+        let mut b = Backoff::new(ms(500), Duration::from_secs(60));
+        assert_eq!(b.fail(0), Duration::ZERO);
+        assert_eq!(b.fail(1 << 63), ms(500), "half of the second ceiling, 1 s");
+        b.reset();
+        assert_eq!(
+            b.fail(u64::MAX),
+            ms(500),
+            "a success starts again from the base"
+        );
     }
 
     #[test]
