@@ -1129,6 +1129,7 @@ mod tests {
 
     /// `rows` as one line of words, with the popup's borders gone, so a clause
     /// reads whole however it wrapped and is missing if a row cut it off.
+    #[cfg(target_os = "linux")]
     fn popup_text(rows: &[String]) -> String {
         let text: String = rows
             .iter()
