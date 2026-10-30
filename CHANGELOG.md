@@ -433,6 +433,11 @@ All notable changes to NetWatch will be documented in this file.
   both now find them. Sockets that differ only by device share one entry in the
   kernel dump, which could be either's, so when the table lists such a pair
   neither row takes anything from it, and they show as unknown.
+- **Device-bound IPv6 sockets find their captured streams.** `ss` prints such a
+  socket as `[fe80::1]%eth0:443`, and the parser that matches a row to its stream
+  expected the port right after the bracket. These rows never matched one, so
+  they showed no rate or application protocol even with a capture running. They
+  match now, and count among the flows in the rates note.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to

@@ -122,11 +122,15 @@ fn split_host_port(addr: &str) -> Option<(&str, u16)> {
     if addr.is_empty() || addr == "*:*" {
         return None;
     }
-    // Bracketed IPv6: [::1]:8080
+    // Bracketed IPv6: [::1]:8080, or with the device `ss` names for a socket
+    // bound to one: [fe80::1]%eth0:8080. A device name cannot hold a colon.
     if let Some(stripped) = addr.strip_prefix('[') {
-        let bracket_end = stripped.find("]:")?;
-        let port: u16 = stripped[bracket_end + 2..].parse().ok()?;
-        return Some((&stripped[..bracket_end], port));
+        let (host, port) = stripped.split_once("]:").or_else(|| {
+            let (host, scoped) = stripped.split_once("]%")?;
+            Some((host, scoped.split_once(':')?.1))
+        })?;
+        let port: u16 = port.parse().ok()?;
+        return Some((host, port));
     }
     // Plain IPv4 or unbracketed IPv6 (ss sometimes prints the latter).
     // The last colon separates port from host.
@@ -3839,6 +3843,60 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
         assert_eq!(parse_host_port("[::1]:443"), Some(("::1".into(), 443)));
     }
 
+    /// A socket bound to a device keys to its stream however its row spells the
+    /// device, because no packet carries one. The spelling `ss` prints for IPv6
+    /// has it between the bracket and the port, and that row used to find no
+    /// stream, so no rate and no protocol, with a capture running.
+    #[test]
+    fn a_device_bound_row_keys_to_its_stream() {
+        for (local, remote, plain_local, plain_remote) in [
+            (
+                "[fe80::10]%eth0:50001",
+                "[fe80::1]:443",
+                ("fe80::10", 50001),
+                ("fe80::1", 443),
+            ),
+            (
+                "[fe80::10%eth0]:50001",
+                "[fe80::1]:443",
+                ("fe80::10", 50001),
+                ("fe80::1", 443),
+            ),
+            (
+                "[::ffff:192.0.2.10]%eth0:50000",
+                "198.51.100.1:443",
+                ("192.0.2.10", 50000),
+                ("198.51.100.1", 443),
+            ),
+            (
+                "192.0.2.10%eth0:50000",
+                "198.51.100.1:443",
+                ("192.0.2.10", 50000),
+                ("198.51.100.1", 443),
+            ),
+        ] {
+            let conn = make_conn("TCP", local, remote, "ESTABLISHED", 42);
+            assert!(has_stream_key(&conn), "{local}");
+            let (key, _) = connection_stream_key(&conn).expect(local);
+            let captured = StreamKey::new(
+                StreamProtocol::Tcp,
+                plain_local.0,
+                plain_local.1,
+                plain_remote.0,
+                plain_remote.1,
+            );
+            assert_eq!(key, captured, "{local}");
+        }
+        assert_eq!(
+            parse_host_port("[fe80::10]%wlp192s0:57713"),
+            Some(("fe80::10".into(), 57713))
+        );
+        // The device is no way around the port.
+        assert_eq!(parse_host_port("[fe80::10]%eth0"), None);
+        assert_eq!(parse_host_port("[fe80::10]%eth0:notaport"), None);
+        assert_eq!(parse_host_port("[fe80::10]eth0:50001"), None);
+    }
+
     #[test]
     fn parse_host_port_ipv6_unbracketed() {
         // ss -n occasionally emits unbracketed IPv6 with the last colon as
@@ -3886,6 +3944,12 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
             ("[::1]:1", "[::1]:443", "udp6"),
             ("[::1]", "[::1]:443", "TCP"),
             ("[::1]:1", "fe80::1]:443", "TCP"),
+            ("[fe80::10]%eth0:1", "[fe80::1]:443", "TCP"),
+            ("[fe80::10%eth0]:1", "[fe80::1]:443", "TCP"),
+            ("192.0.2.10%eth0:1", "1.2.3.4:443", "TCP"),
+            ("[fe80::10]%eth0", "[fe80::1]:443", "TCP"),
+            ("[fe80::10]%eth0:notaport", "[fe80::1]:443", "TCP"),
+            ("[fe80::10]eth0:1", "[fe80::1]:443", "TCP"),
         ] {
             let mut row = rows[0].clone();
             row.local_addr = local.into();
