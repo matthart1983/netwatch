@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::collectors::traffic::InterfaceTraffic;
 use crate::sort::{SortColumn, TabSortState};
+use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
@@ -1933,15 +1934,6 @@ fn remote_host_only(addr: &str) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2106,6 +2098,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0], DashRow::Solo { .. }));
         assert!(!rows[0].foldable());
+    }
+
+    /// A solo row's name gets 13 of the process column's 16. Counted in
+    /// chars, an eight-char CJK name fitted them, drew 16 columns after the
+    /// indent, and the table cut its last char off with nothing to say so.
+    #[test]
+    fn a_wide_process_name_ends_in_an_ellipsis_inside_its_column() {
+        use crate::collectors::connections::Connection;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let app = crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        let mut conn = Connection {
+            protocol: "TCP".into(),
+            local_addr: "192.0.2.10:50000".into(),
+            remote_addr: "203.0.113.7:443".into(),
+            state: "ESTABLISHED".into(),
+            pid: Some(4242),
+            process_name: Some("接続監視接続監視".into()),
+            handshake_rtt_us: None,
+            rx_rate: Some(1000.0),
+            tx_rate: Some(100.0),
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
+        };
+        // A stale row loses its process name before the view sees it.
+        conn.evidence.observe();
+        app.connection_collector.publish_for_test(vec![conn]);
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 6)).unwrap();
+        terminal
+            .draw(|f| render_connections(f, &app, f.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Border, then header, then the row. The table starts a column in
+        // from the border, and a wide char's second cell is blank.
+        let cells =
+            |xs: std::ops::Range<u16>| -> String { xs.map(|x| buf[(x, 2)].symbol()).collect() };
+        assert_eq!(cells(2..18).replace(' ', ""), "接続監視接続…");
+        assert_eq!(cells(19..34), "203.0.113.7:443");
     }
 
     /// Folded is one row; expanded is the header plus every socket. Both

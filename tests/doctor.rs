@@ -237,3 +237,45 @@ fn doctor_reports_the_proc_net_fallback_when_ss_is_missing() {
         found.detail
     );
 }
+/// `--check-capture` enters with the capture thread's policy, so it reports
+/// what capture runs under: in best-effort that drops CAP_NET_RAW, which main
+/// keeps. Holding CAP_NET_RAW takes a user and network namespace, so this
+/// skips where it cannot make one.
+#[test]
+fn capture_check_applies_the_capture_policy() {
+    let fixture = Fixture::new();
+    let mut command = Command::new("unshare");
+    command
+        .args(["--user", "--map-root-user", "--net", "sh", "-c"])
+        .arg(r#"ip link set lo up && exec "$0" doctor --json --check-capture --interface lo"#)
+        .arg(env!("CARGO_BIN_EXE_netwatch"));
+    for (key, value) in fixture.command().get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let output = match command.output() {
+        Ok(output) if output.status.success() => output,
+        other => {
+            eprintln!("skipped: no user and network namespace with lo up: {other:?}");
+            return;
+        }
+    };
+    let snapshot: netwatch::runtime::capabilities::CapabilitySnapshot =
+        serde_json::from_slice(&output.stdout).unwrap();
+    let Some(check) = snapshot
+        .protections
+        .iter()
+        .find(|p| p.component == "capture-check")
+    else {
+        eprintln!(
+            "skipped: capture did not open on lo: {:?}",
+            snapshot.get("capture")
+        );
+        return;
+    };
+    assert_eq!(check.effective.as_deref(), Some("best-effort"));
+    let net_raw = "CAP_NET_RAW".to_string();
+    assert!(check.caps_dropped.contains(&net_raw), "{check:?}");
+    assert!(!check.caps_retained.contains(&net_raw), "{check:?}");
+}

@@ -1,5 +1,5 @@
 //! Explicit per-worker entry policy. No input is processed before entry returns.
-use super::{Mode, Report, SandboxPaths};
+use super::{CaptureAuthority, Mode, Report, SandboxPaths};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,11 +14,20 @@ pub struct Component {
 struct Policy {
     mode: Mode,
     paths: SandboxPaths,
+    /// Set once by [`ensure`], which knows the session; until then
+    /// [`capture_authority`] reads [`CaptureAuthority::DropAfterOpen`].
+    capture_authority: OnceLock<CaptureAuthority>,
     /// Shared by every worker and the UI, the capture thread included, so
     /// every access goes through `safe_lock`.
     components: Mutex<BTreeMap<String, Component>>,
     #[cfg(target_os = "linux")]
     prepared: Result<landlock::RulesetCreated, String>,
+    /// Stacked on `prepared` by parser threads; see [`super::Role`].
+    #[cfg(target_os = "linux")]
+    prepared_parser: Result<landlock::RulesetCreated, String>,
+    /// Stacked on `prepared` by the capture thread.
+    #[cfg(target_os = "linux")]
+    prepared_capture: Result<landlock::RulesetCreated, String>,
 }
 type SharedJoin = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
 static HANDLES: Mutex<Vec<SharedJoin>> = Mutex::new(Vec::new());
@@ -94,7 +103,12 @@ pub fn install(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
             mode,
             #[cfg(target_os = "linux")]
             prepared: super::linux::prepare_ruleset(&paths),
+            #[cfg(target_os = "linux")]
+            prepared_parser: super::linux::prepare_parser_layer(mode),
+            #[cfg(target_os = "linux")]
+            prepared_capture: super::linux::prepare_capture_layer(mode, &paths),
             paths,
+            capture_authority: OnceLock::new(),
             components: Mutex::new(BTreeMap::new()),
         })
         .map_err(|_| "worker policy already installed".to_string())
@@ -103,18 +117,42 @@ pub fn install(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
 pub(super) fn prepared_ruleset() -> Option<&'static Result<landlock::RulesetCreated, String>> {
     POLICY.get().map(|p| &p.prepared)
 }
-pub fn ensure(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
+/// The layer `role` stacks on the shared ruleset. Each thread clones its own.
+#[cfg(target_os = "linux")]
+pub(super) fn prepared_layer(
+    role: super::Role,
+) -> Option<&'static Result<landlock::RulesetCreated, String>> {
+    POLICY.get().map(|p| match role {
+        super::Role::Capture => &p.prepared_capture,
+        _ => &p.prepared_parser,
+    })
+}
+/// Install the policy if `main` has not, and record the session's capture
+/// authority. Workers that entered before this took
+/// [`CaptureAuthority::DropAfterOpen`].
+pub fn ensure(mode: Mode, paths: SandboxPaths, authority: CaptureAuthority) -> Result<(), String> {
     if let Some(policy) = POLICY.get() {
         if policy.mode != mode {
             return Err("worker policy mode cannot change during a session".into());
         }
-        return preflight();
+    } else {
+        if !matches!(mode, Mode::Disabled) {
+            paths.prepare().map_err(|e| e.to_string())?;
+        }
+        install(mode, paths)?;
     }
-    if !matches!(mode, Mode::Disabled) {
-        paths.prepare().map_err(|e| e.to_string())?;
+    let policy = POLICY.get().expect("installed above");
+    if *policy.capture_authority.get_or_init(|| authority) != authority {
+        return Err("capture authority cannot change during a session".into());
     }
-    install(mode, paths)?;
     preflight()
+}
+/// Whether main and the network workers keep CAP_NET_RAW on entry.
+pub fn capture_authority() -> CaptureAuthority {
+    POLICY
+        .get()
+        .and_then(|p| p.capture_authority.get().copied())
+        .unwrap_or(CaptureAuthority::DropAfterOpen)
 }
 /// Check enforceability in a disposable thread before opening optional sources.
 pub fn preflight() -> Result<(), String> {
@@ -172,6 +210,15 @@ pub fn note(name: &str, detail: impl Into<String>) {
 }
 
 pub fn fail(name: &str, error: impl Into<String>) {
+    #[cfg(all(test, target_os = "linux"))]
+    {
+        let held = [caps::CapSet::Permitted, caps::CapSet::Inheritable]
+            .into_iter()
+            .filter_map(|set| caps::read(None, set).ok())
+            .flatten()
+            .collect();
+        FAILED_HOLDING.lock().unwrap().insert(name.into(), held);
+    }
     if let Some(p) = POLICY.get() {
         crate::app::safe_lock(&p.components, "worker::fail").insert(
             name.into(),
@@ -183,7 +230,9 @@ pub fn fail(name: &str, error: impl Into<String>) {
         );
     }
 }
-/// Enforce on the actual worker. Strict failures return false before processing.
+/// Enforce on the actual worker, with the policy of its role
+/// ([`super::roles::role_for`]). Strict failures return false before
+/// processing.
 pub fn enter(name: &str) -> bool {
     enter_retaining(name, super::Retain::Nothing)
 }
@@ -198,7 +247,8 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
     let Some(p) = POLICY.get() else {
         return true;
     };
-    let report = super::apply_retaining(p.mode, &p.paths, retain);
+    let role = super::roles::role_for(name);
+    let report = super::apply_retaining(p.mode, &p.paths, retain, role);
     #[cfg(test)]
     let report = {
         let mut report = report;
@@ -215,6 +265,18 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
         let denied =
             std::fs::read(path).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
         PROBES.lock().unwrap().insert(name.into(), denied);
+    }
+    #[cfg(test)]
+    if let Some(port) = std::env::var("NETWATCH_WORKER_NET_PROBE")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        // The errno of a TCP connect to a loopback listener, or `None` when
+        // it connected.
+        let errno = std::net::TcpStream::connect(("127.0.0.1", port))
+            .err()
+            .map(|e| e.raw_os_error().unwrap_or(-1));
+        NET_PROBES.lock().unwrap().insert(name.into(), errno);
     }
     let allowed = !matches!(p.mode, Mode::Strict) || report.mode.warnings.is_empty();
     let mut components = crate::app::safe_lock(&p.components, "worker::enter");
@@ -258,20 +320,23 @@ pub fn drop_load_caps(name: &str) {
 /// What [`relinquish`] left each unconfined thread holding, by name.
 static RELINQUISHED: Mutex<BTreeMap<String, Report>> = Mutex::new(BTreeMap::new());
 
-/// Give up, on the calling thread, every capability except CAP_SYS_PTRACE and
-/// CAP_DAC_READ_SEARCH, without confining it.
+/// Give up, on the calling thread, every capability its role does not keep
+/// unconfined, without confining it. The ProcBroker keeps CAP_SYS_PTRACE and
+/// CAP_DAC_READ_SEARCH, and any other thread nothing.
 ///
-/// For the ProcBroker, which stays outside Landlock to read other processes'
-/// socket fds and so never enters. Under sudo it would otherwise keep every
-/// capability the process started with, CAP_NET_RAW and the BPF set included,
-/// for the whole session and in every mode. Needs no policy, because the
-/// broker can start before [`ensure`] installs one; the outcome is recorded
-/// for [`relinquished`] either way.
+/// For threads that never enter. The ProcBroker stays outside Landlock to read
+/// other processes' socket fds; the TUI's shutdown deadline waits for signals
+/// from before the policy's session starts; a capture thread whose device
+/// failed to open returns without entering. Each starts from main before main
+/// drops anything, so under sudo it would otherwise keep every capability the
+/// process started with, CAP_NET_RAW and the BPF set included, and in every
+/// mode. Needs no policy, because the broker can start before [`ensure`]
+/// installs one; the outcome is recorded for [`relinquished`] either way.
 pub fn relinquish(name: &str) {
     #[cfg(target_os = "linux")]
     {
         let mut report = Report::default();
-        super::linux::relinquish_caps(&mut report);
+        super::linux::relinquish_caps(super::roles::role_for(name), &mut report);
         for warning in &report.mode.warnings {
             tracing::warn!(target: "netwatch::sandbox", thread = name, "{warning}");
         }
@@ -378,6 +443,15 @@ pub fn summary() -> String {
 
 #[cfg(test)]
 static PROBES: Mutex<BTreeMap<String, bool>> = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+static NET_PROBES: Mutex<BTreeMap<String, Option<i32>>> = Mutex::new(BTreeMap::new());
+/// What the thread that last called [`fail`] for each name held then.
+#[cfg(all(test, target_os = "linux"))]
+static FAILED_HOLDING: Mutex<BTreeMap<String, caps::CapsHashSet>> = Mutex::new(BTreeMap::new());
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn held_at_failure(name: &str) -> Option<caps::CapsHashSet> {
+    FAILED_HOLDING.lock().unwrap().get(name).cloned()
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -387,6 +461,10 @@ mod tests {
     fn isolated_worker_boundaries() {
         const CHILD: &str = "NETWATCH_WORKER_POLICY_TEST";
         let Ok(root) = std::env::var(CHILD) else {
+            if super::super::linux::kernel_denies_files_but_not_tcp() {
+                eprintln!("skipped: strict needs Landlock ABI 4 (Linux 6.7) to deny TCP");
+                return;
+            }
             struct TestDir(std::path::PathBuf);
             impl Drop for TestDir {
                 fn drop(&mut self) {
@@ -407,6 +485,10 @@ mod tests {
                 ),
             )
             .unwrap();
+            // Workers connect to this on entry; the kernel completes the
+            // handshake without an accept.
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let probe_port = probe.local_addr().unwrap().port().to_string();
             for injected in ["", "blocked"] {
                 let result = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -417,6 +499,7 @@ mod tests {
                     .env(CHILD, temp.0.as_path())
                     .env("NETWATCH_WORKER_FORCE_FAILURE", injected)
                     .env("NETWATCH_WORKER_PROBE", temp.0.as_path().join("secret"))
+                    .env("NETWATCH_WORKER_NET_PROBE", &probe_port)
                     .output()
                     .unwrap();
                 assert!(
@@ -462,7 +545,21 @@ mod tests {
         std::os::unix::fs::symlink(&root, root.join("exports")).unwrap();
         let escape = root.join("exports").join("escape");
         let secret = root.join("secret");
+        // /proc is a read grant, and a thread may write its own name to
+        // /proc/thread-self/comm. Opening it for writing is allowed here and
+        // must be refused once confined, which it would not be if the
+        // ruleset gave a read row more than reading.
+        let open_comm_for_write = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/proc/thread-self/comm")
+        };
+        open_comm_for_write().unwrap();
         spawn("boundary-check", move || {
+            assert_eq!(
+                open_comm_for_write().unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
             assert_eq!(
                 std::fs::read(secret).unwrap_err().kind(),
                 std::io::ErrorKind::PermissionDenied
@@ -497,6 +594,32 @@ mod tests {
                 snapshot()
             );
         }
+        // Capture enters with the layer `install` prepared for its role, which
+        // has the read grants and none of the write grants. Every other
+        // confined thread can write the configuration.
+        let config = root.join("config").join("config.toml");
+        for (name, writes) in [("connections", true), ("capture", false)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let config = config.clone();
+            spawn(name, move || {
+                let wrote = std::fs::write(&config, b"sandbox = \"off\"\n");
+                tx.send(wrote.map_err(|e| e.kind())).unwrap();
+            })
+            .join()
+            .unwrap();
+            let expected = if writes {
+                Ok(())
+            } else {
+                Err(std::io::ErrorKind::PermissionDenied)
+            };
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(1)),
+                Ok(expected),
+                "{name}"
+            );
+        }
+        let capture = snapshot()["capture"].report.clone().unwrap();
+        assert_eq!(capture.platform.landlock_layer, Some("capture"));
         // Online lookups are opt-in (off by default, see `geoip_online` in
         // NetwatchConfig); force them on here so the geoip worker actually
         // spawns and this test still covers its sandbox entry.
@@ -539,6 +662,54 @@ mod tests {
                 "actual {name} worker could read sentinel"
             );
         }
+        // The exporter starts metrics-client on the listener's thread, where
+        // it inherits the listener's layer whatever its own role, so the
+        // scrape below shows the listener's deny only. Entered from this
+        // unconfined thread, it has to deny TCP by its own role.
+        spawn("metrics-client", || {}).join().unwrap();
+        assert_eq!(
+            NET_PROBES.lock().unwrap().get("metrics-client"),
+            Some(&Some(nix::libc::EACCES)),
+            "metrics-client's own role keeps the network"
+        );
+        // An exporter serving from parser threads still answers a scrape
+        // from this unconfined thread: accepting and answering is neither a
+        // bind nor a connect, and the listener was bound before entry.
+        let metrics_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let exporter = crate::metrics::MetricsExporter::new(format!("127.0.0.1:{metrics_port}"));
+        exporter.start();
+        let mut scrape = std::net::TcpStream::connect(("127.0.0.1", metrics_port)).unwrap();
+        std::io::Write::write_all(&mut scrape, b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut scrape, &mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let net = NET_PROBES.lock().unwrap().clone();
+        for name in [
+            "keylog",
+            "metrics-listener",
+            "metrics-client",
+            "boundary-check",
+            "capture",
+        ] {
+            assert_eq!(
+                net.get(name),
+                Some(&Some(nix::libc::EACCES)),
+                "actual {name} worker could connect: {net:?}"
+            );
+        }
+        // The online GeoIP worker is on its way out, so it is not held to
+        // connecting here.
+        for name in ["whois", "reverse-dns", "insights"] {
+            assert_eq!(
+                net.get(name),
+                Some(&None),
+                "actual {name} worker could not connect: {net:?}"
+            );
+        }
         assert!(wait_ready(Duration::from_secs(1)).is_ok());
         assert_eq!(shutdown(Duration::from_secs(2)), 0);
         // Parent thread remains unrestricted: tests changed the real workers only.
@@ -558,6 +729,227 @@ mod tests {
         .unwrap();
         let comm = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(comm.trim_end(), "policy-prefligh");
+    }
+
+    /// Make Landlock look absent to the calling thread and every thread it
+    /// starts afterwards: landlock_create_ruleset, which every Landlock call
+    /// starts with, fails with ENOSYS. Syscalls added since Linux 5.1 have the
+    /// same number on every architecture netwatch builds for, so the filter
+    /// does not check which.
+    fn hide_landlock() {
+        use nix::libc;
+        let statement = |code: u32, k: u32| libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let mut filter = [
+            statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0),
+            libc::sock_filter {
+                jf: 1,
+                ..statement(
+                    libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                    libc::SYS_landlock_create_ruleset as u32,
+                )
+            },
+            statement(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+            ),
+            statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        let (zero, one): (libc::c_ulong, libc::c_ulong) = (0, 1);
+        let mode = libc::SECCOMP_MODE_FILTER as libc::c_ulong;
+        // SAFETY: prctl reads four arguments after the option, each passed
+        // as the unsigned long the kernel takes, and PR_SET_NO_NEW_PRIVS
+        // fails unless the last three are zero. PR_SET_SECCOMP reads
+        // `program` and the `filter` it points to, both alive until it
+        // returns.
+        let installed = unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero) == 0
+                && libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    mode,
+                    &program as *const libc::sock_fprog,
+                    zero,
+                    zero,
+                ) == 0
+        };
+        assert!(installed, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Strict refuses a parser entry on a kernel that cannot deny TCP
+    /// (OD3). The filesystem layer fails too when Landlock is hidden, so the
+    /// error has to name the TCP deny; any strict failure would not do.
+    #[test]
+    fn strict_refuses_parser_entry_without_the_tcp_deny() {
+        const CHILD: &str = "NETWATCH_WORKER_NO_LANDLOCK_TEST";
+        // The filter cannot be removed, so it goes on a child.
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::worker::tests::strict_refuses_parser_entry_without_the_tcp_deny",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        hide_landlock();
+        install(Mode::Strict, SandboxPaths::default()).unwrap();
+        let error = preflight().unwrap_err();
+        assert!(
+            error.contains("cannot deny TCP") || error.contains("parser network deny unavailable"),
+            "{error}"
+        );
+        assert!(!snapshot()["policy-preflight"].ready);
+    }
+
+    /// Workers that enter before the session starts drop CAP_NET_RAW; the
+    /// session then says whether main keeps it, once.
+    #[test]
+    fn ensure_sets_the_capture_authority_once() {
+        const CHILD: &str = "NETWATCH_WORKER_AUTHORITY_TEST";
+        // POLICY is process-wide, so install it in a child.
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::worker::tests::ensure_sets_the_capture_authority_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        assert_eq!(capture_authority(), CaptureAuthority::DropAfterOpen);
+        install(Mode::Disabled, SandboxPaths::default()).unwrap();
+        assert_eq!(capture_authority(), CaptureAuthority::DropAfterOpen);
+        let tui = CaptureAuthority::RetainForReopen;
+        ensure(Mode::Disabled, SandboxPaths::default(), tui).unwrap();
+        assert_eq!(capture_authority(), tui);
+        ensure(Mode::Disabled, SandboxPaths::default(), tui).unwrap();
+        let error = ensure(
+            Mode::Disabled,
+            SandboxPaths::default(),
+            CaptureAuthority::DropAfterOpen,
+        )
+        .unwrap_err();
+        assert!(error.contains("capture authority"), "{error}");
+        assert_eq!(capture_authority(), tui);
+    }
+
+    /// Whether a `health` worker still holds CAP_NET_RAW once it has entered
+    /// on a thread of its own.
+    fn health_keeps_net_raw() -> bool {
+        std::thread::spawn(|| {
+            assert!(enter("health"));
+            caps::has_cap(None, caps::CapSet::Permitted, caps::Capability::CAP_NET_RAW).unwrap()
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// The session's capture authority reaches each worker's entry: a
+    /// network worker drops CAP_NET_RAW until a TUI's `ensure` says capture
+    /// reopens, and keeps it from then on.
+    #[test]
+    fn network_worker_keeps_cap_net_raw_once_a_tui_starts() {
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::network_worker_keeps_cap_net_raw_once_a_tui_starts",
+        ) {
+            return;
+        }
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        assert!(!health_keeps_net_raw(), "entered before the session");
+        let tui = CaptureAuthority::RetainForReopen;
+        ensure(Mode::BestEffort, SandboxPaths::default(), tui).unwrap();
+        assert!(health_keeps_net_raw(), "entered in a TUI");
+    }
+
+    /// The daemon and the Diagnose CLI never reopen capture, so their
+    /// network workers drop CAP_NET_RAW.
+    #[test]
+    fn network_worker_drops_cap_net_raw_where_capture_never_reopens() {
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::network_worker_drops_cap_net_raw_where_capture_never_reopens",
+        ) {
+            return;
+        }
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        let daemon = CaptureAuthority::DropAfterOpen;
+        ensure(Mode::BestEffort, SandboxPaths::default(), daemon).unwrap();
+        assert!(!health_keeps_net_raw());
+    }
+
+    /// A thread that never enters keeps only what its name's role needs
+    /// unconfined: the proc broker its scan's two capabilities, the TUI's
+    /// shutdown deadline and a capture thread whose device failed to open
+    /// nothing.
+    #[test]
+    fn relinquish_keeps_only_what_the_role_needs() {
+        use caps::{CapSet, Capability};
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::relinquish_keeps_only_what_the_role_needs",
+        ) {
+            return;
+        }
+        let broker = [Capability::CAP_SYS_PTRACE, Capability::CAP_DAC_READ_SEARCH];
+        for (name, keeps) in [
+            ("proc-broker", &broker[..]),
+            ("shutdown-deadline", &[]),
+            ("capture", &[]),
+        ] {
+            let held = std::thread::spawn(move || {
+                // Root in a user namespace holds nothing Inheritable or
+                // Ambient, so grant CAP_NET_RAW there first, as the systemd
+                // unit's AmbientCapabilities does.
+                for set in [CapSet::Inheritable, CapSet::Ambient] {
+                    caps::raise(None, set, Capability::CAP_NET_RAW).unwrap();
+                }
+                relinquish(name);
+                [
+                    CapSet::Effective,
+                    CapSet::Permitted,
+                    CapSet::Inheritable,
+                    CapSet::Ambient,
+                ]
+                .map(|set| (set, caps::read(None, set).unwrap()))
+            })
+            .join()
+            .unwrap();
+            for (set, held) in held {
+                let expected: caps::CapsHashSet =
+                    if matches!(set, CapSet::Effective | CapSet::Permitted) {
+                        keeps.iter().copied().collect()
+                    } else {
+                        Default::default()
+                    };
+                assert_eq!(held, expected, "{name} {set:?}");
+            }
+            let report = &relinquished()[name];
+            assert!(report.mode.warnings.is_empty(), "{name}: {report:?}");
+        }
     }
 
     /// The capture thread records its state in the component map and the UI

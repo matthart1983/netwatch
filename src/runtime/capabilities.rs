@@ -127,7 +127,7 @@ impl CapabilitySnapshot {
         );
         let ebpf = cfg!(all(target_os = "linux", feature = "ebpf"));
         let attribution = if ebpf && !matches!(Mode::from_config(&config.sandbox), Mode::Disabled) {
-            "eBPF disabled by sandbox policy; socket polling fallback not checked"
+            "eBPF loads under sandbox policy and its reader keeps load capabilities; initialization and socket fallback not checked"
         } else if ebpf {
             "eBPF compiled in; initialization and socket fallback not checked"
         } else {
@@ -632,7 +632,7 @@ fn static_connection_table(ss: Option<&std::path::Path>, proc_net_readable: bool
             State::Ready,
             "ss_found",
             format!(
-                "{} found; live sessions read the connection table from ss -tunap (not run here)",
+                "{} found; live sessions read the connection table from ss -tuna (not run here)",
                 path.display()
             ),
             None,
@@ -668,7 +668,7 @@ fn live_connection_table(coverage: &crate::collectors::attribution::Coverage) ->
     let next = if note.starts_with("ss not found") {
         "Install iproute2 for ss"
     } else {
-        "Check that ss -tunap runs for this user and sandbox"
+        "Check that ss -tuna runs for this user and sandbox"
     };
     if coverage.completed_at.is_none() {
         return (
@@ -682,7 +682,7 @@ fn live_connection_table(coverage: &crate::collectors::attribution::Coverage) ->
         Some(TableSource::Ss) => (
             State::Ready,
             "ss",
-            "Connection table from ss -tunap".into(),
+            "Connection table from ss -tuna".into(),
             None,
         ),
         Some(TableSource::ProcNet) => (
@@ -920,7 +920,14 @@ pub fn capture_child(interface: &str, mode: Mode) -> anyhow::Result<()> {
             protection: None,
         },
         Ok(capture) => {
-            let report = sandbox::apply(mode, &sandbox::SandboxPaths::default());
+            // The capture thread's policy, so strict fails here where it
+            // would refuse capture.
+            let report = sandbox::apply_retaining(
+                mode,
+                &sandbox::SandboxPaths::default(),
+                sandbox::Retain::Nothing,
+                sandbox::Role::Capture,
+            );
             let rejected = matches!(mode, Mode::Strict) && !report.mode.warnings.is_empty();
             let result = CaptureResult {
                 interface: interface.into(),
@@ -1111,6 +1118,16 @@ mod tests {
         assert_eq!(snapshot.get("online_geo").state, State::NotChecked);
         assert!(snapshot.get("online_geo").detail.contains("cleartext"));
     }
+    /// Since 0.32.2 eBPF loads inside the sandbox policy, so the default
+    /// configuration must not report it switched off by that policy.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[test]
+    fn static_doctor_says_ebpf_loads_under_the_sandbox() {
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let detail = &snapshot.get("attribution").detail;
+        assert!(!detail.contains("disabled"), "{detail}");
+        assert!(detail.contains("keeps load capabilities"), "{detail}");
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn static_doctor_names_the_connection_table_it_expects() {
@@ -1173,7 +1190,7 @@ mod tests {
         ));
         assert_eq!(
             next,
-            Some("Check that ss -tunap runs for this user and sandbox")
+            Some("Check that ss -tuna runs for this user and sandbox")
         );
 
         let (state, reason, detail, _) = live_connection_table(&polled(

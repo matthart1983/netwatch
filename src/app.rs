@@ -704,8 +704,9 @@ impl App {
     }
 
     /// Start persistent workers through their policy entry boundaries.
-    /// Capture opens its resource before entering; the SDK source stays disabled
-    /// under sandbox policy because its internal reader has no entry hook.
+    /// Capture opens its resource before entering. eBPF loads inside the policy;
+    /// the SDK's reader inherits it but keeps the load capabilities, because it
+    /// has no entry hook of its own.
     pub(crate) fn start_workers(&mut self) {
         if self.workers_started {
             return;
@@ -1704,7 +1705,8 @@ where
     crate::runtime::bootstrap::prime_collectors(&mut app);
     // Kick off a one-shot traceroute so the topology view's ISP gateway hop
     // is populated without requiring the user to press T first.
-    app.traceroute_runner.run("1.1.1.1");
+    app.traceroute_runner
+        .run(crate::collectors::traceroute::STARTUP_TARGET);
 
     // Event loop design:
     //   1. Render  — draw current app state to the terminal
@@ -1902,6 +1904,9 @@ fn shutdown_deadline() {
     let _ = std::thread::Builder::new()
         .name("shutdown-deadline".into())
         .spawn(move || {
+            // Started before main drops anything and never confined, so it
+            // would keep every capability netwatch started with.
+            crate::sandbox::worker::relinquish("shutdown-deadline");
             if let Some(signal) = signals.forever().next() {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 if !SHUTDOWN_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1967,6 +1972,7 @@ pub async fn run_headless(
                         &app.traffic.interfaces(),
                         &app.health_prober,
                         &app.connection_collector,
+                        &app.packet_collector,
                         app.egress_profiler.violation_totals_sorted(),
                     );
                     exporter.set_collectors_ok(healthy);
@@ -4401,6 +4407,53 @@ mod tests {
         assert!(app.conn_tracker.is_none());
         #[cfg(target_os = "macos")]
         assert!(app.pktap_handle.is_none());
+    }
+
+    /// The shutdown-deadline thread starts before main drops anything and
+    /// never enters, so it gives up every capability itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_deadline_thread_holds_no_capability() {
+        if !crate::sandbox::audit::as_root_in_user_namespace(
+            "app::tests::shutdown_deadline_thread_holds_no_capability",
+        ) {
+            return;
+        }
+        super::shutdown_deadline();
+        // Its four sets as procfs shows them. It drops once it is running, so
+        // they are read until they are empty or 3 seconds pass. The kernel
+        // keeps the first 15 bytes of its name.
+        let sets = || {
+            std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .flatten()
+                .find(|task| {
+                    std::fs::read_to_string(task.path().join("comm"))
+                        .is_ok_and(|comm| comm.trim_end() == "shutdown-deadli")
+                })
+                .and_then(|task| std::fs::read_to_string(task.path().join("status")).ok())
+                .map(|status| {
+                    status
+                        .lines()
+                        .filter(|line| {
+                            ["CapPrm:", "CapEff:", "CapInh:", "CapAmb:"]
+                                .iter()
+                                .any(|set| line.starts_with(set))
+                        })
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+        };
+        let empty = |sets: &[String]| {
+            sets.len() == 4 && sets.iter().all(|line| line.ends_with("\t0000000000000000"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut seen = sets();
+        while !seen.as_deref().is_some_and(empty) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            seen = sets();
+        }
+        assert!(seen.as_deref().is_some_and(empty), "{seen:?}");
     }
 
     use super::*;
