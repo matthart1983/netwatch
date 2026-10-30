@@ -1,16 +1,17 @@
 # NetWatch threat model
 
 This describes the 0.39 implementation so far: the wave-1 capability and WHOIS
-fixes, and the parser and capture roles. It is a containment inventory, not a
-guarantee against arbitrary code execution. Linux non-root capability-based operation is preferred. Running
+fixes, the parser and capture roles, and capture authority. It is a
+containment inventory, not a guarantee against arbitrary code execution. Linux non-root capability-based operation is preferred. Running
 as root works, but containment is limited; the sandbox is defence in depth.
 See [the restricted-group setup](REFERENCE.md#running-without-sudo-linux) and
 [reporting policy](../SECURITY.md).
 
 ## Run modes and assets
 
-TUI and daemon startup install worker policy, start resources, and restrict the
-main thread. Capture opens its device before entry. Early CLI dispatch can return
+TUI and daemon startup install worker policy, start resources, restrict the main
+thread, and then audit every thread's capabilities. Capture opens its device
+before entry. Early CLI dispatch can return
 before policy installation, so a file-reading subcommand must not be assumed
 sandboxed. Strict startup rejects required entry failures; best-effort reports
 degradation. Disabled mode installs no restrictions. See
@@ -75,19 +76,34 @@ parser-fs: ResolveUnix
 <!-- /policy:abi -->
 ```
 
-Capability removals are verified. The first row is dropped on ordinary confined
-threads, the second is additional in strict mode, and the third is additional on
-parser and capture threads in every mode. The BPF load worker temporarily retains
-the fourth row; the unconfined proc broker retains only capabilities it started
-with from the fifth row. This is a deny-list, not a complete root allow-list. See
-[capability policy](../src/sandbox/linux.rs#L45) and
+Capability removals are verified in the Effective, Permitted, Inheritable and
+Ambient sets. The first row is dropped on every confined thread, the second is
+additional in strict mode, and the third is additional on parser and capture
+threads in every mode. The fourth is additional on main and the network workers
+in sessions that never reopen capture: the daemon, `diagnose run`, `diagnose
+coverage` and every strict session. A best-effort TUI, the demo included, leaves
+it on them so `c`, `i` and `Shift+R` can reopen capture, though network workers
+that start before the session is known still drop it. The BPF load worker
+temporarily retains the fifth row. Threads that never enter drop capabilities
+themselves: the proc broker keeps only what it started with from the sixth row,
+and the TUI's shutdown-deadline thread and a capture thread whose device failed
+to open keep nothing. This is a deny-list, not a complete root allow-list. See
+[capability policy](../src/sandbox/linux.rs#L45),
+[capture authority](../src/sandbox/mod.rs#L71) and
 [broker entry](../src/sandbox/worker.rs#L1).
+
+After main enters, startup reads every thread's four sets from
+`/proc/self/task/*/status`. A thread holding CAP_NET_ADMIN, or CAP_NET_RAW in a
+session that drops it, gets a warning naming it and its thread id, and strict
+refuses to start ([audit](../src/sandbox/audit.rs#L1)). The audit runs once; a
+thread started later from one that holds CAP_NET_RAW inherits it unchecked.
 
 ```text
 <!-- policy:caps -->
-default: CAP_BPF, CAP_PERFMON, CAP_SYS_ADMIN, CAP_SYS_RAWIO, CAP_SYS_MODULE, CAP_SYS_BOOT, CAP_SYS_TIME, CAP_SYS_PACCT, CAP_SYS_TTY_CONFIG, CAP_SYSLOG, CAP_WAKE_ALARM, CAP_BLOCK_SUSPEND, CAP_SYS_PTRACE, CAP_KILL, CAP_CHECKPOINT_RESTORE, CAP_IPC_OWNER, CAP_SETUID, CAP_SETGID, CAP_SETPCAP, CAP_SETFCAP, CAP_MKNOD, CAP_SYS_CHROOT, CAP_LINUX_IMMUTABLE, CAP_LEASE, CAP_MAC_ADMIN, CAP_MAC_OVERRIDE, CAP_AUDIT_CONTROL, CAP_AUDIT_WRITE, CAP_AUDIT_READ, CAP_NET_BROADCAST
+default: CAP_BPF, CAP_PERFMON, CAP_SYS_ADMIN, CAP_SYS_RAWIO, CAP_SYS_MODULE, CAP_SYS_BOOT, CAP_SYS_TIME, CAP_SYS_PACCT, CAP_SYS_TTY_CONFIG, CAP_SYSLOG, CAP_WAKE_ALARM, CAP_BLOCK_SUSPEND, CAP_SYS_PTRACE, CAP_KILL, CAP_CHECKPOINT_RESTORE, CAP_IPC_OWNER, CAP_SETUID, CAP_SETGID, CAP_SETPCAP, CAP_SETFCAP, CAP_MKNOD, CAP_SYS_CHROOT, CAP_LINUX_IMMUTABLE, CAP_LEASE, CAP_MAC_ADMIN, CAP_MAC_OVERRIDE, CAP_AUDIT_CONTROL, CAP_AUDIT_WRITE, CAP_AUDIT_READ, CAP_NET_BROADCAST, CAP_NET_ADMIN
 strict-extra: CAP_NET_RAW
 parser-extra: CAP_NET_RAW
+after-open: CAP_NET_RAW
 bpf-load: CAP_BPF, CAP_PERFMON, CAP_SYS_ADMIN
 proc-broker: CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH
 <!-- /policy:caps -->
@@ -154,7 +170,7 @@ write: /dev/null
    a process boundary ([worker](../src/sandbox/worker.rs#L1)).
 2. ProcBroker stays outside Landlock to scan procfs. Wave 1 limits its capabilities
    to ptrace and DAC read/search; it is still privileged
-   ([broker policy](../src/sandbox/linux.rs#L146)).
+   ([broker policy](../src/sandbox/linux.rs#L160)).
 3. The SDK reader inherits the eBPF worker's layers but keeps its creation-time
    load capabilities; it has no separate entry hook
    ([eBPF startup](../src/ebpf/conn_tracker.rs#L130)).
@@ -189,12 +205,24 @@ write: /dev/null
    a compromised parser cannot read SSH keys was too broad: shared descriptors,
    other threads and privileged interfaces must also be considered
    ([retained capabilities](../src/sandbox/linux.rs#L45)).
-8. Parser and capture threads drop CAP_NET_RAW in every mode. Best-effort keeps
-   it on main and the network workers, because `c`, `i` and `Shift+R` reopen
-   capture on a new thread started from main; a parser running injected code can
-   still reach main's (item 1). Strict drops it on every confined thread, which
-   can make capture restart fail ([parser list](../src/sandbox/linux.rs#L130),
-   [strict list](../src/sandbox/linux.rs#L119)).
+8. Parser and capture threads drop CAP_NET_RAW in best-effort and strict mode.
+   A best-effort TUI keeps it on main and the network workers, because `c`,
+   `i` and `Shift+R` reopen capture on a new thread started from main; a parser
+   running injected code can still reach main's (item 1). The daemon,
+   `diagnose run`, `diagnose coverage` and strict sessions drop it on every
+   thread once capture has opened, so capture cannot reopen there, and the
+   startup audit checks that no thread holds it. In those sessions the `ping`
+   that health falls back to, and the one Diagnose's PMTU probe runs, can hold
+   no more than the worker that starts it, so on a host whose `ping_group_range`
+   excludes the user both fail and health falls back to TCP. With the sandbox
+   on, no thread keeps CAP_NET_ADMIN; disabled mode drops neither capability
+   from main or the workers. Dropping CAP_NET_RAW stops a thread opening raw or
+   packet sockets and setting `IP_TRANSPARENT` or `SO_MARK`, and its
+   subprocesses inheriting it through the Ambient set; it does not revoke the
+   capture descriptor (below)
+   ([parser list](../src/sandbox/linux.rs#L135),
+   [after-open list](../src/sandbox/linux.rs#L143),
+   [strict list](../src/sandbox/linux.rs#L124)).
 9. Every confined thread but capture can write the configuration, so a
    compromised parser can persist a setting such as `sandbox = "off"` for the
    next start. The capture thread has no write grant
@@ -216,13 +244,18 @@ write: /dev/null
     capture-error hint and the package install messages still give an in-place
     `setcap` line without that restriction (E3 below).
 
-Capture drops CAP_NET_RAW on entry, but that does not revoke the AF_PACKET
-descriptor it opened before. Such a descriptor retains layer-2 capture/injection
-authority in its network namespace.
-Capture opens before policy entry; a dumpcap-style separate capture process is
-needed for a stronger boundary. This document does not claim an independent root
-capture acceptance test was performed. See
-[capture startup](../src/collectors/packets/mod.rs#L1).
+Capture drops CAP_NET_RAW on entry, and in sessions that never reopen every
+other thread drops it too, but that does not revoke the AF_PACKET descriptor
+capture opened before. Such a descriptor retains layer-2 capture/injection
+authority in its network namespace. With every capability dropped, a libpcap
+descriptor opened on one interface still sent a frame out of another and, once
+rebound, read another interface's traffic (Linux 7.1, libpcap 1.10.6). Every
+thread shares it (item 1), so no capability drop takes capture authority away
+from a compromised parser. Capture opens before policy entry; a dumpcap-style
+separate capture process is needed for a stronger boundary. The drops and the
+audit were measured as root in a user and network namespace with a veth pair;
+this document does not claim an independent root capture acceptance test was
+performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 
 ## Input inventory
 
@@ -301,7 +334,7 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | A2 selection leaking addresses to RDAP | Fixed: only W queues WHOIS |
 | A4 root capability deny-list and broker restriction | Included; full root allow-list deferred |
 | B1 parser TCP deny, scopes, ResolveUnix, no-write capture policy, CAP_NET_RAW off parser threads | Included |
-| C1 capture authority and NET_ADMIN audit | Later 0.39 work |
+| C1 capture authority and NET_ADMIN audit | Included |
 | D1 seccomp no-socket policy | Later 0.39 work |
 | E2 local GeoIP/update command | Later 0.39 work |
 | E3 capture-error hint and package messages still setcap a world-executable binary | Later 0.39 work |

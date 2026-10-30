@@ -1,5 +1,5 @@
 //! Explicit per-worker entry policy. No input is processed before entry returns.
-use super::{Mode, Report, SandboxPaths};
+use super::{CaptureAuthority, Mode, Report, SandboxPaths};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,6 +14,9 @@ pub struct Component {
 struct Policy {
     mode: Mode,
     paths: SandboxPaths,
+    /// Set once by [`ensure`], which knows the session; until then
+    /// [`capture_authority`] reads [`CaptureAuthority::DropAfterOpen`].
+    capture_authority: OnceLock<CaptureAuthority>,
     /// Shared by every worker and the UI, the capture thread included, so
     /// every access goes through `safe_lock`.
     components: Mutex<BTreeMap<String, Component>>,
@@ -105,6 +108,7 @@ pub fn install(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
             #[cfg(target_os = "linux")]
             prepared_capture: super::linux::prepare_capture_layer(mode, &paths),
             paths,
+            capture_authority: OnceLock::new(),
             components: Mutex::new(BTreeMap::new()),
         })
         .map_err(|_| "worker policy already installed".to_string())
@@ -123,18 +127,32 @@ pub(super) fn prepared_layer(
         _ => &p.prepared_parser,
     })
 }
-pub fn ensure(mode: Mode, paths: SandboxPaths) -> Result<(), String> {
+/// Install the policy if `main` has not, and record the session's capture
+/// authority. Workers that entered before this took
+/// [`CaptureAuthority::DropAfterOpen`].
+pub fn ensure(mode: Mode, paths: SandboxPaths, authority: CaptureAuthority) -> Result<(), String> {
     if let Some(policy) = POLICY.get() {
         if policy.mode != mode {
             return Err("worker policy mode cannot change during a session".into());
         }
-        return preflight();
+    } else {
+        if !matches!(mode, Mode::Disabled) {
+            paths.prepare().map_err(|e| e.to_string())?;
+        }
+        install(mode, paths)?;
     }
-    if !matches!(mode, Mode::Disabled) {
-        paths.prepare().map_err(|e| e.to_string())?;
+    let policy = POLICY.get().expect("installed above");
+    if *policy.capture_authority.get_or_init(|| authority) != authority {
+        return Err("capture authority cannot change during a session".into());
     }
-    install(mode, paths)?;
     preflight()
+}
+/// Whether main and the network workers keep CAP_NET_RAW on entry.
+pub fn capture_authority() -> CaptureAuthority {
+    POLICY
+        .get()
+        .and_then(|p| p.capture_authority.get().copied())
+        .unwrap_or(CaptureAuthority::DropAfterOpen)
 }
 /// Check enforceability in a disposable thread before opening optional sources.
 pub fn preflight() -> Result<(), String> {
@@ -192,6 +210,15 @@ pub fn note(name: &str, detail: impl Into<String>) {
 }
 
 pub fn fail(name: &str, error: impl Into<String>) {
+    #[cfg(all(test, target_os = "linux"))]
+    {
+        let held = [caps::CapSet::Permitted, caps::CapSet::Inheritable]
+            .into_iter()
+            .filter_map(|set| caps::read(None, set).ok())
+            .flatten()
+            .collect();
+        FAILED_HOLDING.lock().unwrap().insert(name.into(), held);
+    }
     if let Some(p) = POLICY.get() {
         crate::app::safe_lock(&p.components, "worker::fail").insert(
             name.into(),
@@ -293,20 +320,23 @@ pub fn drop_load_caps(name: &str) {
 /// What [`relinquish`] left each unconfined thread holding, by name.
 static RELINQUISHED: Mutex<BTreeMap<String, Report>> = Mutex::new(BTreeMap::new());
 
-/// Give up, on the calling thread, every capability except CAP_SYS_PTRACE and
-/// CAP_DAC_READ_SEARCH, without confining it.
+/// Give up, on the calling thread, every capability its role does not keep
+/// unconfined, without confining it. The ProcBroker keeps CAP_SYS_PTRACE and
+/// CAP_DAC_READ_SEARCH, and any other thread nothing.
 ///
-/// For the ProcBroker, which stays outside Landlock to read other processes'
-/// socket fds and so never enters. Under sudo it would otherwise keep every
-/// capability the process started with, CAP_NET_RAW and the BPF set included,
-/// for the whole session and in every mode. Needs no policy, because the
-/// broker can start before [`ensure`] installs one; the outcome is recorded
-/// for [`relinquished`] either way.
+/// For threads that never enter. The ProcBroker stays outside Landlock to read
+/// other processes' socket fds; the TUI's shutdown deadline waits for signals
+/// from before the policy's session starts; a capture thread whose device
+/// failed to open returns without entering. Each starts from main before main
+/// drops anything, so under sudo it would otherwise keep every capability the
+/// process started with, CAP_NET_RAW and the BPF set included, and in every
+/// mode. Needs no policy, because the broker can start before [`ensure`]
+/// installs one; the outcome is recorded for [`relinquished`] either way.
 pub fn relinquish(name: &str) {
     #[cfg(target_os = "linux")]
     {
         let mut report = Report::default();
-        super::linux::relinquish_caps(&mut report);
+        super::linux::relinquish_caps(super::roles::role_for(name), &mut report);
         for warning in &report.mode.warnings {
             tracing::warn!(target: "netwatch::sandbox", thread = name, "{warning}");
         }
@@ -415,6 +445,13 @@ pub fn summary() -> String {
 static PROBES: Mutex<BTreeMap<String, bool>> = Mutex::new(BTreeMap::new());
 #[cfg(test)]
 static NET_PROBES: Mutex<BTreeMap<String, Option<i32>>> = Mutex::new(BTreeMap::new());
+/// What the thread that last called [`fail`] for each name held then.
+#[cfg(all(test, target_os = "linux"))]
+static FAILED_HOLDING: Mutex<BTreeMap<String, caps::CapsHashSet>> = Mutex::new(BTreeMap::new());
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn held_at_failure(name: &str) -> Option<caps::CapsHashSet> {
+    FAILED_HOLDING.lock().unwrap().get(name).cloned()
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -779,6 +816,140 @@ mod tests {
             "{error}"
         );
         assert!(!snapshot()["policy-preflight"].ready);
+    }
+
+    /// Workers that enter before the session starts drop CAP_NET_RAW; the
+    /// session then says whether main keeps it, once.
+    #[test]
+    fn ensure_sets_the_capture_authority_once() {
+        const CHILD: &str = "NETWATCH_WORKER_AUTHORITY_TEST";
+        // POLICY is process-wide, so install it in a child.
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::worker::tests::ensure_sets_the_capture_authority_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        assert_eq!(capture_authority(), CaptureAuthority::DropAfterOpen);
+        install(Mode::Disabled, SandboxPaths::default()).unwrap();
+        assert_eq!(capture_authority(), CaptureAuthority::DropAfterOpen);
+        let tui = CaptureAuthority::RetainForReopen;
+        ensure(Mode::Disabled, SandboxPaths::default(), tui).unwrap();
+        assert_eq!(capture_authority(), tui);
+        ensure(Mode::Disabled, SandboxPaths::default(), tui).unwrap();
+        let error = ensure(
+            Mode::Disabled,
+            SandboxPaths::default(),
+            CaptureAuthority::DropAfterOpen,
+        )
+        .unwrap_err();
+        assert!(error.contains("capture authority"), "{error}");
+        assert_eq!(capture_authority(), tui);
+    }
+
+    /// Whether a `health` worker still holds CAP_NET_RAW once it has entered
+    /// on a thread of its own.
+    fn health_keeps_net_raw() -> bool {
+        std::thread::spawn(|| {
+            assert!(enter("health"));
+            caps::has_cap(None, caps::CapSet::Permitted, caps::Capability::CAP_NET_RAW).unwrap()
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// The session's capture authority reaches each worker's entry: a
+    /// network worker drops CAP_NET_RAW until a TUI's `ensure` says capture
+    /// reopens, and keeps it from then on.
+    #[test]
+    fn network_worker_keeps_cap_net_raw_once_a_tui_starts() {
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::network_worker_keeps_cap_net_raw_once_a_tui_starts",
+        ) {
+            return;
+        }
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        assert!(!health_keeps_net_raw(), "entered before the session");
+        let tui = CaptureAuthority::RetainForReopen;
+        ensure(Mode::BestEffort, SandboxPaths::default(), tui).unwrap();
+        assert!(health_keeps_net_raw(), "entered in a TUI");
+    }
+
+    /// The daemon and the Diagnose CLI never reopen capture, so their
+    /// network workers drop CAP_NET_RAW.
+    #[test]
+    fn network_worker_drops_cap_net_raw_where_capture_never_reopens() {
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::network_worker_drops_cap_net_raw_where_capture_never_reopens",
+        ) {
+            return;
+        }
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        let daemon = CaptureAuthority::DropAfterOpen;
+        ensure(Mode::BestEffort, SandboxPaths::default(), daemon).unwrap();
+        assert!(!health_keeps_net_raw());
+    }
+
+    /// A thread that never enters keeps only what its name's role needs
+    /// unconfined: the proc broker its scan's two capabilities, the TUI's
+    /// shutdown deadline and a capture thread whose device failed to open
+    /// nothing.
+    #[test]
+    fn relinquish_keeps_only_what_the_role_needs() {
+        use caps::{CapSet, Capability};
+        if !super::super::audit::as_root_in_user_namespace(
+            "sandbox::worker::tests::relinquish_keeps_only_what_the_role_needs",
+        ) {
+            return;
+        }
+        let broker = [Capability::CAP_SYS_PTRACE, Capability::CAP_DAC_READ_SEARCH];
+        for (name, keeps) in [
+            ("proc-broker", &broker[..]),
+            ("shutdown-deadline", &[]),
+            ("capture", &[]),
+        ] {
+            let held = std::thread::spawn(move || {
+                // Root in a user namespace holds nothing Inheritable or
+                // Ambient, so grant CAP_NET_RAW there first, as the systemd
+                // unit's AmbientCapabilities does.
+                for set in [CapSet::Inheritable, CapSet::Ambient] {
+                    caps::raise(None, set, Capability::CAP_NET_RAW).unwrap();
+                }
+                relinquish(name);
+                [
+                    CapSet::Effective,
+                    CapSet::Permitted,
+                    CapSet::Inheritable,
+                    CapSet::Ambient,
+                ]
+                .map(|set| (set, caps::read(None, set).unwrap()))
+            })
+            .join()
+            .unwrap();
+            for (set, held) in held {
+                let expected: caps::CapsHashSet =
+                    if matches!(set, CapSet::Effective | CapSet::Permitted) {
+                        keeps.iter().copied().collect()
+                    } else {
+                        Default::default()
+                    };
+                assert_eq!(held, expected, "{name} {set:?}");
+            }
+            let report = &relinquished()[name];
+            assert!(report.mode.warnings.is_empty(), "{name}: {report:?}");
+        }
     }
 
     /// The capture thread records its state in the component map and the UI
