@@ -112,7 +112,7 @@ Each entry in `protections` describes one thread:
 | --- | --- |
 | `landlock_abi` | The Landlock ABI of what this thread enforces, 0 if nothing: the newest feature in force. The filesystem layer alone is 3 at most, TCP needs 4, the abstract socket and signal scopes 6, pathname Unix sockets 9. Before 0.39 this was the kernel's ABI, which on Linux 7.1 read 9 on threads that enforce 3. |
 | `landlock_kernel_abi` | The ABI the kernel reports. |
-| `network_policy` | `denied` when this thread's TCP bind and connect are, else `allowed`. Main and the network workers read `allowed`. `denied` does not mean no network: see the [threat model](THREAT-MODEL.md), items 4 and 6. |
+| `network_policy` | `denied` when this thread's TCP bind and connect are, `allowed` when it entered and they are not, as for main and the network workers, and `not_entered` when it has no report. That last one is a capture that failed to open, a worker just started, or `ebpf-reader`, the note for the eBPF SDK's reader thread, which inherits `denied` from the `ebpf` worker. `denied` does not mean no network: see the [threat model](THREAT-MODEL.md), items 4 and 6. |
 | `landlock_restrictions` | Any of `filesystem`, `filesystem_write` (capture's layer has no write grant), `tcp_bind`, `tcp_connect`, `abstract_unix_socket`, `signal`, `pathname_unix_socket`, and `socket_create` for the seccomp filter on capture, keylog and the metrics threads. |
 | `capture_authority` | CAP_NET_RAW on this thread: `dropped`, `retained_for_reopen`, `not_held` or `not_applicable`. |
 | `socket_filter` | The no-socket filter: `installed`, `unknown_arch` (this build has no syscall table for it), `failed` or `not_applicable`. |

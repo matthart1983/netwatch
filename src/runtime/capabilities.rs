@@ -53,7 +53,10 @@ pub struct Protection {
     /// The ABI the kernel reports.
     #[serde(default)]
     pub landlock_kernel_abi: u32,
-    /// `denied` when this thread's TCP bind and connect are, else `allowed`.
+    /// `denied` when this thread's TCP bind and connect are, `allowed` when it
+    /// entered and they are not, and `not_entered` when it has no report: a
+    /// capture that failed to open, a worker just started, or the note for the
+    /// eBPF SDK's reader, which inherits the `ebpf` worker's policy.
     #[serde(default)]
     pub network_policy: String,
     /// `filesystem`, `filesystem_write`, `tcp_bind`, `tcp_connect`,
@@ -92,7 +95,7 @@ impl Protection {
             error,
             landlock_kernel_abi: report.map_or(0, |r| r.platform.landlock_kernel_abi),
             network_policy: report
-                .map_or("allowed", |r| r.platform.network_policy())
+                .map_or("not_entered", |r| r.platform.network_policy())
                 .into(),
             landlock_restrictions: report
                 .map(|r| {
@@ -1728,9 +1731,10 @@ mod tests {
         );
         assert_eq!(protection.capture_authority, "dropped");
         assert_eq!(protection.socket_filter, "installed");
-        // A worker that has not reported is not denied anything.
+        // A worker with no report ran under no policy of its own, which is not
+        // the same as one that entered and was allowed the network.
         let waiting = Protection::from_report("traffic", false, None, None);
-        assert_eq!(waiting.network_policy, "allowed");
+        assert_eq!(waiting.network_policy, "not_entered");
         assert_eq!(waiting.capture_authority, "not_applicable");
         assert_eq!(waiting.socket_filter, "not_applicable");
     }

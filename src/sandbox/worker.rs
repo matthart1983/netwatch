@@ -436,24 +436,25 @@ pub fn wait_ready(timeout: Duration) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
-/// Of the workers whose role stacks a layer on the filesystem one, how many
-/// entered with TCP bind and connect denied, and how many there are.
+/// Of the workers whose role stacks a layer on the filesystem one and that have
+/// entered, how many have TCP bind and connect denied, and how many there are.
+///
+/// A component with no report ran under no policy of its own, so it is neither:
+/// a capture that failed to open never entered, a worker just started has not
+/// yet, and `ebpf-reader` is a note about the SDK's reader thread, which has no
+/// entry to report. That thread inherits the deny from the `ebpf` worker, which
+/// is counted.
 pub fn parser_tcp_coverage(states: &BTreeMap<String, Component>) -> (usize, usize) {
-    let parsers = states
+    let entered: Vec<_> = states
         .iter()
-        .filter(|(name, _)| super::roles::role_for(name).layer().is_some());
-    let (mut denied, mut total) = (0, 0);
-    for (_, state) in parsers {
-        total += 1;
-        if state
-            .report
-            .as_ref()
-            .is_some_and(|r| r.platform.landlock_network_blocked)
-        {
-            denied += 1;
-        }
-    }
-    (denied, total)
+        .filter(|(name, _)| super::roles::role_for(name).layer().is_some())
+        .filter_map(|(_, state)| state.report.as_ref())
+        .collect();
+    let denied = entered
+        .iter()
+        .filter(|report| report.platform.landlock_network_blocked)
+        .count();
+    (denied, entered.len())
 }
 pub fn summary() -> String {
     let states = snapshot();
@@ -952,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_tcp_coverage_counts_only_the_roles_with_a_layer() {
+    fn parser_tcp_coverage_counts_only_parsers_that_entered() {
         let component = |blocked: Option<bool>| Component {
             ready: true,
             report: blocked.map(|blocked| {
@@ -962,19 +963,26 @@ mod tests {
             }),
             error: None,
         };
-        let states: BTreeMap<String, Component> = [
-            ("capture", component(Some(true))),
-            ("connections", component(Some(true))),
-            ("keylog", component(Some(false))),
-            // Started and not yet entered: it counts, and is not denied yet.
-            ("traffic", component(None)),
-            ("whois", component(Some(false))),
-            ("health", component(None)),
-        ]
-        .into_iter()
-        .map(|(name, state)| (name.to_string(), state))
-        .collect();
-        assert_eq!(parser_tcp_coverage(&states), (2, 4));
+        let healthy = |name: &str| (name.to_string(), component(Some(true)));
+        let mut states: BTreeMap<String, Component> =
+            [healthy("connections"), healthy("capture"), healthy("ebpf")]
+                .into_iter()
+                .collect();
+        // A network worker is not a parser, whatever its policy.
+        states.insert("whois".into(), component(Some(false)));
+        assert_eq!(parser_tcp_coverage(&states), (3, 3));
+        // A healthy session with eBPF attached still reads N/N. The reader is a
+        // note: it inherits the deny from `ebpf`, which is counted.
+        states.insert("ebpf-reader".into(), component(None));
+        assert_eq!(parser_tcp_coverage(&states), (3, 3));
+        // A worker started and not yet entered, and a capture that failed to
+        // open, ran under no policy. Neither is a parser the deny missed.
+        states.insert("traffic".into(), component(None));
+        states.insert("capture".into(), component(None));
+        assert_eq!(parser_tcp_coverage(&states), (2, 2));
+        // One that entered without the deny does count against it.
+        states.insert("keylog".into(), component(Some(false)));
+        assert_eq!(parser_tcp_coverage(&states), (2, 3));
     }
 
     /// Workers that enter before the session starts drop CAP_NET_RAW; the
