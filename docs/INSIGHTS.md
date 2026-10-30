@@ -64,8 +64,9 @@ plain HTTP provides no transport encryption. Netwatch marks an `http://` endpoin
 that is not on this host as `cleartext, off-host`: a line on the Diagnose page,
 with or without an open issue, a label on the AI Endpoint row in Settings, and in
 `netwatch doctor`, `insights` as degraded with reason `cleartext_off_host`. It warns
-and still sends; there is no key to refuse. Loopback addresses, `localhost` and
-`https://` carry no mark. A localhost URL only identifies the
+and still sends; there is no key to refuse. An `http://` URL it cannot read as
+this host is marked too. Loopback addresses, `localhost` and `https://` carry no
+mark. A localhost URL only identifies the
 first recipient: an Ollama-compatible server may forward inference to a cloud
 provider. Netwatch neither verifies local-only execution nor enforces a network
 boundary around the model server. Check that server's configuration and data

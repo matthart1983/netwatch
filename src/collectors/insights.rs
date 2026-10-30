@@ -491,12 +491,19 @@ pub const CLEARTEXT_OFF_HOST: &str = "cleartext, off-host";
 /// The endpoint is plain `http://` on something other than this host, so
 /// every request carries DNS names, peer addresses and packet summaries
 /// across the network unencrypted. `0.0.0.0` and `::` count as this host,
-/// where connecting to them either lands or fails. An endpoint that does not
-/// parse sends nothing.
+/// where connecting to them either lands or fails.
+///
+/// An `http://` endpoint that cannot be read as this host is flagged. The
+/// request does not go through this parser: `http://gpu.1:11434` is refused
+/// here, for its numeric last label, and `ureq` connects to it all the same.
 pub fn cleartext_off_host(endpoint: &str) -> bool {
     use std::net::IpAddr;
-    let Ok(url) = url::Url::parse(resolve_endpoint(endpoint)) else {
-        return false;
+    let base = resolve_endpoint(endpoint);
+    let Ok(url) = url::Url::parse(base) else {
+        return base
+            .trim_start()
+            .get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
     };
     if url.scheme() != "http" {
         return false;
@@ -505,6 +512,7 @@ pub fn cleartext_off_host(endpoint: &str) -> bool {
         Some(url::Host::Domain(name)) => return name.trim_end_matches('.') != "localhost",
         Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
         Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).to_canonical(),
+        // No host, and so no request.
         None => return false,
     };
     !(ip.is_loopback() || ip.is_unspecified())
@@ -592,6 +600,12 @@ mod tests {
             // Not the loopback name, however close.
             "http://localhost.evil.example",
             "http://notlocalhost",
+            // `url` refuses these and `ureq` still connects, or might: an
+            // http:// that cannot be read as this host gets the warning.
+            "http://gpu.1:11434",
+            "HTTP://GPU.1",
+            " http://gpu.1:11434",
+            "http://[not-an-address]:11434",
         ] {
             assert!(cleartext_off_host(off_host), "{off_host}");
         }
@@ -610,6 +624,7 @@ mod tests {
             "http://[::]:11434",
             "https://ollama.example.com",
             "https://10.0.0.5:11434",
+            "https://gpu.1:11434",
             // Requests to these fail before anything is sent.
             "ollama.lan:11434",
             "10.0.0.5:11434",
