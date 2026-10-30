@@ -77,9 +77,9 @@ parser-fs: ResolveUnix
 <!-- /policy:abi -->
 ```
 
-Four workers also take a seccomp filter, after their Landlock layers: socket(2)
-returns EPERM, and so does socketcall(2) on 32-bit ARM. Every other syscall is
-allowed. A syscall through another architecture's table, or an x32 one on x86_64,
+Four workers also take a seccomp filter, after their Landlock layers: socket(2) and
+io_uring_setup(2) return EPERM, and so does socketcall(2) on 32-bit ARM. Every other
+syscall is allowed. A syscall through another architecture's table, or an x32 one on x86_64,
 kills the process. The filter stays on the thread and on anything it starts, and
 each of these opens what it needs before entry or takes it from accept(2). The
 filter is on x86_64, aarch64 and little-endian 32-bit ARM. A build for any other
@@ -201,7 +201,8 @@ write: /dev/null
    ([eBPF startup](../src/ebpf/conn_tracker.rs#L130)).
 4. Landlock denies only connect(2) and bind(2) on TCP sockets, only on parser and
    capture threads, and only from Linux 6.7. The no-socket filter stops capture,
-   keylog and the metrics threads opening any new socket through socket(2). Every
+   keylog and the metrics threads opening any new socket through socket(2) or a new
+   io_uring. Every
    other parser thread can still open UDP, ICMP, SCTP and netlink sockets, and
    MPTCP, which falls back to TCP: on Linux 7.1 an MPTCP socket on a parser thread
    connected to a plain TCP listener. So can any thread through a descriptor
@@ -228,16 +229,25 @@ write: /dev/null
    the network workers are not scoped on any kernel: the resolver, the clipboard
    helpers and D-Bus clients need those sockets
    ([layer](../src/sandbox/linux.rs#L501)).
-6. There is no syscall allow-list. The one seccomp filter denies two syscalls on
-   four workers and allows everything else, so it does not stop every way of
-   getting a socket. On Linux 7.1 a thread under the filter set up an io_uring,
-   submitted `IORING_OP_SOCKET`, which makes no socket(2) call for the filter to
-   see, and sent a UDP datagram from the socket it got. A host can turn this off
-   with `kernel.io_uring_disabled`, and a test fails if the filter starts stopping
-   io_uring_setup, so this stays true of the code. accept4(2) and socketpair(2)
-   are allowed too. Main, the network workers and the other parser threads have no
-   filter at all, and a thread under it can reach them through shared memory (item
-   1). On an architecture without a syscall table the filter is skipped
+6. There is no syscall allow-list. The one seccomp filter denies socket(2),
+   socketcall(2) and io_uring_setup(2) on four workers and allows everything else.
+   io_uring_setup is on the list because `IORING_OP_SOCKET` makes a socket with no
+   socket(2) call for a filter to see: on Linux 7.1, under a filter without that
+   row, a thread set up a ring, got a socket and sent a UDP datagram from it. With
+   the row a ring cannot be set up, and that same attempt stops at EPERM. The other
+   io_uring syscalls stay allowed, so a ring opened before the filter would still
+   work, like any other inherited descriptor (item 4): on Linux 7.1 a ring opened
+   first still made a socket under the filter, and a test holds the filter to that.
+   None exists to inherit. `src` opens no ring, and in the locked crates the only
+   code that could is switched off (tokio's needs `tokio_unstable`, rustix's a
+   feature nothing enables). libpcap 1.10.6, libnl, libibverbs and glibc on the
+   Linux 7.1 host do not contain the name. Real daemon and TUI sessions there, under
+   a filter from before exec that kills the process on any io_uring syscall, ran and
+   exited cleanly with no ring among their descriptors. That run could not load eBPF,
+   which needs real root. accept4(2) and socketpair(2) are allowed too. Main, the
+   network workers and the other parser threads have no filter at all, so they can
+   set up a ring, and a thread under the filter can reach them through shared memory
+   (item 1). On an architecture without a syscall table the filter is skipped
    ([filter](../src/sandbox/seccomp.rs#L1)).
 7. Root retains filesystem, scheduling and other capabilities. The new deny-list
    reduces authority but does not promise root containment, and `doctor` and Settings
@@ -379,7 +389,7 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | A4 root capability deny-list and broker restriction | Included; full root allow-list deferred |
 | B1 parser TCP deny, scopes, ResolveUnix, no-write capture policy, CAP_NET_RAW off parser threads | Included |
 | C1 capture authority and NET_ADMIN audit | Included |
-| D1 seccomp no-socket filter on capture, keylog and the metrics threads | Included; other parser threads and io_uring remain open (items 4 and 6) |
+| D1 seccomp no-socket filter on capture, keylog and the metrics threads | Included; other parser threads and descriptors opened earlier remain open (items 4 and 6) |
 | E2 local GeoIP/update command | Later 0.39 work |
 | E3 capture-error hint and package messages still setcap a world-executable binary | Later 0.39 work |
 | E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Later 0.39 work |

@@ -6,8 +6,10 @@
 //! leaves it no write grant. Main and the network workers keep the network.
 //! Application worker entry points apply policy before processing; capture
 //! prepares its device first. Strict entry failure withholds processing, and
-//! strict requires the TCP deny (Landlock ABI 4, Linux 6.7). Main applies its
-//! policy after resource startup. macOS, Windows and FreeBSD have no backend.
+//! strict requires the TCP deny (Landlock ABI 4, Linux 6.7). Capture, keylog and
+//! the metrics threads ([`roles::no_sockets`]) also take a seccomp filter that
+//! returns EPERM for socket(2) and io_uring_setup(2). Main applies its policy
+//! after resource startup. macOS, Windows and FreeBSD have no backend.
 //!
 //! Selected capability removals are checked after each attempt. Every
 //! confined thread drops CAP_NET_ADMIN, which nothing uses. A best-effort TUI
@@ -120,7 +122,8 @@ impl NetRaw {
 /// What became of a thread's no-socket filter ([`roles::no_sockets`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SocketFilter {
-    /// On the thread: socket(2) returns EPERM there and in what it starts.
+    /// On the thread: socket(2) and io_uring_setup(2) return EPERM there and in
+    /// what it starts.
     Installed,
     /// Skipped: this build's architecture has no syscall table. Not a warning,
     /// so strict runs without it.

@@ -21,8 +21,9 @@
 //!   and the live capture thread has dropped it and is denied TCP connect.
 //! - (d) Confined workers hold nothing on the deny-list, and the broker only what
 //!   its scan needs.
-//! - (e) Capture, keylog and the metrics threads get EPERM from socket(2), while
-//!   metrics still answers a scrape and a parser without the filter keeps sockets.
+//! - (e) Capture, keylog and the metrics threads get EPERM from socket(2) and
+//!   io_uring_setup(2), while metrics still answers a scrape and a parser without
+//!   the filter keeps sockets.
 //!
 //! What a user namespace cannot show: `/proc/kcore` is checked against capabilities
 //! in the initial namespace, so that one stays a manual `sudo` acceptance step.
@@ -578,7 +579,10 @@ mod lab {
             let task = task_named(&comm).unwrap();
             let probed = Probe::on(task.tid, None);
             assert_eq!(probed.sockets, [libc::EPERM; 3], "{name}");
-            println!("{name}: socket(2) gets EPERM for UDP, MPTCP and netlink");
+            assert_eq!(probed.io_uring, libc::EPERM, "{name} io_uring_setup");
+            println!(
+                "{name}: EPERM from socket(2) for UDP, MPTCP and netlink, and io_uring_setup(2)"
+            );
         }
         drop(waiting);
 
@@ -593,13 +597,17 @@ mod lab {
         // need so that `ss`, `ip` and `iw` work.
         let (tx, rx) = std::sync::mpsc::channel();
         worker::spawn("connections", move || {
-            tx.send(socket_errnos()).unwrap();
+            tx.send((socket_errnos(), io_uring_errno())).unwrap();
         })
         .join()
         .unwrap();
-        let [udp, _, netlink] = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let ([udp, _, netlink], ring) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((udp, netlink), (0, 0), "a parser without the filter");
-        println!("connections worker: UDP and netlink sockets still open");
+        // A host can turn io_uring off, so what this gets is reported, not held
+        // to anything. It is what shows the EPERMs above came from the filter.
+        println!(
+            "connections worker: UDP and netlink sockets still open; io_uring_setup errno {ring} (0 opened)"
+        );
     }
 
     /// The errno of socket(2) on the calling thread for UDP, MPTCP and netlink,
@@ -624,13 +632,31 @@ mod lab {
         })
     }
 
+    /// The errno of io_uring_setup(2) on the calling thread, 0 for a ring that
+    /// opened. Async-signal-safe, like [`socket_errnos`].
+    fn io_uring_errno() -> i32 {
+        let mut params = [0u64; 15];
+        // SAFETY: io_uring_setup reads and writes the 120-byte io_uring_params
+        // it is given, which `params` is, alive throughout.
+        let fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 8, params.as_mut_ptr()) };
+        if fd < 0 {
+            // SAFETY: errno's location is valid for the thread's lifetime.
+            return unsafe { *libc::__errno_location() };
+        }
+        // SAFETY: the call just returned this descriptor and nothing else owns it.
+        unsafe { libc::close(fd as i32) };
+        0
+    }
+
     /// What one thread got back from the handler below.
     struct Probe {
         sockets: [i32; 3],
+        io_uring: i32,
         connect: i32,
     }
 
     static PROBE_DONE: AtomicBool = AtomicBool::new(false);
+    static PROBE_IO_URING: AtomicI32 = AtomicI32::new(0);
     static PROBE_SOCKETS: [AtomicI32; 3] =
         [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
     /// A TCP socket main opened, for the thread to connect. -1 for none.
@@ -648,6 +674,7 @@ mod lab {
         for (slot, errno) in PROBE_SOCKETS.iter().zip(socket_errnos()) {
             slot.store(errno, Ordering::SeqCst);
         }
+        PROBE_IO_URING.store(io_uring_errno(), Ordering::SeqCst);
         let fd = PROBE_FD.load(Ordering::SeqCst);
         if fd >= 0 {
             let address = libc::sockaddr_in {
@@ -725,6 +752,7 @@ mod lab {
             drop(socket);
             Self {
                 sockets: [0, 1, 2].map(|at| PROBE_SOCKETS[at].load(Ordering::SeqCst)),
+                io_uring: PROBE_IO_URING.load(Ordering::SeqCst),
                 connect: PROBE_CONNECT.load(Ordering::SeqCst),
             }
         }

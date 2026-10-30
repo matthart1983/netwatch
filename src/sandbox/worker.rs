@@ -477,35 +477,43 @@ pub fn summary() -> String {
 static PROBES: Mutex<BTreeMap<String, bool>> = Mutex::new(BTreeMap::new());
 #[cfg(test)]
 static NET_PROBES: Mutex<BTreeMap<String, Option<i32>>> = Mutex::new(BTreeMap::new());
-/// The errno of socket(2) for UDP, MPTCP and netlink on each worker as it
-/// finished entry, or `None` for one that opened.
+/// The errno of socket(2) for UDP, MPTCP and netlink, then of io_uring_setup(2),
+/// on each worker as it finished entry, or `None` for one that opened.
 #[cfg(test)]
-static SOCKET_PROBES: Mutex<BTreeMap<String, [Option<i32>; 3]>> = Mutex::new(BTreeMap::new());
+static SOCKET_PROBES: Mutex<BTreeMap<String, [Option<i32>; 4]>> = Mutex::new(BTreeMap::new());
 #[cfg(test)]
-fn probe_sockets() -> [Option<i32>; 3] {
+fn probe_sockets() -> [Option<i32>; 4] {
     #[cfg(target_os = "linux")]
     {
         use nix::libc;
         use std::os::fd::{FromRawFd, OwnedFd};
-        [
+        let opened = |fd: libc::c_long| {
+            if fd < 0 {
+                return std::io::Error::last_os_error().raw_os_error();
+            }
+            // SAFETY: the caller just got this descriptor from the kernel and
+            // nothing else owns it.
+            drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+            None
+        };
+        let [udp, mptcp, netlink] = [
             (libc::AF_INET, libc::SOCK_DGRAM, 0),
             (libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_MPTCP),
             (libc::AF_NETLINK, libc::SOCK_RAW, 0),
         ]
+        // SAFETY: socket takes three integers and reads no memory of ours.
         .map(|(domain, kind, protocol)| {
-            // SAFETY: socket takes three integers and reads no memory of ours.
-            let fd = unsafe { libc::socket(domain, kind, protocol) };
-            if fd < 0 {
-                return std::io::Error::last_os_error().raw_os_error();
-            }
-            // SAFETY: socket just returned this descriptor and nothing else
-            // owns it.
-            drop(unsafe { OwnedFd::from_raw_fd(fd) });
-            None
-        })
+            opened(unsafe { libc::socket(domain, kind, protocol) } as libc::c_long)
+        });
+        let mut params = [0u64; 15];
+        // SAFETY: io_uring_setup reads and writes the 120-byte io_uring_params
+        // it is given, which `params` is, alive throughout.
+        let ring =
+            opened(unsafe { libc::syscall(libc::SYS_io_uring_setup, 8, params.as_mut_ptr()) });
+        [udp, mptcp, netlink, ring]
     }
     #[cfg(not(target_os = "linux"))]
-    [None; 3]
+    [None; 4]
 }
 /// What the thread that last called [`fail`] for each name held then.
 #[cfg(all(test, target_os = "linux"))]
@@ -765,15 +773,15 @@ mod tests {
             Some(&Some(nix::libc::EPERM)),
             "{net:?}"
         );
-        // The no-socket workers get EPERM for every family, and the parser
-        // threads without the filter do not.
+        // The no-socket workers get EPERM for every family and for a ring, and
+        // the parser threads without the filter still open sockets.
         let sockets = SOCKET_PROBES.lock().unwrap().clone();
         let eperm = Some(nix::libc::EPERM);
         for name in ["keylog", "metrics-listener", "metrics-client", "capture"] {
-            assert_eq!(sockets.get(name), Some(&[eperm; 3]), "{name}");
+            assert_eq!(sockets.get(name), Some(&[eperm; 4]), "{name}");
         }
         for name in ["connections", "whois"] {
-            let [udp, _, netlink] = sockets[name];
+            let [udp, _, netlink, _] = sockets[name];
             assert_eq!((udp, netlink), (None, None), "{name}");
         }
         // The online GeoIP worker is on its way out, so it is not held to

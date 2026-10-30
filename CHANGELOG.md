@@ -625,16 +625,18 @@ All notable changes to NetWatch will be documented in this file.
   the `ping` that health falls back to and the Diagnose PMTU probe now
   fail, and health measures over TCP instead.
 - **The capture, keylog and metrics threads can no longer open a socket with
-  socket(2).** Landlock's TCP deny stops connect(2) and bind(2) on TCP sockets
-  only. A compromised parser could still open UDP, ICMP and netlink sockets, and
-  on Linux 7.1 an MPTCP socket reached a plain TCP listener past the deny. These
-  four workers now take a seccomp filter on Linux, on x86_64, aarch64 and armv5te,
-  that returns EPERM for socket(2). A build for another architecture skips it and
-  says so in the sandbox report, and a kernel that refuses it stops a strict start.
-  The filter does not cover the other parser threads, which start `ss`, `ip` and
-  `iw` and need netlink, or a socket opened earlier, or one made through io_uring.
-  `docs/THREAT-MODEL.md` lists those gaps. No new crate: the filter is about a
-  dozen hand-written BPF instructions.
+  socket(2) or through io_uring.** Landlock's TCP deny stops connect(2) and bind(2)
+  on TCP sockets only. A compromised parser could still open UDP, ICMP and netlink
+  sockets, and on Linux 7.1 an MPTCP socket reached a plain TCP listener past the
+  deny. These four workers now take a seccomp filter on Linux, on x86_64, aarch64 and
+  armv5te, that returns EPERM for socket(2) and io_uring_setup(2). The second is
+  there because `IORING_OP_SOCKET` makes a socket with no socket(2) call for a filter
+  to see, and netwatch opens no ring, so this costs nothing. A build for another
+  architecture skips the filter and says so in the sandbox report, and a kernel that
+  refuses it stops a strict start. The filter does not cover the other parser threads,
+  which start `ss`, `ip` and `iw` and need netlink, or a descriptor opened earlier, a
+  ring's included. `docs/THREAT-MODEL.md` lists those gaps. No new crate: the filter
+  is about a dozen hand-written BPF instructions.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
@@ -726,8 +728,8 @@ All notable changes to NetWatch will be documented in this file.
   real daemon and TUI sessions as root in a user and network namespace with a veth
   pair. It checks that capture still receives frames, what every thread holds, that
   a stopped daemon cannot reopen capture and a TUI can, and what capture, keylog and
-  the metrics threads get from TCP connect and socket(2). It skips unless
-  `NETWATCH_CAP_LAB=1`. `scripts/capture-authority-audit.sh` audits the real
+  the metrics threads get from TCP connect, socket(2) and io_uring_setup(2). It
+  skips unless `NETWATCH_CAP_LAB=1`. `scripts/capture-authority-audit.sh` audits the real
   `netwatch daemon` from outside. `sandbox-lab.yml` runs both, with the sandbox tests
   that make their own user namespace, on pull requests touching the sandbox or
   capture and once a week. It is separate from `ci.yml`, so it holds no tag, and the

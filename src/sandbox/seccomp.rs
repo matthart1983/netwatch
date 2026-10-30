@@ -5,9 +5,11 @@
 //! so a parser thread can still open a UDP, netlink or ping socket, and an
 //! MPTCP one that falls back to TCP. These workers never open a socket after
 //! entry, so socket(2) returns EPERM for them, and socketcall(2) where the
-//! architecture has it. Every other syscall is allowed: this is not an
-//! allow-list, and it does nothing about a descriptor opened earlier or a
-//! socket made through io_uring (docs/THREAT-MODEL.md, items 4 and 6).
+//! architecture has it. So does io_uring_setup(2), because `IORING_OP_SOCKET`
+//! makes a socket with no socket(2) for a filter to see, and nothing in netwatch
+//! uses a ring. Every other syscall is allowed: this is not an allow-list, and it
+//! does nothing about a descriptor opened earlier, a ring's included
+//! (docs/THREAT-MODEL.md, items 4 and 6).
 //!
 //! A syscall made through another architecture's table would skip the socket
 //! check, because the same number means something else there, so one of those
@@ -34,6 +36,7 @@ struct Arch {
     audit: u32,
     socket: u32,
     socketcall: Option<u32>,
+    io_uring_setup: u32,
     /// Whether syscall numbers with [`X32_SYSCALL_BIT`] set are the x32 ABI's.
     x32: bool,
 }
@@ -46,6 +49,7 @@ const TABLE: [Arch; 3] = [
         audit: 0xc000_003e,
         socket: 41,
         socketcall: None,
+        io_uring_setup: 425,
         x32: true,
     },
     Arch {
@@ -53,6 +57,7 @@ const TABLE: [Arch; 3] = [
         audit: 0xc000_00b7,
         socket: 198,
         socketcall: None,
+        io_uring_setup: 425,
         x32: false,
     },
     // armv5te, EABI. socketcall is in the kernel's OABI table only, but a
@@ -63,6 +68,7 @@ const TABLE: [Arch; 3] = [
         audit: 0x4000_0028,
         socket: 281,
         socketcall: Some(102),
+        io_uring_setup: 425,
         x32: false,
     },
 ];
@@ -107,7 +113,10 @@ fn program(arch: &Arch) -> Vec<libc::sock_filter> {
     if arch.x32 {
         filter.extend([op(IF_AT_LEAST, 0, 1, X32_SYSCALL_BIT), kill]);
     }
-    for number in std::iter::once(arch.socket).chain(arch.socketcall) {
+    for number in [arch.socket, arch.io_uring_setup]
+        .into_iter()
+        .chain(arch.socketcall)
+    {
         filter.extend([op(IF_EQUAL, 0, 1, number), eperm]);
     }
     filter.push(op(RETURN, 0, 0, libc::SECCOMP_RET_ALLOW));
@@ -185,7 +194,7 @@ fn install_for(arch: Option<&Arch>, report: &mut Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     fn row(name: &str) -> &'static Arch {
         TABLE.iter().find(|arch| arch.name == name).unwrap()
@@ -234,7 +243,12 @@ mod tests {
         ] {
             let filter = program(row(name));
             assert_eq!(run(&filter, audit, socket), EPERM, "{name}");
+            assert_eq!(run(&filter, audit, 425), EPERM, "{name} io_uring_setup");
             assert_eq!(run(&filter, audit, read), ALLOW, "{name}");
+            // io_uring_enter and io_uring_register need a ring, and only one
+            // opened before the filter can be there to use them.
+            assert_eq!(run(&filter, audit, 426), ALLOW, "{name} io_uring_enter");
+            assert_eq!(run(&filter, audit, 427), ALLOW, "{name} io_uring_register");
             // accept4 is how a metrics listener takes its connections.
             let accept4 = if name == "x86_64" { 288 } else { 242 };
             assert_eq!(run(&filter, audit, accept4), ALLOW, "{name}");
@@ -242,6 +256,7 @@ mod tests {
             for other in [0x4000_0003, 0x4000_0028, 0xc000_0028, 0xc000_00b7] {
                 if other != audit {
                     assert_eq!(run(&filter, other, socket), KILL, "{name} {other:#x}");
+                    assert_eq!(run(&filter, other, 425), KILL, "{name} {other:#x}");
                 }
             }
         }
@@ -271,6 +286,10 @@ mod tests {
             return;
         };
         assert_eq!(arch.socket as libc::c_long, libc::SYS_socket);
+        assert_eq!(
+            arch.io_uring_setup as libc::c_long,
+            libc::SYS_io_uring_setup
+        );
         assert_eq!(arch.name, std::env::consts::ARCH);
     }
 
@@ -358,40 +377,52 @@ mod tests {
         filtered(move || listener.accept().map(|_| ()).unwrap());
     }
 
-    #[test]
-    fn io_uring_is_not_stopped() {
-        // The gap the threat model names: IORING_OP_SOCKET makes a socket with
-        // no socket(2) for the filter to see. This fails if that changes, so
-        // the document changes with it. Hosts can turn io_uring off.
-        const IO_URING_SETUP: libc::c_long = 425;
-        let opened = filtered(|| {
-            let mut params = [0u64; 15];
-            // SAFETY: io_uring_setup reads and writes the 120-byte
-            // io_uring_params it is given, which `params` is, alive throughout.
-            let fd = unsafe { libc::syscall(IO_URING_SETUP, 8, params.as_mut_ptr()) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: the call just returned this descriptor and nothing else
-            // owns it.
-            drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
-            Ok(())
-        });
-        match opened {
-            Ok(()) => {}
-            Err(error) => {
-                let errno = error.raw_os_error();
-                assert!(
-                    [libc::EPERM, libc::ENOSYS].contains(&errno.unwrap_or(0)),
-                    "{error}"
-                );
-                let disabled = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled");
-                assert!(
-                    disabled.map_or(true, |v| v.trim() != "0"),
-                    "the filter stopped io_uring_setup: {error}"
-                );
-            }
+    /// io_uring_setup(2) on the calling thread: the ring, or the errno.
+    fn io_uring_setup() -> Result<OwnedFd, i32> {
+        let mut params = [0u64; 15];
+        // SAFETY: io_uring_setup reads and writes the 120-byte io_uring_params
+        // it is given, which `params` is, alive throughout.
+        let fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 8, params.as_mut_ptr()) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
         }
+        // SAFETY: the call just returned this descriptor and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    }
+
+    #[test]
+    fn io_uring_setup_gets_eperm() {
+        // IORING_OP_SOCKET makes a socket with no socket(2) for the filter to
+        // see, so without a ring there is no such operation to submit.
+        assert_eq!(filtered(|| io_uring_setup().map(drop)), Err(libc::EPERM));
+    }
+
+    #[test]
+    fn a_ring_opened_earlier_still_works() {
+        // The gap the threat model names: the filter stops new rings, and a ring
+        // is one more descriptor threads share. Nothing in netwatch opens one,
+        // which is what keeps this hypothetical. Hosts can turn io_uring off.
+        let Ok(ring) = io_uring_setup() else {
+            eprintln!("skipped: io_uring is off on this host");
+            return;
+        };
+        let entered = filtered(move || {
+            // SAFETY: with nothing to submit or wait for, and no signal mask,
+            // io_uring_enter reads no memory of ours.
+            let entered = unsafe {
+                libc::syscall(
+                    libc::SYS_io_uring_enter,
+                    ring.as_raw_fd(),
+                    0,
+                    0,
+                    0,
+                    std::ptr::null::<libc::c_void>(),
+                    0,
+                )
+            };
+            (entered, std::io::Error::last_os_error().raw_os_error())
+        });
+        assert_eq!(entered.0, 0, "{entered:?}");
     }
 
     /// Frames of a classic little-endian pcap file, as tests/pcap_golden.rs
