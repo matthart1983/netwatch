@@ -25,9 +25,10 @@ All notable changes to NetWatch will be documented in this file.
   byte budget, and a dropped flow's row has no rate, which looked the same as a
   connection with no traffic. Once the running capture has dropped a flow, and
   while some rows have no rate, the table's title reads `rates: M of N flows`:
-  M rows with a rate, of the N that could have one. Once the Timeline has
-  evicted closed connections, its events title reads `closed: last N`, with the
-  number it still holds.
+  M rows with a rate, of the N that could have one. The note is the first thing
+  to go when that row is too short. Once the Timeline has evicted closed
+  connections, its events title reads `closed: last N`, with the number it still
+  holds.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check

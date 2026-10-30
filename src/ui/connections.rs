@@ -958,25 +958,7 @@ fn render_connection_table(
             app.ui.connection_group.label()
         )
     };
-    let block = widgets::panel_block(t)
-        .title(Line::from(Span::styled(
-            " connections ",
-            Style::default().fg(t.brand).bold(),
-        )))
-        .title(
-            Line::from(
-                attribution_warning
-                    .map(|w| Span::styled(w, Style::default().fg(t.status_warn).bold()))
-                    .into_iter()
-                    .chain(rates.map(|r| Span::styled(r, Style::default().fg(t.status_warn))))
-                    .chain([Span::styled(
-                        title_right,
-                        Style::default().fg(t.brand).bold(),
-                    )])
-                    .collect::<Vec<_>>(),
-            )
-            .alignment(Alignment::Right),
-        );
+    let block = table_block(t, area.width, attribution_warning, rates, title_right);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1055,6 +1037,42 @@ fn render_connection_table(
             empty_area,
         );
     }
+}
+
+/// The table's panel, and in its border row the title, the attribution warning,
+/// the counts, and the rates note if there is room left. The note is the least
+/// of them, so it goes first: a right-aligned title wider than the row draws
+/// over whatever is to its left, and the row reads as if the note were not
+/// there.
+fn table_block(
+    t: &crate::theme::Theme,
+    width: u16,
+    warning: Option<String>,
+    rates: Option<String>,
+    counts: String,
+) -> Block<'static> {
+    const TITLE: &str = " connections ";
+    let width_of = crate::ui::text::width;
+    // Inside the two corners.
+    let room = (width as usize).saturating_sub(2);
+    let taken = width_of(TITLE) + warning.as_deref().map_or(0, width_of) + width_of(&counts);
+    let rates = rates.filter(|r| taken + width_of(r) <= room);
+    widgets::panel_block(t)
+        .title(Line::from(Span::styled(
+            TITLE,
+            Style::default().fg(t.brand).bold(),
+        )))
+        .title(
+            Line::from(
+                warning
+                    .map(|w| Span::styled(w, Style::default().fg(t.status_warn).bold()))
+                    .into_iter()
+                    .chain(rates.map(|r| Span::styled(r, Style::default().fg(t.status_warn))))
+                    .chain([Span::styled(counts, Style::default().fg(t.brand).bold())])
+                    .collect::<Vec<_>>(),
+            )
+            .alignment(Alignment::Right),
+        )
 }
 
 /// A group header: the key named once, with the rollup of everything folded
@@ -2373,8 +2391,12 @@ mod tests {
     }
 
     fn table_title(app: &crate::app::App) -> String {
+        table_title_at(app, 200)
+    }
+
+    fn table_title_at(app: &crate::app::App, width: u16) -> String {
         use ratatui::{backend::TestBackend, Terminal};
-        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, 50)).unwrap();
         terminal.draw(|f| render(f, app, f.area())).unwrap();
         let buffer = terminal.backend().buffer();
         let table = layout_chunks(buffer.area)[2];
@@ -2559,6 +2581,77 @@ mod tests {
         app.packet_collector.clear();
         app.connection_collector.publish_for_test(rows);
         assert!(!table_title(&app).contains("rates:"), "cleared");
+    }
+
+    /// The note goes first when the border row is short. Where it does not
+    /// fit, the row is exactly what it would be without one, and that includes
+    /// a warning already too long to leave the title whole.
+    #[test]
+    fn the_rates_note_gives_way_to_the_rest_of_its_row() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        const NOTE: &str = " rates: 1,431 of 10,800 flows ";
+        const WARNING: &str = " ⚠ ebpf unavailable · new connections unattributed ";
+        const COUNTS: &str = " 150 processes · 12000 conns  group: process ";
+        let theme = crate::theme::dark();
+        let row = |width: u16, warning: Option<&str>, note: Option<&str>| -> String {
+            let area = Rect::new(0, 0, width, 3);
+            let mut buffer = Buffer::empty(area);
+            table_block(
+                &theme,
+                width,
+                warning.map(str::to_string),
+                note.map(str::to_string),
+                COUNTS.to_string(),
+            )
+            .render(area, &mut buffer);
+            (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+        };
+
+        for (width, warning, fits) in [
+            (60, None, false),
+            (80, None, false),
+            (100, None, true),
+            (120, None, true),
+            (60, Some(WARNING), false),
+            (80, Some(WARNING), false),
+            (100, Some(WARNING), false),
+            (120, Some(WARNING), false),
+            (160, Some(WARNING), true),
+        ] {
+            let with_note = row(width, warning, Some(NOTE));
+            let without = row(width, warning, None);
+            if fits {
+                assert!(with_note.contains(NOTE), "{width}: {with_note}");
+                assert!(with_note.contains(" connections "), "{width}: {with_note}");
+                assert!(with_note.contains(COUNTS), "{width}: {with_note}");
+                assert!(
+                    with_note.contains(warning.unwrap_or("")),
+                    "{width}: {with_note}"
+                );
+            } else {
+                assert_eq!(with_note, without, "at {width}");
+            }
+        }
+        // The warning keeps the place the note would have taken.
+        let row_at_120 = row(120, Some(WARNING), Some(NOTE));
+        assert!(row_at_120.contains(WARNING), "{row_at_120}");
+        assert!(row_at_120.contains(" connections "), "{row_at_120}");
+    }
+
+    /// The same through the real table, where the note is live.
+    #[test]
+    fn the_table_shows_the_note_only_where_it_fits() {
+        let (rows, _) = table_with_rates(431);
+        let app = crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.packet_collector.mark_capturing_for_test();
+        sweep_the_tracker(&app, 0);
+        app.connection_collector.publish_for_test(rows);
+        for (width, fits) in [(60, false), (80, false), (100, true), (120, true)] {
+            let title = table_title_at(&app, width);
+            assert_eq!(title.contains("rates:"), fits, "{title}");
+            assert!(title.contains(" connections "), "{title}");
+            assert!(title.contains("group: process"), "{title}");
+        }
     }
 
     #[test]
