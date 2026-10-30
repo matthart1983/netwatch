@@ -525,7 +525,8 @@ only when you run it. Nothing refreshes the files on its own, and `netwatch doct
 
 An empty `geoip_db` or `geoip_asn_db` uses these files, City ahead of Country, and a path in the
 config wins. Run the command as the user who runs netwatch: the files live in that user's cache
-directory and only that user can read them.
+directory and only that user can read them. It refuses a cache directory whose path is not valid
+UTF-8, because netwatch could not load a database saved there.
 
 The command name, `--city` and the exit codes are stable. The data source and the file location may
 change between releases, so a script should ask `netwatch doctor --json` what loaded rather than
@@ -834,22 +835,27 @@ Variables named `NETWATCH_*` that are not listed here are test hooks and may cha
 ## What netwatch sends off this machine
 
 GeoIP lookups read local files, so the GeoIP column sends nothing anywhere. This is what does
-leave the host. The [threat model](THREAT-MODEL.md#outbound-inventory) lists the same
-destinations, and a test holds it to the code.
+leave the host. "Automatically" means in every TUI, `netwatch daemon`, `netwatch diagnose run` and
+`netwatch diagnose coverage` session, with nothing to press. The
+[threat model](THREAT-MODEL.md#outbound-inventory) lists the same destinations, and a test holds
+its default endpoints to the code.
 
 | What | When | Where it goes | What it carries |
 |------|------|---------------|-----------------|
-| Reference DNS query | Automatically, in the TUI and the daemon | 1.1.1.1 | A query for `dns.google` |
-| Internet reachability | Automatically, in the TUI and the daemon | 1.1.1.1, with a TCP fallback on port 443 | A probe, no data |
-| STUN | Automatically, in the TUI and the daemon | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | A binding request, which reveals your public address to them |
-| Startup trace | Every TUI start | 1.1.1.1 | TTL-limited packets |
-| Health probes | Automatically, in the TUI and the daemon | Your gateway and the configured resolver | ICMP echoes and DNS queries |
+| Reference DNS query | Automatically | 1.1.1.1 | A query for `dns.google` |
+| Internet reachability | Automatically | 1.1.1.1, with a TCP fallback on port 443 | A probe, no data |
+| STUN | Automatically, about once a minute | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | A binding request, which reveals your public address to them |
+| Health probes | Automatically | Your gateway and the configured resolver | ICMP echoes, with TCP connects where those are dropped, and DNS queries |
 | Reverse DNS | Automatically, for addresses in this host's own connections | The system resolver | The addresses it looks up |
+| Startup trace | Every TUI start, the demo included | 1.1.1.1 | TTL-limited packets |
+| Traceroute | Only when you press `T` | The selected peer on Connections or Topology | TTL-limited packets |
+| Periodic trace | Only with `diagnose_probes.trace_refresh_secs` set | `diagnose_probes.trace_target` | TTL-limited packets |
+| Diagnose targets | With `[[diagnose_targets]]` set: automatically on their schedule (`interval_secs`, default 60 s), and on demand | The hosts you list, and your resolvers for their names | DNS lookups, TCP and TLS handshakes and an HTTP request to the path you set |
 | WHOIS | Only when you press `W` | `rdap.org` and the registry it redirects to | On Connections the selected remote address, on Packets the selected packet's two addresses; private ranges are not sent |
-| Diagnose experiments | When you run them | The defaults in the [threat model](THREAT-MODEL.md#outbound-inventory), or targets you configure | Probes; the upload test sends up to 25 MB of filler |
+| Diagnose experiments | When you start one from Diagnose or with `netwatch diagnose coverage --test`; a test you started can repeat itself | The defaults in the [threat model](THREAT-MODEL.md#outbound-inventory), your resolver and gateway, or what `diagnose_probes` sets | Probes; the upload test sends up to 25 MB of filler |
 | GeoIP download | Only when you run `netwatch geoip update` | `download.db-ip.com`, HTTPS only | The file names and dates it asks for, no addresses |
-| Insights, opt-in | When `insights_enabled` is on | The endpoint you configure | Network and packet summaries |
-| Remote, opt-in | With `--remote` or `NETWATCH_REMOTE_URL` | The URL you give | Metrics; HTTPS unless you allow otherwise |
+| Insights, opt-in | While `insights_enabled` is on, up to every 15 s | The endpoint you configure, by default Ollama on this machine | Network and packet summaries, with top talkers and DNS names |
+| Remote, opt-in | With `--remote` or `NETWATCH_REMOTE_URL` | The URL you give | Interface, health, system and disk metrics, the connection count, and the hostname, OS, kernel, uptime, CPU model and memory size; HTTPS unless you allow otherwise |
 
 ## Configuration
 

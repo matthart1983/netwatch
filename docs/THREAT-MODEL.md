@@ -294,9 +294,10 @@ bounds or that terminal sanitization protects other output formats.
 
 The marked inventory is checked row by row against default health, startup-trace,
 active-probe, load-test, WHOIS and GeoIP update endpoints. User-configured endpoints
-can differ. DNS resolution itself can contact the system resolver. Health checks and
-one startup trace run automatically; explicit experiments, WHOIS and the GeoIP update
-require their respective user actions. See
+can differ. DNS resolution itself can contact the system resolver. Health checks, one
+startup trace and any configured Diagnose targets run automatically; explicit
+experiments, traceroute, WHOIS and the GeoIP update require their respective user
+actions. See
 [health](../src/collectors/health.rs#L177),
 [startup trace](../src/collectors/traceroute.rs#L37),
 [active defaults](../src/diagnose/active.rs#L35),
@@ -311,6 +312,7 @@ require their respective user actions. See
 | Internet reachability | 1.1.1.1, TCP fallback on port 443 |
 | Startup trace | 1.1.1.1; TTL-limited trace (UDP, ICMP echo on Windows) on every TUI start, demo included; ignores trace_target |
 | STUN | stun.l.google.com:19302 and stun.cloudflare.com:3478; public mapping |
+| Traceroute on T | The selected peer on Connections or Topology; TTL-limited trace |
 | Dual-stack experiments | 1.1.1.1:443, [2606:4700:4700::1111]:443, 8.8.8.8:443, [2001:4860:4860::8888]:443 |
 | Captive portal | http://connectivitycheck.gstatic.com/generate_204 and http://cp.cloudflare.com/generate_204 |
 | Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB |
@@ -318,7 +320,7 @@ require their respective user actions. See
 | GeoIP update | https://download.db-ip.com/free/ ; only when `netwatch geoip update` runs; HTTPS only, no redirects; the file name and date, no addresses |
 | Insights, opt-in | Configured Ollama-compatible /api/chat endpoint; network and packet summaries |
 | Remote, opt-in | Configured ingestion endpoint; metrics; HTTPS unless explicitly allowed insecure |
-| Other probes | Configured resolver, gateway, trace/PMTU targets; targets and traffic depend on configuration |
+| Other probes | Configured resolver, gateway, trace/PMTU targets and `[[diagnose_targets]]`, which run on their own schedule; targets and traffic depend on configuration |
 <!-- /egress -->
 
 ## Platforms, release trust and remaining work
