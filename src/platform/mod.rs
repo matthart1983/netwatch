@@ -40,7 +40,13 @@ pub mod windows;
 /// Each `&&` stops the chain before a binary is granted anything unrestricted,
 /// such as where a Nix store refuses the `chown`. REFERENCE.md has the longer
 /// recipe that copies a binary like that one.
-pub const LINUX_CAPTURE_FIX: &str = r#"b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b""#;
+///
+/// `usermod` does not change the groups of a session already running, and
+/// `chmod` has just taken execute away from it. Until a new login the next
+/// `netwatch` gets permission denied, and pasting this again stops at `which`,
+/// so the last step says so. It is a step and not a note after the command, so
+/// the two cannot be separated, and it fits one row of 80 columns.
+pub const LINUX_CAPTURE_FIX: &str = r#"b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b" && echo 'Log in again to join the group: netwatch cannot start until you do'"#;
 
 /// A message ending in a chain of commands, as the refused-capture error does
 /// on Linux: what comes before the chain, and each command with its `&&`. A
@@ -601,8 +607,27 @@ sudo() {
         }
         assert_eq!(
             run(),
-            "groupadd, usermod, chown first/netwatch, chmod first/netwatch, setcap first/netwatch"
+            "groupadd, usermod, chown first/netwatch, chmod first/netwatch, setcap first/netwatch, \
+             Log in again to join the group: netwatch cannot start until you do"
         );
+
+        // The state that message is for: the only netwatch has just been taken
+        // away from this session, so pasting the line again finds nothing,
+        // and running it would be permission denied.
+        std::fs::remove_file(root.join("second").join("netwatch")).unwrap();
+        assert_eq!(run(), "");
+    }
+
+    /// What the banner and doctor show is this constant, so both say it too.
+    #[test]
+    fn the_fix_line_says_to_log_in_again() {
+        let error = format!("not permitted — {LINUX_CAPTURE_FIX}");
+        let (_, commands) = super::fix_commands(&error).unwrap();
+        let last = commands.last().unwrap();
+        assert!(last.starts_with("echo 'Log in again"), "{last}");
+        assert!(last.contains("cannot start"), "{last}");
+        // Ending the chain, so it only says so once the steps have worked.
+        assert!(commands[commands.len() - 2].contains("setcap"));
     }
 
     /// The group-restricted recipe in REFERENCE.md and the man page, run by

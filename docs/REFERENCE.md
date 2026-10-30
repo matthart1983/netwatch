@@ -753,15 +753,19 @@ echo "After logging in again, run $bin"
 > a world-executable copy.
 
 When capture is refused, netwatch prints a shorter form of this for a binary it can change in
-place, such as a package's. Log in again after running it. A binary on a read-only store stops
+place, such as a package's. A binary on a read-only store stops
 it at `chown` before anything is granted, and needs the recipe above. `netwatch doctor
 --check-capture` prints it with each command on its own row. The Dashboard and Packets headers
 draw it whole, or, when the terminal has too few rows or columns, point to doctor and to this
 section instead:
 
 ```bash
-b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b"
+b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b" && echo 'Log in again to join the group: netwatch cannot start until you do'
 ```
+
+As it says, log in again before the next `netwatch`. `usermod` does not change a session already
+running, so until then the group restriction keeps this session out too: `netwatch` gets
+permission denied, and pasting the line again stops at `which`, which no longer finds it.
 
 The [systemd unit](../packaging/systemd/netwatch.service) needs none of this: it grants the
 capabilities to its own service user.
