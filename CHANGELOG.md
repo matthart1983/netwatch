@@ -335,6 +335,12 @@ All notable changes to NetWatch will be documented in this file.
   the first emoji and its width. Names from packets, peers and other
   processes have their joiners replaced with `·` before layout, so this
   only hit text that missed that step.
+- **`diagnose run --budget` rejects a huge minute count instead of
+  panicking.** `--budget 18446744073709551615m` overflowed the conversion to
+  seconds. A debug build panicked, and a release build wrapped around, so
+  some huge values landed back inside the 5 s to 10 min range and were
+  accepted. Every out-of-range budget now exits 3 with "budget must be
+  between 5s and 10m", including numbers too large to read at all.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
