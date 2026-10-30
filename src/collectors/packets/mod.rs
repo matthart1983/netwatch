@@ -1917,6 +1917,11 @@ impl PacketCollector {
             let mut cap = match prepare_capture(&interface, bpf.as_deref()) {
                 Ok(cap) => cap,
                 Err(message) => {
+                    // This thread never enters, and until it returns it holds
+                    // what main held when it started it, CAP_NET_RAW
+                    // included. Recording the failure lets startup go on to
+                    // audit every thread, so give them up first.
+                    crate::sandbox::worker::relinquish("capture");
                     // A cancelled generation must not overwrite a newer start's error.
                     if !capturing.load(Ordering::SeqCst) {
                         return;
@@ -6302,6 +6307,46 @@ mod lifecycle_tests {
             10,
         );
         assert_eq!((ladder.total, ladder.position), (3, Some(3)));
+    }
+
+    /// A capture thread whose device fails to open returns without
+    /// entering. It starts with what main holds, and recording the failure
+    /// lets startup's audit run while the thread may still be alive, so the
+    /// thread must hold nothing by then.
+    #[test]
+    fn capture_prepare_failure_drops_before_return() {
+        if !crate::sandbox::audit::as_root_in_user_namespace(
+            "collectors::packets::lifecycle_tests::capture_prepare_failure_drops_before_return",
+        ) {
+            return;
+        }
+        crate::sandbox::worker::install(
+            crate::sandbox::Mode::BestEffort,
+            crate::sandbox::SandboxPaths::default(),
+        )
+        .unwrap();
+        let mut collector = PacketCollector::new();
+        collector.start_capture("netwatch-pr04-nonexistent-interface", None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while collector.capturing.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        collector.stop_capture();
+        assert!(collector.get_error().is_some());
+        let held = crate::sandbox::worker::held_at_failure("capture").unwrap();
+        for cap in [
+            caps::Capability::CAP_NET_RAW,
+            caps::Capability::CAP_NET_ADMIN,
+        ] {
+            assert!(
+                !held.contains(&cap),
+                "{cap} held when the failure was recorded"
+            );
+        }
+        // The thread that started it keeps what it had.
+        assert!(
+            caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_NET_RAW).unwrap()
+        );
     }
 
     #[test]

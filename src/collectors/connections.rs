@@ -3287,7 +3287,10 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
             ..Default::default()
         };
         paths.prepare().unwrap();
-        crate::sandbox::worker::install(crate::sandbox::Mode::Strict, paths).unwrap();
+        // Best-effort, because strict also needs the TCP deny, which Linux
+        // 6.2 to 6.6 lack and this test does not use. A filesystem layer that
+        // fails still records an error for the check below.
+        crate::sandbox::worker::install(crate::sandbox::Mode::BestEffort, paths).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local = listener.local_addr().unwrap().to_string();
         let fake_ss: &'static str = Box::leak(

@@ -42,6 +42,15 @@ All notable changes to NetWatch will be documented in this file.
   `collectors::packets::hex_dump` and `ascii_dump`. `PacketCollector::ring_bytes`
   and the hidden `StreamTracker::held_bytes`, `byte_budget` and
   `dropped_flows` are new. The library is not a stable interface.
+- **`--sandbox-strict` and `sandbox = "strict"` need Linux 6.7 or newer.**
+  Strict mode now requires the parser threads' TCP deny described under
+  Security, which needs Landlock ABI 4. On Linux 6.2 to 6.6, which passed strict
+  before, netwatch now refuses to start in strict mode and says the kernel
+  cannot deny TCP. Older kernels already failed strict. Best-effort runs on
+  any kernel as before and logs one line when the deny is unavailable.
+  `netwatch doctor --check-capture` now checks under the capture thread's
+  policy, so on those kernels it reports capture as unavailable in strict
+  mode, where it used to report it ready.
 - **The Timeline keeps every open connection and the last 2,000 that
   closed.** Its limit of 2,000 counted open connections too, but dropped only
   closed ones. On a host with 2,000 or more open connections, each one left
@@ -302,10 +311,12 @@ All notable changes to NetWatch will be documented in this file.
   CAP_SYS_RAWIO, which with the sandbox's `/proc` grant can read kernel
   memory, page cache included, through `/proc/kcore`, past every filesystem
   rule. Confined threads now also drop CAP_SYS_RAWIO, CAP_SYS_MODULE,
-  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 22 more, and keep 11 (10 in
-  strict mode): file access in the user's directories, resource limits and
-  scheduling, a metrics port below 1024, CAP_NET_RAW to reopen capture, and
-  CAP_NET_ADMIN. Root still owns most files, so under sudo the sandbox
+  CAP_SYS_PTRACE, CAP_SETUID, CAP_SETGID and 23 more. In the TUI, main and
+  the network workers keep 10: file access in the user's directories,
+  resource limits and scheduling, a metrics port below 1024, and CAP_NET_RAW
+  to reopen capture. Parser and capture threads keep 9, without CAP_NET_RAW,
+  and so does every confined thread in strict mode, the daemon and the
+  Diagnose CLI. Root still owns most files, so under sudo the sandbox
   remains defence in depth, not containment. Losing CAP_SYS_PTRACE costs
   something under sudo on a kernel where Landlock does not enforce (older
   than 5.13, or Landlock missing from `lsm=`): confined threads can no
@@ -318,9 +329,9 @@ All notable changes to NetWatch will be documented in this file.
   process is named by the kernel's 15-character `comm` rather than its
   executable, and its connections have no owner on a poll that finds the
   latest process-attribution scan more than 5 seconds old. Where Landlock
-  enforces, it already refused those reads. Runs without elevation, with the
-  documented `setcap` line or under the systemd unit drop what they did
-  before.
+  enforces, it already refused those reads. Runs without elevation drop what
+  they did before, and so do runs with the documented `setcap` line or under
+  the systemd unit, apart from the CAP_NET_RAW change below.
 - **The process-attribution thread no longer keeps every capability
   netwatch started with.** It reads other processes' socket fds in `/proc`
   to name each connection's owner, so it runs outside the sandbox, and it
@@ -392,6 +403,96 @@ All notable changes to NetWatch will be documented in this file.
   `geoip_online` on, the line under the selected connection sent
   ip-api.com, in cleartext, the server name a TLS or QUIC connection had
   sent instead of its address. It now sends the address.
+- **The threat model states the limits of the Linux sandbox.** The 0.17.0
+  release notes overstated protection by saying a compromised parser cannot
+  read SSH keys, exfiltrate arbitrary files or pivot via new raw sockets.
+  Threads share memory and descriptors, the proc broker is outside Landlock,
+  and outbound networking was unrestricted. From this release parser threads
+  cannot connect or bind TCP sockets on Linux 6.7 or newer, which still
+  leaves them UDP and the other ways out listed below. Under the `setcap`
+  line or sudo, the default best-effort mode left CAP_NET_RAW on every
+  confined thread, the parser included, so capture could reopen, and only
+  `--sandbox-strict` dropped it. Parser and capture threads now drop it in
+  every mode, but that does not close a descriptor already open, and every
+  thread shares the open capture descriptor, so a compromised parser can
+  still capture and inject through it. Root operation has limited
+  containment.
+  The preferred Linux setup restricts a capability-enabled binary to a
+  dedicated group; policy and endpoint tables are checked in tests, and the
+  outbound inventory lists the trace to 1.1.1.1 that every TUI session runs
+  at startup. `netwatch doctor` said eBPF was disabled by the sandbox
+  policy, untrue since 0.32.2; it now says eBPF loads under the policy and
+  its reader keeps the load capabilities.
+- **Parser threads can no longer call `connect` or `bind` on a TCP
+  socket.** On Linux 6.7 or newer, the workers that read packets, files,
+  kernel tables or subprocess output now stack a second Landlock layer that
+  denies TCP bind and connect. Capture, the TLS keylog reader, the metrics
+  endpoint, eBPF and connections are among them. Before, a parser bug that
+  ran code could connect anywhere or listen on any port, as every confined
+  thread could. The metrics endpoint still answers scrapes, because
+  accepting a connection is neither. Where the kernel supports it, the same
+  layer also stops these threads connecting to abstract Unix sockets from
+  Linux 6.12 and to pathname Unix sockets such as D-Bus or nscd from 7.1.
+  From 6.12, on a kernel with the fix for Landlock erratum 2, it stops them
+  signalling processes outside their domain. Main keeps the network, and so
+  do the workers whose job is a connection: reverse DNS, WHOIS, GeoIP,
+  health, traceroute, Insights, remote publishing and the Diagnose probes.
+  A worker missing from the role table counts as a parser. UDP, ICMP and
+  MPTCP stay open to parser threads, and MPTCP falls back to TCP. Two TCP
+  calls also get past the deny, because Landlock checks only `connect` and
+  `bind`: a TCP Fast Open send (`sendto` with `MSG_FASTOPEN`) opens a
+  connection, and `listen` on an unbound socket takes a random port on
+  every address and accepts connections on it. So this makes sending data
+  out after code execution harder without preventing it. On older kernels
+  best-effort logs `parser network deny unavailable` once and runs as
+  before.
+- **Parser and capture threads drop CAP_NET_RAW in best-effort mode too.**
+  Under the `setcap` line or sudo, every confined thread kept CAP_NET_RAW
+  unless `--sandbox-strict` was given, so a compromised parser could open
+  raw and packet sockets and inject frames. Those threads now drop it
+  whenever the sandbox is on. Capture opens its device before it drops the
+  capability, and `c`, `i` and `Shift+R` reopen capture on a new thread, so
+  they keep working. Main and the network workers keep CAP_NET_RAW in a
+  best-effort TUI. The capture thread still holds the device it opened,
+  which can capture and inject on its interface.
+- **The capture thread can no longer write files.** It had every write
+  grant the other confined threads have, so a parser bug in it could
+  rewrite `config.toml`, for example to turn the sandbox off for the next
+  start. Its Landlock layer now allows reading only. Nothing in the capture
+  loop writes a file; exports and incident bundles are written by other
+  threads. The other confined threads can still write the configuration.
+- **With the sandbox on, the daemon and the Diagnose CLI hold no raw-socket
+  capability once capture has opened, and no thread keeps CAP_NET_ADMIN.**
+  Under the `setcap` line, sudo or the systemd unit, `netwatch daemon`,
+  `diagnose run` and `diagnose coverage` kept CAP_NET_RAW on the main
+  thread and the network workers for the whole session, though none of
+  them ever reopens capture. A thread running injected code could open raw
+  sockets, set `IP_TRANSPARENT` or `SO_MARK`, and hand the capability to
+  the commands it started through the Ambient set the systemd unit grants.
+  Run as root, every thread also kept CAP_NET_ADMIN, which nothing in
+  netwatch uses. Promiscuous capture opens with CAP_NET_RAW alone. Those
+  sessions now drop CAP_NET_RAW from main and the network workers after
+  capture opens, and in best-effort and strict mode every thread drops
+  CAP_NET_ADMIN, so `netwatch doctor --check-capture --json` under sudo no
+  longer lists it in `caps_retained`. The TUI keeps CAP_NET_RAW on main and
+  the network workers in best-effort mode, so `c`, `i` and `Shift+R` still
+  reopen capture. In strict mode they fail, as before. Once startup is
+  done, netwatch reads every thread's capability sets. If a thread still
+  holds CAP_NET_ADMIN, or CAP_NET_RAW in a session that drops it, netwatch
+  names the thread in a warning, and with `--sandbox-strict` refuses to
+  start. With `--no-sandbox` or `sandbox = "off"`, main and the workers
+  keep both capabilities, as before, and the audit warns about nothing.
+  None of this revokes the capture descriptor already open, which every
+  thread shares and which can still capture and inject on any interface in
+  its network namespace. In the daemon and the Diagnose CLI, on a host
+  whose `net.ipv4.ping_group_range` leaves out the user netwatch runs as,
+  the `ping` that health falls back to and the Diagnose PMTU probe now
+  fail, and health measures over TCP instead.
+
+### Dependencies
+- **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
+  sockets is Landlock ABI 9, which earlier releases of the crate do not
+  know. Cargo.lock already had 0.4.7, so nothing new is compiled.
 
 ### CI
 - **A Diagnose load test unit test no longer fails on a slow runner.**
@@ -400,6 +501,32 @@ All notable changes to NetWatch will be documented in this file.
   macOS runner sometimes missed, failing the run and cancelling the Linux
   and Windows jobs with it. The sampler now takes its clock as an argument,
   and the test gives it one that moves only when it is slept on.
+- **The sandbox tests catch a worker whose role changes by accident.** They
+  read the name every worker spawn site in `src` uses and fail on one the
+  role table does not list, so renaming a network worker can no longer turn
+  it into a parser unnoticed. A child test hides Landlock behind a seccomp
+  filter and checks that strict mode refuses a parser thread because it
+  cannot deny TCP. Another enters the capture role through the installed
+  policy and checks that it cannot write the configuration. The list of
+  capabilities each role drops is also checked without a user namespace,
+  which CI's runners refuse, so CI fails if CAP_NET_RAW leaves the parser
+  and capture threads' list.
+- **`cargo test` still passes on Linux 6.2 to 6.6.** Strict mode now refuses
+  parser threads there, so the strict worker acceptance test skips on those
+  kernels with a message, and the `/proc/net` fallback test, which needs no
+  TCP deny, runs in best-effort mode. Older kernels, and kernels without
+  Landlock, fail both tests as before.
+- **The capability tests cover capture authority.** Which capabilities
+  each role drops in each session and how the startup audit reads a
+  thread's status file are checked on the Linux runner, and which session
+  keeps CAP_NET_RAW on every runner. Where a user namespace can be made,
+  tests run as root in one: they enter each role, start a capture on a
+  missing interface, audit a thread holding CAP_NET_RAW, enter a network
+  worker before and after the session sets its capture authority, run
+  main's entry beside a thread that kept CAP_NET_RAW in best-effort and
+  strict mode, and check what the shutdown-deadline thread and the other
+  threads that never enter keep. CI's runners refuse user namespaces, so
+  those skip there.
 - **CI checks the connection table at 10,000 rows.** A generator builds
   connection tables shaped like a busy host's. In every run, a 10,000-row
   table must show its true count and scroll to its last row, and the

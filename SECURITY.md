@@ -38,7 +38,10 @@ and that the tool often runs as root. In rough priority order:
 1. **Privilege escalation** — anything that lets an unprivileged local user
    leverage NetWatch's elevated capture/eBPF privileges.
 2. **Sandbox escape** — on Linux, NetWatch applies a post-startup Landlock
-   sandbox; bypasses of it (or of `--sandbox-strict`) are in scope.
+   sandbox; bypasses in non-root runs (including `--sandbox-strict`) are in scope.
+   Root runs work, but containment is limited and the sandbox is defence in
+   depth only. This does not exclude hostile-input or privilege-escalation bugs
+   merely because they are reproduced in a root run.
 3. **Hostile-input handling** — crashes, hangs, or memory unsafety in the
    packet, DPI, TLS/QUIC, DNS, or HTTP parsers when fed malicious traffic.
    (Parser *panics* on hostile input are security bugs here, not ordinary
@@ -66,3 +69,6 @@ metrics endpoint to the internet deliberately).
   contain decrypted traffic.
 - `netwatch daemon` metrics bind to `127.0.0.1` by default; keep it that way
   unless you have a reason not to.
+
+See the [threat model](docs/THREAT-MODEL.md) for per-thread privileges, outbound
+traffic, unsupported boundaries and planned hardening.
