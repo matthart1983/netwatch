@@ -1,0 +1,163 @@
+//! A config.toml that is there but does not load. The library returns an
+//! error naming the file; the binary refuses to start a session on it rather
+//! than run on the defaults.
+use netwatch::config::{ConfigError, NetwatchConfig};
+use std::{fs, path::PathBuf};
+
+/// The configuration the review reproduced: one value of the wrong type used
+/// to discard the whole file, so a strict sandbox started best-effort and
+/// uptime recording came back on.
+const BROKEN: &str = "sandbox = 'strict'\nrecord_uptime = false\nrefresh_rate_ms = 'oops'\n";
+
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("netwatch-config-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(path.join("config/netwatch")).unwrap();
+        fs::write(path.join("config/netwatch/config.toml"), BROKEN).unwrap();
+        Self(path)
+    }
+    fn config(&self) -> PathBuf {
+        self.0.join("config/netwatch/config.toml")
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn an_invalid_value_does_not_silently_disable_strict_mode() {
+    let fixture = Fixture::new();
+    match NetwatchConfig::load_from(&fixture.config()) {
+        Err(ConfigError::Parse { path, position, .. }) => {
+            assert_eq!(path, fixture.config());
+            assert_eq!(position, Some((3, 19)));
+        }
+        Err(e) => panic!("read error for a readable file: {e}"),
+        Ok(config) => panic!(
+            "loaded with sandbox {:?} and record_uptime {}",
+            config.sandbox, config.record_uptime
+        ),
+    }
+}
+
+/// The binary, with the config directory set on the child only: dirs reads
+/// `XDG_CONFIG_HOME` on Linux and the BSDs, where macOS and Windows do not.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod cli {
+    use super::Fixture;
+    use std::{
+        fs,
+        io::Read,
+        process::{Command, ExitStatus, Stdio},
+        time::{Duration, Instant},
+    };
+
+    impl Fixture {
+        fn command(&self) -> Command {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_netwatch"));
+            cmd.env("HOME", &self.0)
+                .env("XDG_CONFIG_HOME", self.0.join("config"))
+                .env("XDG_CACHE_HOME", self.0.join("cache"))
+                .env("XDG_STATE_HOME", self.0.join("state"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        }
+
+        /// Run with `args` until it exits, or fail after 30 s: a session that
+        /// started runs until stopped.
+        fn run(&self, args: &[&str]) -> (ExitStatus, String, String) {
+            let mut child = self.command().args(args).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("netwatch {args:?} started on a config that does not load");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let (mut stdout, mut stderr) = (String::new(), String::new());
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            (status, stdout, stderr)
+        }
+
+        /// Only the config directory: no cache, log, state or export
+        /// directory, so nothing started.
+        fn untouched(&self) -> bool {
+            let entries: Vec<_> = fs::read_dir(&self.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            entries == ["config"] && fs::read_to_string(self.config()).unwrap() == super::BROKEN
+        }
+    }
+
+    /// The TUI checks the config before it takes the terminal, so it refuses
+    /// without one, the same as the daemon.
+    #[test]
+    fn tui_and_daemon_refuse_to_start() {
+        for args in [&[][..], &["daemon"][..]] {
+            let fixture = Fixture::new();
+            let (status, _, stderr) = fixture.run(args);
+            assert_eq!(status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains(&format!("invalid config {}", fixture.config().display())),
+                "{args:?}: {stderr}"
+            );
+            assert!(stderr.contains("line 3, column 19"), "{args:?}: {stderr}");
+            assert!(fixture.untouched(), "{args:?}: {stderr}");
+        }
+    }
+
+    /// `diagnose run` keeps its documented status for "no session": 3.
+    #[test]
+    fn diagnose_run_exits_3() {
+        let fixture = Fixture::new();
+        let (status, stdout, stderr) = fixture.run(&["diagnose", "run", "--budget", "5s"]);
+        assert_eq!(status.code(), Some(3), "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(
+            stderr.contains(&fixture.config().display().to_string()),
+            "{stderr}"
+        );
+        assert!(fixture.untouched(), "{stderr}");
+    }
+
+    #[test]
+    fn commands_that_need_no_config_still_run() {
+        let fixture = Fixture::new();
+        for args in [&["--version"][..], &["--help"][..], &["uptime"][..]] {
+            let (status, _, stderr) = fixture.run(args);
+            assert!(status.success(), "{args:?}: {stderr}");
+        }
+    }
+
+    #[test]
+    fn generate_config_does_not_overwrite_it() {
+        let fixture = Fixture::new();
+        let (status, _, stderr) = fixture.run(&["--generate-config"]);
+        assert_eq!(status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("not overwriting"), "{stderr}");
+        assert!(stderr.contains("refresh_rate_ms"), "{stderr}");
+        assert!(fixture.untouched(), "{stderr}");
+    }
+}

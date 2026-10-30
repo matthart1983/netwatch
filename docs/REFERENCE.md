@@ -444,7 +444,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
-| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. |
+| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
 
 TUI flags:
@@ -825,6 +825,15 @@ release can retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
 A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
 out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
 to start.
+
+A file netwatch cannot read or parse is different. If the TOML is broken, or a key has a value
+of the wrong type (`refresh_rate_ms = "fast"`), `netwatch` and `netwatch daemon` print the
+file, line and column and exit 1 without starting. Running on the defaults instead would
+drop every other setting in the file, `sandbox = "strict"` and `record_uptime = false`
+included. `diagnose run` exits 3 and `diagnose coverage` exits 1 with the same message.
+`netwatch doctor` reports it as `config_invalid` or `config_unreadable` without quoting the
+file. Neither `--generate-config` nor Settings overwrites the file. With no file at all, the
+defaults apply as before.
 
 ### Appearance
 

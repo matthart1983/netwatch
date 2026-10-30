@@ -701,41 +701,51 @@ fn live_connection_table(coverage: &crate::collectors::attribution::Coverage) ->
 }
 
 pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
-    let (config, config_state, code, detail) =
-        match NetwatchConfig::path().map(std::fs::read_to_string) {
-            Some(Ok(raw)) => match toml::from_str::<NetwatchConfig>(&raw) {
-                Ok(config) => (
-                    config,
-                    State::Ready,
-                    "config_valid",
-                    "Configuration parsed; endpoints not contacted",
+    use crate::config::ConfigError;
+    // The loader live sessions use, so doctor fails a file exactly when they
+    // refuse it. It gives the line and column but not toml's message, which
+    // quotes the line: malformed content is never echoed.
+    const REFUSED: &str = "defaults shown. Live sessions refuse to start until it is fixed";
+    let path = NetwatchConfig::path();
+    let loaded = path.as_deref().map(NetwatchConfig::load_from);
+    let (config, config_state, code, detail) = match loaded {
+        Some(Ok(config)) if path.as_deref().is_some_and(std::path::Path::exists) => (
+            config,
+            State::Ready,
+            "config_valid",
+            "Configuration parsed; endpoints not contacted".to_string(),
+        ),
+        Some(Err(ConfigError::Parse { path, position, .. })) => (
+            NetwatchConfig::default(),
+            State::Unavailable,
+            "config_invalid",
+            match position {
+                Some((line, column)) => format!(
+                    "{} is invalid at line {line}, column {column}; {REFUSED}",
+                    path.display()
                 ),
-                Err(_) => (
-                    NetwatchConfig::default(),
-                    State::Unavailable,
-                    "config_invalid",
-                    "Configuration is invalid; defaults shown. Fix config before live use",
-                ),
+                None => format!("{} is invalid; {REFUSED}", path.display()),
             },
-            Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => (
-                NetwatchConfig::default(),
-                State::Unavailable,
-                "config_unreadable",
-                "Configuration cannot be read; defaults shown",
-            ),
-            _ => (
-                NetwatchConfig::default(),
-                State::Ready,
-                "defaults",
-                "No saved configuration; defaults shown",
-            ),
-        };
+        ),
+        Some(Err(ConfigError::Read { path, source })) => (
+            NetwatchConfig::default(),
+            State::Unavailable,
+            "config_unreadable",
+            format!("{} cannot be read ({source}); {REFUSED}", path.display()),
+        ),
+        Some(Ok(_)) | None => (
+            NetwatchConfig::default(),
+            State::Ready,
+            "defaults",
+            "No saved configuration; defaults shown".to_string(),
+        ),
+    };
     let mut snapshot = CapabilitySnapshot::configured(&config);
     snapshot.put(
         "config",
         config_state,
         code,
-        detail,
+        &detail,
         Some("Review config.toml; doctor never writes it"),
     );
     if interface.is_some() {
@@ -898,7 +908,9 @@ pub fn capture_child(interface: &str, mode: Mode) -> anyhow::Result<()> {
         }
     };
     let interface = selected.as_str();
-    let config = NetwatchConfig::load();
+    // Doctor runs this check only once the config loads. If it stopped loading
+    // since, the check fails rather than opening capture without its filter.
+    let config = NetwatchConfig::load()?;
     let filter = (!config.bpf_filter.is_empty()).then_some(config.bpf_filter.as_str());
     let result = match crate::collectors::packets::prepare_capture(interface, filter) {
         Err(error) => CaptureResult {
@@ -939,9 +951,12 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
     let mut snapshot = inspect_static(interface);
     if check_capture {
         snapshot.scope = "capture_check".into();
-        {
+        // The check runs under the configured interface, filter and sandbox
+        // mode. A config that does not load leaves those unknown, and the
+        // defaults could check a weaker sandbox than the one configured.
+        if let Ok(config) = NetwatchConfig::load() {
             let interface = snapshot.interface.clone().unwrap_or_default();
-            let mode = Mode::from_config(&NetwatchConfig::load().sandbox);
+            let mode = Mode::from_config(&config.sandbox);
             let result = bounded_check(&interface, mode);
             match result {
                 Ok(result) => {
@@ -991,6 +1006,14 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
                     Some("Check interface and driver; check is limited to five seconds"),
                 ),
             }
+        } else {
+            snapshot.put(
+                "capture",
+                State::NotChecked,
+                "config_not_loaded",
+                "Capture not opened: the configuration does not load",
+                Some("Fix config.toml as the config entry says, then check again"),
+            );
         }
     }
     if json {
