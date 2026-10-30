@@ -493,7 +493,10 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   (ICMP blocked and TCP/443 unanswered) is *unmeasured*, and is neither up nor down. With
   `third_party_probes = false` the probe is never sent, so all of it is unmeasured unless the
   gateway or DNS is down, and the report has no uptime percentage to give.
-- **Uptime %** is up time over the time known to be up or down.
+- **Uptime %** is up time over the time known to be up or down. It needs the internet probe,
+  the only hop that can say the connection is up: over a period in which that probe was never
+  measured, the text leaves the figure out and `--json` gives `"uptime_pct": null`, outages or
+  not.
 
 `--json` and `--csv` carry the same outages for an ISP ticket or a chart. Both are versioned
 (`"schema": 1` in JSON) and covered by the 1.0 compatibility promise. Each outage's `ended` is
