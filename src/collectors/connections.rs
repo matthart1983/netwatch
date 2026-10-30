@@ -144,26 +144,37 @@ fn normalize_ip(ip: &str) -> String {
 /// Last-resort match for UDP Connections whose remote is wildcard
 /// (typical of `lsof`'s view of QUIC sockets on macOS). Returns the
 /// AppProtocol of any tracked Stream that shares the Connection's
-/// local endpoint, or `None` if no such Stream exists.
+/// local endpoint, or `None` if no such Stream exists. `by_local` is
+/// [`udp_app_protocols_by_local`] of the poll's stream snapshot.
 fn match_udp_app_protocol_by_local(
     conn: &Connection,
-    app_protos: &HashMap<StreamKey, crate::dpi::AppProtocol>,
+    by_local: &HashMap<(String, u16), crate::dpi::AppProtocol>,
 ) -> Option<crate::dpi::AppProtocol> {
-    let proto = stream_protocol(&conn.protocol)?;
-    if proto != StreamProtocol::Udp {
+    if stream_protocol(&conn.protocol)? != StreamProtocol::Udp {
         return None;
     }
-    let (l_ip, l_port) = parse_host_port(&conn.local_addr)?;
-    let local_endpoint = (l_ip, l_port);
+    by_local.get(&parse_host_port(&conn.local_addr)?).cloned()
+}
+
+/// Each UDP stream's AppProtocol under both of its endpoints, built once per
+/// poll. Searching every stream for each wildcard row instead cost the poll
+/// O(rows × streams). Where streams share an endpoint, the first in
+/// `app_protos`'s order wins, as it did in that search.
+fn udp_app_protocols_by_local(
+    app_protos: &HashMap<StreamKey, crate::dpi::AppProtocol>,
+) -> HashMap<(String, u16), crate::dpi::AppProtocol> {
+    let mut by_local = HashMap::new();
     for (key, ap) in app_protos {
-        if key.protocol != proto {
+        if key.protocol != StreamProtocol::Udp {
             continue;
         }
-        if key.addr_a == local_endpoint || key.addr_b == local_endpoint {
-            return Some(ap.clone());
+        for endpoint in [&key.addr_a, &key.addr_b] {
+            by_local
+                .entry(endpoint.clone())
+                .or_insert_with(|| ap.clone());
         }
     }
-    None
+    by_local
 }
 
 pub fn connection_stream_key(conn: &Connection) -> Option<(StreamKey, LocalSide)> {
@@ -230,11 +241,14 @@ impl RateState {
 }
 
 pub struct ConnectionCollector {
-    /// Latest connection list, published via the `Arc<RwLock<Arc<…>>>`
-    /// snapshot pattern. Readers clone the inner `Arc` in O(1) instead of
-    /// contending with the background `update()` thread on an exclusive lock
-    /// across an arbitrarily large `Vec<Connection>`.
-    snapshot: Arc<RwLock<Arc<Vec<Connection>>>>,
+    /// Latest connection list and its generation, published via the
+    /// `Arc<RwLock<…Arc<…>>>` snapshot pattern. Readers clone the inner `Arc`
+    /// in O(1) instead of contending with the background `update()` thread
+    /// on an exclusive lock across an arbitrarily large `Vec<Connection>`.
+    snapshot: Arc<RwLock<Published>>,
+    /// What [`Self::connections`] last returned, reused until the next
+    /// publish or until another of its rows goes stale.
+    served: Mutex<Option<Served>>,
     busy: Arc<AtomicBool>,
     stream_tracker: Arc<Mutex<StreamTracker>>,
     rate_state: Arc<Mutex<RateState>>,
@@ -261,7 +275,8 @@ pub struct ConnectionCollector {
 impl ConnectionCollector {
     pub fn new(stream_tracker: Arc<Mutex<StreamTracker>>) -> Self {
         Self {
-            snapshot: Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            snapshot: Arc::new(RwLock::new(Published::default())),
+            served: Mutex::new(None),
             busy: Arc::new(AtomicBool::new(false)),
             stream_tracker,
             rate_state: Arc::new(Mutex::new(RateState::new())),
@@ -281,28 +296,53 @@ impl ConnectionCollector {
         }
     }
 
-    /// Cheap snapshot of the most recent connection list. Single atomic
-    /// refcount bump regardless of connection count — the returned `Arc`
-    /// derefs to `&Vec<Connection>` so call sites work with it like a slice.
+    /// Cheap snapshot of the most recent connection list. Rows whose
+    /// evidence is older than `MAX_MATCH_AGE` show without an owner or rates.
+    /// The same `Arc` comes back until the next publish or until another row
+    /// goes stale, so a call is a refcount bump regardless of connection
+    /// count, and a caller can tell the table changed when the pointer does.
+    /// The returned `Arc` derefs to `&Vec<Connection>` so call sites work
+    /// with it like a slice.
     pub fn connections(&self) -> Arc<Vec<Connection>> {
-        let snapshot = Arc::clone(&safe_read(&self.snapshot, "connections::snapshot"));
-        if snapshot.iter().any(|c| !c.evidence.fresh()) {
-            let mut rows = (*snapshot).clone();
-            for row in &mut rows {
-                if !row.evidence.fresh() {
-                    row.pid = None;
-                    row.process_name = None;
-                    row.evidence.process = None;
-                    row.evidence.unknown_reason =
-                        Some(super::attribution::UnknownReason::StaleSnapshot);
-                    row.rx_rate = None;
-                    row.tx_rate = None;
-                }
-            }
-            Arc::new(rows)
-        } else {
-            snapshot
+        self.connections_with_generation().1
+    }
+
+    /// [`Self::connections`], and a generation that changes whenever the
+    /// table it returns does: one more after every publish, and one more
+    /// each time a row goes stale between publishes, which blanks its owner
+    /// with no new poll. A view built from the table can key on the
+    /// generation alone. Both come from one call, so a poll that publishes
+    /// in between cannot pair one table's generation with another's rows.
+    pub fn connections_with_generation(&self) -> (u64, Arc<Vec<Connection>>) {
+        let mut served = safe_lock(&self.served, "connections::served");
+        // Read under `served`, so a reader holding an older publish cannot
+        // replace a newer one there and take the generation backwards.
+        let (snapshot, published) = {
+            let published = safe_read(&self.snapshot, "connections::snapshot");
+            (Arc::clone(&published.rows), published.generation)
+        };
+        let now = Instant::now();
+        if let Some(hit) = served
+            .as_ref()
+            .filter(|s| s.published == published && s.until.is_none_or(|until| now <= until))
+        {
+            return (hit.generation(), Arc::clone(&hit.rows));
         }
+        // The same publish served again means another row went stale.
+        let strips = served
+            .as_ref()
+            .map_or(0, |s| s.strips + u64::from(s.published == published));
+        let (rows, until) = strip_stale(snapshot, now);
+        let next = Served {
+            published,
+            strips,
+            rows,
+            until,
+        };
+        let generation = next.generation();
+        let rows = Arc::clone(&next.rows);
+        *served = Some(next);
+        (generation, rows)
     }
 
     /// Attach a PKTAP attribution cache. When set, `update()` will overlay
@@ -359,7 +399,7 @@ impl ConnectionCollector {
     /// Publish `rows` as if a poll had produced them, for render tests.
     #[cfg(test)]
     pub(crate) fn publish_for_test(&self, rows: Vec<Connection>) {
-        *safe_write(&self.snapshot, "connections::publish") = Arc::new(rows);
+        publish(&self.snapshot, rows);
     }
 
     /// Whether the poll [`Self::update`] spawned is still running, for tests
@@ -467,6 +507,7 @@ impl ConnectionCollector {
             state.initialized = true;
             state.generations = generations.clone();
             state.tick(stream_bytes, Instant::now());
+            let udp_by_local = udp_app_protocols_by_local(&app_protos);
             for conn in &mut result {
                 if let Some((key, side)) = connection_stream_key(conn) {
                     if let Some((rx, tx)) = state.rate_for(&key, side) {
@@ -494,7 +535,7 @@ impl ConnectionCollector {
                     // local endpoint wins. For QUIC each flow has a
                     // unique local port so the match is unambiguous in
                     // practice.
-                    if let Some(proto) = match_udp_app_protocol_by_local(conn, &app_protos) {
+                    if let Some(proto) = match_udp_app_protocol_by_local(conn, &udp_by_local) {
                         conn.app_protocol = Some(proto);
                     }
                 }
@@ -550,11 +591,83 @@ impl ConnectionCollector {
             log_table_source_change(&safe_read(&coverage, "connections::coverage"), &measured);
             *safe_write(&coverage, "connections::coverage") = measured;
             let count = result.len();
-            *safe_write(&snapshot, "connections::publish") = Arc::new(result);
+            publish(&snapshot, result);
             tracing::trace!(target: "netwatch::connections", count, "published connection snapshot");
             busy.store(false, Ordering::SeqCst);
         });
     }
+}
+
+/// A poll's table, and how many tables have been published up to and
+/// including it. The count sits in the lock with the table rather than in an
+/// `AtomicU64`, which armv5te does not have, and a reader gets both from one
+/// read.
+#[derive(Default)]
+struct Published {
+    rows: Arc<Vec<Connection>>,
+    generation: u64,
+}
+
+/// What [`ConnectionCollector::connections`] returned for one publish.
+struct Served {
+    /// The [`Published::generation`] `rows` came from.
+    published: u64,
+    /// How many times a row went stale between publishes, counting every
+    /// publish so far.
+    strips: u64,
+    rows: Arc<Vec<Connection>>,
+    /// When the next of `rows`' fresh rows goes stale; `None` when every row
+    /// already has.
+    until: Option<Instant>,
+}
+
+impl Served {
+    /// What [`ConnectionCollector::connections_with_generation`] reports:
+    /// each publish and each strip adds one, so no two tables share it.
+    fn generation(&self) -> u64 {
+        self.published + self.strips
+    }
+}
+
+/// Replace the published table and count it, in one write.
+fn publish(snapshot: &RwLock<Published>, rows: Vec<Connection>) {
+    let mut published = safe_write(snapshot, "connections::publish");
+    published.rows = Arc::new(rows);
+    published.generation += 1;
+}
+
+/// `snapshot` as readers see it at `now`: a row whose evidence is older than
+/// `MAX_MATCH_AGE` loses its owner and rates, since neither can be vouched
+/// for any more. Also returns when the next of the remaining fresh rows will
+/// go stale. The table is copied only when some row is stale.
+fn strip_stale(
+    snapshot: Arc<Vec<Connection>>,
+    now: Instant,
+) -> (Arc<Vec<Connection>>, Option<Instant>) {
+    // When a row's evidence goes stale, or `None` if it already has: the
+    // test `MatchEvidence::fresh` makes, at `now`.
+    let fresh_until = |c: &Connection| {
+        c.evidence
+            .observed_at
+            .and_then(|t| t.checked_add(super::attribution::MAX_MATCH_AGE))
+            .filter(|&until| now <= until)
+    };
+    let until = snapshot.iter().filter_map(fresh_until).min();
+    if snapshot.iter().all(|c| fresh_until(c).is_some()) {
+        return (snapshot, until);
+    }
+    let mut rows = (*snapshot).clone();
+    for row in &mut rows {
+        if fresh_until(row).is_none() {
+            row.pid = None;
+            row.process_name = None;
+            row.evidence.process = None;
+            row.evidence.unknown_reason = Some(super::attribution::UnknownReason::StaleSnapshot);
+            row.rx_rate = None;
+            row.tx_rate = None;
+        }
+    }
+    (Arc::new(rows), until)
 }
 
 fn measure_coverage(
@@ -607,16 +720,29 @@ fn measure_coverage(
 /// version-installed tools is the version itself — Claude Code appeared under
 /// eight different "process names", one per release it had run.
 ///
-/// Resolution is cached within a poll by PID and process identity. Identity
-/// changes invalidate names rather than promoting old event names to a new PID.
+/// Resolution is memoised within a poll by PID: the identity is read once
+/// before the executable lookup and once after it, however many rows the
+/// process owns. Reading it twice per row cost a 10,000-socket poll about
+/// 200 ms. Identity changes invalidate names rather than promoting old event
+/// names to a new PID: a row recorded for another process than the one this
+/// poll read, or a PID whose identity changed across the lookup, loses its
+/// owner.
 fn canonicalize_process_names(connections: &mut [Connection]) {
-    let mut cache: HashMap<(u32, Option<super::attribution::ProcessIdentity>), Option<String>> =
-        HashMap::new();
+    /// One PID's identity as this poll read it, and once a row has asked,
+    /// the name `stable_name` gave and whether the identity held across it.
+    struct Memo {
+        before: Option<super::attribution::ProcessIdentity>,
+        resolved: Option<(Option<String>, bool)>,
+    }
+    let mut memo: HashMap<u32, Memo> = HashMap::new();
     for conn in connections {
         let Some(pid) = conn.pid else {
             continue;
         };
-        let before = super::attribution::process_identity(pid);
+        let Memo { before, resolved } = memo.entry(pid).or_insert_with(|| Memo {
+            before: super::attribution::process_identity(pid),
+            resolved: None,
+        });
         // A later executable lookup without a start token could name a recycled
         // PID. Retain the original polling observation without upgrading it.
         if before.is_none() && conn.evidence.process.is_none() {
@@ -634,14 +760,14 @@ fn canonicalize_process_names(connections: &mut [Connection]) {
             conn.evidence.unknown_reason = Some(super::attribution::UnknownReason::IdentityChanged);
             continue;
         }
-        let resolved = cache
-            .entry((pid, before.clone()))
-            .or_insert_with(|| crate::platform::procname::stable_name(pid))
-            .clone();
-        let after = super::attribution::process_identity(pid);
-        if before == after {
-            if let Some(name) = resolved {
-                conn.process_name = Some(name);
+        let (name, unchanged) = resolved.get_or_insert_with(|| {
+            let name = crate::platform::procname::stable_name(pid);
+            let after = super::attribution::process_identity(pid);
+            (name, *before == after)
+        });
+        if *unchanged {
+            if let Some(name) = name {
+                conn.process_name = Some(name.clone());
             }
         } else {
             conn.pid = None;
@@ -758,7 +884,16 @@ fn parse_endpoint(addr: &str) -> (Option<std::net::IpAddr>, Option<u16>) {
     (ip, port)
 }
 
-const MAX_TRACKED_CONNECTIONS: usize = 2000;
+/// Closed connections the timeline keeps: the most recently closed, by
+/// `last_seen`. Active ones are never evicted, however many there are, so
+/// this bounds the history and not the table. It used to count active
+/// entries too, and with 2,000 or more open every closed one was evicted on
+/// the tick it closed.
+pub(crate) const MAX_CLOSED_HISTORY: usize = 2_000;
+/// The fewest closed entries evicted at once, so the index is rebuilt once
+/// per batch rather than on every tick that something closes. StreamTracker
+/// evicts in batches of the same size.
+const CLOSED_EVICT_BATCH: usize = 256;
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct ConnectionKey {
@@ -781,6 +916,10 @@ pub struct TrackedConnection {
 pub struct ConnectionTimeline {
     pub tracked: Vec<TrackedConnection>,
     known_keys: HashMap<ConnectionKey, usize>,
+    /// Entries not active at the last update.
+    closed: usize,
+    /// Whether closed entries have been evicted since the timeline started.
+    trimmed: bool,
 }
 
 impl Default for ConnectionTimeline {
@@ -794,22 +933,37 @@ impl ConnectionTimeline {
         Self {
             tracked: Vec::new(),
             known_keys: HashMap::new(),
+            closed: 0,
+            trimmed: false,
         }
     }
 
-    /// Current tracked-connection count, for the `M` debug overlay.
-    pub fn tracked_len(&self) -> usize {
-        self.tracked.len()
+    /// Closed entries held, at most [`MAX_CLOSED_HISTORY`], for the `M`
+    /// debug overlay.
+    pub fn closed_len(&self) -> usize {
+        self.closed
     }
-    /// Hard cap from `MAX_TRACKED_CONNECTIONS`, for the `M` debug overlay.
-    pub fn tracked_cap(&self) -> usize {
-        MAX_TRACKED_CONNECTIONS
+
+    /// Whether the timeline has evicted closed connections, so it no longer
+    /// holds every one that closed since it started.
+    pub fn closed_trimmed(&self) -> bool {
+        self.trimmed
+    }
+
+    /// When the timeline first saw `key`, without a search of every entry.
+    pub fn first_seen(&self, key: &ConnectionKey) -> Option<Instant> {
+        self.known_keys
+            .get(key)
+            .map(|&i| self.tracked[i].first_seen)
     }
 
     pub fn update(&mut self, connections: &[Connection]) {
         let now = Instant::now();
 
-        let mut current_keys: HashSet<ConnectionKey> = HashSet::new();
+        // Closed unless this table still lists it.
+        for tracked in &mut self.tracked {
+            tracked.is_active = false;
+        }
 
         for conn in connections {
             let key = ConnectionKey {
@@ -818,8 +972,6 @@ impl ConnectionTimeline {
                 remote_addr: conn.remote_addr.clone(),
                 pid: conn.pid,
             };
-
-            current_keys.insert(key.clone());
 
             if let Some(&idx) = self.known_keys.get(&key) {
                 let tracked = &mut self.tracked[idx];
@@ -840,48 +992,40 @@ impl ConnectionTimeline {
             }
         }
 
-        for tracked in &mut self.tracked {
-            if !current_keys.contains(&tracked.key) {
-                tracked.is_active = false;
+        self.closed = self.tracked.iter().filter(|t| !t.is_active).count();
+        if self.closed > MAX_CLOSED_HISTORY {
+            self.evict_closed((self.closed - MAX_CLOSED_HISTORY).max(CLOSED_EVICT_BATCH));
+        }
+    }
+
+    /// Drop the `count` closed entries that closed longest ago. Among those
+    /// that closed on the same tick, the one first seen earliest goes first.
+    fn evict_closed(&mut self, count: usize) {
+        let mut closed: Vec<usize> = (0..self.tracked.len())
+            .filter(|&i| !self.tracked[i].is_active)
+            .collect();
+        closed
+            .sort_unstable_by_key(|&i| (self.tracked[i].last_seen, self.tracked[i].first_seen, i));
+        closed.truncate(count);
+
+        let mut evict = vec![false; self.tracked.len()];
+        for &i in &closed {
+            evict[i] = true;
+            self.known_keys.remove(&self.tracked[i].key);
+        }
+        let mut index = 0;
+        self.tracked.retain(|_| {
+            let keep = !evict[index];
+            index += 1;
+            keep
+        });
+        for (i, tracked) in self.tracked.iter().enumerate() {
+            if let Some(idx) = self.known_keys.get_mut(&tracked.key) {
+                *idx = i;
             }
         }
-
-        // Evict oldest inactive connections if over limit
-        if self.tracked.len() > MAX_TRACKED_CONNECTIONS {
-            let mut inactive_indices: Vec<usize> = self
-                .tracked
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| !t.is_active)
-                .map(|(i, _)| i)
-                .collect();
-            inactive_indices.sort_by_key(|&i| self.tracked[i].first_seen);
-
-            let to_remove = self.tracked.len() - MAX_TRACKED_CONNECTIONS;
-            let remove_set: HashSet<usize> = inactive_indices.into_iter().take(to_remove).collect();
-
-            if !remove_set.is_empty() {
-                let removed_keys: Vec<ConnectionKey> = remove_set
-                    .iter()
-                    .map(|&i| self.tracked[i].key.clone())
-                    .collect();
-                for key in &removed_keys {
-                    self.known_keys.remove(key);
-                }
-
-                let mut new_tracked = Vec::new();
-                let mut new_keys = HashMap::new();
-                for (i, t) in self.tracked.drain(..).enumerate() {
-                    if !remove_set.contains(&i) {
-                        let new_idx = new_tracked.len();
-                        new_keys.insert(t.key.clone(), new_idx);
-                        new_tracked.push(t);
-                    }
-                }
-                self.tracked = new_tracked;
-                self.known_keys = new_keys;
-            }
-        }
+        self.closed -= closed.len();
+        self.trimmed = true;
     }
 }
 
@@ -1217,13 +1361,16 @@ struct LinuxTable {
 /// long-tested path, and because it labels a socket bound to a device
 /// (`127.0.0.53%lo:53`), which `/proc/net` does not record. Process owners come
 /// from the same `/proc` overlay either way, so attribution does not change.
+///
+/// `ss` runs without `-p`: the overlay replaces every owner it reports, and
+/// the per-process fd walk `-p` makes tripled its time at 10,000 sockets.
 #[cfg(target_os = "linux")]
 fn parse_linux_connections_result(
     program: &str,
     brokered: Option<&ProcSnapshot>,
 ) -> Result<LinuxTable, String> {
     use super::attribution::TableSource;
-    let ss_error = match Command::new(program).args(["-tunap"]).output() {
+    let ss_error = match Command::new(program).args(["-tuna"]).output() {
         Ok(output) => match parse_ss_command_output(output, brokered) {
             Ok(rows) => {
                 return Ok(LinuxTable {
@@ -1345,23 +1492,13 @@ fn parse_ss_command_output(
             let local_addr = cols[4].to_string();
             let remote_addr = cols[5].to_string();
 
-            // The process column (`users:(("name",pid=N,fd=M))`) can contain
-            // spaces — Firefox's "Web Content", "Isolated Web Co", etc. —
-            // which `split_whitespace` above would shred across cols[6..].
-            // Slice from the literal `users:((` token in the raw line so the
-            // whole field reaches the parser intact.
-            let (pid, process_name) = match line.find("users:((") {
-                Some(idx) => parse_ss_process(&line[idx..]),
-                None => (None, None),
-            };
-
             connections.push(Connection {
                 protocol,
                 local_addr,
                 remote_addr,
                 state,
-                pid,
-                process_name,
+                pid: None,
+                process_name: None,
                 handshake_rtt_us: None,
                 rx_rate: None,
                 tx_rate: None,
@@ -1374,32 +1511,17 @@ fn parse_ss_command_output(
         }
     }
 
-    // `ss -p` only attributes sockets the caller is privileged to see. As a
+    // Owners come straight from the kernel's tables, never from `ss -p`,
+    // which only attributes sockets the caller is privileged to see: as a
     // normal user it returns NO process info — not even for the box's own
     // daemons — and on some hosts it stays empty even under sudo (see issue
-    // #40). Fill anything ss left nameless straight from the kernel's tables:
-    // /proc/net/{tcp,udp}{,6} maps a 5-tuple → socket inode, and
+    // #40). /proc/net/{tcp,udp}{,6} maps a 5-tuple → socket inode, and
     // /proc/<pid>/fd/* maps that inode → owning process. Same source ss uses,
     // no subprocess, and it degrades to "attribute what this uid can see"
-    // instead of the current all-or-nothing.
+    // instead of all-or-nothing.
     overlay_proc_attribution(&mut connections, brokered);
 
     Ok(connections)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_ss_process(field: &str) -> (Option<u32>, Option<String>) {
-    // Format: users:(("process",pid=1234,fd=3)). The name is between the
-    // first pair of double-quotes, so it survives embedded spaces.
-    let name = field.split('"').nth(1).map(|s| s.to_string());
-
-    let pid = field
-        .split("pid=")
-        .nth(1)
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.parse().ok());
-
-    (pid, name)
 }
 
 /// Parse a `/proc/net/{tcp,udp}*` hex endpoint (`"0100007F:1F90"`) into
@@ -1433,7 +1555,7 @@ fn parse_proc_net_hex(s: &str) -> Option<(std::net::IpAddr, u16)> {
 }
 
 /// The kernel's socket tables, in the order they are read. They hold exactly
-/// the sockets `ss -tunap` lists: TCP and UDP, both families.
+/// the sockets `ss -tuna` lists: TCP and UDP, both families.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PROC_NET_TABLES: [(&str, StreamProtocol); 4] = [
     ("/proc/net/tcp", StreamProtocol::Tcp),
@@ -1526,8 +1648,8 @@ fn format_ss_endpoint((ip, port): (std::net::IpAddr, u16)) -> String {
 }
 
 /// A connection row for one `/proc/net` socket, shaped as the `ss` parser
-/// shapes its rows. The owner is left for [`overlay_proc_attribution`], which
-/// replaces whatever `ss` reported too.
+/// shapes its rows. The owner is left for [`overlay_proc_attribution`], as it
+/// is for `ss` rows.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn proc_net_connection(protocol: StreamProtocol, socket: &ProcNetSocket) -> Connection {
     Connection {
@@ -1755,8 +1877,9 @@ fn apply_owner(conn: &mut Connection, owner: &SocketOwner, checked: (u64, u64)) 
     conn.evidence.observe();
     conn.evidence.owner_checked_utc_ms = Some(checked);
 }
-/// Revalidate every Linux polling match, including ss-provided PIDs. A PID name
-/// alone cannot establish that the socket still belongs to that process.
+/// Find every Linux polling row's owner in `/proc`. Rows from `ss -tuna` and
+/// the `/proc/net` fallback carry no PID, and any a row holds is dropped: a
+/// PID alone cannot establish that the socket still belongs to that process.
 ///
 /// A sandboxed worker cannot read other processes' `/proc/<pid>/fd` (Landlock
 /// denies ptrace-mode access outside its domain), so when a [`ProcBroker`]
@@ -2333,6 +2456,56 @@ mod tests {
             Some(super::super::attribution::UnknownReason::IdentityChanged)
         );
     }
+    /// The memo reads a pid's identity once per poll and still judges every
+    /// row against it: a row recorded for an earlier process with this pid
+    /// loses its owner, before or after a row that keeps it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonicalize_rejects_reused_pid_with_memo() {
+        use super::super::attribution::{process_identity, ProcessIdentity, UnknownReason};
+        let me = std::process::id();
+        let identity = process_identity(me).unwrap();
+        for current in [[true, false, true], [false, true, false]] {
+            let mut rows: Vec<Connection> = current
+                .iter()
+                .enumerate()
+                .map(|(i, &current)| {
+                    let mut c = make_conn(
+                        "TCP",
+                        &format!("127.0.0.1:{}", 100 + i),
+                        "127.0.0.1:200",
+                        "ESTABLISHED",
+                        me,
+                    );
+                    c.process_name = Some("scraped".into());
+                    c.evidence.unknown_reason = None;
+                    c.evidence.process = Some(ProcessIdentity {
+                        start_token: if current {
+                            identity.start_token.clone()
+                        } else {
+                            "an earlier process".into()
+                        },
+                        ..identity.clone()
+                    });
+                    c
+                })
+                .collect();
+            canonicalize_process_names(&mut rows);
+            for (row, current) in rows.iter().zip(current) {
+                if current {
+                    assert_eq!(row.pid, Some(me));
+                    let name = row.process_name.as_deref().unwrap_or_default();
+                    assert!(name.contains("netwatch"), "{name:?}");
+                } else {
+                    assert_eq!((row.pid, row.process_name.as_deref()), (None, None));
+                    assert_eq!(
+                        row.evidence.unknown_reason,
+                        Some(UnknownReason::IdentityChanged)
+                    );
+                }
+            }
+        }
+    }
     /// A /proc snapshot in which `conn` is attributed to this process.
     ///
     /// Between fork and exec, a child spawned by another test shares every
@@ -2705,14 +2878,14 @@ mod tests {
         );
     }
 
-    /// The same sockets as `proc_net_tests`' fixtures, as `ss -tunap` prints
+    /// The same sockets as `proc_net_tests`' fixtures, as `ss -tuna` prints
     /// them. Both sources must produce identical rows.
     #[cfg(target_os = "linux")]
     #[test]
     fn ss_and_proc_net_fixtures_produce_identical_rows() {
         use std::os::unix::process::ExitStatusExt;
         let ss = "\
-Netid State     Recv-Q Send-Q          Local Address:Port      Peer Address:Port Process
+Netid State     Recv-Q Send-Q          Local Address:Port      Peer Address:Port
 tcp   LISTEN    0      4096                127.0.0.1:8080           0.0.0.0:*
 tcp   ESTAB     0      0                  192.0.2.10:51234     198.51.100.7:443
 tcp   TIME-WAIT 0      0                   127.0.0.1:41394        127.0.0.1:8080
@@ -2903,6 +3076,136 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
             .connections()
             .iter()
             .any(|c| c.protocol == "TCP" && c.local_addr == local && c.state == "LISTEN"));
+    }
+
+    #[test]
+    fn connections_generation_bumps_per_publish() {
+        let generation = |c: &ConnectionCollector| c.connections_with_generation().0;
+        let collector = ConnectionCollector::new(Arc::new(Mutex::new(StreamTracker::new())));
+        assert_eq!(generation(&collector), 0);
+        collector.publish_for_test(Vec::new());
+        collector.publish_for_test(Vec::new());
+        assert_eq!(generation(&collector), 2);
+        assert_eq!(generation(&collector), 2);
+
+        // A poll publishes once.
+        #[cfg(target_os = "linux")]
+        {
+            use std::time::Duration;
+            let collector = collector.with_ss_program(MISSING_SS);
+            collector.update();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while collector.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(generation(&collector), 3);
+        }
+    }
+
+    /// A table with stale rows is copied once to strip them, not on every
+    /// call, and again only when a publish, or another row going stale,
+    /// changes what readers see. The generation changes with it, so a view
+    /// keyed on the generation alone sees an owner blanked between polls.
+    #[test]
+    fn stale_strip_is_cached() {
+        use super::super::attribution::{UnknownReason, MAX_MATCH_AGE};
+        use std::time::Duration;
+        let collector = ConnectionCollector::new(Arc::new(Mutex::new(StreamTracker::new())));
+        let row = |port: u16, pid: u32, observed_at: Instant| {
+            let mut c = make_conn(
+                "TCP",
+                &format!("127.0.0.1:{port}"),
+                "127.0.0.1:9",
+                "ESTABLISHED",
+                pid,
+            );
+            c.evidence.observed_at = Some(observed_at);
+            c
+        };
+        let now = Instant::now();
+        let fresh = row(1, 1, now);
+        let stale = row(2, 2, now - MAX_MATCH_AGE - Duration::from_secs(1));
+        // Goes stale two seconds from now.
+        let ageing = row(3, 3, now - MAX_MATCH_AGE + Duration::from_secs(2));
+        collector.publish_for_test(vec![fresh.clone(), stale, ageing.clone()]);
+
+        let (first_generation, first) = collector.connections_with_generation();
+        assert!(Arc::ptr_eq(&first, &collector.connections()));
+        assert_eq!(collector.connections_with_generation().0, first_generation);
+        assert_eq!(
+            first.iter().map(|c| c.pid).collect::<Vec<_>>(),
+            [Some(1), None, Some(3)]
+        );
+        assert_eq!(
+            first[1].evidence.unknown_reason,
+            Some(UnknownReason::StaleSnapshot)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ageing.evidence.fresh() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (second_generation, second) = collector.connections_with_generation();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(second_generation > first_generation);
+        assert_eq!(
+            second.iter().map(|c| c.pid).collect::<Vec<_>>(),
+            [Some(1), None, None]
+        );
+        assert!(Arc::ptr_eq(&second, &collector.connections()));
+        assert_eq!(collector.connections_with_generation().0, second_generation);
+
+        // A table with nothing stale is served as published, not copied.
+        // Its generation is past the strip's, not the publish count, which
+        // the strip already reached.
+        let mut fresh = fresh;
+        fresh.evidence.observe();
+        collector.publish_for_test(vec![fresh]);
+        let (third_generation, third) = collector.connections_with_generation();
+        assert!(third_generation > second_generation);
+        assert_eq!(third[0].pid, Some(1));
+        assert!(Arc::ptr_eq(
+            &third,
+            &safe_read(&collector.snapshot, "connections::snapshot").rows
+        ));
+    }
+
+    #[test]
+    fn wildcard_udp_rows_find_a_stream_by_local_endpoint() {
+        use crate::dpi::AppProtocol;
+        let stun = AppProtocol::Stun {
+            message_type: "Binding Request".into(),
+        };
+        let ssh = AppProtocol::Ssh {
+            version: "SSH-2.0".into(),
+        };
+        let app_protos = HashMap::from([
+            (
+                StreamKey::new(
+                    StreamProtocol::Udp,
+                    "198.51.100.7",
+                    3478,
+                    "192.0.2.10",
+                    50000,
+                ),
+                stun.clone(),
+            ),
+            (
+                StreamKey::new(StreamProtocol::Tcp, "192.0.2.10", 50001, "198.51.100.7", 22),
+                ssh,
+            ),
+        ]);
+        let by_local = udp_app_protocols_by_local(&app_protos);
+        let found = |proto: &str, local: &str| {
+            match_udp_app_protocol_by_local(&make_conn(proto, local, "*:*", "UNCONN", 1), &by_local)
+        };
+        // Either side of the stream can be the local one.
+        assert_eq!(found("UDP", "192.0.2.10:50000"), Some(stun.clone()));
+        assert_eq!(found("UDP", "198.51.100.7:3478"), Some(stun));
+        assert_eq!(found("UDP", "192.0.2.10:50002"), None);
+        // TCP streams and TCP rows take no part.
+        assert_eq!(found("UDP", "192.0.2.10:50001"), None);
+        assert_eq!(found("TCP", "192.0.2.10:50000"), None);
     }
 
     /// The log notes each change of table once, including a session whose
@@ -3231,17 +3534,6 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
         assert_eq!(normalize_addr("0.0.0.0:*"), None);
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn ss_process_field_with_space_in_name() {
-        // Regression: Firefox child processes have spaces in comm. The whole
-        // `users:((...))` field must reach the parser intact (the caller now
-        // slices from `users:((` rather than a whitespace column).
-        let (pid, name) = parse_ss_process(r#"users:(("Isolated Web Co",pid=4242,fd=91))"#);
-        assert_eq!(pid, Some(4242));
-        assert_eq!(name.as_deref(), Some("Isolated Web Co"));
-    }
-
     #[test]
     fn update_adds_new_connections() {
         let mut tl = ConnectionTimeline::new();
@@ -3360,52 +3652,94 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
         assert!(tl.tracked[0].is_active);
     }
 
-    #[test]
-    fn eviction_removes_oldest_inactive_over_limit() {
-        let mut tl = ConnectionTimeline::new();
-
-        // Add MAX_TRACKED_CONNECTIONS active connections
-        let conns: Vec<Connection> = (0..MAX_TRACKED_CONNECTIONS as u32)
+    fn numbered(local: &str, n: u32) -> Vec<Connection> {
+        (0..n)
             .map(|i| {
                 make_conn(
                     "TCP",
-                    &format!("127.0.0.1:{}", i),
+                    &format!("{local}:{i}"),
                     "10.0.0.1:443",
                     "ESTABLISHED",
                     i,
                 )
             })
-            .collect();
-        tl.update(&conns);
-        assert_eq!(tl.tracked.len(), MAX_TRACKED_CONNECTIONS);
+            .collect()
+    }
 
-        // Mark all as inactive, then add new ones to exceed the limit
-        tl.update(&[]);
-        let extra: Vec<Connection> = (0..10u32)
-            .map(|i| {
-                make_conn(
-                    "TCP",
-                    &format!("192.168.0.1:{}", i),
-                    "10.0.0.1:443",
-                    "ESTABLISHED",
-                    50000 + i,
-                )
-            })
-            .collect();
-        tl.update(&extra);
-
-        // Should have evicted enough inactive to get back to MAX_TRACKED_CONNECTIONS
-        assert_eq!(tl.tracked.len(), MAX_TRACKED_CONNECTIONS);
-        // All extra connections should still be present
-        for i in 0..10u32 {
-            let key = ConnectionKey {
-                protocol: "TCP".into(),
-                local_addr: format!("192.168.0.1:{}", i),
-                remote_addr: "10.0.0.1:443".into(),
-                pid: Some(50000 + i),
-            };
-            assert!(tl.known_keys.contains_key(&key));
+    fn key_of(c: &Connection) -> ConnectionKey {
+        ConnectionKey {
+            protocol: c.protocol.clone(),
+            local_addr: c.local_addr.clone(),
+            remote_addr: c.remote_addr.clone(),
+            pid: c.pid,
         }
+    }
+
+    /// Every entry is indexed at its own position, and nothing else is.
+    fn assert_indexed(tl: &ConnectionTimeline) {
+        assert_eq!(tl.known_keys.len(), tl.tracked.len());
+        for (i, t) in tl.tracked.iter().enumerate() {
+            assert_eq!(tl.known_keys.get(&t.key), Some(&i));
+            assert_eq!(tl.first_seen(&t.key), Some(t.first_seen));
+        }
+    }
+
+    #[test]
+    fn closed_history_keeps_every_active_entry_and_the_last_closed() {
+        let mut tl = ConnectionTimeline::new();
+        let old = numbered("127.0.0.1", MAX_CLOSED_HISTORY as u32);
+        tl.update(&old);
+        tl.update(&[]);
+        assert_eq!(tl.closed_len(), MAX_CLOSED_HISTORY);
+
+        // At the bound, new connections evict nothing: the bound is on what
+        // has closed, not on what the timeline holds.
+        let new = numbered("192.168.0.1", 10);
+        tl.update(&new);
+        assert_eq!(tl.tracked.len(), MAX_CLOSED_HISTORY + 10);
+        assert!(!tl.closed_trimmed());
+
+        // Past it, a whole batch of the longest closed goes at once.
+        tl.update(&[]);
+        assert_eq!(
+            tl.closed_len(),
+            MAX_CLOSED_HISTORY + 10 - CLOSED_EVICT_BATCH
+        );
+        assert_eq!(tl.tracked.len(), tl.closed_len());
+        assert!(tl.closed_trimmed());
+        for c in &old[..CLOSED_EVICT_BATCH] {
+            assert_eq!(tl.first_seen(&key_of(c)), None, "{} kept", c.local_addr);
+        }
+        for c in old[CLOSED_EVICT_BATCH..].iter().chain(&new) {
+            assert!(
+                tl.first_seen(&key_of(c)).is_some(),
+                "{} evicted",
+                c.local_addr
+            );
+        }
+        assert_indexed(&tl);
+    }
+
+    #[test]
+    fn closed_history_evicts_what_closed_longest_ago() {
+        let mut tl = ConnectionTimeline::new();
+        // First seen with the rest, and first in the table, but the last to
+        // close: eviction by first sight would take it first.
+        let long_lived = make_conn("TCP", "10.9.9.9:22", "10.0.0.2:50000", "ESTABLISHED", 7);
+        let mut rows = vec![long_lived.clone()];
+        rows.extend(numbered("127.0.0.1", MAX_CLOSED_HISTORY as u32));
+        tl.update(&rows);
+        tl.update(std::slice::from_ref(&long_lived));
+        assert!(!tl.closed_trimmed());
+        tl.update(&[]);
+
+        assert!(tl.closed_trimmed());
+        assert_eq!(tl.closed_len(), MAX_CLOSED_HISTORY + 1 - CLOSED_EVICT_BATCH);
+        assert!(tl.first_seen(&key_of(&long_lived)).is_some());
+        assert!(rows[1..=CLOSED_EVICT_BATCH]
+            .iter()
+            .all(|c| tl.first_seen(&key_of(c)).is_none()));
+        assert_indexed(&tl);
     }
 
     #[test]
