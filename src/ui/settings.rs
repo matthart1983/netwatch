@@ -413,11 +413,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let popup_width = (area.width * 60 / 100)
         .max(50)
         .min(area.width.saturating_sub(4));
-    // +14 holds the rows below the settings, with one to spare: a blank, the
-    // sandbox row, up to three worker rows, the capability line, the
-    // connection-table row, the doctor hint, a blank, the status row, the
-    // footer and two borders.
-    let popup_height = (SETTINGS_COUNT as u16 + 14).min(area.height.saturating_sub(4));
+    // +19 holds the rows below the settings, with one to spare: a blank, the
+    // sandbox row and up to five rows of its detail, up to three worker rows,
+    // the capability line, the connection-table row, the doctor hint, a blank,
+    // the status row, the footer and two borders.
+    let popup_height = (SETTINGS_COUNT as u16 + 19).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -486,7 +486,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // confirm enforcement at runtime rather than trusting the README.
     lines.push(Line::raw(""));
     let capabilities = crate::runtime::capabilities::CapabilitySnapshot::live(app);
-    let sandbox_summary = capabilities.get("sandbox").detail.clone();
+    let sandbox_detail = capabilities.get("sandbox").detail.clone();
+    let mut sandbox_clauses = sandbox_detail.split(" · ");
+    let sandbox_summary = sandbox_clauses.next().unwrap_or_default().to_string();
     let sandbox_color =
         if capabilities.get("sandbox").state == crate::runtime::capabilities::State::Ready {
             app.theme.status_good
@@ -500,6 +502,19 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(sandbox_summary, Style::default().fg(sandbox_color)),
     ]));
+    // A row each, from the left edge: the popup does not wrap, and what a
+    // worker got or a root session lacks must show in a narrow terminal.
+    for clause in sandbox_clauses {
+        let color = if clause.starts_with("running as root") {
+            app.theme.status_warn
+        } else {
+            sandbox_color
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {clause}"),
+            Style::default().fg(color),
+        )));
+    }
 
     for (name, state) in crate::sandbox::worker::snapshot()
         .iter()
@@ -937,6 +952,63 @@ mod tests {
         assert!(is_cycle_through(cursor::SANDBOX));
         assert!(is_cycle_through(cursor::THEME));
         assert!(!is_cycle_through(cursor::REFRESH_RATE));
+    }
+
+    fn rows_at(app: &App, width: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(width, 50)).unwrap();
+        terminal.draw(|f| render(f, app, f.area())).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
+    /// A session as root says containment is limited, on a row of its own that
+    /// fits the narrowest popup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_say_when_running_as_root() {
+        let test = "ui::settings::tests::settings_say_when_running_as_root";
+        if !crate::sandbox::audit::as_root_in_user_namespace(test) {
+            return;
+        }
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.sandbox_report.mode.effective = Some("best-effort");
+        for width in [80, 120] {
+            let rows = rows_at(&app, width);
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("running as root: containment limited")),
+                "{width} columns:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// The sandbox detail is split across rows, so the parts after the first
+    /// are not lost off the end of one.
+    #[test]
+    fn settings_put_each_sandbox_clause_on_a_row() {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.sandbox_report.mode.effective = Some("best-effort");
+        app.sandbox_report.platform.landlock_abi = 3;
+        app.sandbox_report.platform.landlock_kernel_abi = 9;
+        let rows = rows_at(&app, 120);
+        let sandbox = rows
+            .iter()
+            .find(|row| row.contains("Sandbox") && row.contains("best-effort:"))
+            .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+        assert!(!sandbox.contains("worker"), "{sandbox}");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("worker coverage not recorded")),
+            "{}",
+            rows.join("\n")
+        );
     }
 
     /// The popup does not wrap, so a state at the end of the capability line

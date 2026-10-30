@@ -189,8 +189,15 @@ pub struct ModeReport {
 
 #[derive(Debug, Clone, Default)]
 pub struct PlatformReport {
-    /// Linux: Landlock ABI level actually enforced (0 = not applied).
+    /// Linux: the Landlock ABI of what this thread actually enforces: the
+    /// newest feature in force (`linux::enforced_abi`). The filesystem
+    /// layer alone is ABI 3 at most, whatever the kernel. 0 = not applied.
     pub landlock_abi: u32,
+    /// Linux: the ABI the kernel reports, 0 without Landlock.
+    pub landlock_kernel_abi: u32,
+    /// Linux: `available`, `not_enabled` or `not_built`. `None` before the
+    /// kernel has been asked, or when the layer could not be built to ask.
+    pub landlock_availability: Option<&'static str>,
     /// Linux: connect(2) and bind(2) on TCP sockets denied on this thread by
     /// its parser or capture layer. The network stays reachable: UDP, MPTCP,
     /// a TCP Fast Open send and listen(2) on an unbound socket all get past
@@ -201,10 +208,11 @@ pub struct PlatformReport {
     /// "parser" or "capture", whether or not the kernel enforced it. `None`
     /// for main and the network workers.
     pub landlock_layer: Option<&'static str>,
-    /// Linux: what that layer enforced on this kernel: `filesystem_write`
-    /// (capture only), `tcp_bind`, `tcp_connect`, `abstract_unix_socket`,
-    /// `signal` and `pathname_unix_socket`. Also `socket_create`, which is the
-    /// seccomp filter rather than Landlock, when it is on the thread.
+    /// Linux: what this thread's entry enforced on this kernel: `filesystem`,
+    /// then from the role's layer `filesystem_write` (capture only),
+    /// `tcp_bind`, `tcp_connect`, `abstract_unix_socket`, `signal` and
+    /// `pathname_unix_socket`. Also `socket_create`, which is the seccomp filter
+    /// rather than Landlock, when it is on the thread.
     pub landlock_restrictions: Vec<&'static str>,
     /// Linux: the no-socket filter, for the workers that take it.
     pub socket_filter: SocketFilter,
@@ -226,6 +234,19 @@ pub struct PlatformReport {
     pub windows_restricted: bool,
 }
 
+impl PlatformReport {
+    /// Whether this thread's TCP bind and connect are denied, as doctor
+    /// reports it. Which sockets that does and does not stop is in
+    /// docs/THREAT-MODEL.md, item 4.
+    pub fn network_policy(&self) -> &'static str {
+        if self.landlock_network_blocked {
+            "denied"
+        } else {
+            "allowed"
+        }
+    }
+}
+
 impl Report {
     /// One-line summary for logs and the Settings overlay header.
     pub fn summary(&self) -> String {
@@ -235,7 +256,16 @@ impl Report {
                 _ => {
                     let mut parts: Vec<String> = Vec::new();
                     if self.platform.landlock_abi > 0 {
-                        parts.push(format!("Landlock ABI V{}", self.platform.landlock_abi));
+                        // Without a layer on top it is the filesystem layer.
+                        let scope = if self.platform.landlock_layer.is_some() {
+                            ""
+                        } else {
+                            " fs"
+                        };
+                        parts.push(format!(
+                            "Landlock{scope} ABI {} (kernel {})",
+                            self.platform.landlock_abi, self.platform.landlock_kernel_abi
+                        ));
                     }
                     if self.platform.landlock_network_blocked {
                         parts.push("TCP connect and bind denied".into());
@@ -284,6 +314,15 @@ pub enum Retain {
     Nothing,
     /// CAP_BPF, CAP_PERFMON and the pre-5.8 CAP_SYS_ADMIN fallback.
     BpfLoad,
+}
+
+/// The Landlock errata this kernel reports fixed, by erratum number. Empty off
+/// Linux and on a kernel without the interface.
+pub fn landlock_errata() -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    return linux::fixed_errata();
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
 }
 
 /// Take socket(2) from the calling thread and everything it starts, after

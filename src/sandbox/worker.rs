@@ -436,6 +436,25 @@ pub fn wait_ready(timeout: Duration) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+/// Of the workers whose role stacks a layer on the filesystem one, how many
+/// entered with TCP bind and connect denied, and how many there are.
+pub fn parser_tcp_coverage(states: &BTreeMap<String, Component>) -> (usize, usize) {
+    let parsers = states
+        .iter()
+        .filter(|(name, _)| super::roles::role_for(name).layer().is_some());
+    let (mut denied, mut total) = (0, 0);
+    for (_, state) in parsers {
+        total += 1;
+        if state
+            .report
+            .as_ref()
+            .is_some_and(|r| r.platform.landlock_network_blocked)
+        {
+            denied += 1;
+        }
+    }
+    (denied, total)
+}
 pub fn summary() -> String {
     let states = snapshot();
     if states.is_empty() {
@@ -872,6 +891,82 @@ mod tests {
             "{error}"
         );
         assert!(!snapshot()["policy-preflight"].ready);
+    }
+
+    /// Best-effort runs on without Landlock: parser workers do their work with
+    /// the network open, and the reports say so.
+    #[test]
+    fn best_effort_runs_parser_workers_without_the_tcp_deny() {
+        const CHILD: &str = "NETWATCH_WORKER_BEST_EFFORT_NO_LANDLOCK_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::worker::tests::best_effort_runs_parser_workers_without_the_tcp_deny",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        hide_landlock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        assert_eq!(preflight(), Ok(()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn("connections", move || {
+            tx.send(std::net::TcpStream::connect(addr).is_ok()).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        let states = snapshot();
+        let report = states["connections"].report.as_ref().unwrap();
+        let platform = &report.platform;
+        assert_eq!(platform.landlock_abi, 0);
+        assert_eq!(platform.landlock_kernel_abi, 0);
+        assert_eq!(platform.landlock_availability, Some("not_built"));
+        assert_eq!(platform.network_policy(), "allowed");
+        assert!(platform.landlock_restrictions.is_empty(), "{report:?}");
+        let warnings = report.mode.warnings.join("; ");
+        assert!(warnings.contains("ENOSYS"), "{warnings}");
+        assert_eq!(parser_tcp_coverage(&states), (0, states.len()));
+        // The degradation shows, which is what best-effort promises instead.
+        assert!(wait_ready(Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn parser_tcp_coverage_counts_only_the_roles_with_a_layer() {
+        let component = |blocked: Option<bool>| Component {
+            ready: true,
+            report: blocked.map(|blocked| {
+                let mut report = Report::default();
+                report.platform.landlock_network_blocked = blocked;
+                report
+            }),
+            error: None,
+        };
+        let states: BTreeMap<String, Component> = [
+            ("capture", component(Some(true))),
+            ("connections", component(Some(true))),
+            ("keylog", component(Some(false))),
+            // Started and not yet entered: it counts, and is not denied yet.
+            ("traffic", component(None)),
+            ("whois", component(Some(false))),
+            ("health", component(None)),
+        ]
+        .into_iter()
+        .map(|(name, state)| (name.to_string(), state))
+        .collect();
+        assert_eq!(parser_tcp_coverage(&states), (2, 4));
     }
 
     /// Workers that enter before the session starts drop CAP_NET_RAW; the

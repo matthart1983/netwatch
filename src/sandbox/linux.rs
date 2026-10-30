@@ -16,8 +16,9 @@ use super::{CaptureAuthority, Mode, NetRaw, Report, Role};
 
 use caps::{CapSet, Capability, CapsHashSet};
 use landlock::{
-    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Erratum, PathBeneath,
-    RestrictionStatus, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Erratum, LandlockStatus,
+    PathBeneath, RestrictionStatus, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -592,6 +593,16 @@ fn layer_ruleset(mode: Mode, fs: BitFlags<AccessFs>) -> Result<Ruleset, String> 
         .map_err(|e| e.to_string())
 }
 
+/// The errata this kernel reports fixed, by the number the kernel's
+/// documentation gives them: bit 0 is erratum 1.
+pub(super) fn fixed_errata() -> Vec<u32> {
+    let bits = Erratum::current().bits();
+    (0..u32::BITS)
+        .filter(|bit| bits & (1 << bit) != 0)
+        .map(|bit| bit + 1)
+        .collect()
+}
+
 /// Whether the kernel has the fix for Landlock erratum 2. Without it, a
 /// signal scope also stops a thread signalling its own process's threads in
 /// other domains, so the scope is added only once the fix is reported, as
@@ -708,40 +719,96 @@ impl Grant {
 }
 
 /// Restrict the calling thread with the filesystem layer. Returns the ABI
-/// the kernel reported.
+/// the crate works to on this kernel.
 fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<ABI, String> {
     let status = ruleset.restrict_self().map_err(|e| e.to_string())?;
 
-    // Record the effective ABI for the Settings overlay. `landlock`
-    // exposes the effective ABI inside `LandlockStatus::Available`.
-    // Without Landlock this is `Unsupported`, which keeps landlock_abi at 0.
-    let abi = kernel_abi(&status);
-    report.platform.landlock_abi = abi as u32;
+    let kernel = kernel_abi(&status.landlock);
+    report.platform.landlock_kernel_abi = kernel;
+    report.platform.landlock_availability = Some(availability(&status.landlock));
 
     if status.ruleset == RulesetStatus::NotEnforced {
         report
             .mode
             .warnings
-            .push("Landlock present but ruleset was not enforced".into());
-    } else if status.ruleset == RulesetStatus::PartiallyEnforced {
-        report
-            .mode
-            .warnings
-            .push("Landlock ruleset partially enforced (older kernel)".into());
-    }
-
-    Ok(abi)
-}
-
-/// The ABI the kernel reported to a restriction, `Unsupported` without
-/// Landlock.
-fn kernel_abi(status: &RestrictionStatus) -> ABI {
-    match status.landlock {
-        landlock::LandlockStatus::Available { effective_abi, .. } => effective_abi,
-        landlock::LandlockStatus::NotEnabled | landlock::LandlockStatus::NotImplemented => {
-            ABI::Unsupported
+            .push(not_enforced_reason(&status.landlock));
+    } else {
+        report.platform.landlock_restrictions.push("filesystem");
+        if status.ruleset == RulesetStatus::PartiallyEnforced {
+            report
+                .mode
+                .warnings
+                .push("Landlock ruleset partially enforced (older kernel)".into());
         }
     }
+    // Without Landlock nothing is in the list, which keeps landlock_abi at 0.
+    report.platform.landlock_abi = enforced_abi(kernel, &report.platform.landlock_restrictions);
+
+    Ok(effective_abi(&status))
+}
+
+/// The ABI the crate uses on this kernel, `Unsupported` without Landlock.
+fn effective_abi(status: &RestrictionStatus) -> ABI {
+    match status.landlock {
+        LandlockStatus::Available { effective_abi, .. } => effective_abi,
+        LandlockStatus::NotEnabled | LandlockStatus::NotImplemented => ABI::Unsupported,
+    }
+}
+
+/// The ABI the kernel itself reports, which can be newer than any the crate
+/// knows, or 0 without Landlock.
+fn kernel_abi(status: &LandlockStatus) -> u32 {
+    match status {
+        LandlockStatus::Available {
+            effective_abi,
+            kernel_abi,
+        } => kernel_abi.unwrap_or(*effective_abi as i32).max(0) as u32,
+        LandlockStatus::NotEnabled | LandlockStatus::NotImplemented => 0,
+    }
+}
+
+/// `available`, `not_enabled` (built in, left out of the boot's LSM list) or
+/// `not_built`.
+fn availability(status: &LandlockStatus) -> &'static str {
+    match status {
+        LandlockStatus::Available { .. } => "available",
+        LandlockStatus::NotEnabled => "not_enabled",
+        LandlockStatus::NotImplemented => "not_built",
+    }
+}
+
+/// Why a filesystem layer took no effect.
+fn not_enforced_reason(status: &LandlockStatus) -> String {
+    match status {
+        LandlockStatus::NotImplemented => {
+            "Landlock not enforced: this kernel has none (ENOSYS)".into()
+        }
+        LandlockStatus::NotEnabled => {
+            "Landlock not enforced: built in but not enabled at boot (EOPNOTSUPP)".into()
+        }
+        LandlockStatus::Available { .. } => format!(
+            "Landlock not enforced on kernel ABI {}, which also cannot deny TCP below ABI 4",
+            kernel_abi(status)
+        ),
+    }
+}
+
+/// The lowest Landlock ABI that offers everything in `restrictions`, which is
+/// what `landlock_abi` reports: the filesystem layer asks for no right newer
+/// than ABI 3, so it never needs more of the kernel than that, however new the
+/// kernel is. `socket_create` is seccomp, so it counts for nothing.
+pub(super) fn enforced_abi(kernel: u32, restrictions: &[&str]) -> u32 {
+    restrictions
+        .iter()
+        .map(|restriction| match *restriction {
+            "filesystem" | "filesystem_write" => kernel.min(3),
+            "tcp_bind" | "tcp_connect" => 4,
+            "abstract_unix_socket" | "signal" => 6,
+            "pathname_unix_socket" => 9,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn deny_unavailable(abi: ABI) -> String {
@@ -784,12 +851,15 @@ fn enforce_layer(mode: Mode, paths: &SandboxPaths, role: Role, report: &mut Repo
             return;
         }
     };
-    let abi = kernel_abi(&status);
+    let abi = effective_abi(&status);
     let enforced = status.ruleset != RulesetStatus::NotEnforced;
     let restrictions = layer_restrictions(abi, enforced, capture, scoped_signals());
     report.platform.landlock_network_blocked =
         restrictions.contains(&"tcp_bind") && restrictions.contains(&"tcp_connect");
-    report.platform.landlock_restrictions = restrictions;
+    report.platform.landlock_restrictions.extend(restrictions);
+    let kernel = kernel_abi(&status.landlock);
+    report.platform.landlock_kernel_abi = kernel;
+    report.platform.landlock_abi = enforced_abi(kernel, &report.platform.landlock_restrictions);
     if !report.platform.landlock_network_blocked && matches!(mode, Mode::Strict) {
         report.mode.warnings.push(deny_unavailable(abi));
     }
@@ -1187,6 +1257,104 @@ mod tests {
     }
 
     #[test]
+    fn enforced_abi_is_the_newest_feature_in_force() {
+        // What each kind of thread ends up with on a kernel at each ABI: the
+        // filesystem layer if the kernel has Landlock, then the role's layer.
+        let list = |kernel: ABI, capture: Option<bool>| {
+            let mut restrictions = Vec::new();
+            if kernel != ABI::Unsupported {
+                restrictions.push("filesystem");
+            }
+            if let Some(capture) = capture {
+                let enforced = kernel != ABI::Unsupported;
+                restrictions.extend(layer_restrictions(kernel, enforced, capture, true));
+            }
+            restrictions
+        };
+        for (kernel, fs_only, layered) in [
+            (ABI::Unsupported, 0, 0),
+            (ABI::V1, 1, 1),
+            (ABI::V2, 2, 2),
+            (ABI::V3, 3, 3),
+            (ABI::V4, 3, 4),
+            (ABI::V5, 3, 4),
+            (ABI::V6, 3, 6),
+            (ABI::V8, 3, 6),
+            (ABI::V9, 3, 9),
+        ] {
+            let number = kernel as u32;
+            let abi = |capture| enforced_abi(number, &list(kernel, capture));
+            assert_eq!(abi(None), fs_only, "fs-only on {kernel:?}");
+            assert_eq!(abi(Some(false)), layered, "parser on {kernel:?}");
+            assert_eq!(abi(Some(true)), layered, "capture on {kernel:?}");
+        }
+        // Without erratum 2's fix a parser still has the abstract socket scope.
+        let no_signal = layer_restrictions(ABI::V6, true, false, false);
+        assert_eq!(enforced_abi(6, &no_signal), 6);
+        // seccomp is not Landlock.
+        assert_eq!(enforced_abi(0, &["socket_create"]), 0);
+        assert_eq!(enforced_abi(9, &["filesystem", "socket_create"]), 3);
+    }
+
+    #[test]
+    fn kernel_abi_reads_what_the_kernel_reported() {
+        let available = |effective_abi, kernel_abi| LandlockStatus::Available {
+            effective_abi,
+            kernel_abi,
+        };
+        assert_eq!(kernel_abi(&available(ABI::V6, None)), 6);
+        // A kernel newer than the crate: the crate works to what it knows.
+        assert_eq!(kernel_abi(&available(ABI::V9, Some(12))), 12);
+        assert_eq!(kernel_abi(&LandlockStatus::NotEnabled), 0);
+        assert_eq!(kernel_abi(&LandlockStatus::NotImplemented), 0);
+    }
+
+    #[test]
+    fn not_enforced_names_the_reason() {
+        let reason = not_enforced_reason(&LandlockStatus::NotImplemented);
+        assert!(reason.contains("ENOSYS"), "{reason}");
+        let reason = not_enforced_reason(&LandlockStatus::NotEnabled);
+        assert!(reason.contains("EOPNOTSUPP"), "{reason}");
+        let reason = not_enforced_reason(&LandlockStatus::Available {
+            effective_abi: ABI::V3,
+            kernel_abi: None,
+        });
+        assert!(
+            reason.contains("ABI 3") && reason.contains("ABI 4"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn landlock_reports_fill_kernel_and_enforced_abi() {
+        if !kernel_denies_tcp() {
+            eprintln!("skipped: kernel Landlock ABI below 4");
+            return;
+        }
+        for role in [Role::Network, Role::Parser, Role::Capture] {
+            std::thread::spawn(move || {
+                let report = enter_as(role, &SandboxPaths::default());
+                let platform = &report.platform;
+                assert!(platform.landlock_kernel_abi >= 4, "{report:?}");
+                assert_eq!(platform.landlock_availability, Some("available"));
+                assert_eq!(platform.landlock_restrictions[0], "filesystem");
+                let expected = if role == Role::Network {
+                    3
+                } else {
+                    enforced_abi(
+                        platform.landlock_kernel_abi,
+                        &platform.landlock_restrictions,
+                    )
+                };
+                assert_eq!(platform.landlock_abi, expected, "{report:?}");
+                assert_eq!(platform.landlock_abi >= 4, role != Role::Network);
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn strict_parser_layer_requires_tcp() {
         // Strict fails the layer, and with it every parser entry, on a kernel
         // that cannot deny TCP; best-effort builds it anyway.
@@ -1388,7 +1556,11 @@ mod tests {
             std::thread::spawn(move || {
                 let report = enter_as(role, &SandboxPaths::default());
                 assert_eq!(report.platform.landlock_layer, None);
-                assert!(report.platform.landlock_restrictions.is_empty());
+                assert!(report
+                    .platform
+                    .landlock_restrictions
+                    .iter()
+                    .all(|r| *r == "filesystem"));
                 assert!(!report.platform.landlock_network_blocked);
                 std::net::TcpStream::connect(addr).unwrap();
             })

@@ -19,6 +19,23 @@ All notable changes to NetWatch will be documented in this file.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
+- **`netwatch doctor` says what Landlock does on this kernel.** Until now it
+  could not: static doctor applied no policy, and a capture check reported only one
+  number, the kernel's. Doctor now runs a parser thread's policy on a disposable
+  thread, tries a TCP bind and connect to its own loopback listener, and reports the
+  result in a top-level `landlock` object with the kernel's ABI, whether Landlock is
+  available, and the errata fixed. A new `landlock` capability sums it up:
+  `parser_network_denied`, `kernel_abi_below_4`, `landlock_not_enabled`,
+  `landlock_not_built`, `self_test_failed`, `sandbox_disabled` or
+  `platform_unsupported`. Each protection gains `landlock_kernel_abi`,
+  `network_policy`, `landlock_restrictions`, `capture_authority` and
+  `socket_filter`, and a live snapshot gains `tasks_holding_net_raw`. All of this is
+  additive, and the JSON stays `schema_version` 1. Settings puts what it found on
+  rows of its own, such as `TCP denied on 13/13 parser workers`, so none of it runs
+  off the end of the popup.
+- **Doctor and Settings say `running as root: containment limited`** when netwatch
+  runs as root. Root keeps most file access whatever the sandbox does, and
+  `SECURITY.md` scopes sandbox escapes to non-root runs.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
@@ -82,6 +99,19 @@ All notable changes to NetWatch will be documented in this file.
   `ConnectionTimeline::tracked_len` and `tracked_cap`, and gain
   `ConnectionTimeline::closed_len`, `closed_trimmed` and `first_seen`, and
   `ConnectionCollector::connections_with_generation`.
+- **`landlock_abi` in doctor's protections now means the ABI a thread enforces,
+  not the kernel's.** It read the kernel's ABI, so on Linux 7.1 every thread reported
+  9, including threads with only the filesystem layer, which needs 3. It is now the
+  newest feature in force: 3 for main and the network workers, and 9 for parser and
+  capture threads on Linux 7.1. Anything reading it for the kernel's version should
+  read the new `landlock_kernel_abi`. A Landlock that cannot enforce now says why,
+  naming ENOSYS, EOPNOTSUPP or the ABI, rather than "present but not enforced".
+  `network_restricted` stays false, because it describes the whole process.
+- **`caps_dropped` and `caps_retained` in doctor's protections hold different
+  values.** They name each capability where they used to say `CAP_OTHER`. Under root
+  the dropped list is longer, as the Security entries below say, CAP_NET_ADMIN no
+  longer appears as retained, and CAP_NET_RAW is dropped on parser and capture threads
+  in every mode and on every thread in daemon, Diagnose CLI and strict sessions.
 
 ### Fixed
 - **One bad value in config.toml no longer throws the whole file away.** A

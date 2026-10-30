@@ -63,7 +63,8 @@ Capture's layer also handles every filesystem right and takes only the read rows
 of the grants table, so the capture thread can write nothing. Strict mode requires
 the TCP part and refuses to start below ABI 4; best-effort logs one line and runs
 without it. The other parts are taken where the kernel has them, so these numbers
-alone do not establish what a kernel enforced. See
+alone do not establish what a kernel enforced; `netwatch doctor --json` reports
+that, per thread and for the kernel. See
 [ruleset construction](../src/sandbox/linux.rs#L466) and
 [layer entry](../src/sandbox/linux.rs#L682).
 
@@ -239,7 +240,8 @@ write: /dev/null
    1). On an architecture without a syscall table the filter is skipped
    ([filter](../src/sandbox/seccomp.rs#L1)).
 7. Root retains filesystem, scheduling and other capabilities. The new deny-list
-   reduces authority but does not promise root containment. Previous wording that
+   reduces authority but does not promise root containment, and `doctor` and Settings
+   say `running as root: containment limited`. Previous wording that
    a compromised parser cannot read SSH keys was too broad: shared descriptors,
    other threads and privileged interfaces must also be considered
    ([retained capabilities](../src/sandbox/linux.rs#L45)).
@@ -377,7 +379,7 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | E2 local GeoIP/update command | Later 0.39 work |
 | E3 capture-error hint and package messages still setcap a world-executable binary | Later 0.39 work |
 | E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Later 0.39 work |
-| F1 doctor reports actual containment | Later 0.39 work |
+| F1 doctor reports actual containment: kernel and enforced ABI, network policy, capture authority, `running as root` | Included |
 | Remaining unsafe-block audit | Later hardening; contributor safety policy applies now |
 | Full-path LoadLibraryExW for Npcap | Deferred |
 | Trusted publishing, signed tags, pinned cargo tools, fuzz lock maintenance | Deferred |
