@@ -11,6 +11,9 @@ updates:
     groups:
       cargo-minor:
         update-types: [minor, patch]
+    # 0.2.3 breaks ratatui's text widths; see the pin in Cargo.toml.
+    ignore:
+      - dependency-name: unicode-width
     open-pull-requests-limit: 5
   - package-ecosystem: github-actions
     directory: /

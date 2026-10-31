@@ -81,7 +81,13 @@ dirs = "7"
 # report wrapped at 80 columns. The TUI measures with ratatui's own widths in
 # ui::text. Already in the tree as a transitive dep of ratatui, and kept on
 # its major so there is one copy and both measure with the same tables.
-unicode-width = "0.2"
+#
+# Pinned because 0.2.3 counts a halfwidth sound mark (ﾞ or ﾟ) as one cell, and
+# ratatui-core 0.1.2 adds one for each mark on top, having expected 0. `ﾊﾟ` then
+# measures 3 where terminals draw 2, and every later column shifts. ratatui-core
+# accepts any version from 0.2.0, so this pin is what holds it for a build without
+# Cargo.lock too. Drop it once ratatui stops adding the cell.
+unicode-width = "=0.2.2"
 # ui::text cuts strings between the graphemes ratatui lays out, so a name is
 # never split inside an emoji sequence. Already in the tree through ratatui.
 unicode-segmentation = "1"

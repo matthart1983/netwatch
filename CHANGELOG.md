@@ -26,6 +26,15 @@ All notable changes to NetWatch will be documented in this file.
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
 
+### Dependencies
+- **`unicode-width` is pinned to 0.2.2.** 0.2.3 counts a halfwidth katakana sound
+  mark (ﾞ or ﾟ) as one cell, which is correct, but ratatui already adds a cell for
+  each one, so `ﾊﾟ` measured 3 columns where terminals draw 2, and everything after
+  such a name in a row shifted right. tmux and xterm.js both draw `ﾊﾟﾊﾟ` in 4. A
+  `cargo install netwatch-tui` without `--locked` could already pick up 0.2.3; this
+  stops that from the next release on.
+- tokio 1.54.1, uuid 1.29.0, brotli 9.1.1 and webpki-roots 1.0.11.
+
 ## [0.39.0] - 2026-10-31
 
 ### Added
