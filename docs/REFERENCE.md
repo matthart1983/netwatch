@@ -946,6 +946,11 @@ first 30 seconds, in every view, and Settings keeps the list. `diagnose run`,
 `diagnose coverage` and `geoip update` print the same line on stderr. `netwatch doctor` reports
 `config` as `degraded`, reason `config_unknown_keys`. None of these prints the key's value.
 
+A key that gets renamed keeps working until 2.0. netwatch reads the old name as the new one and
+warns `<old> was renamed <new> in <release>` in the same places. `netwatch doctor` leaves `config`
+`ready`, with reason `config_renamed_keys`. If the file sets both names, the new one wins. A save
+writes the new name. No key has been renamed so far. `geoip_online` below was removed.
+
 A save keeps those keys. Settings and `--generate-config` edit a file that loads in place, so
 comments stay too, and a value that has not changed keeps its spelling. `--generate-config`
 sets every key netwatch reads to its default, and empties `diagnose_targets`; what it does not

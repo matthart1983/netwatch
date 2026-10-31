@@ -3,7 +3,7 @@
 use crate::{
     app::{App, AttributionStatus},
     collectors::geo::{DbFile, DbStatus},
-    config::NetwatchConfig,
+    config::{ConfigWarning, ConfigWarningKind, NetwatchConfig},
     sandbox::{self, Mode},
 };
 use serde::{Deserialize, Serialize};
@@ -1237,6 +1237,39 @@ fn live_connection_table(coverage: &crate::collectors::attribution::Coverage) ->
     }
 }
 
+/// Add what config files got wrong to the `config` row: key names and files,
+/// never a value, as with a file that does not parse. A key that is ignored means
+/// a setting is not in force, which is `degraded`. A renamed key still works, so
+/// the row stays `ready` with a reason of its own.
+fn report_config_warnings(
+    files: [&Vec<ConfigWarning>; 2],
+    state: &mut State,
+    code: &mut &'static str,
+    detail: &mut String,
+) {
+    for warnings in files {
+        let Some(first) = warnings.first() else {
+            continue;
+        };
+        let messages: Vec<_> = warnings.iter().map(|w| w.kind.message()).collect();
+        detail.push_str(&format!(
+            "; {}: {}",
+            first.file.display(),
+            messages.join(", ")
+        ));
+    }
+    if *state != State::Ready {
+        return;
+    }
+    let kinds = || files.into_iter().flatten().map(|w| &w.kind);
+    if kinds().any(|kind| matches!(kind, ConfigWarningKind::UnknownKey(_))) {
+        *state = State::Degraded;
+        *code = "config_unknown_keys";
+    } else if kinds().any(|kind| matches!(kind, ConfigWarningKind::RenamedKey { .. })) {
+        *code = "config_renamed_keys";
+    }
+}
+
 pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
     use crate::config::ConfigError;
     // The loader live sessions use, so doctor fails a file exactly when they
@@ -1277,22 +1310,13 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
             "No saved configuration; defaults shown".to_string(),
         ),
     };
-    // Key names and files, never a value, as with a file that does not parse.
     let policy = crate::collectors::egress::default_policy_warnings();
-    for warnings in [&config.load_warnings, &policy] {
-        if let Some(first) = warnings.first() {
-            let messages: Vec<_> = warnings.iter().map(|w| w.kind.message()).collect();
-            detail.push_str(&format!(
-                "; {}: {}",
-                first.file.display(),
-                messages.join(", ")
-            ));
-            if config_state == State::Ready {
-                config_state = State::Degraded;
-                code = "config_unknown_keys";
-            }
-        }
-    }
+    report_config_warnings(
+        [&config.load_warnings, &policy],
+        &mut config_state,
+        &mut code,
+        &mut detail,
+    );
     let mut snapshot = CapabilitySnapshot::configured(&config);
     snapshot.put(
         "config",
@@ -1624,6 +1648,52 @@ fn wait_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_renamed_key_leaves_config_ready_and_an_ignored_one_does_not() {
+        use crate::config::{ConfigWarning, ConfigWarningKind};
+        let warning = |kind| ConfigWarning {
+            file: "/etc/netwatch/config.toml".into(),
+            kind,
+        };
+        let renamed = warning(ConfigWarningKind::RenamedKey {
+            old: "colour_theme",
+            new: "theme",
+            since: "1.1",
+            both_set: false,
+        });
+        let unknown = warning(ConfigWarningKind::UnknownKey("typo".into()));
+        let report = |warnings: Vec<ConfigWarning>, state: State| {
+            let (mut state, mut code, mut detail) = (state, "config_valid", "Parsed".to_string());
+            report_config_warnings([&warnings, &Vec::new()], &mut state, &mut code, &mut detail);
+            (state, code, detail)
+        };
+
+        let (state, code, detail) = report(vec![], State::Ready);
+        assert_eq!(
+            (state, code, detail.as_str()),
+            (State::Ready, "config_valid", "Parsed")
+        );
+
+        let (state, code, detail) = report(vec![renamed.clone()], State::Ready);
+        assert_eq!((state, code), (State::Ready, "config_renamed_keys"));
+        assert!(
+            detail.contains("colour_theme was renamed theme in 1.1"),
+            "{detail}"
+        );
+        assert!(detail.contains("/etc/netwatch/config.toml"), "{detail}");
+
+        let (state, code, detail) = report(vec![renamed, unknown.clone()], State::Ready);
+        assert_eq!((state, code), (State::Degraded, "config_unknown_keys"));
+        assert!(
+            detail.contains("colour_theme") && detail.contains("typo"),
+            "{detail}"
+        );
+
+        // A file that did not load stays what it is.
+        let (state, code, _) = report(vec![unknown], State::Unavailable);
+        assert_eq!((state, code), (State::Unavailable, "config_valid"));
+    }
+
     use super::*;
     #[test]
     fn blocked_capture_child_is_terminated_at_deadline() {

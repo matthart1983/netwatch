@@ -21,6 +21,15 @@ All notable changes to NetWatch will be documented in this file.
   `__capture-check` stays silent. Loading itself says nothing, however often a
   session does it. This adds the serde_ignored crate, which reports what the
   deserializer really skipped, where a list of known keys kept by hand would drift.
+- **A key in `config.toml` or `egress-policy.toml` that gets renamed keeps working,
+  with a warning.** Nothing has been renamed so far, so this changes nothing today:
+  the one key to go, `geoip_online`, was removed, and `auto_close_secs` was a field of
+  recorded episodes and never a config key. After 1.0 a rename is one line in a table.
+  netwatch reads the old name as the new one, warns `<old> was renamed <new> in
+  <release>` wherever an unknown key warns, and a save writes the new name. If a file
+  sets both, the new name wins and the warning says the old one is ignored. `doctor`
+  keeps `config` `ready` for a renamed key, with reason `config_renamed_keys`, because
+  the setting is still in force.
 
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1

@@ -31,7 +31,9 @@ with `npcap_present_unloaded`, including the two `unavailable` cases above.
 
 A key `config.toml` or `egress-policy.toml` sets that netwatch does not read makes
 `config` `degraded`, with reason `config_unknown_keys`. Its detail names each key and
-its file, never a value, and live sessions start as usual.
+its file, never a value, and live sessions start as usual. A key under a name it used
+to have still works, so `config` stays `ready`, with reason `config_renamed_keys` and a
+detail giving the new name.
 
 Missing or malformed configuration is reported explicitly; malformed content and
 configured endpoint credentials are not echoed. A configuration file that cannot

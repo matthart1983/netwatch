@@ -368,6 +368,14 @@ pub struct ConfigWarning {
 pub enum ConfigWarningKind {
     /// A key netwatch does not read, so setting it changes nothing.
     UnknownKey(String),
+    /// A key under a name it used to have. Its value is in force under `new`,
+    /// unless the file sets `new` as well, which then wins.
+    RenamedKey {
+        old: &'static str,
+        new: &'static str,
+        since: &'static str,
+        both_set: bool,
+    },
 }
 
 impl ConfigWarningKind {
@@ -381,6 +389,18 @@ impl ConfigWarningKind {
                     crate::ui::sanitize::display(key)
                 )
             }
+            Self::RenamedKey {
+                old,
+                new,
+                since,
+                both_set: false,
+            } => format!("{old} was renamed {new} in {since}; it still works until 2.0"),
+            Self::RenamedKey {
+                old,
+                new,
+                since,
+                both_set: true,
+            } => format!("{old} was renamed {new} in {since}; both are set, so {old} is ignored"),
         }
     }
 }
@@ -451,6 +471,14 @@ pub(crate) fn from_toml_reporting_unread<T: serde::de::DeserializeOwned>(
         unread.push(key);
     })?;
     Ok((value, unread))
+}
+
+/// A config file as read: its text, with any renamed keys moved, the config it
+/// holds, and the keys that were not read.
+struct ParsedConfig {
+    text: String,
+    config: NetwatchConfig,
+    unread: Vec<KeyPath>,
 }
 
 /// Bring `old`, a table as the file has it, up to `new`, what the config would
@@ -608,14 +636,13 @@ impl NetwatchConfig {
     /// [`load`](Self::load) from `path` rather than the platform location.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match Self::read_file(path)? {
-            Some((_, cfg, _)) => Ok(cfg),
+            Some(parsed) => Ok(parsed.config),
             None => Ok(Self::default()),
         }
     }
 
-    /// The text at `path`, the config it holds and the keys that did not read,
-    /// or `None` if there is nothing at the path.
-    fn read_file(path: &Path) -> Result<Option<(String, Self, Vec<KeyPath>)>, ConfigError> {
+    /// What is at `path`, or `None` if there is nothing.
+    fn read_file(path: &Path) -> Result<Option<ParsedConfig>, ConfigError> {
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
             // Nothing at the path at all. A symlink to a missing file is
@@ -633,32 +660,48 @@ impl NetwatchConfig {
                 })
             }
         };
-        let (mut cfg, unread) =
-            Self::parse(&contents, path).map_err(|source| ConfigError::Parse {
+        // With a renamed key in the file the position is in the text as moved,
+        // which can be a line out. The message still names the key.
+        let mut parsed =
+            Self::parse(&contents, path, RENAMED_KEYS).map_err(|source| ConfigError::Parse {
                 path: path.into(),
                 position: source.span().map(|span| line_column(&contents, span.start)),
                 source: Box::new(source),
             })?;
-        cfg.validate();
-        Ok(Some((contents, cfg, unread)))
+        parsed.config.validate();
+        Ok(Some(parsed))
     }
 
     /// `text`, the contents of `file`, with [`load_warnings`](Self::load_warnings)
     /// filled in. Not validated: that is for what a session will run on.
     pub fn from_toml(text: &str, file: &Path) -> Result<Self, toml::de::Error> {
-        Self::parse(text, file).map(|(cfg, _)| cfg)
+        Self::parse(text, file, RENAMED_KEYS).map(|parsed| parsed.config)
     }
 
-    fn parse(text: &str, file: &Path) -> Result<(Self, Vec<KeyPath>), toml::de::Error> {
-        let (mut cfg, unread): (Self, Vec<KeyPath>) = from_toml_reporting_unread(text)?;
-        cfg.load_warnings = unread
-            .iter()
-            .map(|key| ConfigWarning {
+    fn parse(
+        text: &str,
+        file: &Path,
+        renames: &[RenamedKey],
+    ) -> Result<ParsedConfig, toml::de::Error> {
+        let (text, moved) = apply_renames(text, renames);
+        let (mut config, unread): (Self, Vec<KeyPath>) = from_toml_reporting_unread(&text)?;
+        config.load_warnings = moved
+            .into_iter()
+            .chain(
+                unread
+                    .iter()
+                    .map(|key| ConfigWarningKind::UnknownKey(key.join("."))),
+            )
+            .map(|kind| ConfigWarning {
                 file: file.into(),
-                kind: ConfigWarningKind::UnknownKey(key.join(".")),
+                kind,
             })
             .collect();
-        Ok((cfg, unread))
+        Ok(ParsedConfig {
+            text: text.into_owned(),
+            config,
+            unread,
+        })
     }
 
     /// Clamp and normalise fields that may arrive out of range from a hand-edited
@@ -691,10 +734,15 @@ impl NetwatchConfig {
     }
 
     /// Write current config to disk, creating parent directories as needed.
-    pub fn save(&self) -> anyhow::Result<()> {
+    pub fn save(&mut self) -> anyhow::Result<()> {
         let path =
             Self::path().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
-        self.save_to(&path)
+        self.save_to(&path)?;
+        // A save writes a renamed key under its new name, which ends its warning.
+        if let Ok(saved) = Self::load_from(&path) {
+            self.load_warnings = saved.load_warnings;
+        }
+        Ok(())
     }
 
     /// [`save`](Self::save) to `path`. A file already there that does not
@@ -703,14 +751,15 @@ impl NetwatchConfig {
     ///
     /// One that does load is edited in place, not replaced, so a key this
     /// version does not read, from a newer one or misspelled, is still there
-    /// and still warned about afterwards. So are the file's comments.
+    /// and still warned about afterwards. So are the file's comments. A renamed
+    /// key moves to its new name, and is not written under both.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         let existing = Self::read_file(path).map_err(|e| {
             let context = format!("{} does not load; not overwriting it", path.display());
             anyhow::Error::new(e).context(context)
         })?;
         let contents = match existing {
-            Some((text, _, unread)) => self.merged_into(&text, &unread)?,
+            Some(parsed) => self.merged_into(&parsed.text, &parsed.unread)?,
             None => toml::to_string_pretty(self)?,
         };
         if let Some(parent) = path.parent() {
@@ -740,6 +789,153 @@ impl NetwatchConfig {
             "cannot update it in place; not overwriting it"
         );
         Ok(merged)
+    }
+}
+
+// ── Keys with a new name ───────────────────────────────────
+
+/// A key that has been renamed: the old spelling keeps working, with a warning,
+/// until 2.0.
+pub(crate) struct RenamedKey {
+    /// Dotted, as the warnings print it. `*` is every entry of an array of
+    /// tables or of a table of named entries, and needs a `*` in `new` at the
+    /// same place. A table that went too can be renamed itself.
+    pub(crate) old: &'static str,
+    pub(crate) new: &'static str,
+    /// The release that renamed it.
+    pub(crate) since: &'static str,
+}
+
+/// Every config.toml key that has been renamed. A rename after 1.0 is the field's
+/// new name and one line here:
+///
+/// ```text
+/// RenamedKey { old: "alerts.bandwidth_limit", new: "alerts.bandwidth_threshold", since: "1.2" },
+/// ```
+///
+/// Empty so far. `geoip_online` was removed, not renamed, as
+/// [`warn_removed_keys`](NetwatchConfig::warn_removed_keys) says, and 0.34's
+/// `auto_close_secs` to `expire_after_secs` is a field of recorded episodes,
+/// with its own alias on `diagnose::engine::Settings`, and was never a key here.
+const RENAMED_KEYS: &[RenamedKey] = &[];
+
+/// `text` with every key in `renames` under its new name, keeping its comment and
+/// value, and what to tell the owner of the file. Moved before the file is read,
+/// not after, so a rename can be of a key that must be there. `text` itself when
+/// none of them is set, which is every file until a key is renamed, or when it is
+/// not TOML, which is for the parser to say.
+pub(crate) fn apply_renames<'a>(
+    text: &'a str,
+    renames: &[RenamedKey],
+) -> (std::borrow::Cow<'a, str>, Vec<ConfigWarningKind>) {
+    use std::borrow::Cow;
+    let mut moved = Vec::new();
+    if renames.is_empty() {
+        return (Cow::Borrowed(text), moved);
+    }
+    let Ok(mut doc) = text.parse::<DocumentMut>() else {
+        return (Cow::Borrowed(text), moved);
+    };
+    for rename in renames {
+        let (old, new): (Vec<_>, Vec<_>) = (
+            rename.old.split('.').collect(),
+            rename.new.split('.').collect(),
+        );
+        let (mut found, mut both_set) = (false, false);
+        rename_in(doc.as_table_mut(), &old, &new, &mut |placed| {
+            found = true;
+            both_set |= !placed;
+        });
+        if found {
+            moved.push(ConfigWarningKind::RenamedKey {
+                old: rename.old,
+                new: rename.new,
+                since: rename.since,
+                both_set,
+            });
+        }
+    }
+    if moved.is_empty() {
+        return (Cow::Borrowed(text), moved);
+    }
+    (Cow::Owned(doc.to_string()), moved)
+}
+
+/// Down the path `old` and `new` share, then across. `moved` hears each key found,
+/// and whether it could go to its new name, which it cannot if that is set too.
+fn rename_in(table: &mut dyn TableLike, old: &[&str], new: &[&str], moved: &mut dyn FnMut(bool)) {
+    match (old, new) {
+        ([head, old_rest @ ..], [new_head, new_rest @ ..])
+            if head == new_head && !old_rest.is_empty() && !new_rest.is_empty() =>
+        {
+            if *head == "*" {
+                for (_, item) in table.iter_mut() {
+                    if let Some(entry) = item.as_table_like_mut() {
+                        rename_in(entry, old_rest, new_rest, moved);
+                    }
+                }
+                return;
+            }
+            let Some(item) = table.get_mut(head) else {
+                return;
+            };
+            if let Some(child) = item.as_table_like_mut() {
+                rename_in(child, old_rest, new_rest, moved);
+            } else if let (["*", old_rest @ ..], ["*", new_rest @ ..]) = (old_rest, new_rest) {
+                for entry in tables_in(item).into_iter().flatten() {
+                    rename_in(entry, old_rest, new_rest, moved);
+                }
+            }
+        }
+        _ => {
+            if let Some((key, item)) = take_key(table, old) {
+                moved(put_key(table, new, &key, item));
+            }
+        }
+    }
+}
+
+/// Remove the key at `path`, and a table that leaves empty, which would otherwise
+/// be reported as unknown once its name has gone.
+fn take_key(table: &mut dyn TableLike, path: &[&str]) -> Option<(toml_edit::Key, Item)> {
+    match path {
+        [] => None,
+        [leaf] => {
+            let key = table.key(leaf)?.clone();
+            Some((key, table.remove(leaf)?))
+        }
+        [head, rest @ ..] => {
+            let child = table.get_mut(head)?.as_table_like_mut()?;
+            let taken = take_key(child, rest)?;
+            if child.is_empty() {
+                table.remove(head);
+            }
+            Some(taken)
+        }
+    }
+}
+
+/// Put `item` at `path` with the comment `old` carried, making any table on the
+/// way. False if something is already there.
+fn put_key(table: &mut dyn TableLike, path: &[&str], old: &toml_edit::Key, item: Item) -> bool {
+    match path {
+        [] => false,
+        [leaf] => {
+            if table.contains_key(leaf) {
+                return false;
+            }
+            let key = toml_edit::Key::new(*leaf)
+                .with_leaf_decor(old.leaf_decor().clone())
+                .with_dotted_decor(old.dotted_decor().clone());
+            table.entry_format(&key).or_insert(item);
+            true
+        }
+        [head, rest @ ..] => {
+            let child = table.entry(head).or_insert(Item::Table(Table::new()));
+            child
+                .as_table_like_mut()
+                .is_some_and(|child| put_key(child, rest, old, item))
+        }
     }
 }
 
@@ -917,10 +1113,166 @@ show_geo = false
     fn unknown_keys(cfg: &NetwatchConfig) -> Vec<String> {
         cfg.load_warnings
             .iter()
-            .map(|warning| match &warning.kind {
-                ConfigWarningKind::UnknownKey(key) => key.clone(),
+            .filter_map(|warning| match &warning.kind {
+                ConfigWarningKind::UnknownKey(key) => Some(key.clone()),
+                _ => None,
             })
             .collect()
+    }
+
+    /// Renames as they will be written, on keys that exist today. The table
+    /// the code reads is empty, so each case passes its own.
+    fn parse_renamed(text: &str, renames: &[RenamedKey]) -> ParsedConfig {
+        NetwatchConfig::parse(text, Path::new("/etc/config.toml"), renames).unwrap()
+    }
+
+    const RENAMES: &[RenamedKey] = &[
+        RenamedKey {
+            old: "colour_theme",
+            new: "theme",
+            since: "1.1",
+        },
+        RenamedKey {
+            old: "alerts.bandwidth_limit",
+            new: "alerts.bandwidth_threshold",
+            since: "1.2",
+        },
+        RenamedKey {
+            old: "scan_threshold",
+            new: "alerts.port_scan_threshold",
+            since: "1.3",
+        },
+        // A key that must be there, so it has to move before the file is read.
+        RenamedKey {
+            old: "diagnose_targets.*.hostname",
+            new: "diagnose_targets.*.host",
+            since: "1.4",
+        },
+        RenamedKey {
+            old: "old_probes.trace_to",
+            new: "diagnose_probes.trace_target",
+            since: "1.5",
+        },
+    ];
+
+    /// The mechanism on every shape of rename, with the comment on the old line
+    /// carried over and a warning that says what to do.
+    #[test]
+    fn a_renamed_key_keeps_working_and_warns() {
+        let parsed = parse_renamed(
+            r#"
+# my colours
+colour_theme = "nord"
+scan_threshold = 7
+[alerts]
+bandwidth_limit = 5
+[old_probes]
+trace_to = "9.9.9.9"
+[[diagnose_targets]]
+name = "a"
+hostname = "a.example"
+[[diagnose_targets]]
+name = "b"
+hostname = "b.example"
+"#,
+            RENAMES,
+        );
+        let cfg = &parsed.config;
+        assert_eq!(cfg.theme, "nord");
+        assert_eq!(cfg.alerts.bandwidth_threshold, 5);
+        assert_eq!(cfg.alerts.port_scan_threshold, 7);
+        assert_eq!(cfg.diagnose_probes.trace_target, "9.9.9.9");
+        assert_eq!(cfg.diagnose_targets[0].host, "a.example");
+        assert_eq!(cfg.diagnose_targets[1].host, "b.example");
+        // Nothing moved is called unknown, nor is the table it left behind.
+        assert_eq!(unknown_keys(cfg), Vec::<String>::new());
+        assert_eq!(cfg.load_warnings.len(), RENAMES.len());
+        assert_eq!(
+            cfg.load_warnings[0].to_string(),
+            "/etc/config.toml: colour_theme was renamed theme in 1.1; it still works until 2.0"
+        );
+        assert!(
+            parsed.text.contains("# my colours\ntheme = \"nord\""),
+            "{}",
+            parsed.text
+        );
+    }
+
+    /// With both, the new name wins and the old one is what the warning calls
+    /// ignored. In a file with neither nothing is rewritten at all.
+    #[test]
+    fn a_new_name_beats_the_old_and_a_file_with_neither_is_untouched() {
+        let cfg = parse_renamed("colour_theme = 'nord'\ntheme = 'ocean'\n", RENAMES).config;
+        assert_eq!(cfg.theme, "ocean");
+        assert_eq!(
+            cfg.load_warnings[0].short(),
+            "config.toml: colour_theme was renamed theme in 1.1; both are set, so colour_theme is ignored"
+        );
+
+        let text = "# as written\ntheme   =   'ocean'\n";
+        let parsed = parse_renamed(text, RENAMES);
+        assert_eq!(parsed.text, text);
+        assert_eq!(parsed.config.load_warnings, []);
+
+        // A value of the wrong type is the same error under either name.
+        let err = NetwatchConfig::parse("colour_theme = 1\n", Path::new("c"), RENAMES)
+            .err()
+            .expect("a number is not a theme");
+        assert!(err.to_string().contains("invalid type"), "{err}");
+    }
+
+    /// A save writes the new name once and the old one not at all, so the next
+    /// load has nothing to say. Saving again changes nothing.
+    #[test]
+    fn a_save_moves_a_renamed_key_to_its_new_name() {
+        let parsed = parse_renamed(
+            "# mine\ncolour_theme = 'nord' # why\n[alerts]\nbandwidth_limit = 5\ntypo = 1\n",
+            RENAMES,
+        );
+        let saved = parsed
+            .config
+            .merged_into(&parsed.text, &parsed.unread)
+            .unwrap();
+        for gone in ["colour_theme", "bandwidth_limit"] {
+            assert!(!saved.contains(gone), "{gone} in\n{saved}");
+        }
+        assert_eq!(saved.matches("theme = ").count(), 1, "{saved}");
+        assert!(saved.contains("# mine\ntheme = 'nord' # why\n"), "{saved}");
+        assert_eq!(
+            saved.matches("bandwidth_threshold = 5\n").count(),
+            1,
+            "{saved}"
+        );
+        assert!(saved.contains("typo = 1\n"), "{saved}");
+
+        let again = parse_renamed(&saved, RENAMES);
+        assert_eq!(unknown_keys(&again.config), ["alerts.typo"]);
+        assert_eq!(again.config.load_warnings.len(), 1, "{saved}");
+        assert_eq!(
+            again
+                .config
+                .merged_into(&again.text, &again.unread)
+                .unwrap(),
+            saved
+        );
+    }
+
+    /// `*` is a named entry as well as an array's, for the policy's
+    /// `[process.<name>]`.
+    #[test]
+    fn a_rename_reaches_every_named_entry() {
+        let (text, moved) = apply_renames(
+            "[process.curl]\nallow_snis = ['a']\n[process.ssh]\nallow_ports = [22]\n",
+            &[RenamedKey {
+                old: "process.*.allow_snis",
+                new: "process.*.allow_sni",
+                since: "1.1",
+            }],
+        );
+        assert_eq!(moved.len(), 1);
+        let policy: crate::collectors::egress::EgressPolicy = toml::from_str(&text).unwrap();
+        assert_eq!(policy.process["curl"].allow_sni, ["a"]);
+        assert_eq!(policy.process["ssh"].allow_ports, [22]);
     }
 
     /// The typo the warning exists for, at every depth a config has, and the

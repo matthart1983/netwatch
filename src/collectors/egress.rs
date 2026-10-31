@@ -2000,8 +2000,10 @@ block = {
             .iter()
             .map(|w| {
                 assert_eq!(w.file, path);
-                let UnknownKey(key) = &w.kind;
-                key.as_str()
+                match &w.kind {
+                    UnknownKey(key) => key.as_str(),
+                    other => panic!("{other:?}"),
+                }
             })
             .collect();
         keys.sort_unstable();

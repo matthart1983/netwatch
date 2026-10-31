@@ -15,7 +15,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{from_toml_reporting_unread, ConfigWarning, ConfigWarningKind};
+use crate::config::{
+    apply_renames, from_toml_reporting_unread, ConfigWarning, ConfigWarningKind, RenamedKey,
+};
+
+/// Every `egress-policy.toml` key that has been renamed, none so far. A rename
+/// after 1.0 is the field's new name and one line here, as in
+/// `config::RENAMED_KEYS`. `*` is every process: `process.*.allow_sni`.
+const RENAMED_KEYS: &[RenamedKey] = &[];
 
 // ── Declared egress policy ─────────────────────────────────────────────
 
@@ -351,13 +358,19 @@ pub fn load_policy_file(path: &Path) -> Option<EgressPolicy> {
         }
     }
     let contents = std::fs::read_to_string(path).ok()?;
+    let (contents, moved) = apply_renames(&contents, RENAMED_KEYS);
     match from_toml_reporting_unread::<EgressPolicy>(&contents) {
         Ok((mut policy, unread)) => {
-            policy.load_warnings = unread
-                .iter()
-                .map(|key| ConfigWarning {
+            policy.load_warnings = moved
+                .into_iter()
+                .chain(
+                    unread
+                        .iter()
+                        .map(|key| ConfigWarningKind::UnknownKey(key.join("."))),
+                )
+                .map(|kind| ConfigWarning {
                     file: path.into(),
-                    kind: ConfigWarningKind::UnknownKey(key.join(".")),
+                    kind,
                 })
                 .collect();
             Some(policy)
@@ -497,6 +510,7 @@ pub fn remove_rules_from_policy_file(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    let existing = apply_renames(&existing, RENAMED_KEYS).0;
     let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -571,6 +585,7 @@ pub fn merge_rules_into_policy_file(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => POLICY_HEADER.to_string(),
         Err(e) => return Err(e),
     };
+    let existing = apply_renames(&existing, RENAMED_KEYS).0;
     let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
