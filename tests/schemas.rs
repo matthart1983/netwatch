@@ -282,6 +282,9 @@ fn doctor_matches_its_schema() {
     bad["capabilities"][0]["detail"] = Value::Null;
     assert_rejected(DOCTOR, &bad, "a null detail");
     let mut bad = doc.clone();
+    bad["interface"] = json!("");
+    assert_rejected(DOCTOR, &bad, "an empty interface, which is null instead");
+    let mut bad = doc.clone();
     bad["metadata"]["schema"] = json!("netwatch.doctor.v2");
     assert_rejected(DOCTOR, &bad, "another version's name");
     let mut bad = doc;
@@ -309,6 +312,49 @@ fn a_failed_capture_check_matches_the_schema() {
     check(DOCTOR, &doc);
     assert_eq!(doc["scope"], "capture_check");
     assert_eq!(capability(&doc, "capture").0, "unavailable");
+
+    // With none named, it selects one if it can. A Windows runner has no Npcap
+    // to check with, and that used to write an empty interface.
+    let output = home
+        .netwatch(&["doctor", "--json", "--check-capture"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    check(DOCTOR, &stdout_json(&output));
+}
+
+/// None named and none up, so selection fails. The namespace needs a sysfs of its
+/// own, because /sys/class/net otherwise still lists the host's interfaces. This
+/// skips where it cannot make one, as tests/doctor.rs does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_capture_check_that_selects_nothing_has_a_null_interface() {
+    let home = Home::new();
+    let mut command = Command::new("unshare");
+    command
+        .args(["--user", "--map-root-user", "--net", "--mount", "sh", "-c"])
+        .arg(r#"mount -t sysfs sys /sys && exec "$0" doctor --json --check-capture"#)
+        .arg(env!("CARGO_BIN_EXE_netwatch"));
+    for (key, value) in home.netwatch(&[]).get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    let output = match command.output() {
+        Ok(output) if output.status.success() => output,
+        other => {
+            eprintln!("skipped: no namespace with its own sysfs: {other:?}");
+            return;
+        }
+    };
+    let doc = stdout_json(&output);
+    check(DOCTOR, &doc);
+    assert!(doc["interface"].is_null(), "{doc}");
+    assert_eq!(
+        capability(&doc, "interface"),
+        ("unavailable", "selection_failed")
+    );
 }
 
 /// A config that does not load: `config` is unavailable and the capture check

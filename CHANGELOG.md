@@ -49,10 +49,17 @@ All notable changes to NetWatch will be documented in this file.
   field was documented to do. A destination in a baseline saved before this keeps
   saying `tls` until a flow to it is seen again.
 
+- **`doctor --json` says `"interface": null` when a capture check selects
+  nothing.** With no `--interface` given and no interface up, or on Windows with no
+  Npcap, it wrote `"interface": ""`, which reads as a name. It now writes the null
+  it writes everywhere else there is no interface.
+
 ### Migration
 - **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
   name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
   said `"tls"`, and keeps its name in `sni`.
+- **`doctor --json` consumers: test `interface` for null, not for an empty string.**
+  A capture check that selected no interface wrote `""` and now writes `null`.
 
 ## [0.39.0] - 2026-10-31
 

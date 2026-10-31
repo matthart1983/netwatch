@@ -28,7 +28,7 @@
       "description": "Rust's name for the operating system. Open set: a build for a new platform adds a value.",
       "examples": ["linux", "macos", "windows", "freebsd"]
     },
-    "interface": { "type": ["string", "null"], "description": "The capture interface asked for or selected. Null when none is configured or chosen." },
+    "interface": { "type": ["string", "null"], "minLength": 1, "description": "The capture interface asked for or selected. Null, never an empty string, when none is configured or a capture check could select none." },
     "capabilities": {
       "type": "array",
       "items": { "$ref": "#/$defs/capability" }

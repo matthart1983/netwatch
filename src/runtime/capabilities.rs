@@ -1504,7 +1504,7 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
             let result = bounded_check(&interface, mode);
             match result {
                 Ok(result) => {
-                    snapshot.interface = Some(result.interface.clone());
+                    snapshot.interface = checked_interface(&result);
                     if result.opened {
                         snapshot.put(
                             "interface",
@@ -1567,6 +1567,11 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
     }
     Ok(())
 }
+/// The interface a capture check names in the report. A check that selected
+/// nothing sends back an empty name, and the JSON has null for that.
+fn checked_interface(result: &CaptureResult) -> Option<String> {
+    (!result.interface.is_empty()).then(|| result.interface.clone())
+}
 fn bounded_check(interface: &str, mode: Mode) -> anyhow::Result<CaptureResult> {
     use std::process::{Command, Stdio};
     let mode = match mode {
@@ -1613,6 +1618,17 @@ fn wait_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_capture_check_that_selected_nothing_names_no_interface() {
+        let result = |interface: &str| CaptureResult {
+            interface: interface.into(),
+            opened: false,
+            error: Some("No up interface found".into()),
+            protection: None,
+        };
+        assert_eq!(checked_interface(&result("")), None);
+        assert_eq!(checked_interface(&result("eth0")).as_deref(), Some("eth0"));
+    }
     #[test]
     fn blocked_capture_child_is_terminated_at_deadline() {
         let child = std::process::Command::new(std::env::current_exe().unwrap())
