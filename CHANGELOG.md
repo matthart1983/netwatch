@@ -6,24 +6,23 @@ All notable changes to NetWatch will be documented in this file.
 
 ### Added
 - **A key netwatch does not read now warns, naming the key and the file.** serde
-  ignored them without a word, so `sandbox_mode = "strict"` left the sandbox
-  best-effort with nothing to say the setting had no effect, and
-  `allow_snis = [...]` in `egress-policy.toml` left a rule with no restriction by
-  name, because an empty list means unrestricted. Both files now report such keys
-  at any depth, such as `alerts.typo` or `process.curl.allow_snis`, and never the
-  value, and netwatch still starts. A session prints `warning: <file>: unknown key
-  <key> is ignored` on stderr before it starts, which a service manager keeps and
-  the TUI shows again when it quits, and writes it to the log. The TUI also says so
-  on its bottom row for its first 30 seconds, in every view, and Settings keeps the
-  list. The Egress tab counts the policy's. `diagnose run`, `diagnose coverage` and
-  `geoip update` print the same line on stderr, and `doctor` reports `config` as
-  `degraded`, reason `config_unknown_keys`, which is additive in its JSON.
-  `__capture-check` stays silent. Loading itself says nothing, however often a
-  session does it. This adds the serde_ignored crate, which reports what the
-  deserializer really skipped, where a list of known keys kept by hand would drift.
+  ignored them without a word. `sandbox_mode = "strict"` left the sandbox best-effort
+  with nothing to say the setting had no effect, and `allow_snis = [...]` in
+  `egress-policy.toml` left a rule with no restriction by name, because an empty list
+  means unrestricted. Both files now report such keys at any depth, such as
+  `alerts.typo` or `process.curl.allow_snis`, and never the value. netwatch still
+  starts. A session prints `warning: <file>: unknown key <key> is ignored` on stderr
+  before it starts and writes it to the log. A service manager keeps that line, and
+  the terminal shows it again when the TUI quits. The TUI also says so on its bottom
+  row for its first 30 seconds, in every view, and Settings keeps the list. The Egress
+  tab counts the policy's, and stops calling the policy `all precise`. `diagnose run`,
+  `diagnose coverage` and `geoip update` print the same line on stderr. `doctor`
+  reports `config` as `degraded`, reason `config_unknown_keys`, which is additive in
+  its JSON. This adds the serde_ignored crate, which reports what the deserializer
+  skipped. A list of known keys kept by hand would drift from the structs.
 - **A key in `config.toml` or `egress-policy.toml` that gets renamed keeps working,
-  with a warning.** Nothing has been renamed so far, so this changes nothing today:
-  the one key to go, `geoip_online`, was removed, and `auto_close_secs` was a field of
+  with a warning.** Nothing has been renamed so far, so this changes nothing today.
+  The one key to go, `geoip_online`, was removed, and `auto_close_secs` was a field of
   recorded episodes and never a config key. After 1.0 a rename is one line in a table.
   netwatch reads the old name as the new one, warns `<old> was renamed <new> in
   <release>` wherever an unknown key warns, and a save writes the new name. If a file
@@ -33,7 +32,7 @@ All notable changes to NetWatch will be documented in this file.
 - **An `[experimental]` table in `config.toml`, for settings that can still change.**
   A key in it is outside the 1.0 compatibility promise and can change or go away in any
   release. Nothing is in it yet, so it has no settings and this is only the place for
-  them. A key in it this version does not read does not warn as unknown: it gets a
+  them. A key in it this version does not read does not warn as unknown. It gets a
   `note:` line on stderr, `doctor` lists it and leaves `config` `ready`, Settings lists
   it, and the TUI's bottom row says nothing. A save keeps the table, and
   `--generate-config` does not write an empty one.
@@ -70,6 +69,15 @@ All notable changes to NetWatch will be documented in this file.
 - **Move `--api-key KEY` to `NETWATCH_API_KEY=KEY`.** Nothing stops working, but the
   flag now warns on stderr, so a wrapper that treats stderr output as failure sees it.
   The units in `packaging/` already use the variable.
+- **Delete `config.toml` before `--generate-config` if you want a clean file.** It
+  still sets every key netwatch reads to its default, but it now keeps your comments and
+  any key netwatch does not read, where it used to overwrite the whole file.
+- **Fix or remove any key netwatch now warns about.** The setting never did anything. A
+  wrapper that treats stderr output as failure will see the warning.
+- **If you parse the JSON in PCAPNG packet comments, check `schema`.** REFERENCE used to
+  promise this layout as stable, and `netwatch.annotation.v1` is now experimental. Its
+  keys can change in any release, and a key removed, renamed or changing meaning still
+  gets a new schema name.
 
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
@@ -95,8 +103,8 @@ All notable changes to NetWatch will be documented in this file.
 - **Saving config.toml no longer deletes what netwatch does not read.** Settings,
   `--generate-config` and a Diagnose target toggle rewrote the whole file from the
   struct, so a key from a newer version or a typo went, and so did the warning about
-  it, with every comment in the file. A save now edits a file that loads in place:
-  those keys stay, comments stay, a value that has not changed keeps its spelling,
+  it, with every comment in the file. A save now edits a file that loads in place.
+  Those keys stay, comments stay, a value that has not changed keeps its spelling,
   and a changed one keeps its line's comment. `--generate-config` still sets every
   key netwatch reads to its default, and still empties `diagnose_targets`, whose
   entries take their own keys with them. A removed key such as `geoip_online` still

@@ -2017,9 +2017,24 @@ block = {
             ]
         );
 
+        // Promoting reloads the file, and the log says each key once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let logged = Arc::new(AtomicUsize::new(0));
         let mut profiler = EgressProfiler::new();
-        profiler.reload_policy(&path);
-        profiler.reload_policy(&path);
+        let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&logged)));
+        tracing::subscriber::with_default(subscriber, || {
+            profiler.reload_policy(&path);
+            profiler.reload_policy(&path);
+        });
+        assert_eq!(logged.load(Ordering::Relaxed), 4);
         assert_eq!(profiler.policy_warnings().len(), 4);
         write_owner_only(&path, b"strict = true\n").unwrap();
         profiler.reload_policy(&path);

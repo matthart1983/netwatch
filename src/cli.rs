@@ -59,7 +59,7 @@ const OPTIONS: &[(&str, bool, &str)] = &[
 /// What `--api-key` prints on stderr. Names the replacement and why, and it is a
 /// constant so that it cannot pick up the key. The flag keeps working until 2.0:
 /// units and scripts use it.
-pub const API_KEY_DEPRECATION: &str = "--api-key is deprecated and will go in 2.0: any user on this host can read the key with ps. Set NETWATCH_API_KEY instead.";
+pub const API_KEY_DEPRECATION: &str = "--api-key is deprecated and will go in 2.0, because any user on this host can read the key with ps. Set NETWATCH_API_KEY instead.";
 pub fn help() -> String {
     let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus --unstable [--only ID] [DIR]\n       netwatch diagnose replay --unstable [--json] <FILE|DIR>...\n       netwatch diagnose features --unstable [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch geoip update [--city]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]  (experimental)\n       netwatch resolver recover --unmanaged  (experimental)\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
     for (name, value, description) in OPTIONS {

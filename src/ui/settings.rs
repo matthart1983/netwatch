@@ -412,6 +412,10 @@ fn format_bandwidth(bytes: u64) -> String {
     }
 }
 
+/// How many of the keys a config got wrong the popup lists. It cannot scroll, and
+/// a file from another version can hold any number.
+const MAX_CONFIG_NOTES: usize = 5;
+
 /// One row of the sandbox detail in the popup.
 struct SandboxRow {
     indent: usize,
@@ -528,7 +532,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     notes.push(capabilities.compact());
     notes.extend(capabilities.connection_table_line());
-    notes.extend(app.config_warnings().map(|warning| warning.short()));
+    let ignored: Vec<_> = app.config_warnings().collect();
+    notes.extend(ignored.iter().take(MAX_CONFIG_NOTES).map(|w| w.short()));
+    if ignored.len() > MAX_CONFIG_NOTES {
+        notes.push(format!(
+            "+{} more: netwatch doctor lists them",
+            ignored.len() - MAX_CONFIG_NOTES
+        ));
+    }
     let note_rows: Vec<(usize, String)> = notes
         .iter()
         .flat_map(|note| {
@@ -971,6 +982,21 @@ mod tests {
                 assert!(text.contains(needle), "{width}: {needle} in {text}");
             }
         }
+
+        let many: String = (0..8).map(|n| format!("key_{n} = 1\n")).collect();
+        let config = NetwatchConfig::from_toml(&many, std::path::Path::new("config.toml")).unwrap();
+        let app = App::prepare_with_config(config);
+        let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(text.matches("unknown key").count(), MAX_CONFIG_NOTES);
+        assert!(text.contains("+3 more: netwatch doctor"), "{text}");
     }
 
     /// Settings redraws the live capability snapshot, which is how a date chrono

@@ -1613,6 +1613,54 @@ anything = "goes"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Tables new to the file go after what is there, a table's own entries after
+    /// it, and the user's stay in their order, wherever the new ones came from.
+    #[test]
+    fn a_save_adds_tables_after_the_ones_the_file_has() {
+        let dir = scratch("save_tables");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "[stray_1]\na = 1\n[stray_2]\na = 1\n[stray_3]\na = 1\n[stray_4]\na = 1\n\
+             [stray_5]\na = 1\n[diagnose_probes]\ntrace_target = \"9.9.9.9\"\n",
+        )
+        .unwrap();
+        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        cfg.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        let at = |needle: &str| {
+            saved
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} not in\n{saved}"))
+        };
+        assert!(at("[stray_1]") < at("[stray_5]"), "{saved}");
+        assert!(at("[stray_5]") < at("[diagnose_probes]"), "{saved}");
+        assert!(
+            at("[diagnose_probes]") < at("[[diagnose_probes.ipv6_pairs]]"),
+            "{saved}"
+        );
+        assert!(at("[stray_5]") < at("[alerts]"), "{saved}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The check at the end of a save: a merge that would change what the file
+    /// means is refused, and the file stays. Nothing a user can do should reach
+    /// this, so it takes a list of keys to keep that names a key netwatch reads:
+    /// the table should go, as it holds what a default config does not.
+    #[test]
+    fn a_merge_that_does_not_read_back_is_refused() {
+        let text = "[diagnose_thresholds]\nsigma_k = 9.0\n";
+        let keep = [vec!["diagnose_thresholds".to_owned()]];
+        let err = NetwatchConfig::default()
+            .merged_into(text, &keep)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot update it in place"),
+            "{err}"
+        );
+        assert!(NetwatchConfig::default().merged_into(text, &[]).is_ok());
+    }
+
     /// `--generate-config` resets what netwatch reads. It cannot reset what it
     /// does not, and a list it empties takes the entries' own keys with it.
     #[test]

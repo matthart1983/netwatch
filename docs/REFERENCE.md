@@ -127,7 +127,7 @@ share evidence with someone else, `netwatch diagnose export` writes a pseudonymi
 
 Classic PCAP and the PCAPNG blocks below are the standard formats, so any reader of them can open
 these files. The JSON in packet comments, `netwatch.annotation.v1`, is experimental and outside
-the 1.0 compatibility promise: its keys can change in any release. A change that removes or
+the 1.0 compatibility promise. Its keys can change in any release. A change that removes or
 renames one, or changes its meaning, gets a new schema name, so a parser can tell.
 
 **Classic PCAP**: little-endian, magic `0xa1b2c3d4` (microsecond timestamps), version 2.4,
@@ -351,10 +351,10 @@ Sharp edges handled for you:
   with a loud log warning. If anyone but the owner can edit the policy, "warn on
   drift" could be silenced by the very thing drifting. `chmod 644` or stricter.
 - **Unknown keys**: a key the policy does not read is ignored and reported, naming the
-  key and the file: on stderr when a session starts, in the log, in Settings, in the
-  Egress tab's header and in `netwatch doctor`, as for
-  [`config.toml`](#configuration). It matters more here. An empty list means
-  unrestricted, so `allow_snis` for `allow_sni` is a rule that restricts no name.
+  key and the file, on stderr when a session starts, in the log, in Settings, in the
+  Egress tab and in `netwatch doctor`, as for [`config.toml`](#configuration). It
+  matters more here. An empty list means unrestricted, so `allow_snis` for `allow_sni`
+  is a rule that restricts no name. The tab stops calling such a policy `all precise`.
   Promoting a rule keeps such a key, as it keeps the rule's `block` table.
 
 **Structured export.** Press `e` on the Egress tab to write the attributed
@@ -477,7 +477,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. `set` and `recover` are experimental. |
-| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
+| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Keeps your comments and any key it does not read; delete the file first for a clean one. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
 
 `diagnose replay`, `features` and `corpus` read and write episode, feature and corpus formats
@@ -959,9 +959,9 @@ warns `<old> was renamed <new> in <release>` in the same places. `netwatch docto
 writes the new name. No key has been renamed so far. `geoip_online` below was removed.
 
 The `[experimental]` table is for settings that can still change, and is outside the 1.0
-compatibility promise: a key in it can change meaning or go away in any release. Nothing is in
+compatibility promise. A key in it can change meaning or go away in any release. Nothing is in
 it yet. A key in it this version does not read is expected rather than a mistake, so it does not
-warn as unknown: stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
+warn as unknown. stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
 `ready`, Settings lists it, and the TUI's bottom row says nothing. A save keeps the table.
 
 A save keeps those keys. Settings and `--generate-config` edit a file that loads in place, so
@@ -1078,7 +1078,7 @@ port_scan_window_secs = 30          # detection window
 
 ### AI Insights
 
-Experimental, like the feature: these three can change in any release.
+Experimental, like the feature. These three can change in any release.
 
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
@@ -1090,7 +1090,7 @@ Experimental, like the feature: these three can change in any release.
 
 ## AI Insights
 
-Experimental: this can change or go away in any release, and is outside the 1.0 compatibility
+Experimental. This can change or go away in any release, and is outside the 1.0 compatibility
 promise.
 
 Insights is opt-in commentary inside **Diagnose (`9`)**, below the findings.

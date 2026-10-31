@@ -1,6 +1,6 @@
 # AI Insights
 
-Experimental: this can change or go away in any release, and is outside the 1.0 compatibility
+Experimental. This can change or go away in any release, and is outside the 1.0 compatibility
 promise.
 
 Insights is optional AI commentary inside **Diagnose (tab `9`)**, below the

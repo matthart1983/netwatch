@@ -47,7 +47,7 @@ These can change or go away in any release, and are outside the 1.0 compatibilit
 - Anything in the `[experimental]` table of `config.toml`.
 
 Only `diagnose replay`, `features` and `corpus` are gated. The rest are opt-in already, and a gate
-would break setups that work today. Rules marked beta are separate: they show their marker wherever
+would break setups that work today. Rules marked beta are separate, and show their marker wherever
 a rule does.
 
 ## Platform tiers (draft for 1.0)
