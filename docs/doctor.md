@@ -169,8 +169,10 @@ this build rather than a session you already have.
 
 ## Output contract
 
-JSON uses `schema_version: 1`, a `scope` (`static` or `capture_check`), `platform`,
-selected `interface`, `capabilities`, `protections` and `network_restricted`.
+[`schemas/doctor.v1.schema.json`](../schemas/doctor.v1.schema.json) describes the JSON, and
+[JSON schemas](REFERENCE.md#json-schemas) has the rules it follows. JSON uses a `metadata` block
+naming that schema, `schema_version: 1`, a `scope` (`static` or `capture_check`), `platform`,
+selected `interface` (null when there is none), `capabilities`, `protections` and `network_restricted`, which is deprecated.
 The additive `attribution_coverage` field is null in doctor reports; only runtime
 snapshots contain observed coverage. See [attribution evidence](attribution.md).
 The additive `landlock` and `tasks_holding_net_raw` fields are described under

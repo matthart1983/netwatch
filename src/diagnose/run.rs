@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 /// the interface, not an implementation detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The run completed and found no Issue. Not a claim that the host is
-    /// healthy — only that the rules that could be evaluated did not fire.
-    /// Observations may still be listed.
+    /// The run completed and no Issue counted. Not a claim that the host is
+    /// healthy. A beta rule's Issue may be listed, since it counts only with
+    /// `--include-beta`, and Observations may be too.
     NoFinding = 0,
     /// The run completed and found at least one open Issue. An Observation,
     /// such as a symmetric NAT, never sets this.
@@ -469,6 +469,7 @@ fn json_report(
             .collect()
     };
     serde_json::json!({
+        "metadata": crate::schemas::DIAGNOSE_RUN.metadata(),
         "schema": 2,
         "version": env!("CARGO_PKG_VERSION"),
         "ruleset": super::rules::CATALOGUE.len(),
@@ -827,6 +828,8 @@ mod tests {
         );
         assert_eq!(json["issues"][0]["beta"], true);
         assert_eq!(json["include_beta"], false);
+        // No finding, exit 0, and an Issue listed: the schema has to allow it.
+        crate::schemas::test_support::check(crate::schemas::DIAGNOSE_RUN.file, &json);
     }
 
     #[test]
@@ -975,6 +978,138 @@ mod tests {
         assert_eq!(observations[0]["rule"], "nat.symmetric");
         // The finding's own `kind` sits beside the subject's, not over it.
         assert_eq!(observations[0]["subject"]["kind"], "host");
+    }
+
+    /// What the fixture's faults write, against
+    /// schemas/diagnose-run.v2.schema.json. The binary reaches only the target
+    /// rules on a test machine (tests/schemas.rs), and this reaches the
+    /// fixture's other findings, every check state and an Observation. The
+    /// second report is one no run writes today, a finding with everything a
+    /// session can put on one, so the fields a run leaves empty are described
+    /// by what they hold and not only by a null.
+    #[test]
+    fn the_fixture_s_findings_match_the_schema() {
+        use crate::diagnose::issue::{Action, Applied, Capability, IssueState, Step, Verification};
+        use crate::diagnose::next_test::{Outcome as TestOutcome, TestRun};
+        use crate::schemas::{test_support as schema, DIAGNOSE_RUN};
+
+        let (engine, _) = crate::diagnose::fixture::run();
+        let mut findings = select(engine.issues(), None);
+        findings.push(symmetric_nat());
+        let json = json_report(
+            outcome(&findings, true, false),
+            &sampling(true),
+            engine.coverage(),
+            &findings,
+            false,
+        );
+        schema::check(DIAGNOSE_RUN.file, &json);
+        assert_eq!(json["metadata"]["schema"], DIAGNOSE_RUN.schema);
+        assert_eq!(
+            json["metadata"]["schema_version"],
+            json["schema"].to_string()
+        );
+
+        let subjects = [
+            Subject::Host,
+            Subject::Egress {
+                process: "curl".into(),
+                destination: "example.com".into(),
+                port: 443,
+            },
+            Subject::Resolver {
+                addr: "192.0.2.53".into(),
+            },
+            Subject::Path {
+                target: "192.0.2.1".into(),
+            },
+            Subject::Socket {
+                local: "192.0.2.2:5000".into(),
+                remote: "192.0.2.1:443".into(),
+            },
+            Subject::Iface {
+                name: "eth0".into(),
+            },
+            Subject::Process {
+                name: "curl".into(),
+                pid: None,
+            },
+            Subject::Process {
+                name: "curl".into(),
+                pid: Some(7),
+            },
+            Subject::Target { name: "api".into() },
+        ];
+        let rich: Vec<Issue> = subjects
+            .into_iter()
+            .enumerate()
+            .map(|(n, subject)| {
+                let mut f = finding(&n.to_string(), "gateway.unreachable", subject);
+                f.stale_since = Some("2026-09-15 10:00:01".into());
+                f.beta = true;
+                f.state = IssueState::Acked;
+                f.scope.configuration = Some("target-config:abc".into());
+                f.scope.via_iface = Some("eth0".into());
+                f.scope.via_resolver = Some("192.0.2.53".into());
+                f.scope.processes_measured = true;
+                f.scope.processes = vec!["curl".into()];
+                f.scope.note = Some("a note".into());
+                f.evidence =
+                    vec![
+                        crate::diagnose::issue::Evidence::new("gateway.loss", 100.0, "%")
+                            .with_baseline(0.5, 0.25)
+                            .with_window(30, 30),
+                    ];
+                let mut apply = Step::apply(
+                    '1',
+                    "switch",
+                    "detail",
+                    Action::SetResolver {
+                        addr: "192.0.2.53".into(),
+                    },
+                    Capability::Root,
+                );
+                apply.applied = Some(Applied::No {
+                    reason: "needs root".into(),
+                });
+                f.remediation = vec![
+                    Step::instruct("do", "this"),
+                    Step::escalate("ask", "them"),
+                    apply,
+                ];
+                f.artifacts = vec!["capture.pcapng".into()];
+                f.consequences = vec!["9".into()];
+                f.suppressed_by = Some("8".into());
+                f.recurrence = 2;
+                f.tests = vec![TestRun {
+                    test: "load.idle_vs_loaded".into(),
+                    at: "2026-09-15 10:00:00".into(),
+                    outcome: TestOutcome::Inconclusive,
+                    detail: "no reply".into(),
+                    measurements: [("rtt".to_string(), 1.5)].into_iter().collect(),
+                    after_action: false,
+                }];
+                f.verification = Some(Verification {
+                    step: 0,
+                    action_at: "2026-09-15 10:00:00".into(),
+                    holding_at_action: false,
+                    top_cause: None,
+                    supporting: vec![],
+                    outcome: None,
+                    decided_at: None,
+                });
+                f
+            })
+            .collect();
+        let json = json_report(
+            outcome(&rich, true, true),
+            &sampling(false),
+            &Coverage::default(),
+            &rich,
+            true,
+        );
+        schema::check(DIAGNOSE_RUN.file, &json);
+        assert_eq!(json["issues"].as_array().unwrap().len(), rich.len());
     }
 
     #[test]
