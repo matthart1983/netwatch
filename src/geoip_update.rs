@@ -746,10 +746,10 @@ mod tests {
             http_date(UNIX_EPOCH + Duration::from_secs(1_790_818_572)).as_deref(),
             Some("Thu, 01 Oct 2026 01:36:12 GMT")
         );
-        assert_eq!(
-            http_date(UNIX_EPOCH + Duration::from_secs(9_000_000_000_000)),
-            None
-        );
+        // Windows' SystemTime cannot hold this at all, so there is nothing to send.
+        if let Some(far) = UNIX_EPOCH.checked_add(Duration::from_secs(9_000_000_000_000)) {
+            assert_eq!(http_date(far), None);
+        }
         assert_eq!(http_date(UNIX_EPOCH - Duration::from_secs(1)), None);
     }
 
