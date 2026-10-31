@@ -4,6 +4,75 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Migration
+- **Add `--unstable` to `diagnose replay`, `diagnose features` and `diagnose corpus`.**
+  `netwatch diagnose replay FILE` becomes `netwatch diagnose replay --unstable FILE`,
+  and likewise `features` and `corpus`. A script that does not gets exit 3. The flag
+  goes after the subcommand, in any position among its arguments.
+- **Move `--api-key KEY` to `NETWATCH_API_KEY=KEY`.** Nothing stops working, but the
+  flag now warns on stderr, so a wrapper that treats stderr output as failure sees it.
+  The units in `packaging/` already use the variable.
+- **Delete `config.toml` before `--generate-config` if you want to start again.** It used
+  to overwrite the file with the defaults. It now adds the keys the file lacks and keeps
+  what it has, so it no longer resets anything.
+- **Delete `diagnose_targets = []` from a generated file before adding a target.** Older
+  releases wrote that line, and TOML does not allow it and `[[diagnose_targets]]` together.
+- **Fix or remove any key netwatch now warns about.** The setting never did anything. A
+  wrapper that treats stderr output as failure will see the warning.
+- **If you parse the JSON in PCAPNG packet comments, check `schema`.** REFERENCE used to
+  promise this layout as stable, and `netwatch.annotation.v1` is now experimental. Its
+  keys can change in any release, and a key removed, renamed or changing meaning still
+  gets a new schema name.
+- **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
+  name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
+  said `"tls"`, and keeps its name in `sni`.
+- **`doctor --json` consumers: test `interface` for null, not for an empty string.**
+  A capture check that selected no interface wrote `""` and now writes `null`.
+- **A save writes only what the session changed.** Settings and the Diagnose target
+  toggle rewrote the whole file from the session's copy. A key netwatch does not read
+  went, with the warning about it and every comment in the file. So did a hand edit made
+  while netwatch ran, which is how `sandbox = "strict"` could go back to `on` when a
+  session saved a theme. `refresh_rate_ms = 50` became 100 and `view = "future_view"`
+  became `full` on an unrelated save. Every save also wrote every default, growing a
+  one-line file to 49 lines and holding today's defaults there when a release changed
+  one. Now a save compares the session's values with what it loaded and changes those
+  keys in the file, keeping the line's comment. Everything else stays as the file has it.
+  If you and the session changed the same key, the session's value wins for that key
+  alone. A target is found by `name`, so entries reordered by hand keep their own
+  comments and keys, a target added by hand survives, and `d` changes only that target's
+  `enabled`. `d` on a target the file no longer has fails and leaves the file. `--view`
+  is for one run, and a save no longer makes it the default. With nothing to write, the
+  file is not touched. A save that does write drops a byte-order mark and ends every line
+  in LF. Removing `geoip_online` also removes a comment directly above it. If the result
+  would not read back as the file plus those changes, the save fails and the file stays.
+- **A save that cannot finish keeps the old file.** `config.toml` and `egress-policy.toml`
+  were truncated and then written, so a full disk could leave half a file. A config cut
+  off at `view = "ful` then stopped netwatch starting, and a lost policy silences every
+  rule. The new contents now go to a temporary file beside the old one, are synced and are
+  renamed over it. The file keeps its mode, a symlink stays and its target is what changes,
+  and a file you made read-only stays refused. Where a rename cannot work, in a directory
+  you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
+  place, as before. The learned egress baseline is written the same way.
+- **A warning that cannot be printed no longer changes how `diagnose run` ends.** With
+  stderr on a full disk or a closed pipe, printing panicked, so `diagnose run --format json`
+  exited 101 with no report, which is not one of its statuses. A failed write to stderr or
+  to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
+  the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
+- **A failed save in Settings stays on screen.** Its status was the last row of the
+  popup's list, so a short terminal cut it off, and with eight unknown keys at 120 columns
+  it needed 44 rows. It now has a row of its own above the footer, at any height the popup
+  opens at, and `✗ Save failed` is in the error colour, not the success one.
+- **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
+  thing that writes defaults. A new file gets every key. A file that exists gains the
+  keys it lacks and keeps what it has, values included. It no longer writes
+  `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
+  append a TOML error, so the file then failed to load with `config_invalid`.
+- **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
+  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key in the
+  rule was lost, with the comments in it and directly above it, and for the file's first
+  rule, the file's header. They all stay now. A list that gains an entry is rewritten on one
+  line, so a comment inside that list goes, and its line's own comment stays.
+
 ### Added
 - **`STABILITY.md` says what 1.0 promises.** Subcommands, long flags, `config.toml`
   and `egress-policy.toml` keys, the versioned JSON outputs, `diagnose run` exit
@@ -84,26 +153,41 @@ All notable changes to NetWatch will be documented in this file.
   call the whole export layout stable. PCAP and PCAPNG are still the standard formats,
   and `netwatch.annotation.v1` still gets a new schema name if a key is removed, renamed
   or changes meaning, but the comments' keys no longer carry a compatibility promise.
+- **The notice for a resolver change left by 0.30 now names the file and says how
+  to put it back.** Netwatch 0.30 recorded live resolver changes in `applied.json`.
+  Since 0.31.1 nothing has restored an entry left open there, because nothing proves
+  who wrote the file. Diagnose said `automatic rollback disabled` and gave the backup,
+  but not the changed file or the next step, and nothing said that removing the journal
+  is what clears the notice. It now says all three. The steps are in [the recovery document](docs/recovery-store.md#legacy-journal):
+  compare `/etc/resolv.conf` with the text the entry says netwatch wrote, copy the backup
+  back as root only if they match, then remove `applied.json`, which is what clears the
+  notice. A backup file alone proves nothing, since no release removes them, so a session
+  that quit cleanly leaves one too. This only reaches someone whose 0.30
+  session was killed with a change in place. `netwatch resolver recover` restores what an
+  interrupted `netwatch resolver set` left, and tests now hold that to a journal and backup
+  a real 0.31.1 wrote.
+- **`netwatch resolver status` and `recover` no longer read as all clear when a 0.30
+  journal has an entry open.** On that host `recover` said `Recovered 0 resolver
+  operations` and `status` said `No resolver authority journal`, with `/etc/resolv.conf`
+  possibly still changed. Both now print the same notice, naming the file and the
+  backup, on Linux. They restore nothing from the journal. `recover`'s exit status stays
+  as it was and does not depend on the journal: 0 when no unresolved record is left in
+  its own store, 1 otherwise. A file a user can write must not be able to fail a root
+  command, so read the output, not just the exit status.
+- **A 0.30 journal entry marked `abandoned` now gets the notice too.** 0.30 and 0.31.0
+  wrote that state when a rollback gave up, either because the backup was missing, which
+  left the file as netwatch set it, or because the file had been edited since. Those
+  entries said nothing, so the resolver could still hold netwatch's change with `recover`
+  saying `Recovered 0`. The journal does not record which it was, so this notice says that
+  and does not offer the backup as the way back. If you have one, the notice stays until
+  you remove `applied.json`.
 
-### Migration
-- **Add `--unstable` to `diagnose replay`, `diagnose features` and `diagnose corpus`.**
-  `netwatch diagnose replay FILE` becomes `netwatch diagnose replay --unstable FILE`,
-  and likewise `features` and `corpus`. A script that does not gets exit 3. The flag
-  goes after the subcommand, in any position among its arguments.
-- **Move `--api-key KEY` to `NETWATCH_API_KEY=KEY`.** Nothing stops working, but the
-  flag now warns on stderr, so a wrapper that treats stderr output as failure sees it.
-  The units in `packaging/` already use the variable.
-- **Delete `config.toml` before `--generate-config` if you want to start again.** It used
-  to overwrite the file with the defaults. It now adds the keys the file lacks and keeps
-  what it has, so it no longer resets anything.
-- **Delete `diagnose_targets = []` from a generated file before adding a target.** Older
-  releases wrote that line, and TOML does not allow it and `[[diagnose_targets]]` together.
-- **Fix or remove any key netwatch now warns about.** The setting never did anything. A
-  wrapper that treats stderr output as failure will see the warning.
-- **If you parse the JSON in PCAPNG packet comments, check `schema`.** REFERENCE used to
-  promise this layout as stable, and `netwatch.annotation.v1` is now experimental. Its
-  keys can change in any release, and a key removed, renamed or changing meaning still
-  gets a new schema name.
+### Removed
+- **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,
+  and the code that wrote the journal went in 0.33. That leaves netwatch reading
+  `applied.json` and never writing it or opening a path it names. The notices about
+  an unreadable journal no longer say `host changes blocked`, since no host change
+  was waiting on them. No behaviour changes beyond that wording.
 
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
@@ -157,45 +241,10 @@ All notable changes to NetWatch will be documented in this file.
   as regular files under a size limit, without following a symlink at that name. A bad
   `applied.json` gets the usual notice, with `cannot read journal`, and bad baselines start
   afresh. `applied.json` must also be this user's own, and baselines need not be, since a
-  `sudo` that keeps HOME leaves them root's. `config.toml`, `egress-policy.toml` and
-  `egress-profiles.json` still get an ordinary read.
-
-### Changed
-- **The notice for a resolver change left by 0.30 now names the file and says how
-  to put it back.** Netwatch 0.30 recorded live resolver changes in `applied.json`.
-  Since 0.31.1 nothing has restored an entry left open there, because nothing proves
-  who wrote the file. Diagnose said `automatic rollback disabled` and gave the backup,
-  but not the changed file or the next step, and nothing said that removing the journal
-  is what clears the notice. It now says all three. The steps are in [the recovery document](docs/recovery-store.md#legacy-journal):
-  compare `/etc/resolv.conf` with the text the entry says netwatch wrote, copy the backup
-  back as root only if they match, then remove `applied.json`, which is what clears the
-  notice. A backup file alone proves nothing, since no release removes them, so a session
-  that quit cleanly leaves one too. This only reaches someone whose 0.30
-  session was killed with a change in place. `netwatch resolver recover` restores what an
-  interrupted `netwatch resolver set` left, and tests now hold that to a journal and backup
-  a real 0.31.1 wrote.
-- **`netwatch resolver status` and `recover` no longer read as all clear when a 0.30
-  journal has an entry open.** On that host `recover` said `Recovered 0 resolver
-  operations` and `status` said `No resolver authority journal`, with `/etc/resolv.conf`
-  possibly still changed. Both now print the same notice, naming the file and the
-  backup, on Linux. They restore nothing from the journal. `recover`'s exit status stays
-  as it was and does not depend on the journal: 0 when no unresolved record is left in
-  its own store, 1 otherwise. A file a user can write must not be able to fail a root
-  command, so read the output, not just the exit status.
-- **A 0.30 journal entry marked `abandoned` now gets the notice too.** 0.30 and 0.31.0
-  wrote that state when a rollback gave up, either because the backup was missing, which
-  left the file as netwatch set it, or because the file had been edited since. Those
-  entries said nothing, so the resolver could still hold netwatch's change with `recover`
-  saying `Recovered 0`. The journal does not record which it was, so this notice says that
-  and does not offer the backup as the way back. If you have one, the notice stays until
-  you remove `applied.json`.
-
-### Removed
-- **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,
-  and the code that wrote the journal went in 0.33. That leaves netwatch reading
-  `applied.json` and never writing it or opening a path it names. The notices about
-  an unreadable journal no longer say `host changes blocked`, since no host change
-  was waiting on them. No behaviour changes beyond that wording.
+  `sudo` that keeps HOME leaves them root's.
+- **The same goes for `config.toml`, `egress-policy.toml` and `egress-profiles.json`.**
+  Each is now read only as a regular file under a size limit. `config.toml` and the
+  policy can still be symlinks. A policy netwatch can't read logs a warning.
 
 ### Dependencies
 - **`unicode-width` is pinned to 0.2.2.** 0.2.3 counts a halfwidth katakana sound
@@ -217,57 +266,6 @@ All notable changes to NetWatch will be documented in this file.
   nothing.** With no `--interface` given and no interface up, or on Windows with no
   Npcap, it wrote `"interface": ""`, which reads as a name. It now writes the null
   it writes everywhere else there is no interface.
-
-### Migration
-- **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
-  name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
-  said `"tls"`, and keeps its name in `sni`.
-- **`doctor --json` consumers: test `interface` for null, not for an empty string.**
-  A capture check that selected no interface wrote `""` and now writes `null`.
-- **A save writes only what the session changed.** Settings and the Diagnose target
-  toggle rewrote the whole file from the session's copy. A key netwatch does not read
-  went, with the warning about it and every comment in the file. So did a hand edit made
-  while netwatch ran, which is how `sandbox = "strict"` could go back to `on` when a
-  session saved a theme. `refresh_rate_ms = 50` became 100 and `view = "future_view"`
-  became `full` on an unrelated save. Every save also wrote every default, growing a
-  one-line file to 49 lines and holding today's defaults there when a release changed
-  one. Now a save compares the session's values with what it loaded and changes those
-  keys in the file, keeping the line's comment. Everything else stays as the file has it.
-  If you and the session changed the same key, the session's value wins for that key
-  alone. A target is found by `name`, so entries reordered by hand keep their own
-  comments and keys, a target added by hand survives, and `d` changes only that target's
-  `enabled`. `d` on a target the file no longer has fails and leaves the file. `--view`
-  is for one run, and a save no longer makes it the default. With nothing to write, the
-  file is not touched. A save that does write drops a byte-order mark and ends every line
-  in LF. Removing `geoip_online` also removes a comment directly above it. If the result
-  would not read back as the file plus those changes, the save fails and the file stays.
-- **A save that cannot finish keeps the old file.** `config.toml` and `egress-policy.toml`
-  were truncated and then written, so a full disk could leave half a file. A config cut
-  off at `view = "ful` then stopped netwatch starting, and a lost policy silences every
-  rule. The new contents now go to a temporary file beside the old one, are synced and are
-  renamed over it. The file keeps its mode, a symlink stays and its target is what changes,
-  and a file you made read-only stays refused. Where a rename cannot work, in a directory
-  you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
-  place, as before. The learned egress baseline is written the same way.
-- **A warning that cannot be printed no longer changes how `diagnose run` ends.** With
-  stderr on a full disk or a closed pipe, printing panicked, so `diagnose run --format json`
-  exited 101 with no report, which is not one of its statuses. A failed write to stderr or
-  to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
-  the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
-- **A failed save in Settings stays on screen.** Its status was the last row of the
-  popup's list, so a short terminal cut it off, and with eight unknown keys at 120 columns
-  it needed 44 rows. It now has a row of its own above the footer, at any height the popup
-  opens at, and `✗ Save failed` is in the error colour, not the success one.
-- **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
-  thing that writes defaults. A new file gets every key. A file that exists gains the
-  keys it lacks and keeps what it has, values included. It no longer writes
-  `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
-  append a TOML error, so the file then failed to load with `config_invalid`.
-- **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
-  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key in the
-  rule was lost, with the comments in it and directly above it, and for the file's first
-  rule, the file's header. They all stay now. A list that gains an entry is rewritten on one
-  line, so a comment inside that list goes, and its line's own comment stays.
 
 ## [0.39.0] - 2026-10-31
 

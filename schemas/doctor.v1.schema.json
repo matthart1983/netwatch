@@ -78,7 +78,7 @@
         "id": {
           "type": "string",
           "description": "Which capability this is. Not every id appears on every platform or scope. Open set: a minor may add an id, so ignore one you do not know.",
-          "examples": ["config", "interface", "capture_library", "capture", "attribution", "attribution_coverage", "connections", "probes", "tcp_metrics", "sandbox", "landlock", "geoip_db", "online_geo", "insights", "whois", "reverse_dns", "remote", "metrics", "resolver"]
+          "examples": ["config", "interface", "capture_library", "capture", "attribution", "attribution_coverage", "connections", "probes", "tcp_metrics", "sandbox", "landlock", "geoip_db", "online_geo", "insights", "whois", "reverse_dns", "remote", "metrics", "resolver", "resolver_store"]
         },
         "state": {
           "enum": ["ready", "not_checked", "unavailable", "disabled", "degraded", "stale"],
@@ -104,7 +104,9 @@
             "configuration_only", "cleartext_off_host", "collector_status", "not_started",
             "demand_driven", "live_lookup_worker",
             "startup_configuration", "environment_only", "worker_entry_only",
-            "authority_not_granted", "resolver_ownership"
+            "authority_not_granted", "resolver_ownership",
+            "authority_store_unreadable",
+            "config_unknown_keys", "config_renamed_keys"
           ]
         },
         "detail": { "type": "string", "description": "Explanation in words. The wording is not stable." },

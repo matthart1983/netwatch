@@ -285,9 +285,10 @@ write: /dev/null
    symlink at that name, so a FIFO or a link to a device there cannot hang it. The
    journal is evidence and nothing more: netwatch reads it only if this user owns it,
    reports the paths it names, opens neither and writes neither, even as root
-   ([recovery store](recovery-store.md#legacy-journal)). `config.toml`,
-   `egress-policy.toml` and `egress-profiles.json` still get an ordinary read, so a FIFO
-   planted at one of them does stop the next start until it is removed.
+   ([recovery store](recovery-store.md#legacy-journal)). `config.toml` and
+   `egress-policy.toml` are read the same way, except that they may be symlinks, since a
+   dotfiles repository is an ordinary place for them. `egress-profiles.json` is not
+   followed.
 10. Subcommands returning before worker installation are outside this policy,
     including file-oriented operations ([dispatch](../src/main.rs#L20)). Static
     doctor is one, and opens the GeoIP databases it reports on unconfined.

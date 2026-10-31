@@ -337,7 +337,7 @@ pub fn wildcard_suggestions(rule: &ProcessRule) -> Vec<String> {
     out
 }
 
-/// Load a policy from disk. `None` if the file is absent or unparseable.
+/// Load a policy from disk. `None` if the file is absent, unreadable or unparseable.
 /// On unix a group- or world-writable policy is **refused** (with a loud
 /// warning): the policy is a trust anchor — if anyone but the owner can
 /// edit it, "warn on drift" can be silenced by the very thing drifting.
@@ -358,7 +358,20 @@ pub fn load_policy_file(path: &Path) -> Option<EgressPolicy> {
             }
         }
     }
-    let contents = std::fs::read_to_string(path).ok()?;
+    let contents = match crate::owner_only::read_user_file(path) {
+        Ok(contents) => contents,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    target: "netwatch::egress",
+                    path = %path.display(),
+                    error = %e,
+                    "could not read egress policy"
+                );
+            }
+            return None;
+        }
+    };
     let (contents, moved) = apply_renames(&contents, RENAMED_KEYS);
     match from_toml_reporting_unread::<EgressPolicy>(&contents) {
         Ok((mut policy, unread)) => {
@@ -486,7 +499,7 @@ pub fn remove_rules_from_policy_file(
     names: &[String],
     path: &Path,
 ) -> std::io::Result<Vec<String>> {
-    let existing = match std::fs::read_to_string(path) {
+    let existing = match crate::owner_only::read_user_file(path) {
         Ok(s) => s,
         // Nothing declared anywhere: removing is vacuously done. Creating the
         // file here just to delete from it would be absurd.
@@ -584,7 +597,7 @@ pub fn merge_rules_into_policy_file(
     rules: &[(String, ProcessRule)],
     path: &Path,
 ) -> std::io::Result<()> {
-    let existing = match std::fs::read_to_string(path) {
+    let existing = match crate::owner_only::read_user_file(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => POLICY_HEADER.to_string(),
         Err(e) => return Err(e),

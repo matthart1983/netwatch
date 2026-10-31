@@ -1235,7 +1235,7 @@ impl EgressProfiler {
     /// instead of accreting forever). Best-effort: absent or unparseable
     /// files are ignored — the baseline re-learns.
     pub fn load_profiles(&mut self, path: &Path) {
-        let Ok(contents) = std::fs::read_to_string(path) else {
+        let Ok(contents) = crate::owner_only::read_saved(path, MAX_PROFILES_FILE) else {
             return;
         };
         let persisted: PersistedProfiles = match serde_json::from_str(&contents) {
@@ -1445,6 +1445,10 @@ struct PersistedDest {
     #[serde(default)]
     bytes_in: u64,
 }
+
+/// Far past a learned baseline's size. It is a file netwatch writes, so anything
+/// larger, or anything but a regular file, isn't what it wrote.
+const MAX_PROFILES_FILE: u64 = 64 << 20;
 
 /// Default learned-baseline location: `<state_dir>/netwatch/egress-profiles.json`
 /// (`~/.local/state` on Linux; falls back to the local data dir on macOS).
