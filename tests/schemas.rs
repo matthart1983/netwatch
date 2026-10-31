@@ -215,12 +215,19 @@ fn the_rule_ids_the_schema_lists_are_the_catalogue() {
     assert_eq!(listed, catalogue);
 }
 
-/// `cargo package` is what decides, so ask it rather than read Cargo.toml.
+/// `cargo package` is what decides, so ask it rather than read Cargo.toml. From
+/// a published crate there is no asking: cargo refuses a directory holding the
+/// `Cargo.toml.orig` it wrote there, and the files being here is the answer.
 #[test]
 fn the_schemas_ship_in_the_crate() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if root.join("Cargo.toml.orig").exists() {
+        assert_eq!(file_names().len(), schemas::ALL.len());
+        return;
+    }
     let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .args(["package", "--list", "--allow-dirty", "--offline"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(root)
         .output()
         .unwrap();
     let listed = String::from_utf8_lossy(&output.stdout);
