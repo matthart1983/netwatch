@@ -1414,10 +1414,10 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         .first()
         .is_some_and(|sub| UNSTABLE_SUBCOMMANDS.contains(&sub.as_str()));
     if unstable && !args.iter().any(|arg| arg == "--unstable") {
-        eprintln!(
+        crate::logging::stderr_line(&format!(
             "error: netwatch diagnose {} needs --unstable, because its format is experimental and can change in any release",
             args[0]
-        );
+        ));
         std::process::exit(super::run::Outcome::Error as i32);
     }
     let args: Vec<String> = args

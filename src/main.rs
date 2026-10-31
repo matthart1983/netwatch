@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     // and `record_uptime` included.
     let api_key_flag = options.api_key.is_some();
     if api_key_flag {
-        eprintln!("warning: {}", netwatch::cli::API_KEY_DEPRECATION);
+        netwatch::logging::stderr_line(&format!("warning: {}", netwatch::cli::API_KEY_DEPRECATION));
     }
     let config = NetwatchConfig::load()?;
     // The TUI is about to hide stderr, and these are back in view when it

@@ -127,6 +127,11 @@ All notable changes to NetWatch will be documented in this file.
   and a file you made read-only stays refused. Where a rename cannot work, in a directory
   you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
   place, as before. The learned egress baseline is written the same way.
+- **A warning that cannot be printed no longer changes how `diagnose run` ends.** With
+  stderr on a full disk or a closed pipe, printing panicked, so `diagnose run --format json`
+  exited 101 with no report, which is not one of its statuses. A failed write to stderr or
+  to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
+  the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
 - **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
   thing that writes defaults. A new file gets every key. A file that exists gains the
   keys it lacks and keeps what it has, values included. It no longer writes

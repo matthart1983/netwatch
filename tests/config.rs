@@ -228,6 +228,87 @@ mod cli {
         assert!(!stderr.contains("value-sentinel"), "{stderr}");
     }
 
+    /// Nothing a command prints can change how it ends. `eprintln!` panics when
+    /// the write fails, so with stderr on a full disk `diagnose run --format json`
+    /// exited 101, which is not one of its statuses, and printed no report.
+    #[cfg(target_os = "linux")]
+    mod unwritable_output {
+        use super::super::Fixture;
+        use std::{
+            fs::{self, File},
+            process::{Command, Output, Stdio},
+        };
+
+        fn full() -> Stdio {
+            Stdio::from(File::options().write(true).open("/dev/full").unwrap())
+        }
+
+        /// Run with both stdout and stderr on a disk with no room.
+        fn run(fixture: &Fixture, args: &[&str]) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_netwatch"))
+                .args(args)
+                .env("HOME", &fixture.0)
+                .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+                .env("XDG_CACHE_HOME", fixture.0.join("cache"))
+                .env("XDG_STATE_HOME", fixture.0.join("state"))
+                .stdin(Stdio::null())
+                .stdout(full())
+                .stderr(full())
+                .output()
+                .unwrap()
+        }
+
+        fn with_warnings() -> Fixture {
+            let fixture = Fixture::new();
+            fs::write(
+                fixture.config(),
+                "sandbox_mode = 'strict'\n[experimental]\nx = 1\n[diagnose_thresholds]\nsigma_k = -1.0\n",
+            )
+            .unwrap();
+            fixture
+        }
+
+        #[test]
+        fn the_warnings_and_errors_keep_their_statuses() {
+            let fixture = with_warnings();
+            for (args, status) in [
+                // A config warning, an invalid threshold and its error line.
+                (
+                    &["diagnose", "run", "--format", "json", "--target", "none"][..],
+                    3,
+                ),
+                (&["diagnose", "run", "--budget", "1s"][..], 3),
+                // `--unstable`'s error.
+                (&["diagnose", "replay", "episode.json.gz"][..], 3),
+                // The config warnings and `--api-key`'s, then main's own error.
+                (&["--remote", "http://192.0.2.1", "--api-key", "k"][..], 1),
+            ] {
+                let output = run(&fixture, args);
+                assert_eq!(output.status.code(), Some(status), "{args:?}");
+            }
+        }
+
+        #[test]
+        fn a_whole_run_keeps_a_status_it_documents() {
+            let fixture = with_warnings();
+            for format in ["json", "text"] {
+                let output = run(
+                    &fixture,
+                    &["diagnose", "run", "--format", format, "--budget", "5s"],
+                );
+                let status = output.status.code();
+                assert!(matches!(status, Some(0..=3)), "{format}: exited {status:?}");
+            }
+        }
+
+        #[test]
+        fn coverage_is_not_taken_down_by_its_output() {
+            let fixture = with_warnings();
+            let output = run(&fixture, &["diagnose", "coverage", "--seconds", "1"]);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+        }
+    }
+
     /// The review's reproduction: a write limit standing in for a full disk left
     /// a config that ended mid-line, and netwatch then refused to start. Through
     /// `--generate-config`, which shares its writer with a Settings save.

@@ -493,7 +493,7 @@ pub fn print_warnings(warnings: &[ConfigWarning]) {
         } else {
             "warning"
         };
-        eprintln!("{level}: {warning}");
+        crate::logging::stderr_line(&format!("{level}: {warning}"));
     }
 }
 
