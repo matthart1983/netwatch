@@ -6,6 +6,7 @@
 //!
 //! Calls are synchronous, with no event and no APC routine: every caller is
 //! already on a worker thread of its own and waits for the answer anyway.
+#![allow(unsafe_code)]
 
 use crate::platform::icmp::{self, Echo};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

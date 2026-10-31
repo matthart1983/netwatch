@@ -13,6 +13,7 @@
 //! `vmactions/freebsd-vm` CI job is what proves these right or wrong — check
 //! its `cargo test` output first if interfaces/connections look wrong on a
 //! real BSD box.
+#![allow(unsafe_code)]
 
 use super::{InterfaceInfo, InterfaceStats};
 use anyhow::Result;

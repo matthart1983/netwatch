@@ -203,6 +203,7 @@ mod tests {
         /// reporting a panic would be asked to set it. `RUST_LIB_BACKTRACE`
         /// is 0, which anyhow documents for panic backtraces without error
         /// ones, so it must not turn the panic's off.
+        #[allow(unsafe_code)]
         pub fn run_child(name: &str, child: &str, backtrace: &str) -> Run {
             let size = Winsize {
                 ws_row: 24,

@@ -1,6 +1,8 @@
 //! Linux smoke check using a disposable sentinel, never real credentials.
 //! Applies strict policy on the actual probe worker; parent cleans up the fixture.
 //! The probe worker is a parser, so strict also needs Linux 6.7 or newer.
+#![allow(unsafe_code)]
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("sandbox_smoke is Linux-only");
@@ -33,6 +35,8 @@ fn main() -> anyhow::Result<()> {
             std::io::ErrorKind::PermissionDenied
         );
         std::fs::write(exports.join("allowed"), b"test-only").unwrap();
+        // SAFETY: socket takes three integers and reads no memory of ours; the
+        // descriptor it returns is checked below.
         let sock = unsafe {
             nix::libc::socket(
                 nix::libc::AF_INET,
@@ -41,6 +45,8 @@ fn main() -> anyhow::Result<()> {
             )
         };
         if sock >= 0 {
+            // SAFETY: `sock` is the descriptor socket just returned, checked
+            // non-negative above, owned by nothing else and not used again.
             unsafe {
                 nix::libc::close(sock);
             }
