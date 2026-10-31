@@ -7,6 +7,7 @@
 //! reads into the plain structs in `platform::ip_helper` while the API's
 //! buffer is alive; the decoding and every choice made from it live there,
 //! where they are tested on every platform.
+#![allow(unsafe_code)]
 
 use super::super::ip_helper::{self, Adapter, IfCounters, IfRow, Route};
 use super::{InterfaceInfo, InterfaceStats};

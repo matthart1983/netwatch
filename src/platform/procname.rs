@@ -122,6 +122,7 @@ pub fn name_from_path(path: &Path) -> Option<String> {
 /// `None` when the process is gone, is a kernel task with no image, or the
 /// caller lacks the privilege to ask.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 pub fn executable_path(pid: u32) -> Option<PathBuf> {
     // `proc_pidpath` lives in libproc, which is part of libSystem and so is
     // already linked — no extra dependency.
@@ -166,6 +167,7 @@ pub fn executable_path(pid: u32) -> Option<PathBuf> {
 /// 99999, kernel ceiling `PID_MAX` 999999), nowhere near this range, so
 /// rejecting it here costs nothing on legitimate input.
 #[cfg(target_os = "freebsd")]
+#[allow(unsafe_code)]
 pub fn executable_path(pid: u32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 

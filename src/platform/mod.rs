@@ -234,6 +234,7 @@ pub fn link_speed_bps(iface: &str) -> Option<u64> {
 /// Adding a fourth fork to the tick path to fetch one integer would be a poor
 /// trade.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[allow(unsafe_code)]
 pub fn link_speed_bps(iface: &str) -> Option<u64> {
     let mut ifap: *mut nix::libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` fills `ifap` with an owned list we free below.
@@ -258,6 +259,7 @@ pub fn link_speed_bps(iface: &str) -> Option<u64> {
 /// entry, a NUL-terminated name and a `sockaddr`, and an `AF_LINK` entry's
 /// non-null `ifa_data` points at its `if_data`.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[allow(unsafe_code)]
 unsafe fn link_baudrate(list: *const nix::libc::ifaddrs, iface: &str) -> Option<u64> {
     use std::ffi::CStr;
 
@@ -361,6 +363,7 @@ mod link_speed_tests {
     /// be passed over, not read.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
+    #[allow(unsafe_code)]
     fn null_ifa_name_is_skipped() {
         use nix::libc::{if_data, ifaddrs, sa_family_t, sockaddr, AF_LINK};
         use std::ptr::addr_of_mut;

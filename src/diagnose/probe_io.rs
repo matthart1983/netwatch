@@ -34,6 +34,7 @@ impl Cancel {
     }
 }
 #[cfg(unix)]
+#[allow(unsafe_code)]
 pub fn command(
     program: &str,
     args: &[&str],

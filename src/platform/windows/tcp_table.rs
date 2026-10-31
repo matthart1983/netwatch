@@ -5,6 +5,7 @@
 //! connections tick, whose output was in the display language. The calls here
 //! return numbers and UTF-16, the same on every install. Decoding the rows is
 //! in `platform::socket_table`, where it is tested on every host.
+#![allow(unsafe_code)]
 
 use crate::platform::socket_table::{self, Socket, Tcp4Row, Tcp6Row, Udp4Row, Udp6Row};
 use std::collections::{HashMap, HashSet};

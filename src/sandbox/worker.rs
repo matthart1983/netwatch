@@ -483,6 +483,7 @@ static NET_PROBES: Mutex<BTreeMap<String, Option<i32>>> = Mutex::new(BTreeMap::n
 #[cfg(test)]
 static SOCKET_PROBES: Mutex<BTreeMap<String, [Option<i32>; 4]>> = Mutex::new(BTreeMap::new());
 #[cfg(test)]
+#[allow(unsafe_code)]
 fn probe_sockets() -> [Option<i32>; 4] {
     #[cfg(target_os = "linux")]
     {
@@ -502,8 +503,8 @@ fn probe_sockets() -> [Option<i32>; 4] {
             (libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_MPTCP),
             (libc::AF_NETLINK, libc::SOCK_RAW, 0),
         ]
-        // SAFETY: socket takes three integers and reads no memory of ours.
         .map(|(domain, kind, protocol)| {
+            // SAFETY: socket takes three integers and reads no memory of ours.
             opened(unsafe { libc::socket(domain, kind, protocol) } as libc::c_long)
         });
         let mut params = [0u64; 15];
@@ -813,6 +814,7 @@ mod tests {
     /// starts with, fails with ENOSYS. Syscalls added since Linux 5.1 have the
     /// same number on every architecture netwatch builds for, so the filter
     /// does not check which.
+    #[allow(unsafe_code)]
     fn hide_landlock() {
         use nix::libc;
         let statement = |code: u32, k: u32| libc::sock_filter {

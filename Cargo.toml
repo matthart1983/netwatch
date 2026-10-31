@@ -123,6 +123,20 @@ tracing-appender = "0.2"
 flate2 = "1"
 brotli = "9"
 
+# The unsafe policy in CONTRIBUTING.md, as lints. Unsafe is flagged outside the
+# modules and items that allow it, and every block needs a SAFETY comment. These
+# are "warn" because CI's `-D warnings` fails on them and a user's `cargo install`
+# on a newer toolchain never does.
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+missing_unsafe_on_extern = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+
 [features]
 # eBPF process attribution is on by default. The runtime gracefully
 # downgrades to lsof/ss if the kernel won't load the BPF object (no

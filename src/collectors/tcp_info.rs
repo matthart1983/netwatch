@@ -349,6 +349,7 @@ pub fn parse_diag_dump(buf: &[u8]) -> FlowMap {
 // ── platform ────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn collect() -> std::io::Result<FlowMap> {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
@@ -547,6 +548,7 @@ pub fn parse_pcblist64(buf: &[u8]) -> FlowMap {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn collect() -> std::io::Result<FlowMap> {
     use std::ffi::CString;
 
