@@ -44,6 +44,9 @@ pub struct View<'a> {
     pub third_party_probes: bool,
     /// Transient status line (export path, applied confirmation, reconciliation).
     pub status: Option<&'a str>,
+    /// `status` is the recovery journal's notice, which is a warning whatever its
+    /// words happen to be: some carry the text of a parse error.
+    pub status_is_recovery: bool,
     /// Set when the engine is replaying a recorded scenario rather than
     /// watching the network. Rendered on every frame and not suppressible —
     /// a demo a viewer can mistake for live measurement is worse than none.
@@ -192,6 +195,7 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
             .journal
             .recovery_notice()
             .or(app.diagnose.status.as_deref()),
+        status_is_recovery: app.diagnose.journal.recovery_notice().is_some(),
         demo_banner: app.diagnose.demo.as_ref().map(|d| d.banner()),
         running_tests: selected_issue(app)
             .map(|id| app.diagnose.tests.running_for(&id))
@@ -1819,7 +1823,9 @@ fn render_report_preview(f: &mut Frame, view: &View, area: Rect) {
 fn render_status(f: &mut Frame, view: &View, status: &str, area: Rect) {
     let t = view.theme;
     let lower = status.to_lowercase();
-    let (glyph, color) = if lower.contains("failed") || lower.contains("error") {
+    let (glyph, color) = if view.status_is_recovery {
+        ("!", t.status_warn)
+    } else if lower.contains("failed") || lower.contains("error") {
         ("✕", t.status_error)
     } else if lower.contains("recovery")
         || lower.contains("blocked")
@@ -1871,6 +1877,7 @@ mod tests {
             endpoint: "local".to_string(),
             third_party_probes: true,
             status: None,
+            status_is_recovery: false,
             demo_banner: None,
             running_tests: vec![],
             history: None,
@@ -2071,6 +2078,7 @@ mod tests {
             endpoint: "local".to_string(),
             third_party_probes: true,
             status: None,
+            status_is_recovery: false,
             demo_banner: None,
             running_tests: vec![],
             history: None,
@@ -2150,6 +2158,7 @@ mod tests {
             endpoint: "local".to_string(),
             third_party_probes: true,
             status: None,
+            status_is_recovery: false,
             demo_banner: None,
             running_tests: vec![],
             history: Some(MetricHistory {
@@ -2193,6 +2202,7 @@ mod tests {
                 endpoint: "local".to_string(),
                 third_party_probes: true,
                 status: None,
+                status_is_recovery: false,
                 demo_banner: None,
                 running_tests: vec![],
                 history: None,
@@ -2259,6 +2269,7 @@ mod tests {
                     endpoint: "local".to_string(),
                     third_party_probes: true,
                     status: None,
+                    status_is_recovery: false,
                     demo_banner: None,
                     running_tests: vec![],
                     history: None,
@@ -2325,6 +2336,7 @@ mod tests {
             endpoint: "local".to_string(),
             third_party_probes: true,
             status: None,
+            status_is_recovery: false,
             demo_banner: None,
             running_tests: vec![],
             history: None,
@@ -2816,6 +2828,7 @@ mod tests {
                 endpoint: "local".to_string(),
                 third_party_probes: true,
                 status: None,
+                status_is_recovery: false,
                 demo_banner: None,
                 running_tests: vec![],
                 history: None,
@@ -2871,6 +2884,7 @@ mod tests {
             endpoint: "local".to_string(),
             third_party_probes: true,
             status: None,
+            status_is_recovery: false,
             demo_banner: None,
             running_tests: vec![],
             history: None,

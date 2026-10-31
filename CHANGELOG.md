@@ -43,6 +43,11 @@ All notable changes to NetWatch will be documented in this file.
   Since 0.31.1. Every line `status`, `set` and `recover` print now ignores a failed
   write: `set` still restores at its deadline, and the exit status and any error on stderr
   are the same as with a working stdout.
+- **A corrupt resolver store no longer shows a green check in Diagnose.** The status line
+  picks its mark from the words in the text, and `resolver authority journal cannot be
+  inspected: expected value at line 1 column 1` has none it warns on, so a root session
+  drew it with `✓`. Since 0.31.1. Every recovery notice is now drawn with `!`, whatever
+  it says. Some that mentioned an OS error used to get `✕`, and now get `!` too.
 
 ### Changed
 - **The notice for a resolver change left by 0.30 now names the file and says how

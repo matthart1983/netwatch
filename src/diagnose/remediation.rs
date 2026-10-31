@@ -95,8 +95,6 @@ impl Journal {
             entries: Vec::new(),
             notice: None,
         };
-        // `render_status` in ui/diagnose.rs warns on the word "recovery"; without
-        // it these lines would be drawn with a success mark.
         match read {
             Ok(text) => match serde_json::from_str::<Vec<JournalEntry>>(&text) {
                 Ok(entries) => journal.entries = entries,
@@ -171,6 +169,16 @@ impl Journal {
 
     pub fn recovery_notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    /// A journal holding only `notice`, for drawing one in a test.
+    #[cfg(test)]
+    pub(crate) fn with_notice(notice: &str) -> Self {
+        Self {
+            path: PathBuf::new(),
+            entries: Vec::new(),
+            notice: Some(notice.to_owned()),
+        }
     }
 
     /// Inspect legacy metadata without reading or writing journal-supplied paths.
@@ -426,9 +434,7 @@ mod tests {
             let temp = Temp::new();
             let path = temp.journal(original);
             let mut journal = Journal::load(path.clone());
-            let notice = journal.recovery_notice().unwrap().to_owned();
-            // `render_status` warns on this word; see `Journal::load`.
-            assert!(notice.contains("recovery"), "{notice}");
+            assert!(journal.recovery_notice().is_some());
             assert!(!journal
                 .inspect_recovery(RecoveryAuthority::InspectOnly)
                 .is_empty());
@@ -446,6 +452,5 @@ mod tests {
         let unreadable = Journal::load(missing.into());
         let notice = unreadable.recovery_notice().unwrap();
         assert!(notice.contains("cannot read"), "{notice}");
-        assert!(notice.contains("recovery"), "{notice}");
     }
 }
