@@ -669,7 +669,7 @@ All notable changes to NetWatch will be documented in this file.
   daemon, a daemon that lost its packet socket, a run with no
   segmentation-offload frames, or a view whose p99 frame time passes
   33 ms. It records decode rate, drops and CPU for every phase. A full run
-  takes 75 minutes and `--smoke` five. No workflow runs it yet.
+  takes 75 minutes and `--smoke` five.
 - **The 10,000-socket poll and Diagnose's socket join are held to their
   budgets.** `scale_poll_real_sockets` fails past 150 ms at the median,
   times `NW_PERF_SLACK`, instead of printing it as pending.
@@ -681,6 +681,12 @@ All notable changes to NetWatch will be documented in this file.
 - **A test checks the metrics table in docs/observability-export.md
   against the exporter.** It fails when a metric is added, renamed or given
   another type without the table.
+- **A workflow runs the flood soak.** `.github/workflows/flood-soak.yml` runs
+  it in full once a week, or by hand with `minutes` and `scenarios`, and runs
+  `--smoke` on pull requests that touch the capture path, the detectors,
+  `src/app.rs` or the soak. It puts the gates and figures on the run's summary
+  page and keeps `flood-soak.json` and the JSONL. It is outside `ci.yml`, so
+  the release guard does not wait on it.
 
 ## [0.38.0] - 2026-10-25
 

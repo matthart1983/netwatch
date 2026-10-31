@@ -1,0 +1,170 @@
+name: Flood soak
+
+# The flood soak (tests/soak/flood_soak.py) runs the real App, then the real
+# `netwatch daemon`, against a packet flood in unprivileged namespaces. It fails
+# on memory past the ceiling or growing between cycles, a capture cap broken, a
+# panic or a slow frame. Once a week or by hand it runs in full, about 75
+# minutes, and pull requests that touch what it measures run --smoke, about
+# five. Kept out of ci.yml because the release guard (scripts/release-guard.sh)
+# waits on every ci.yml run, and for 30 minutes at most. So nothing here holds a
+# tag: a release candidate needs a green manual run at minutes=60.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/collectors/packets/**"
+      - "src/dpi/**"
+      - "src/collectors/network_intel.rs"
+      - "src/collectors/incident.rs"
+      - "src/app.rs"
+      - "examples/flood_soak.rs"
+      - "tests/soak/**"
+      - ".github/workflows/flood-soak.yml"
+  schedule:
+    - cron: "30 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Both cycles together. The paced rates and the daemon add 15, and the job stops at 100."
+        type: number
+        default: 60
+      scenarios:
+        description: "Comma-separated, for the cycles: udp-churn, syn-churn, dns, mtu-tcp, replay, bulk. Empty runs all six."
+        type: string
+
+# Read-only token for every job: nothing here writes to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  flood-soak:
+    runs-on: ubuntu-latest
+    # Room for the build and the run. A hung run would otherwise hold the runner
+    # for GitHub's six-hour default.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 20 || 100 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install libpcap and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev iproute2 util-linux
+
+      # Needs no namespace, so it runs before the check below and reports on
+      # its own when a runner refuses one.
+      - name: Build the driver and netwatch
+        run: cargo build --release --example flood_soak --bin netwatch
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+      # which refuses the uid_map write the harness's unshare needs
+      # ("write failed /proc/self/uid_map: Operation not permitted").
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # Answers one question before the soak relies on it: will this runner
+      # give an unprivileged user a user, network and mount namespace in which
+      # sysfs can be remounted and a veth added? It fails rather than skips, so
+      # a refusal cannot pass as a soak that ran. Unlike the health lab, the
+      # soak adds no qdisc.
+      - name: Check the runner allows the soak's namespaces
+        shell: bash
+        run: |
+          unshare --user --map-root-user --net --mount sh -c \
+            'mount -t sysfs sysfs /sys && ls /sys/class/net &&
+             ip link add d0 type veth peer name d1'
+
+      # A pull request runs --smoke. A schedule has no inputs, so it runs the
+      # harness's defaults, which are the full run. An empty --scenarios would
+      # leave the harness nothing to divide the minutes by, so it is left out.
+      # The harness exits non-zero on any failed gate.
+      - name: Run the flood soak
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          MINUTES: ${{ inputs.minutes }}
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          args=()
+          if [ "${EVENT}" = pull_request ]; then
+            args+=(--smoke)
+          else
+            [ -z "${MINUTES}" ] || args+=(--minutes "${MINUTES}")
+            [ -z "${SCENARIOS}" ] || args+=(--scenarios "${SCENARIOS}")
+          fi
+          python3 -I tests/soak/flood_soak.py "${args[@]}" --artifacts flood-soak
+
+      # A run the timeout stopped has its lines but no summary, so this gates
+      # what it got. A gate's reading can hold a driver's stderr, hence row()'s
+      # escaping.
+      - name: Put the table on the run's summary page
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f flood-soak.json ] && [ -f flood-soak.jsonl ]; then
+            python3 -I tests/soak/flood_soak.py --summarise flood-soak.jsonl > /dev/null || true
+          fi
+          if [ ! -f flood-soak.json ]; then
+            echo "The flood soak wrote no results. See the job's log." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          python3 -I - flood-soak.json >> "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json, sys
+
+          s = json.load(open(sys.argv[1]))
+
+          def row(*cells):
+              text = ('-' if c is None else str(c).replace('|', '\\|').replace('\n', ' ') for c in cells)
+              print('|', ' | '.join(text), '|')
+
+          def head(*cells):
+              print()
+              row(*cells)
+              row(*['---'] * len(cells))
+
+          host = s['host'] or {}
+          print('## Flood soak:', 'passed' if s['passed'] else 'FAILED')
+          print()
+          print(f"Commit {s['commit']}, kernel {host.get('kernel')}, {host.get('cpus')} CPUs "
+                f"({host.get('cpu')}), {host.get('mem_mib')} MiB, recorder {s['recorder']}, "
+                f"GeoIP {', '.join(s['geoip'] or []) or 'none'}.")
+
+          head('Gate', 'Result', 'Reading')
+          for g in s['gates']:
+              row(g['gate'], 'pass' if g['passed'] else '**FAIL**', g['detail'])
+
+          head('Phase', 'Offered', 'Decoded pps', 'Drop %', 'CPU %', 'Peak RSS MiB', 'VmHWM MiB', 'Slowest view, p50/p99 ms')
+          for p in s['phases']:
+              frames = p.get('frame_ms') or {}
+              view = max(frames, key=lambda v: frames[v]['p99'], default=None)
+              offered = f"{p['offered_mb_s']} MB/s" if 'offered_mb_s' in p else p.get('offered_pps')
+              slowest = f"{view}, {frames[view]['p50']}/{frames[view]['p99']}" if view else None
+              row(p['name'], offered, p.get('decoded_pps'), p.get('drop_pct'), p.get('cpu_pct'),
+                  p.get('rss_max_mib'), p.get('hwm_mib'), slowest)
+          for load, d in ((s['daemon'] or {}).get('loads') or {}).items():
+              row(f'daemon, {load}', None, None, None, d.get('cpu_pct'), d.get('rss_max_mib'), d.get('hwm_mib'), None)
+
+          head('View', 'Frames', 'p50 ms', 'p99 ms', 'Max ms')
+          for view, f in s['frame_ms'].items():
+              row(view, f['n'], f['p50'], f['p99'], f['max'])
+          PY
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flood-soak
+          path: |
+            flood-soak.json
+            flood-soak.jsonl
+            flood-soak/
+          if-no-files-found: warn
