@@ -19,6 +19,9 @@ pub mod store;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// An entry is under half a KiB, and netwatch 0.30 was out for a week.
+const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
+
 /// Where a journal entry is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,19 +86,12 @@ impl Journal {
     }
 
     fn load(path: PathBuf) -> Self {
-        let read = std::fs::read_to_string(&path);
-        Self::parse(path, read)
-    }
-
-    /// A journal from the outcome of reading `path`, for a caller that has to be
-    /// more careful about the read than [`Self::load`].
-    fn parse(path: PathBuf, read: std::io::Result<String>) -> Self {
         let mut journal = Self {
             path,
             entries: Vec::new(),
             notice: None,
         };
-        match read {
+        match crate::owner_only::read_owned(&journal.path, MAX_JOURNAL_BYTES) {
             Ok(text) => match serde_json::from_str::<Vec<JournalEntry>>(&text) {
                 Ok(entries) => journal.entries = entries,
                 Err(e) => journal.notice = Some(format!(
@@ -440,6 +436,35 @@ mod tests {
                 .is_empty());
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
         }
+    }
+
+    /// A confined thread can write the cache, and this read comes before the
+    /// session can do anything else. What is at the path gets a notice, not a read.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_oversize_file_at_the_journal_is_reported_without_a_read() {
+        let temp = Temp::new();
+        let path = temp.0.join("applied.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let (sent, received) = std::sync::mpsc::channel();
+        let fifo = path.clone();
+        std::thread::spawn(move || sent.send(Journal::load(fifo).notice));
+        let notice = received
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("reading the journal blocked")
+            .unwrap();
+        assert!(notice.contains("cannot read journal"), "{notice}");
+        fs::remove_file(&path).unwrap();
+
+        // Whitespace, so a read with no limit would parse it and find no notice.
+        let oversize = " ".repeat(MAX_JOURNAL_BYTES as usize) + " []";
+        let journal = Journal::load(temp.journal(&oversize));
+        let notice = journal.recovery_notice().unwrap();
+        assert!(notice.contains("cannot read journal"), "{notice}");
     }
 
     #[test]

@@ -48,6 +48,16 @@ All notable changes to NetWatch will be documented in this file.
   inspected: expected value at line 1 column 1` has none it warns on, so a root session
   drew it with `✓`. Since 0.31.1. Every recovery notice is now drawn with `!`, whatever
   it says. Some that mentioned an OS error used to get `✕`, and now get `!` too.
+- **A FIFO or a huge file in the cache no longer stops a session starting.** A FIFO at
+  `applied.json` or `baselines.json` blocked the daemon before its first log line and left
+  a TUI on the alternate screen ignoring Ctrl-C and `q`, and a symlink to `/dev/zero` read
+  until memory ran out. Any confined thread but capture can write the cache, so a
+  compromised parser could plant one for the next start. Sessions now read these two only
+  as regular files under a size limit, without following a symlink at that name. A bad
+  `applied.json` gets the usual notice, with `cannot read journal`, and bad baselines start
+  afresh. `applied.json` must also be this user's own, and baselines need not be, since a
+  `sudo` that keeps HOME leaves them root's. `config.toml`, `egress-policy.toml` and
+  `egress-profiles.json` still get an ordinary read.
 
 ### Changed
 - **The notice for a resolver change left by 0.30 now names the file and says how

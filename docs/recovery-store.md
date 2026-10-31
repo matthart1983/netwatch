@@ -90,10 +90,11 @@ other way to find one: `ls /etc/resolv.conf.netwatch-*.bak`. Check for one too w
 the notice says the journal is invalid or cannot be read, since then it cannot name
 a backup.
 
-`status` and `recover` often run as root, and under a `sudo` that keeps HOME the
-journal is in someone else's home. They read it only as a regular, single-link file
-the current user owns, up to 64 KiB, and they only print from it, with control
-characters replaced. Anything else gets `cannot read journal` in place of the entry.
+A confined thread can write the cache, and under a `sudo` that keeps HOME the journal
+is in someone else's home. So every session and command reads it only as a regular,
+single-link file the current user owns, up to 64 KiB, without following a symlink, and
+only prints from it, with control characters replaced on the command line. Anything else
+gets `cannot read journal` in place of the entry.
 
 ## Lock and trust scope
 

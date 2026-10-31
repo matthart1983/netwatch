@@ -438,29 +438,11 @@ fn authority_refusal_at(directory: &Path, root: bool) -> Option<String> {
     })
 }
 
-/// Read the legacy journal for a command that may be running as root. Under a
-/// `sudo` that keeps HOME this path is in someone else's home, so a symlink, a
-/// FIFO, a device or another user's file gets an error instead of a read.
-fn read_legacy_journal(path: &Path, uid: u32) -> io::Result<String> {
-    let mut journal = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = journal.metadata()?;
-    if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
-        return Err(io::Error::other(
-            "not a regular, single-link file owned by this user",
-        ));
-    }
-    String::from_utf8(read_bounded(&mut journal)?).map_err(io::Error::other)
-}
-
 /// What `status` and `recover` say about the legacy journal, which neither acts
 /// on: an empty authority store does not mean the resolver is as it was. Printed
 /// to a terminal, so nothing from the file reaches it unscrubbed.
-fn legacy_notice(path: PathBuf, uid: u32) -> Option<String> {
-    let read = read_legacy_journal(&path, uid);
-    let mut journal = Journal::parse(path, read);
+fn legacy_notice(path: PathBuf) -> Option<String> {
+    let mut journal = Journal::load(path);
     journal.inspect_recovery(RecoveryAuthority::InspectOnly);
     let notice = journal.recovery_notice()?;
     Some(format!(
@@ -476,8 +458,7 @@ pub(super) fn command(request: Request) -> anyhow::Result<()> {
     // It never changes the result: the journal is outside recovery authority, so
     // a file a user can write must not be able to fail a root command.
     if reports_legacy {
-        let uid = nix::unistd::geteuid().as_raw();
-        if let Some(notice) = legacy_notice(Journal::default_path(), uid) {
+        if let Some(notice) = legacy_notice(Journal::default_path()) {
             report(&notice);
         }
     }
@@ -876,51 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_journal_is_read_only_as_a_small_file_this_user_owns() {
-        let fixture = Fixture::new();
-        let uid = nix::unistd::geteuid().as_raw();
-        let journal = fixture.0.join("applied.json");
-        std::fs::write(&journal, "[]").unwrap();
-        assert_eq!(read_legacy_journal(&journal, uid).unwrap(), "[]");
-        assert!(read_legacy_journal(&journal, uid + 1).is_err());
-
-        let link = fixture.0.join("link.json");
-        symlink(&journal, &link).unwrap();
-        assert!(read_legacy_journal(&link, uid).is_err());
-        let second_name = fixture.0.join("second.json");
-        std::fs::hard_link(&journal, &second_name).unwrap();
-        assert!(read_legacy_journal(&journal, uid).is_err());
-        std::fs::remove_file(second_name).unwrap();
-
-        let large = fixture.0.join("large.json");
-        std::fs::write(&large, vec![b' '; LIMIT as usize + 1]).unwrap();
-        assert!(read_legacy_journal(&large, uid).is_err());
-
-        // Would block forever if it were opened for an ordinary read.
-        let fifo = fixture.0.join("fifo.json");
-        assert!(Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap()
-            .success());
-        assert!(read_legacy_journal(&fifo, uid).is_err());
-        assert!(read_legacy_journal(Path::new("/dev/zero"), 0).is_err());
-    }
-
-    #[test]
     fn the_legacy_notice_is_scrubbed_and_absent_when_nothing_is_open() {
         let fixture = Fixture::new();
-        let uid = nix::unistd::geteuid().as_raw();
         let journal = fixture.0.join("applied.json");
-        assert_eq!(legacy_notice(journal.clone(), uid), None);
+        assert_eq!(legacy_notice(journal.clone()), None);
         std::fs::write(&journal, "[]").unwrap();
-        assert_eq!(legacy_notice(journal.clone(), uid), None);
+        assert_eq!(legacy_notice(journal.clone()), None);
         std::fs::write(
             &journal,
             r#"[{"issue_id":"a\u001b[2Jb","target":"/etc/resolv.conf","backup":null,"state":"applied"}]"#,
         )
         .unwrap();
-        let notice = legacy_notice(journal, uid).unwrap();
+        let notice = legacy_notice(journal).unwrap();
         assert!(!notice.contains('\u{1b}'), "{notice:?}");
         assert!(notice.contains("/etc/resolv.conf"), "{notice}");
     }

@@ -158,6 +158,49 @@ fn assert_legacy_notice(stdout: &str) {
     assert!(stdout.contains("docs/recovery-store.md"), "{stdout}");
 }
 
+/// A confined thread can write the cache, so what a session finds at these paths
+/// may be planted. Until 0.40 a FIFO at either stopped a daemon before its first
+/// log line, and left a TUI on the alternate screen ignoring Ctrl-C and `q`, whose
+/// handling starts later. The session has to get as far as its sandbox.
+#[test]
+fn a_session_starts_past_a_fifo_or_oversize_file_in_its_cache() {
+    let oversize = " ".repeat(17 * 1024 * 1024);
+    for name in ["applied.json", "baselines.json"] {
+        for planted in ["fifo", "oversize"] {
+            let fixture = Fixture::new();
+            let path = fixture.0.join("cache/netwatch").join(name);
+            if planted == "fifo" {
+                assert!(Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success());
+            } else {
+                fs::write(&path, &oversize).unwrap();
+            }
+            let mut child = fixture
+                .command()
+                .arg("daemon")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !fixture.log().contains("sandbox applied") && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let log = fixture.log();
+            let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+            child.wait().unwrap();
+            assert!(log.contains("sandbox applied"), "{planted} {name}: {log}");
+            if name == "applied.json" {
+                assert!(log.contains("cannot read journal"), "{planted}: {log}");
+            }
+        }
+    }
+}
+
 /// Run a command with `/var/lib/netwatch` refused by the kernel, as it is for
 /// anyone but root once `sudo netwatch resolver set` has run. A mount namespace
 /// puts a scratch tmpfs over `/var/lib`, holding a directory with mode 000, and
