@@ -13,6 +13,9 @@ pub enum Command {
     Resolver(Vec<String>),
     Diagnose(Vec<String>),
     Uptime(Vec<String>),
+    GeoipUpdate {
+        city: bool,
+    },
     CaptureChild {
         interface: String,
         mode: Mode,
@@ -46,7 +49,7 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 pub fn help() -> String {
-    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
+    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch geoip update [--city]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
     for (name, value, description) in OPTIONS {
         text.push_str(&format!(
             "  {name:<19} {}{description}\n",
@@ -74,6 +77,14 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
     }
     if args.first().map(String::as_str) == Some("uptime") {
         return Ok(Command::Uptime(args[1..].to_vec()));
+    }
+    if args.first().map(String::as_str) == Some("geoip") {
+        let rest: Vec<_> = args[1..].iter().map(String::as_str).collect();
+        return match rest[..] {
+            ["update"] => Ok(Command::GeoipUpdate { city: false }),
+            ["update", "--city"] => Ok(Command::GeoipUpdate { city: true }),
+            _ => anyhow::bail!("usage: netwatch geoip update [--city]"),
+        };
     }
     if args.first().map(String::as_str) == Some("__capture-check") {
         if args.len() != 3 || !["off", "strict", "best-effort"].contains(&args[2].as_str()) {
@@ -259,6 +270,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn geoip_routes() {
+        assert!(matches!(
+            command("geoip update").unwrap(),
+            Command::GeoipUpdate { city: false }
+        ));
+        assert!(matches!(
+            command("geoip update --city").unwrap(),
+            Command::GeoipUpdate { city: true }
+        ));
+        for s in [
+            "geoip",
+            "geoip download",
+            "geoip update --typo",
+            "geoip update --city --city",
+            "geoip --city update",
+        ] {
+            assert!(command(s).is_err(), "{s}");
+        }
+        assert!(help().contains("netwatch geoip update [--city]"));
+    }
+
     /// Shipped completions and the man page must cover every option the
     /// parser accepts. A flag that exists but cannot be completed, or is
     /// undocumented in the man page a distro installs, is the packaging
@@ -287,11 +320,32 @@ mod tests {
         }
 
         // The subcommands the parser routes on, which are not in OPTIONS.
-        for sub in ["daemon", "doctor", "diagnose", "uptime", "resolver"] {
+        for sub in [
+            "daemon", "doctor", "diagnose", "uptime", "geoip", "resolver",
+        ] {
             for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH), ("man", MAN)] {
                 assert!(text.contains(sub), "{what} is missing the {sub} subcommand");
             }
         }
+
+        // Its one subcommand and flag, which are not in OPTIONS either.
+        for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+            for word in ["update", "city"] {
+                assert!(
+                    text.split(|c: char| !c.is_ascii_alphanumeric())
+                        .any(|w| w == word),
+                    "{what} completion is missing geoip's {word}"
+                );
+            }
+        }
+        assert!(
+            MAN.lines().any(|l| l.trim_end() == ".B geoip update"),
+            "man page is missing geoip update"
+        );
+        assert!(
+            MAN.contains("\\-\\-city"),
+            "man page is missing geoip update --city"
+        );
 
         for sub in crate::diagnose::episode::SUBCOMMANDS {
             for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {

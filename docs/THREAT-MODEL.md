@@ -1,7 +1,7 @@
 # NetWatch threat model
 
 This describes the 0.39 implementation so far: the wave-1 capability and WHOIS
-fixes, the parser and capture roles, and capture authority. It is a
+fixes, the parser and capture roles, capture authority and the no-socket filter. It is a
 containment inventory, not a guarantee against arbitrary code execution. Linux non-root capability-based operation is preferred. Running
 as root works, but containment is limited; the sandbox is defence in depth.
 See [the restricted-group setup](REFERENCE.md#running-without-sudo-linux) and
@@ -34,7 +34,7 @@ collector, UI, persistence and optional outbound-service interfaces; see
 | T2 Local unprivileged user | Process names, local traffic, accessible files |
 | T3 File supplier | Episodes, databases, keylogs and configuration |
 | T4 Network intermediary | DNS replies and unauthenticated HTTP services |
-| T5 Remote service | WHOIS, GeoIP, Insights or ingestion responses |
+| T5 Remote service | WHOIS, GeoIP downloads, Insights or ingestion responses |
 | T6 Dependency/build compromise | Crates, actions, tool downloads, release credentials |
 | T7 Already-root attacker | Outside the host-protection promise |
 
@@ -48,8 +48,8 @@ not isolated address spaces. The input inventory below names their implementatio
 Every confined thread takes a filesystem layer. Parser and capture threads stack
 a second layer on it; main and the network workers do not
 ([roles](../src/sandbox/roles.rs#L47)). The network workers are reverse DNS,
-WHOIS, online GeoIP, health, traceroute, Insights, remote publishing, the three
-Diagnose probe workers and the runtime's blocking pool. Every other worker is a
+WHOIS, health, traceroute, Insights, remote publishing, the three Diagnose probe
+workers and the runtime's blocking pool. Every other worker is a
 parser, and so is any worker name missing from the table. Main keeps the network
 because it starts network workers after its own entry, and a thread keeps every
 layer it inherits.
@@ -63,7 +63,10 @@ Capture's layer also handles every filesystem right and takes only the read rows
 of the grants table, so the capture thread can write nothing. Strict mode requires
 the TCP part and refuses to start below ABI 4; best-effort logs one line and runs
 without it. The other parts are taken where the kernel has them, so these numbers
-alone do not establish what a kernel enforced. There is no seccomp filter. See
+alone do not establish what a kernel enforced. `netwatch doctor --json` reports what
+a parser thread enforces on this kernel, and a running session's log says what each of
+its threads got ([where each value can be read](doctor.md#where-each-value-can-be-read)).
+See
 [ruleset construction](../src/sandbox/linux.rs#L466) and
 [layer entry](../src/sandbox/linux.rs#L682).
 
@@ -74,6 +77,30 @@ parser-net: V4
 parser-scope: V6
 parser-fs: ResolveUnix
 <!-- /policy:abi -->
+```
+
+Four workers also take a seccomp filter, after their Landlock layers: socket(2) and
+io_uring_setup(2) return EPERM, and so does socketcall(2) on 32-bit ARM. Every other
+syscall is allowed. A syscall through another architecture's table, or an x32 one on x86_64,
+kills the process. The filter stays on the thread and on anything it starts, and
+each of these opens what it needs before entry or takes it from accept(2). The
+filter is on x86_64, aarch64 and little-endian 32-bit ARM. A build for any other
+architecture skips it and reports `socket_filter: unknown_arch`, strict included.
+Where the architecture is supported and the kernel refuses the filter, the entry
+gets a warning, so strict refuses to start
+([filter](../src/sandbox/seccomp.rs#L1),
+[which workers](../src/sandbox/roles.rs#L78)). The other parser threads go
+without it. Connections, tcp-info and traffic start `ss`, `ip` and `iw`, which need
+netlink. The rest, the terminal thread and the eBPF worker's load path among them,
+have not been audited for it.
+
+```text
+<!-- policy:no-sockets -->
+capture
+keylog
+metrics-listener
+metrics-client
+<!-- /policy:no-sockets -->
 ```
 
 Capability removals are verified in the Effective, Permitted, Inheritable and
@@ -174,11 +201,17 @@ write: /dev/null
 3. The SDK reader inherits the eBPF worker's layers but keeps its creation-time
    load capabilities; it has no separate entry hook
    ([eBPF startup](../src/ebpf/conn_tracker.rs#L130)).
-4. Only connect(2) and bind(2) on TCP sockets are denied, only on parser and
-   capture threads, and only from Linux 6.7. UDP, ICMP, SCTP and netlink sockets
-   stay open to those threads, and so does MPTCP, which falls back to TCP: on
-   Linux 7.1 an MPTCP socket on a parser thread connected to a plain TCP
-   listener. Two TCP calls get past the deny. A TCP Fast Open send (`sendto` or
+4. Landlock denies only connect(2) and bind(2) on TCP sockets, only on parser and
+   capture threads, and only from Linux 6.7. The no-socket filter stops capture,
+   keylog and the metrics threads opening any new socket through socket(2) or a new
+   io_uring. Every
+   other parser thread can still open UDP, ICMP, SCTP and netlink sockets, and
+   MPTCP, which falls back to TCP: on Linux 7.1 an MPTCP socket on a parser thread
+   connected to a plain TCP listener. So can any thread through a descriptor
+   opened earlier, the filtered ones included, because threads share descriptors
+   (item 1); a test holds a UDP socket opened before the filter to that
+   ([filter tests](../src/sandbox/seccomp.rs#L1)). On a thread with socket(2) open,
+   two TCP calls get past the deny. A TCP Fast Open send (`sendto` or
    `sendmsg` with `MSG_FASTOPEN`) opens a connection and delivers its data
    without connect(2), and listen(2) on an unbound socket takes an ephemeral port
    on every address without bind(2). Both work from a parser thread on Linux 7.1,
@@ -198,10 +231,29 @@ write: /dev/null
    the network workers are not scoped on any kernel: the resolver, the clipboard
    helpers and D-Bus clients need those sockets
    ([layer](../src/sandbox/linux.rs#L501)).
-6. There is no syscall allow-list; filesystem restrictions are not seccomp
-   ([backend](../src/sandbox/linux.rs#L1)).
+6. There is no syscall allow-list. The one seccomp filter denies socket(2),
+   socketcall(2) and io_uring_setup(2) on four workers and allows everything else.
+   io_uring_setup is on the list because `IORING_OP_SOCKET` makes a socket with no
+   socket(2) call for a filter to see: on Linux 7.1, under a filter without that
+   row, a thread set up a ring, got a socket and sent a UDP datagram from it. With
+   the row a ring cannot be set up, and that same attempt stops at EPERM. The other
+   io_uring syscalls stay allowed, so a ring opened before the filter would still
+   work, like any other inherited descriptor (item 4): on Linux 7.1 a ring opened
+   first still made a socket under the filter, and a test holds the filter to that.
+   None exists to inherit. `src` opens no ring, and in the locked crates the only
+   code that could is switched off (tokio's needs `tokio_unstable`, rustix's a
+   feature nothing enables). libpcap 1.10.6, libnl, libibverbs and glibc on the
+   Linux 7.1 host do not contain the name. Real daemon and TUI sessions there, under
+   a filter from before exec that kills the process on any io_uring syscall, ran and
+   exited cleanly with no ring among their descriptors. That run could not load eBPF,
+   which needs real root. accept4(2) and socketpair(2) are allowed too. Main, the
+   network workers and the other parser threads have no filter at all, so they can
+   set up a ring, and a thread under the filter can reach them through shared memory
+   (item 1). On an architecture without a syscall table the filter is skipped
+   ([filter](../src/sandbox/seccomp.rs#L1)).
 7. Root retains filesystem, scheduling and other capabilities. The new deny-list
-   reduces authority but does not promise root containment. Previous wording that
+   reduces authority but does not promise root containment, and `doctor` and Settings
+   say `running as root: containment limited`. Previous wording that
    a compromised parser cannot read SSH keys was too broad: shared descriptors,
    other threads and privileged interfaces must also be considered
    ([retained capabilities](../src/sandbox/linux.rs#L45)).
@@ -229,14 +281,20 @@ write: /dev/null
    ([write grants](../src/sandbox/linux.rs#L427),
    [capture layer](../src/sandbox/linux.rs#L487)).
 10. Subcommands returning before worker installation are outside this policy,
-    including file-oriented operations ([dispatch](../src/main.rs#L20)).
-11. GeoIP downloading and parsing need separate review. The planned `netwatch
-    geoip update` command and sandboxed parser are future work, not current
-    protection (E2 below).
+    including file-oriented operations ([dispatch](../src/main.rs#L20)). Static
+    doctor is one, and opens the GeoIP databases it reports on unconfined.
+11. `netwatch geoip update` installs the policy, downloads on main, which stays
+    unconfined and keeps any capability the process started with, and undoes the
+    gzip, reads and writes each database on a `geoip-update` parser thread. TLS
+    and HTTP framing are handled on main by rustls and ureq. A body marked with a
+    content coding, which ureq would decompress on main, is refused unread. A
+    session reads each database on main before main enters its policy, then looks
+    addresses up on the threads that ask, so a hostile file that passed validation
+    still reaches them ([update](../src/geoip_update.rs#L1)).
 12. macOS, Windows and FreeBSD have no NetWatch filesystem sandbox backend
     ([platform dispatch](../src/sandbox/mod.rs#L1)).
-13. Strict means required policy entry succeeds, the parser TCP deny included; it
-    does not imply no network for main and the network workers, no privileged
+13. Strict means required policy entry succeeds, the parser TCP deny and on a
+    supported architecture the no-socket filter included; it does not imply no network for main and the network workers, no privileged
     reader, or a separate parser process
     ([worker startup](../src/sandbox/worker.rs#L1)).
 14. File capabilities on a world-executable binary let every local account invoke
@@ -254,7 +312,11 @@ rebound, read another interface's traffic (Linux 7.1, libpcap 1.10.6). Every
 thread shares it (item 1), so no capability drop takes capture authority away
 from a compromised parser. Capture opens before policy entry; a dumpcap-style
 separate capture process is needed for a stronger boundary. The drops and the
-audit were measured as root in a user and network namespace with a veth pair;
+audit are measured as root in a user and network namespace with a veth pair, by
+[the sandbox lab](../tests/capture_authority.rs) on real sessions and
+[an audit of the real daemon](../scripts/capture-authority-audit.sh). A user
+namespace is not real root. In particular the `/proc/kcore` check is against the
+initial namespace's capabilities, so it stays a manual `sudo` acceptance step, and
 this document does not claim an independent root capture acceptance test was
 performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 
@@ -270,7 +332,7 @@ performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 | I6 eBPF events | B2/B7, [tracker](../src/ebpf/conn_tracker.rs#L1) |
 | I7 Interface/OS API data | B2, [platform](../src/platform/mod.rs#L1) |
 | I8 TLS keylog | B3/B5, exact configured file grant above |
-| I9 GeoIP databases | B3, exact city/ASN file grants above |
+| I9 GeoIP databases | B3, exact city/ASN file grants above; regular files up to 2 GiB, or 256 MiB for downloaded ones; [reader](../src/collectors/geo.rs#L1) |
 | I10 Configuration | B3/B5, [config](../src/config.rs#L1) |
 | I11 Episode JSON/gzip | B3/B4, [episodes](../src/diagnose/episode.rs#L1); A1 hardening pending |
 | I12 Uptime history | B3/B4, [uptime](../src/uptime.rs#L1); A1 hardening pending |
@@ -280,6 +342,7 @@ performed. See [capture startup](../src/collectors/packets/mod.rs#L1).
 | I16 Insights responses | B6, [Insights](../src/collectors/insights.rs#L1) |
 | I17 Remote ingestion errors | B6, [remote](../src/remote/mod.rs#L1); A1 URL redaction pending |
 | I18 Probe responses | B1/B6, [active probes](../src/diagnose/active.rs#L1) |
+| I19 Downloaded GeoIP gzip and databases | B3/B6, [update](../src/geoip_update.rs#L1), on a parser thread |
 
 These rows identify review surfaces; they do not claim every parser has the same
 bounds or that terminal sanitization protects other output formats.
@@ -287,10 +350,11 @@ bounds or that terminal sanitization protects other output formats.
 ## Outbound inventory
 
 The marked inventory is checked row by row against default health, startup-trace,
-active-probe, load-test and WHOIS endpoints. User-configured endpoints can differ.
-DNS resolution itself can contact the system resolver. Health checks and one
-startup trace run automatically; explicit experiments and WHOIS require their
-respective user actions.
+active-probe, load-test, WHOIS and GeoIP update endpoints. User-configured endpoints
+can differ. DNS resolution itself can contact the system resolver. Health checks, one
+startup trace and any configured Diagnose targets run automatically; explicit
+experiments, traceroute, WHOIS and the GeoIP update require their respective user
+actions.
 
 `third_party_probes = false` stops the rows below that name it, and the three
 Diagnose tests that ask 1.1.1.1 (`dns.alt_resolver`,
@@ -298,13 +362,14 @@ Diagnose tests that ask 1.1.1.1 (`dns.alt_resolver`,
 test). Their readings then show as not measured, and Diagnose opens no issue on
 them. It does not cover probes of the configured
 resolver and gateway, or traffic the user starts or configures: `T`, `W`, `t` on a
-coverage row, Insights, remote, and `diagnose_probes.trace_refresh_secs`, whose
+coverage row, `netwatch geoip update`, configured Diagnose targets, Insights, remote, and `diagnose_probes.trace_refresh_secs`, whose
 default `trace_target` is 1.1.1.1. See
 [health](../src/collectors/health.rs#L177),
 [startup trace](../src/collectors/traceroute.rs#L37),
 [active defaults](../src/diagnose/active.rs#L35),
-[load test](../src/diagnose/next_test.rs#L403), and
-[WHOIS](../src/collectors/whois.rs#L11).
+[load test](../src/diagnose/next_test.rs#L403),
+[WHOIS](../src/collectors/whois.rs#L11), and
+[GeoIP update](../src/geoip_update.rs#L1).
 
 <!-- egress -->
 | Service | Destination and disclosure |
@@ -313,14 +378,15 @@ default `trace_target` is 1.1.1.1. See
 | Internet reachability | 1.1.1.1, TCP fallback on port 443; off with third_party_probes = false |
 | Startup trace | 1.1.1.1; TTL-limited trace (UDP, ICMP echo on Windows) on every TUI start, demo included; ignores trace_target; off with third_party_probes = false |
 | STUN | stun.l.google.com:19302 and stun.cloudflare.com:3478; public mapping; off with third_party_probes = false |
+| Traceroute on T | The selected peer on Connections or Topology; TTL-limited trace |
 | Dual-stack experiments | 1.1.1.1:443, [2606:4700:4700::1111]:443, 8.8.8.8:443, [2001:4860:4860::8888]:443 |
 | Captive portal | http://connectivitycheck.gstatic.com/generate_204 and http://cp.cloudflare.com/generate_204 |
 | Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB, timing connections to 1.1.1.1:443; off with third_party_probes = false |
 | WHOIS on W | https://rdap.org/ip/ and the registry it redirects to; on Connections the selected remote address; on Packets the selected packet's source and destination, your own public address included; private ranges are not sent |
-| Online GeoIP fallback | http://ip-api.com; peer address, cleartext; E2 will remove it |
+| GeoIP update | https://download.db-ip.com/free/ ; only when `netwatch geoip update` runs; HTTPS only, no redirects; the file name and date, no addresses |
 | Insights, opt-in | Configured Ollama-compatible /api/chat endpoint; network and packet summaries; an http:// endpoint off this host is sent to, and flagged cleartext_off_host in Diagnose, Settings and doctor |
 | Remote, opt-in | Configured ingestion endpoint; metrics; HTTPS unless explicitly allowed insecure |
-| Other probes | Configured resolver, gateway, trace/PMTU targets; targets and traffic depend on configuration |
+| Other probes | Configured resolver, gateway, trace/PMTU targets and `[[diagnose_targets]]`, which run on their own schedule; targets and traffic depend on configuration |
 <!-- /egress -->
 
 ## Platforms, release trust and remaining work
@@ -345,11 +411,12 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | A4 root capability deny-list and broker restriction | Included; full root allow-list deferred |
 | B1 parser TCP deny, scopes, ResolveUnix, no-write capture policy, CAP_NET_RAW off parser threads | Included |
 | C1 capture authority and NET_ADMIN audit | Included |
-| D1 seccomp no-socket policy | Later 0.39 work |
-| E2 local GeoIP/update command | Later 0.39 work |
+| D1 seccomp no-socket filter on capture, keylog and the metrics threads | Included; other parser threads and descriptors opened earlier remain open (items 4 and 6) |
+| C2 `netwatch geoip update`, downloads parsed on a parser thread | Included |
+| E2 online GeoIP fallback | Removed: lookups read local files, and `geoip_online` is ignored |
 | E3 capture-error hint and package messages restrict the binary to a group before setcap | Included |
 | E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Included |
-| F1 doctor reports actual containment | Later 0.39 work |
+| F1 doctor reports actual containment: kernel and enforced ABI, network policy, capture authority, `running as root` | Included |
 | Remaining unsafe-block audit | Later hardening; contributor safety policy applies now |
 | Full-path LoadLibraryExW for Npcap | Deferred |
 | Trusted publishing, signed tags, pinned cargo tools, fuzz lock maintenance | Deferred |

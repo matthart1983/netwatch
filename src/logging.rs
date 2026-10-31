@@ -9,9 +9,12 @@
 //! - macOS:   `~/Library/Caches/netwatch/netwatch.log.YYYY-MM-DD`
 //! - Windows: `%LOCALAPPDATA%\netwatch\netwatch.log.YYYY-MM-DD`
 //!
-//! Level defaults to WARN (quiet — captures real failures, not chatter).
-//! Override via `RUST_LOG`, e.g. `RUST_LOG=netwatch=debug` when reproducing
-//! a stuck resolver, a pcap startup failure, or a remote-stream issue.
+//! Level defaults to WARN (quiet — captures real failures, not chatter), but
+//! for INFO on `netwatch::sandbox`: a few lines a session, which are the only
+//! place that session's per-thread sandbox report can be read
+//! (docs/doctor.md). Override via `RUST_LOG`, e.g. `RUST_LOG=netwatch=debug`
+//! when reproducing a stuck resolver, a pcap startup failure, or a
+//! remote-stream issue.
 
 use std::path::{Path, PathBuf};
 
@@ -57,8 +60,8 @@ fn init_inner() -> Option<WorkerGuard> {
     let file_appender = daily_appender(&log_dir)?;
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,netwatch=warn"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,netwatch=warn,netwatch::sandbox=info"));
 
     let layer = fmt::layer()
         .with_writer(writer)

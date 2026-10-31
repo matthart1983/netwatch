@@ -24,6 +24,9 @@ netwatch \- real-time network diagnostics in your terminal
 .RB [ \-\-json " | " \-\-csv ]
 .RI [ DIR ]
 .br
+.B netwatch geoip update
+.RB [ \-\-city ]
+.br
 .B netwatch resolver
 .I SUBCOMMAND
 .RI [ OPTIONS ]
@@ -173,6 +176,23 @@ give machine-readable output with a versioned schema. A hop is down after
 three probe cycles in a row with no reply. Time when netwatch was not running
 is reported as not monitored, never as up.
 .TP
+.B geoip update
+Download DB\-IP Lite's Country and ASN databases for offline GeoIP lookups, and
+the City database too with
+.B \-\-city
+or once it has been downloaded. Reports a file as updated or as already current.
+An empty
+.B geoip_db
+or
+.B geoip_asn_db
+in the configuration uses these files. A running session keeps what it opened
+until it is restarted. Nothing refreshes them on its own, and
+.B netwatch doctor
+flags one over 60 days old. Exits 0 when every file is up to date and 1
+otherwise, leaving a file it could not replace as it was. The data source and
+the file location may change between releases. IP geolocation by DB\-IP
+(https://db\-ip.com), CC BY 4.0.
+.TP
 .B resolver status
 Report the current DNS resolver and whether netwatch could change it.
 .TP
@@ -252,6 +272,11 @@ to alert on everything outside the allowlist as well.
 .TP
 .I ~/.cache/netwatch/exports/
 Packet captures (PCAPNG and PCAP), incident bundles and Diagnose reports.
+.TP
+.I ~/.cache/netwatch/geoip/
+Databases
+.B netwatch geoip update
+downloaded.
 .TP
 .I ~/.local/state/netwatch/uptime/
 The uptime log

@@ -369,9 +369,12 @@ allow_sni   = ["*.google.com", "*.gstatic.com"]   # exact or *.wildcard (incl. a
 allow_ports = [443]
 
 [process.node]
-allow_asn = ["CLOUDFLARENET"]                     # fallback when a flow has no SNI
+allow_asn = ["Cloudflare, Inc."]                  # fallback when a flow has no SNI
 allow_ip  = ["203.0.113.9"]                        # for a raw-IP dest with no name at all
 ```
+
+`allow_asn` matches the organisation name in the ASN database you load, so a name from another
+database does not carry over: MaxMind's `CLOUDFLARENET` is DB-IP's `Cloudflare, Inc.`.
 
 Rules are expressed in terms a firewall can't write — `process → {SNI, ASN, IP, port}` —
 because the flow already carries the owning process (eBPF/proc attribution) and the
@@ -397,16 +400,18 @@ netwatch --sandbox-strict     # reject unverified required startup entries
 netwatch --no-sandbox         # explicitly disable Netwatch policy
 ```
 
-- **Capabilities:** selected BPF/admin capability removals are verified in effective,
-  permitted and inheritable sets. Strict also drops `CAP_NET_RAW`; best-effort
-  retains it for capture reopening. Effective retained capabilities are recorded.
-  This is not a claim that every elevated capability is removed.
+- **Capabilities:** removals are verified in the effective, permitted, inheritable
+  and ambient sets. Parser and capture threads drop `CAP_NET_RAW` in every mode. A
+  best-effort TUI keeps it on main and the network workers to reopen capture (`c`,
+  `i`, `Shift+R`); the daemon, `diagnose run`, `diagnose coverage` and strict drop it
+  on every thread once capture has opened. Effective retained capabilities are
+  recorded. This is not a claim that every elevated capability is removed.
 - **Writable paths:** owned private config/cache/state directories, dedicated
   `netwatch/exports` and `netwatch/scratch` cache subdirectories, and `/dev/null`.
   There is no whole-CWD, shared `/tmp` or `/run/user` write grant. Directories are
   prepared before restrictions; broad roots and symlink directory targets fail
   preparation. Exports normally land in `~/.cache/netwatch/exports` on Linux.
-- **Inputs:** configured GeoIP and keylog files receive exact read grants; system
+- **Inputs:** GeoIP files in use and the configured keylog file receive exact read grants; system
   executable/library and resolver paths remain readable. Missing or replaced
   keylog/database files require restarting Netwatch. Rotation does not expand the
   policy to a parent directory.
@@ -416,8 +421,26 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   nonzero exit. After the main thread drops raw-socket authority, capture restart
   may fail; it never retries unsandboxed. macOS/Windows have no backend and reject
   strict startup. Best-effort reports degradation on those platforms.
-- **Network:** no network restrictions are installed. Settings reports policy-entry
-  results, not an independent proof that the entire process is exploit-proof.
+- **Network:** policy is per thread, and only on Linux.
+
+  | Threads | TCP bind and connect | socket(2) |
+  | --- | --- | --- |
+  | Main and the network workers (reverse DNS, WHOIS, GeoIP, health, traceroute, Insights, remote, Diagnose probes, blocking pool) | Allowed | Allowed |
+  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink, and the others have not been audited for the filter |
+  | Capture, keylog, metrics listener and client | Denied from Linux 6.7 | EPERM |
+
+  `netwatch doctor --json` reports the kernel's ABI and what a parser thread enforces
+  on it. What each thread of a running session got, its `network_policy` included, is
+  in that session's log, and Settings has the totals; `doctor` shows `protections`
+  empty and `tasks_holding_net_raw` null
+  ([where each value can be read](doctor.md#where-each-value-can-be-read)). A kernel
+  below Linux 6.7 runs best-effort without
+  the deny and refuses `--sandbox-strict`. A denied thread still has other routes:
+  UDP, ICMP and netlink on threads with socket(2), any descriptor opened earlier, and
+  the rest of the [threat model's list](THREAT-MODEL.md#what-containment-does-not-cover).
+  Settings reports policy-entry results, not an independent proof that the entire
+  process is exploit-proof.
+- **Root:** Settings and `doctor` say `running as root: containment limited`.
 
 Linux denial tests exercise actual lookup/Insights/keylog workers and keylog restart.
 Privileged capture/restart and macOS/Windows runtime validation remain release checks.
@@ -443,6 +466,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose features [--out FILE] [--schema FILE] FILE\|DIR...` | Write the feature table of recorded episodes. |
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
+| `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
 | `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
@@ -504,6 +528,38 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
 
 The log is `~/.local/state/netwatch/uptime/`, one small file per day (about 80 KB), kept 90
 days, readable only by you. Nothing is uploaded. `record_uptime = false` turns it off.
+
+### GeoIP databases
+
+`netwatch geoip update` downloads DB-IP's free Country and ASN databases, which fill the GeoIP
+column and the organisation names. `--city` adds the City database, and later runs keep it up to
+date. That is a 60 MB download, and a session holds its 127 MB in memory, against 8 MB for Country.
+
+```
+$ netwatch geoip update
+updated /home/you/.cache/netwatch/geoip/dbip-country-lite.mmdb (DBIP-Country-Lite, built 2026-10-01)
+updated /home/you/.cache/netwatch/geoip/dbip-asn-lite.mmdb (DBIP-ASN-Lite (compat=GeoLite2-ASN), built 2026-10-01)
+IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0
+restart netwatch to load it
+```
+
+A file the server has nothing newer for is reported as `already current`. The command exits 0 when
+every file is up to date and 1 otherwise, and a file it could not replace stays as it was. It runs
+only when you run it. Nothing refreshes the files on its own, and `netwatch doctor` reports
+`geoip_db` as `degraded` (`db_stale`) once a loaded database is over 60 days old.
+
+An empty `geoip_db` or `geoip_asn_db` uses these files, City ahead of Country, and a path in the
+config wins. Run the command as the user who runs netwatch: the files live in that user's cache
+directory and only that user can read them. It refuses a cache directory whose path is not valid
+UTF-8, because netwatch could not load a database saved there.
+
+The command name, `--city` and the exit codes are stable. The data source and the file location may
+change between releases, so a script should ask `netwatch doctor --json` what loaded rather than
+look for a file name. On Linux the download is read on a worker thread that cannot open TCP
+connections from Linux 6.7 on; see the [threat model](THREAT-MODEL.md).
+
+IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0. Settings and `netwatch doctor` show that
+line whenever a loaded database says it is DB-IP's, wherever the file came from.
 
 ---
 
@@ -819,6 +875,31 @@ Variables named `NETWATCH_*` that are not listed here are test hooks and may cha
 
 ---
 
+## What netwatch sends off this machine
+
+GeoIP lookups read local files, so the GeoIP column sends nothing anywhere. This is what does
+leave the host. "Automatically" means in every TUI, `netwatch daemon`, `netwatch diagnose run` and
+`netwatch diagnose coverage` session, with nothing to press. The
+[threat model](THREAT-MODEL.md#outbound-inventory) lists the same destinations, and a test holds
+its default endpoints to the code.
+
+| What | When | Where it goes | What it carries |
+|------|------|---------------|-----------------|
+| Reference DNS query | Automatically | 1.1.1.1 | A query for `dns.google` |
+| Internet reachability | Automatically | 1.1.1.1, with a TCP fallback on port 443 | A probe, no data |
+| STUN | Automatically, about once a minute | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | A binding request, which reveals your public address to them |
+| Health probes | Automatically | Your gateway and the configured resolver | ICMP echoes, with TCP connects where those are dropped, and DNS queries |
+| Reverse DNS | Automatically, for addresses in this host's own connections | The system resolver | The addresses it looks up |
+| Startup trace | Every TUI start, the demo included | 1.1.1.1 | TTL-limited packets |
+| Traceroute | Only when you press `T` | The selected peer on Connections or Topology | TTL-limited packets |
+| Periodic trace | Only with `diagnose_probes.trace_refresh_secs` set | `diagnose_probes.trace_target` | TTL-limited packets |
+| Diagnose targets | With `[[diagnose_targets]]` set: automatically on their schedule (`interval_secs`, default 60 s), and on demand | The hosts you list, and your resolvers for their names | DNS lookups, TCP and TLS handshakes and an HTTP request to the path you set |
+| WHOIS | Only when you press `W` | `rdap.org` and the registry it redirects to | On Connections the selected remote address, on Packets the selected packet's two addresses; private ranges are not sent |
+| Diagnose experiments | When you start one from Diagnose or with `netwatch diagnose coverage --test`; a test you started can repeat itself | The defaults in the [threat model](THREAT-MODEL.md#outbound-inventory), your resolver and gateway, or what `diagnose_probes` sets | Probes; the upload test sends up to 25 MB of filler |
+| GeoIP download | Only when you run `netwatch geoip update` | `download.db-ip.com`, HTTPS only | The file names and dates it asks for, no addresses |
+| Insights, opt-in | While `insights_enabled` is on, up to every 15 s | The endpoint you configure, by default Ollama on this machine | Network and packet summaries, with top talkers and DNS names |
+| Remote, opt-in | With `--remote` or `NETWATCH_REMOTE_URL` | The URL you give | Interface, health, system and disk metrics, the connection count, and the hostname, OS, kernel, uptime, CPU model and memory size; HTTPS unless you allow otherwise |
+
 ## Configuration
 
 NetWatch runs with zero setup — every key below has a working default, and the file doesn't
@@ -907,9 +988,9 @@ full resolution.
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `show_geo` | `true` | `true` `false` | Show the GeoIP column in Connections. |
-| `geoip_db` | `""` | file path | MaxMind GeoLite2-City or GeoLite2-Country `.mmdb`. Empty means no offline lookups; see `geoip_online` for the fallback. |
-| `geoip_asn_db` | `""` | file path | MaxMind GeoLite2-ASN `.mmdb`, for AS numbers. Optional. |
-| `geoip_online` | `false` | `true` `false` | Fall back to `http://ip-api.com` when `geoip_db` is empty or fails to open. Off by default: enabling it sends every public peer IP to a third party over cleartext HTTP, with no per-host opt-out, and anyone on the path can read the lookups and change the answers. ip-api.com offers HTTPS only on its paid tier, so there is no encrypted option. With this on, Settings shows the GeoIP DB Path as `ip-api.com (cleartext)`, or as `ip-api.com (cleartext) if unreadable:` and the path when `geoip_db` is set. |
+| `geoip_db` | `""` | file path | A City or Country `.mmdb`, DB-IP's or MaxMind's. Empty uses what [`netwatch geoip update`](#geoip-databases) downloaded, if anything. Lookups never leave this machine. A file over 2 GiB, or anything but a regular file, is reported as unreadable. |
+| `geoip_asn_db` | `""` | file path | An ASN `.mmdb`, DB-IP's or MaxMind's, for organisation names. Empty uses what `netwatch geoip update` downloaded, if anything. The same limits apply. |
+| `geoip_online` | removed | | Removed in 0.39: it sent peer addresses to a third party in cleartext. A config that sets it still loads, the setting is ignored, and the log says so once per start. The next save from Settings drops it. Run [`netwatch geoip update`](#geoip-databases) instead. |
 
 ### Security
 
@@ -1002,7 +1083,7 @@ and the [Diagnose rule coverage](diagnostic-coverage.md).
 | Connections | 2s | `lsof` + PKTAP | `/proc/net/tcp` + eBPF kprobe |
 | Health probes | Every 5 ticks | Gateway/internet ICMP, DNS queries | Gateway/internet ICMP, DNS queries |
 | Packets | Real-time | libpcap (BPF) | libpcap |
-| GeoIP | On-demand | MaxMind .mmdb / ip-api.com | MaxMind .mmdb / ip-api.com |
+| GeoIP | On-demand | Local `.mmdb` files | Local `.mmdb` files |
 
 ```
 Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders

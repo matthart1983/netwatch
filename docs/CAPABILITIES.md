@@ -22,6 +22,7 @@ establish macOS or Windows runtime parity.
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |
 | Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules | Shared detectors; absent TCP metrics limit socket rules |
 | Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend | No backend (no Capsicum) |
+| Network policy per thread | Parser and capture threads denied TCP bind and connect from Linux 6.7; capture, keylog and metrics threads also lose socket(2) on x86_64, aarch64 and armv5te; main and network workers unrestricted | None | None | None |
 | Strict sandbox startup | Rejects preflight/required entry failures; raw capture reopening may fail | Rejected: no backend | Rejected: no backend | Rejected: no backend |
 | Resolver changes | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable | Unavailable |
 | AI commentary | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
@@ -76,9 +77,11 @@ The [sandbox reference](REFERENCE.md#landlock-sandbox-linux) documents current
 worker entry enforcement and exact file/dedicated-directory grants. eBPF loads
 inside the policy; the SDK reader inherits it but keeps the load capabilities
 until it has an entry hook of its own.
-Network access remains unrestricted. Linux tests cover actual lookup, Insights and
-keylog entries, keylog restart, export access, symlink replacement and strict entry
-rejection. Privileged capture/restart and cross-platform acceptance remain pending.
+On Linux, network policy is per thread: the table above says which, `netwatch doctor
+--json` says what a parser thread gets on this kernel, and a session's log what each
+of its threads got. Linux tests cover actual lookup,
+Insights and keylog entries, keylog restart, export access, symlink replacement and
+strict entry rejection. Privileged capture/restart and cross-platform acceptance remain pending.
 Managed workers have a shared shutdown deadline; an in-flight blocking operation
 may still outlive it and is reported rather than forcibly interrupted.
 

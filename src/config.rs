@@ -30,20 +30,20 @@ pub struct NetwatchConfig {
     /// Default BPF capture filter (e.g. "tcp port 443")
     pub bpf_filter: String,
 
-    /// Path to MaxMind GeoLite2-City or GeoLite2-Country .mmdb file
-    /// (empty = no offline lookups; see `geoip_online` for the fallback)
+    /// Path to a City or Country .mmdb file, DB-IP's or MaxMind's. Empty uses
+    /// what `netwatch geoip update` downloaded, if anything; see
+    /// [`geoip_paths`](Self::geoip_paths).
     pub geoip_db: String,
 
-    /// Path to MaxMind GeoLite2-ASN .mmdb file (optional, for AS numbers)
+    /// Path to an ASN .mmdb file, DB-IP's or MaxMind's, for organisation
+    /// names. Empty uses what `netwatch geoip update` downloaded, if anything.
     pub geoip_asn_db: String,
 
-    /// Allow falling back to ip-api.com when no local `geoip_db` is
-    /// configured, or the one configured fails to open. Off by default:
-    /// without an mmdb, enabling this sends every public peer IP a
-    /// connection or packet touches to a third party, in cleartext HTTP,
-    /// with no per-host opt-out. ip-api.com has no HTTPS on its free tier,
-    /// so this cannot be made private. Install a MaxMind database for
-    /// offline lookups, or opt into this explicitly.
+    /// Removed in 0.39, when it sent every public peer address to a third party
+    /// in cleartext. Still read, so a config that sets it loads, and
+    /// [`warn_removed_keys`](Self::warn_removed_keys) can say so, but nothing
+    /// acts on it and a save drops it from the file.
+    #[serde(default, skip_serializing)]
     pub geoip_online: bool,
 
     /// Network intelligence alert settings
@@ -455,6 +455,63 @@ impl NetwatchConfig {
     }
 }
 
+// ── GeoIP database locations ───────────────────────────────
+
+impl NetwatchConfig {
+    /// Log a warning for each key a config still sets that no longer does
+    /// anything. For the session's start, once the log exists: `main` loads
+    /// the config before it installs the logger, and a session loads it again
+    /// after that and on every save, so this cannot live in [`Self::load_from`].
+    pub fn warn_removed_keys(&self) {
+        if self.geoip_online {
+            tracing::warn!(
+                target: "netwatch::config",
+                "geoip_online was removed in 0.39: it sent peer addresses to a third party in cleartext. Run `netwatch geoip update` for offline lookups."
+            );
+        }
+    }
+
+    /// The City or Country database and the ASN database a session opens, each
+    /// empty when there is none. A path in the config wins; an empty one means
+    /// what `netwatch geoip update` downloaded, City ahead of Country.
+    pub fn geoip_paths(&self) -> (String, String) {
+        // What a test finds must not depend on who runs it, or on whether they
+        // have run the command.
+        #[cfg(test)]
+        let downloaded: Option<PathBuf> = None;
+        #[cfg(not(test))]
+        let downloaded = crate::geoip_update::downloaded_dir();
+        self.geoip_paths_in(downloaded.as_deref())
+    }
+
+    pub(crate) fn geoip_paths_in(&self, downloaded: Option<&Path>) -> (String, String) {
+        use crate::geoip_update::Database;
+        // A session takes paths as text. One that is not UTF-8 cannot be passed
+        // on, and a lossy copy names a different file, so it is not found.
+        // `netwatch geoip update` refuses to write there and says why.
+        let found = |db: Database| {
+            downloaded
+                .map(|dir| dir.join(db.file_name()))
+                .filter(|path| path.is_file())
+                .and_then(|path| path.to_str().map(str::to_owned))
+        };
+        let or_downloaded = |set: &str, downloaded: Option<String>| {
+            if set.trim().is_empty() {
+                downloaded.unwrap_or_default()
+            } else {
+                set.to_owned()
+            }
+        };
+        (
+            or_downloaded(
+                &self.geoip_db,
+                found(Database::City).or_else(|| found(Database::Country)),
+            ),
+            or_downloaded(&self.geoip_asn_db, found(Database::Asn)),
+        )
+    }
+}
+
 // ── Helpers to map string ↔ app types ──────────────────────
 
 use crate::app::{Tab, TimelineWindow};
@@ -521,6 +578,127 @@ show_geo = false
         assert!(cfg.packet_follow);
         assert!(!cfg.confirm_quit);
         assert_eq!(cfg.alerts.port_scan_threshold, 20);
+    }
+
+    /// A config from before 0.39 still loads and is told about the key, once,
+    /// and the key does not survive a save.
+    #[test]
+    fn geoip_online_true_parses_and_is_ignored() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                assert_eq!(*event.metadata().level(), tracing::Level::WARN);
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("nw-geoip-online-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(&path, "geoip_online = true\ntheme = \"nord\"\n").unwrap();
+
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            // Loading and saving say nothing. A session does both repeatedly.
+            let cfg = NetwatchConfig::load_from(&path).unwrap();
+            assert!(cfg.geoip_online);
+            assert_eq!(cfg.theme, "nord");
+            cfg.save_to(&path).unwrap();
+            assert_eq!(events.load(Ordering::Relaxed), 0);
+
+            cfg.warn_removed_keys();
+            assert_eq!(events.load(Ordering::Relaxed), 1);
+
+            // The save dropped it, so the next start has nothing to say.
+            let saved = fs::read_to_string(&path).unwrap();
+            assert!(!saved.contains("geoip_online"), "{saved}");
+            let cfg = NetwatchConfig::load_from(&path).unwrap();
+            assert!(!cfg.geoip_online);
+            assert_eq!(cfg.theme, "nord");
+            cfg.warn_removed_keys();
+            assert_eq!(events.load(Ordering::Relaxed), 1);
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An empty key means the downloaded file where there is one, a path in
+    /// the config always wins, and each key is decided on its own.
+    #[test]
+    fn empty_geoip_paths_use_the_downloaded_files() {
+        let dir = std::env::temp_dir().join(format!("nw-geoip-paths-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let text = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+        let empty = NetwatchConfig::default();
+        let paths = |cfg: &NetwatchConfig| cfg.geoip_paths_in(Some(&dir));
+
+        assert_eq!(paths(&empty), (String::new(), String::new()));
+        assert_eq!(
+            empty.geoip_paths_in(None),
+            (String::new(), String::new()),
+            "no cache directory"
+        );
+
+        fs::write(dir.join("dbip-country-lite.mmdb"), "x").unwrap();
+        fs::write(dir.join("dbip-asn-lite.mmdb"), "x").unwrap();
+        assert_eq!(
+            paths(&empty),
+            (text("dbip-country-lite.mmdb"), text("dbip-asn-lite.mmdb"))
+        );
+
+        // City ahead of Country.
+        fs::write(dir.join("dbip-city-lite.mmdb"), "x").unwrap();
+        assert_eq!(paths(&empty).0, text("dbip-city-lite.mmdb"));
+
+        let own_db = NetwatchConfig {
+            geoip_db: "/geo/own.mmdb".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            paths(&own_db),
+            ("/geo/own.mmdb".to_owned(), text("dbip-asn-lite.mmdb"))
+        );
+        let own_asn = NetwatchConfig {
+            geoip_asn_db: "/geo/asn.mmdb".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            paths(&own_asn),
+            (text("dbip-city-lite.mmdb"), "/geo/asn.mmdb".to_owned())
+        );
+        // A set path that is not there is reported, not quietly replaced.
+        let missing = NetwatchConfig {
+            geoip_db: "/nonexistent.mmdb".into(),
+            ..Default::default()
+        };
+        assert_eq!(paths(&missing).0, "/nonexistent.mmdb");
+
+        // Only a file counts.
+        let empty_dir = dir.join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+        fs::create_dir(empty_dir.join("dbip-country-lite.mmdb")).unwrap();
+        assert_eq!(empty.geoip_paths_in(Some(&empty_dir)).0, "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `is_file` accepted the real path and a lossy copy of it went on, so
+    /// doctor looked for a file with a different name and called it unreadable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_downloaded_file_under_a_non_utf8_path_is_not_found() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("nw-geoip-paths-{}", uuid::Uuid::new_v4()));
+        let dir = root.join(std::ffi::OsStr::from_bytes(b"cache-\xff"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("dbip-country-lite.mmdb"), "x").unwrap();
+        assert_eq!(
+            NetwatchConfig::default().geoip_paths_in(Some(&dir)),
+            (String::new(), String::new())
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
