@@ -13,6 +13,7 @@
 //! interface counters were last tick, and the previous trace to each target.
 
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -23,7 +24,7 @@ use super::detectors::{
 };
 use crate::app::App;
 use crate::collectors::connections::Connection;
-use crate::collectors::tcp_info::normalize_endpoint;
+use crate::collectors::tcp_info::{endpoint_scope, normalize_endpoint};
 use crate::collectors::traceroute::{TracerouteResult, TracerouteStatus};
 use crate::collectors::traffic::InterfaceTraffic;
 use crate::platform::InterfaceInfo;
@@ -294,17 +295,30 @@ impl LiveSampler {
         Some(unix_secs(completed))
     }
 
-    /// The verdict this socket is currently carrying, if it has one.
+    /// The verdict each socket is currently carrying, for a surface that reads
+    /// them across a whole table: built once, where a lookup per row would
+    /// format a key per row.
     ///
     /// Read by the surfaces that show a verdict column. They must not
     /// re-classify: `classify_socket` is cheap but the *age* of a verdict is
     /// not derivable from a single sample, and a column that disagreed with
     /// the Diagnose tab about what a socket is doing would be worse than no
     /// column at all.
-    pub fn verdict_for(&self, local: &str, remote: &str) -> Option<SocketVerdict> {
-        self.verdict_since
-            .get(&format!("{local} → {remote}"))
-            .map(|(v, _)| *v)
+    pub fn socket_verdicts(&self, conns: &[Connection]) -> SocketVerdicts<'_> {
+        if self.verdict_since.is_empty() {
+            return SocketVerdicts(HashMap::new());
+        }
+        let collisions = scope_collisions(conns);
+        SocketVerdicts(
+            self.verdict_since
+                .iter()
+                .filter_map(|(key, (verdict, _))| {
+                    let (local, remote) = key.split_once(" → ")?;
+                    let spelled = (Cow::Borrowed(local), Cow::Borrowed(remote));
+                    (!collisions.contains(&spelled)).then_some(((local, remote), *verdict))
+                })
+                .collect(),
+        )
     }
 
     /// Apply a batch of readings to the store.
@@ -618,6 +632,24 @@ impl LiveSampler {
     }
 }
 
+/// Each socket's current verdict, keyed as the kernel flows are.
+pub struct SocketVerdicts<'a>(HashMap<(&'a str, &'a str), SocketVerdict>);
+
+impl SocketVerdicts<'_> {
+    /// The verdict on the socket this connection-table row describes. Rows
+    /// bracket IPv6, spell IPv4-mapped addresses out and name a socket's device,
+    /// and the flows do none of that, so looking up a row's own spelling found
+    /// nothing for those.
+    pub fn for_row(&self, conn: &Connection) -> Option<SocketVerdict> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let local = flow_spelling(&conn.local_addr);
+        let remote = flow_spelling(&conn.remote_addr);
+        self.0.get(&(&*local, &*remote)).copied()
+    }
+}
+
 /// A (local, remote) pair spelled as the kernel flows key it.
 pub(crate) type EndpointKey<'a> = (Cow<'a, str>, Cow<'a, str>);
 
@@ -639,7 +671,58 @@ pub(crate) fn rows_by_endpoints(conns: &[Connection]) -> HashMap<EndpointKey<'_>
             ))
             .or_insert(conn);
     }
+    for key in scope_collisions(conns) {
+        by_endpoints.remove(&key);
+    }
     by_endpoints
+}
+
+/// The endpoints the table lists under more than one device.
+///
+/// Two sockets can share addresses and ports if they are bound to different
+/// devices: link-local addresses repeat across links, and so can anything else
+/// across VRFs. The kernel flows name no device, so they hold one entry for
+/// the lot, and it could be either socket's. A row then takes nothing from that
+/// entry, and shows as unknown rather than with what may be the other's state.
+/// Rows in one device that share endpoints are one socket, held by two
+/// processes, as they are with no device at all.
+pub(crate) fn scope_collisions(conns: &[Connection]) -> HashSet<EndpointKey<'_>> {
+    let mut collisions = HashSet::new();
+    // Most hosts have no such row, and then none of this has to be spelled.
+    if !conns
+        .iter()
+        .any(|c| c.local_addr.contains('%') || c.remote_addr.contains('%'))
+    {
+        return collisions;
+    }
+    let mut scopes = HashMap::with_capacity(conns.len());
+    for conn in conns {
+        let key = (
+            flow_spelling(&conn.local_addr),
+            flow_spelling(&conn.remote_addr),
+        );
+        let scope = (
+            endpoint_scope(&conn.local_addr),
+            endpoint_scope(&conn.remote_addr),
+        );
+        match scopes.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(scope);
+            }
+            Entry::Occupied(entry) => {
+                if *entry.get() != scope {
+                    collisions.insert(entry.key().clone());
+                }
+            }
+        }
+    }
+    collisions
+}
+
+/// Whether a row's endpoints are shared with a row bound to another device; see
+/// [`scope_collisions`].
+pub(crate) fn scope_collides(conns: &[Connection], local: &str, remote: &str) -> bool {
+    scope_collisions(conns).contains(&(flow_spelling(local), flow_spelling(remote)))
 }
 
 /// A row's endpoint as `normalize_endpoint` spells it, without parsing the
@@ -650,20 +733,21 @@ pub(crate) fn rows_by_endpoints(conns: &[Connection]) -> HashMap<EndpointKey<'_>
 /// canonical text `normalize_endpoint` writes too. So an unbracketed row is
 /// already in that form, and a bracketed one only loses its brackets, unless
 /// it holds a dotted IPv4-mapped address, which becomes plain IPv4. Any other
-/// shape, such as lsof's lone closing bracket, takes the full parse.
+/// shape, such as lsof's lone closing bracket or a device name, takes the full
+/// parse.
 fn flow_spelling(addr: &str) -> Cow<'_, str> {
     match addr
         .strip_prefix('[')
         .and_then(|rest| rest.split_once("]:"))
     {
-        Some((host, port)) if !host.contains(['.', '[', ']']) => {
+        Some((host, port)) if !host.contains(['.', '[', ']', '%']) => {
             let mut key = String::with_capacity(host.len() + 1 + port.len());
             key.push_str(host);
             key.push(':');
             key.push_str(port);
             Cow::Owned(key)
         }
-        _ if addr.contains(['[', ']']) => Cow::Owned(normalize_endpoint(addr)),
+        _ if addr.contains(['[', ']', '%']) => Cow::Owned(normalize_endpoint(addr)),
         _ => Cow::Borrowed(addr),
     }
 }
@@ -1464,6 +1548,115 @@ mod tests {
         );
     }
 
+    /// A socket bound to a device has one in its row and none in its flow. The
+    /// three spellings of that are a row `ss` prints after the address, on
+    /// either family, and one printed inside the brackets.
+    #[test]
+    fn sockets_find_the_rows_of_device_bound_sockets() {
+        let rows = vec![
+            bound_row("v6", "[fe80::10]%eth0:50001", "[fe80::1]:443"),
+            bound_row("v4", "192.0.2.10%eth0:50000", "198.51.100.1:443"),
+            bound_row("inner", "[fe80::20%eth0]:50002", "[fe80::2]:443"),
+        ];
+        let sockets = sockets_of(
+            rows,
+            &[
+                ("fe80::10:50001", "fe80::1:443"),
+                ("192.0.2.10:50000", "198.51.100.1:443"),
+                ("fe80::20:50002", "fe80::2:443"),
+            ],
+        );
+        for (local, process) in [
+            ("fe80::10:50001", "v6"),
+            ("192.0.2.10:50000", "v4"),
+            ("fe80::20:50002", "inner"),
+        ] {
+            let socket = sockets.iter().find(|s| s.local == local).unwrap();
+            assert_eq!(socket.process.as_deref(), Some(process), "{local}");
+            assert_eq!(socket.tx_bps, Some(1_000.0), "{local}");
+        }
+    }
+
+    /// The kernel flows name no device, so one flow stands for sockets that
+    /// differ only by theirs. It cannot be said whose it is, and it goes to
+    /// neither rather than to whichever comes first. Rows in one device are
+    /// one socket, and find their flow as they always have.
+    #[test]
+    fn a_flow_shared_by_two_devices_joins_no_row() {
+        for (first, second, joined) in [
+            ("[fe80::10]%eth0:50001", "[fe80::10]%eth1:50001", None),
+            ("[fe80::10]%eth0:50001", "[fe80::10%eth1]:50001", None),
+            ("[fe80::10]:50001", "[fe80::10]%eth1:50001", None),
+            (
+                "[fe80::10]%eth0:50001",
+                "[fe80::10%eth0]:50001",
+                Some("first"),
+            ),
+            (
+                "[fe80::10]%eth0:50001",
+                "[fe80::10]%eth0:50001",
+                Some("first"),
+            ),
+        ] {
+            let rows = vec![
+                bound_row("first", first, "[fe80::1]:443"),
+                bound_row("second", second, "[fe80::1]:443"),
+                bound_row("other", "192.0.2.10%eth1:50000", "198.51.100.1:443"),
+            ];
+            let collides = scope_collides(&rows, first, "[fe80::1]:443");
+            assert_eq!(collides, joined.is_none(), "{first} and {second}");
+            let sockets = sockets_of(
+                rows,
+                &[
+                    ("fe80::10:50001", "fe80::1:443"),
+                    ("192.0.2.10:50000", "198.51.100.1:443"),
+                ],
+            );
+            let socket = |local: &str| sockets.iter().find(|s| s.local == local).unwrap();
+            let shared = socket("fe80::10:50001");
+            assert_eq!(shared.process.as_deref(), joined, "{first} and {second}");
+            assert_eq!(
+                shared.tx_bps,
+                joined.map(|_| 1_000.0),
+                "{first} and {second}: unknown, not idle"
+            );
+            // One device's own row is untouched by another's collision.
+            let other = socket("192.0.2.10:50000");
+            assert_eq!(other.process.as_deref(), Some("other"));
+        }
+    }
+
+    fn bound_row(process: &str, local: &str, remote: &str) -> Connection {
+        let mut c = crate::testutil::connections::synthetic_connections(1, 1).remove(0);
+        c.protocol = "TCP".into();
+        c.state = "ESTABLISHED".into();
+        c.process_name = Some(process.into());
+        c.local_addr = local.into();
+        c.remote_addr = remote.into();
+        c.tx_rate = Some(1_000.0);
+        c.rx_rate = Some(500.0);
+        c.evidence.observe();
+        c
+    }
+
+    /// The socket pass over `rows`, with `flows` keyed as the kernel dump keys
+    /// them.
+    fn sockets_of(rows: Vec<Connection>, flows: &[(&str, &str)]) -> Vec<SocketObs> {
+        use crate::collectors::tcp_info::{FlowMap, TcpInfo};
+        let info = TcpInfo {
+            rtt_us: Some(20_000),
+            ..TcpInfo::default()
+        };
+        let flows: FlowMap = flows
+            .iter()
+            .map(|(local, remote)| ((local.to_string(), remote.to_string()), info))
+            .collect();
+        let app = App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.connection_collector.publish_for_test(rows);
+        app.tcp_info.publish_for_test(flows);
+        LiveSampler::new().sockets(&app, &Thresholds::default())
+    }
+
     /// The join's shortcut spells every row as `normalize_endpoint` does.
     #[test]
     fn flow_spelling_agrees_with_normalize_endpoint() {
@@ -1477,6 +1670,12 @@ mod tests {
                 "[2001:db8::1]:8080",
                 "[::ffff:192.0.2.1]:443",
                 "[fe80::1%eth0]:22",
+                "[fe80::1]%eth0:22",
+                "192.0.2.10%eth0:50000",
+                "127.0.0.53%lo:53",
+                "0.0.0.0%wlan0:68",
+                "[::ffff:192.0.2.1]%eth0:443",
+                "*%eth0:68",
                 "fe80::1]:1024",
                 "[::]:*",
                 "0.0.0.0:*",

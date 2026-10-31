@@ -7,6 +7,7 @@
 //! and [`AppUiState`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use ratatui::layout::Rect;
 
@@ -54,6 +55,11 @@ pub struct AppCaches {
     /// `rtt_history`. Prevents double-counting if the same handshake shows
     /// up across multiple `sample_rtt_from_streams` calls.
     pub rtt_sampled_streams: HashSet<u32>,
+    /// The Connections tab's rows for the current table and filters. Readers
+    /// take `&App`, hence the lock, and hold the view while the UI state it
+    /// was built from changes, hence the `Arc`. See
+    /// [`crate::ui::connections::current_view`].
+    pub conn_view: Mutex<Option<Arc<crate::ui::connections::ConnView>>>,
 }
 
 /// State owned by the Lite view (`src/ui/lite.rs`).

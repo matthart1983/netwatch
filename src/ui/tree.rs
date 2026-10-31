@@ -87,6 +87,25 @@ where
         .collect()
 }
 
+/// [`group_by`] with keys borrowed from outside the items, which at 10,000
+/// rows saves a String per row and a second hash lookup.
+pub fn group_by_str<'k, T>(
+    items: impl IntoIterator<Item = T>,
+    key: impl Fn(&T) -> &'k str,
+) -> Vec<(&'k str, Vec<T>)> {
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut buckets: Vec<(&str, Vec<T>)> = Vec::new();
+    for item in items {
+        let k = key(&item);
+        let i = *index.entry(k).or_insert_with(|| {
+            buckets.push((k, Vec::new()));
+            buckets.len() - 1
+        });
+        buckets[i].1.push(item);
+    }
+    buckets
+}
+
 /// Flatten groups into the visible row list, honouring fold state.
 ///
 /// This is the single definition of "what is on screen, in order". Both the
@@ -312,6 +331,18 @@ mod tests {
         assert_eq!(g[0].0, "a", "first key seen comes first");
         assert_eq!(g[0].1, vec![("a", 1), ("a", 3)]);
         assert_eq!(g[1].0, "b");
+    }
+
+    #[test]
+    fn group_by_str_groups_as_group_by_does() {
+        let items = vec![("a", 1), ("b", 2), ("a", 3), ("", 4), ("b", 5)];
+        let owned = group_by(items.clone(), |(k, _)| k.to_string());
+        let borrowed = group_by_str(items, |(k, _)| *k);
+        assert_eq!(borrowed.len(), owned.len());
+        for ((k, v), (ok, ov)) in borrowed.iter().zip(&owned) {
+            assert_eq!(k, ok);
+            assert_eq!(v, ov);
+        }
     }
 
     /// The window must never scroll past the end, or the last page renders
