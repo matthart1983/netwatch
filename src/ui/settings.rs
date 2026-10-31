@@ -556,7 +556,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // +9 holds the rest beside the settings, with one to spare: the attribution,
     // a blank, the doctor hint, a blank, the status row, the footer and two borders.
     let popup_height = (SETTINGS_COUNT + 9 + sandbox_detail.len() + note_rows.len()) as u16;
-    let popup_height = popup_height.min(area.height.saturating_sub(4));
+    let popup_height = popup_height
+        .min(area.height.saturating_sub(4))
+        .max(3)
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -673,39 +676,57 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::raw("  Setup details: netwatch doctor --json"));
 
-    // Status message
-    lines.push(Line::raw(""));
-    if let Some(ref status) = app.ui.settings_status {
-        lines.push(Line::from(Span::styled(
+    // Status message, on a row of its own above the footer: the rows above can
+    // run past the popup, and `✗ Save failed` must not go with them.
+    let status_row = if let Some(ref status) = app.ui.settings_status {
+        let color = if status.starts_with('✗') {
+            app.theme.status_error
+        } else {
+            app.theme.status_good
+        };
+        Some(Line::from(Span::styled(
             format!("  {}", status),
-            Style::default().fg(app.theme.status_good),
-        )));
+            Style::default().fg(color),
+        )))
     } else if app.ui.settings_cursor == cursor::SANDBOX {
         // Sandbox changes don't reapply at runtime — Landlock can't be
         // undone and dropped caps can't be regained. Surface that to the
         // user inline so they don't expect the live process to react.
-        lines.push(Line::from(Span::styled(
+        Some(Line::from(Span::styled(
             "  Applies on next netwatch start.",
             Style::default().fg(app.theme.text_muted),
-        )));
+        )))
     } else if matches!(
         app.ui.settings_cursor,
         cursor::AI_INSIGHTS | cursor::AI_MODEL | cursor::AI_ENDPOINT
     ) {
-        lines.push(Line::from(Span::styled(
+        Some(Line::from(Span::styled(
             "  Experimental: can change in any release.",
             Style::default().fg(app.theme.text_muted),
-        )));
+        )))
     } else {
-        lines.push(Line::raw(""));
-    }
+        None
+    };
 
-    let content_height = inner.height.saturating_sub(1);
+    let content_height = inner.height.saturating_sub(2);
     let content = Paragraph::new(lines);
     f.render_widget(
         content,
         Rect::new(inner.x, inner.y, inner.width, content_height),
     );
+    if let Some(row) = status_row {
+        // With no room for both this row wins over the footer, and with no room
+        // inside the borders it goes over them.
+        let area = match inner.height {
+            0 => Rect::new(popup.x, popup.y, popup.width, popup.height.min(1)),
+            1 => inner,
+            _ => Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1),
+        };
+        f.render_widget(Paragraph::new(row), area);
+        if inner.height < 2 {
+            return;
+        }
+    }
 
     // Footer
     let footer_spans = if app.ui.settings_editing {
@@ -953,6 +974,32 @@ mod tests {
         }
         for row in [cursor::THEME, cursor::SANDBOX, cursor::CONFIRM_QUIT] {
             assert!(!drawn(row), "row {row}");
+        }
+    }
+
+    /// With eight unknown keys at 120 columns the status row needed 44 rows, so a
+    /// failed save said nothing on most terminals. It has a row of its own now,
+    /// at every height the popup can open at.
+    #[test]
+    fn a_failed_save_shows_at_any_height() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let many: String = (0..8).map(|n| format!("key_{n} = 1\n")).collect();
+        let config = NetwatchConfig::from_toml(&many, std::path::Path::new("config.toml")).unwrap();
+        let mut app = App::prepare_with_config(config);
+        app.ui.settings_status = Some("✗ Save failed: no space left on device".into());
+        for width in [80, 120] {
+            for height in 1..=70 {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| render(f, &app, f.area())).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(text.contains("Save failed"), "{width}x{height}");
+            }
         }
     }
 

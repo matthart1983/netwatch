@@ -132,6 +132,10 @@ All notable changes to NetWatch will be documented in this file.
   exited 101 with no report, which is not one of its statuses. A failed write to stderr or
   to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
   the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
+- **A failed save in Settings stays on screen.** Its status was the last row of the
+  popup's list, so a short terminal cut it off, and with eight unknown keys at 120 columns
+  it needed 44 rows. It now has a row of its own above the footer, at any height the popup
+  opens at, and `✗ Save failed` is in the error colour, not the success one.
 - **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
   thing that writes defaults. A new file gets every key. A file that exists gains the
   keys it lacks and keeps what it has, values included. It no longer writes

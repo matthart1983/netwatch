@@ -768,7 +768,13 @@ pub fn render_config_notice(f: &mut Frame, app: &App, area: Rect) {
         height: 1,
         ..area
     };
-    let tail = format!("{more}  , settings");
+    // Lite has no Settings of its own: `,` does nothing there, and `L` leaves it.
+    let way = if app.ui.view_mode == crate::app::ViewMode::Lite {
+        "L then , settings"
+    } else {
+        ", settings"
+    };
+    let tail = format!("{more}  {way}");
     let room = usize::from(row.width).saturating_sub(3 + crate::ui::text::width(&tail));
     let text = format!(" ⚠ {}{tail}", ellipsise(&first.short(), room));
     let style = Style::default()

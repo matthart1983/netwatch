@@ -152,6 +152,11 @@ fn unknown_keys_degrade_config_and_are_named_without_their_values() {
         assert!(row.detail.contains(&needle), "{needle}: {}", row.detail);
     }
     assert_eq!(fs::read_to_string(&config).unwrap(), raw);
+    let next = row.next_check.as_deref().unwrap();
+    assert!(
+        next.contains("config.toml") && next.contains("egress-policy.toml"),
+        "{next}"
+    );
 
     // A key under `[experimental]` is listed, and is no reason to call it degraded.
     fs::write(&config, "[experimental]\nsomething = 'value-sentinel'\n").unwrap();
@@ -183,6 +188,23 @@ fn unknown_keys_degrade_config_and_are_named_without_their_values() {
         .unwrap();
     let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(snapshot.get("config").reason, "config_unknown_keys");
+    // And it names that file. Only that one needs looking at.
+    let next = snapshot.get("config").next_check.clone().unwrap();
+    assert!(next.contains("egress-policy.toml"), "{next}");
+    assert!(!next.contains("config.toml"), "{next}");
+
+    // Only the config, the other way round.
+    fs::remove_file(&policy).unwrap();
+    fs::write(&config, "typo = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
+    let next = snapshot.get("config").next_check.clone().unwrap();
+    assert!(next.contains("config.toml"), "{next}");
+    assert!(!next.contains("egress-policy.toml"), "{next}");
 }
 /// A database that does not open used to look the same as no database at all,
 /// and doctor reports it without opening any connection to find out.

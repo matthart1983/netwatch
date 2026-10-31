@@ -5570,17 +5570,33 @@ mod render_safety_tests {
         assert!(!before.contains("ignored"), "not until a session sets it");
 
         app.ui.config_notice_until = Some(Instant::now() + Duration::from_secs(60));
-        for view in [ViewMode::Full, ViewMode::Lite, ViewMode::Dense] {
+        // What the row says to press has to work in that view: Lite does not bind
+        // `,`, and `L` takes it to the full view, which does.
+        for (view, way) in [
+            (ViewMode::Full, "  , settings"),
+            (ViewMode::Lite, "  L then , settings"),
+            (ViewMode::Dense, "  , settings"),
+        ] {
             app.ui.view_mode = view;
             let row = bottom(&mut app, 200);
-            for needle in [
-                "config.toml: unknown key",
-                "is ignored",
-                "(+1 more)",
-                "settings",
-            ] {
+            for needle in ["config.toml: unknown key", "is ignored", "(+1 more)", way] {
                 assert!(row.contains(needle), "{view:?}: {needle} in {row}");
             }
+            let key =
+                |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+            let keys: &[KeyCode] = if view == ViewMode::Lite {
+                &[KeyCode::Char('L'), KeyCode::Char(',')]
+            } else {
+                &[KeyCode::Char(',')]
+            };
+            for code in keys {
+                handle_key(&mut app, key(*code));
+            }
+            assert!(
+                app.ui.show_settings,
+                "{view:?}: {way} did not open Settings"
+            );
+            app.ui.show_settings = false;
         }
         // Narrow, the count and the way to the list survive the cut.
         app.ui.view_mode = ViewMode::Full;

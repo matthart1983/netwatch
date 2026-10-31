@@ -1311,6 +1311,15 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
         ),
     };
     let policy = crate::collectors::egress::default_policy_warnings();
+    // The file to look at: the config, unless only the policy has something to say.
+    let review = match (
+        config_state == State::Ready && config.load_warnings.is_empty(),
+        policy.is_empty(),
+    ) {
+        (true, false) => "Review egress-policy.toml; doctor never writes it",
+        (false, false) => "Review config.toml and egress-policy.toml; doctor never writes them",
+        (_, true) => "Review config.toml; doctor never writes it",
+    };
     report_config_warnings(
         [&config.load_warnings, &policy],
         &mut config_state,
@@ -1318,13 +1327,7 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
         &mut detail,
     );
     let mut snapshot = CapabilitySnapshot::configured(&config);
-    snapshot.put(
-        "config",
-        config_state,
-        code,
-        &detail,
-        Some("Review config.toml; doctor never writes it"),
-    );
+    snapshot.put("config", config_state, code, &detail, Some(review));
     #[cfg(target_os = "linux")]
     {
         snapshot.landlock = Some(landlock_self_test());
