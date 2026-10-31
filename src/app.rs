@@ -5596,11 +5596,18 @@ mod render_safety_tests {
         assert_eq!(bottom(&mut app, 200), before);
     }
 
-    /// With nothing to say there is no row, whatever the clock says.
+    /// With nothing to say there is no row, whatever the clock says, and a key
+    /// under `[experimental]` is not worth one.
     #[test]
     fn a_clean_config_shows_no_notice() {
         use std::time::{Duration, Instant};
-        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let config = NetwatchConfig::from_toml(
+            "[experimental]\nsomething = 1\n",
+            std::path::Path::new("/etc/netwatch/config.toml"),
+        )
+        .unwrap();
+        assert_eq!(config.load_warnings.len(), 1);
+        let mut app = App::prepare_with_config(config);
         let before = rows(&draw_at(&mut app, 200, 50)).pop().unwrap();
         app.ui.config_notice_until = Some(Instant::now() + Duration::from_secs(60));
         assert_eq!(rows(&draw_at(&mut app, 200, 50)).pop().unwrap(), before);

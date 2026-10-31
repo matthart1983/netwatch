@@ -30,6 +30,30 @@ All notable changes to NetWatch will be documented in this file.
   sets both, the new name wins and the warning says the old one is ignored. `doctor`
   keeps `config` `ready` for a renamed key, with reason `config_renamed_keys`, because
   the setting is still in force.
+- **An `[experimental]` table in `config.toml`, for settings that can still change.**
+  A key in it is outside the 1.0 compatibility promise and can change or go away in any
+  release. Nothing is in it yet, so it has no settings and this is only the place for
+  them. A key in it this version does not read does not warn as unknown: it gets a
+  `note:` line on stderr, `doctor` lists it and leaves `config` `ready`, Settings lists
+  it, and the TUI's bottom row says nothing. A save keeps the table, and
+  `--generate-config` does not write an empty one.
+
+### Changed
+- **`diagnose replay`, `diagnose features` and `diagnose corpus` now need
+  `--unstable`.** They read and write the episode, feature and corpus formats, which
+  are experimental and can change in any release, and nothing said so to someone
+  scripting against them. Without the flag each prints an error naming it and exits 3,
+  the status `diagnose run` documents for bad arguments, before reading or writing
+  anything. With it they behave as before, including exit 1 for their other errors.
+  `--unstable` gates only these three. `diagnose run`, `coverage`, `episodes` and
+  `export` are unchanged, as are AI Insights, `--remote` and the resolver commands,
+  which are opt-in already.
+
+### Migration
+- **Add `--unstable` to `diagnose replay`, `diagnose features` and `diagnose corpus`.**
+  `netwatch diagnose replay FILE` becomes `netwatch diagnose replay --unstable FILE`,
+  and likewise `features` and `corpus`. A script that does not gets exit 3. The flag
+  goes after the subcommand, in any position among its arguments.
 
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1

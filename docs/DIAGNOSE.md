@@ -95,7 +95,7 @@ CLI equivalents:
 
 ```sh
 netwatch diagnose episodes
-netwatch diagnose replay /path/to/episode.json.gz
+netwatch diagnose replay --unstable /path/to/episode.json.gz
 netwatch diagnose export --since 7d --dry-run
 netwatch diagnose export --since 7d --out /path/to/bundle.json.gz
 ```
@@ -487,8 +487,8 @@ recording. A `lab` row keeps the frames the health lab recorded, and only its
 decisions are derived again.
 
 ```sh
-netwatch diagnose corpus              # regenerate after an intended semantic change
-netwatch diagnose corpus --only ID    # one manifest row
+netwatch diagnose corpus --unstable              # regenerate after an intended semantic change
+netwatch diagnose corpus --unstable --only ID    # one manifest row
 ```
 
 A diff there is a change in what netwatch concludes, and belongs in the same

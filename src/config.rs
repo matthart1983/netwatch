@@ -188,10 +188,35 @@ pub struct NetwatchConfig {
     #[serde(default, skip_serializing_if = "is_default_thresholds")]
     pub diagnose_thresholds: crate::diagnose::detectors::Thresholds,
 
+    /// Settings that can still change: `[experimental]`. See
+    /// [`ExperimentalConfig`].
+    #[serde(default, skip_serializing_if = "is_default_experimental")]
+    pub experimental: ExperimentalConfig,
+
     /// What the file this came from should have its owner told. Never read
     /// from or written to a file; see [`ConfigWarning`].
     #[serde(skip)]
     pub load_warnings: Vec<ConfigWarning>,
+}
+
+/// `[experimental]` in config.toml: where a setting goes while it can still
+/// change. A top-level key is covered by the 1.0 compatibility promise from the
+/// day it ships, so a setting that might not last starts here, as a field, and
+/// can change or go away in any release.
+///
+/// Nothing belongs in it yet, so it has no fields. It exists now so that the
+/// table parses, and has the meaning documented, before anything uses it. A key
+/// in it this version does not read is expected, from another version, rather
+/// than a mistake, so it is [`ConfigWarningKind::UnreadExperimentalKey`], and a
+/// save keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalConfig {}
+
+/// Saved only once it holds something, so `--generate-config` writes no empty
+/// table.
+fn is_default_experimental(experimental: &ExperimentalConfig) -> bool {
+    *experimental == ExperimentalConfig::default()
 }
 
 fn is_default_thresholds(t: &crate::diagnose::detectors::Thresholds) -> bool {
@@ -280,6 +305,7 @@ impl Default for NetwatchConfig {
             egress_violation_cooldown_secs: default_egress_cooldown(),
             groups_start_collapsed: default_groups_collapsed(),
             confirm_quit: false,
+            experimental: ExperimentalConfig::default(),
             load_warnings: Vec::new(),
         }
     }
@@ -368,6 +394,9 @@ pub struct ConfigWarning {
 pub enum ConfigWarningKind {
     /// A key netwatch does not read, so setting it changes nothing.
     UnknownKey(String),
+    /// A key under `[experimental]` that this version does not read. Quieter
+    /// than [`Self::UnknownKey`]: these come and go between releases by design.
+    UnreadExperimentalKey(String),
     /// A key under a name it used to have. Its value is in force under `new`,
     /// unless the file sets `new` as well, which then wins.
     RenamedKey {
@@ -389,6 +418,10 @@ impl ConfigWarningKind {
                     crate::ui::sanitize::display(key)
                 )
             }
+            Self::UnreadExperimentalKey(key) => format!(
+                "{} is not used by this version; experimental settings can change or go away in any release",
+                crate::ui::sanitize::display(key)
+            ),
             Self::RenamedKey {
                 old,
                 new,
@@ -416,9 +449,19 @@ impl ConfigWarning {
         )
     }
 
+    /// Whether this is worth interrupting someone for, or only worth having
+    /// where they would look.
+    pub fn is_quiet(&self) -> bool {
+        matches!(self.kind, ConfigWarningKind::UnreadExperimentalKey(_))
+    }
+
     /// For the log, once it exists.
     pub fn log(&self) {
-        tracing::warn!(target: "netwatch::config", "{self}");
+        if self.is_quiet() {
+            tracing::info!(target: "netwatch::config", "{self}");
+        } else {
+            tracing::warn!(target: "netwatch::config", "{self}");
+        }
     }
 }
 
@@ -433,7 +476,12 @@ impl std::fmt::Display for ConfigWarning {
 /// the journal under a service manager.
 pub fn print_warnings(warnings: &[ConfigWarning]) {
     for warning in warnings {
-        eprintln!("warning: {warning}");
+        let level = if warning.is_quiet() {
+            "note"
+        } else {
+            "warning"
+        };
+        eprintln!("{level}: {warning}");
     }
 }
 
@@ -472,6 +520,8 @@ pub(crate) fn from_toml_reporting_unread<T: serde::de::DeserializeOwned>(
     })?;
     Ok((value, unread))
 }
+
+const EXPERIMENTAL_TABLE: &str = "experimental";
 
 /// A config file as read: its text, with any renamed keys moved, the config it
 /// holds, and the keys that were not read.
@@ -687,11 +737,14 @@ impl NetwatchConfig {
         let (mut config, unread): (Self, Vec<KeyPath>) = from_toml_reporting_unread(&text)?;
         config.load_warnings = moved
             .into_iter()
-            .chain(
-                unread
-                    .iter()
-                    .map(|key| ConfigWarningKind::UnknownKey(key.join("."))),
-            )
+            .chain(unread.iter().map(|key| {
+                let key_name = key.join(".");
+                if key.first().map(String::as_str) == Some(EXPERIMENTAL_TABLE) {
+                    ConfigWarningKind::UnreadExperimentalKey(key_name)
+                } else {
+                    ConfigWarningKind::UnknownKey(key_name)
+                }
+            }))
             .map(|kind| ConfigWarning {
                 file: file.into(),
                 kind,
@@ -776,11 +829,15 @@ impl NetwatchConfig {
         let wanted = toml::to_string_pretty(self)?;
         let new: DocumentMut = wanted.parse()?;
         let mut doc: DocumentMut = text.parse()?;
+        // The table stays even with nothing in it this version reads, or nothing
+        // in it at all: the comment above a setting someone switched off.
+        let mut keep = unread.to_vec();
+        keep.push(vec![EXPERIMENTAL_TABLE.to_owned()]);
         merge_table(
             doc.as_table_mut(),
             new.as_table(),
             &mut KeyPath::new(),
-            unread,
+            &keep,
         );
         let merged = doc.to_string();
         let back: Self = toml::from_str(&merged)?;
@@ -1257,6 +1314,58 @@ hostname = "b.example"
         );
     }
 
+    /// `[experimental]` parses, what is in it is not called unknown, a save keeps
+    /// it, comment and all, and a file that never mentioned it does not gain it.
+    #[test]
+    fn the_experimental_table_parses_and_is_quieter_than_an_unknown_key() {
+        let dir = scratch("experimental");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "typo = 1\n# trying this out\n[experimental]\nfuture_thing = 1\n[experimental.nested]\na = 2\n",
+        )
+        .unwrap();
+        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(unknown_keys(&cfg), ["typo"]);
+        let quiet: Vec<_> = cfg.load_warnings.iter().filter(|w| w.is_quiet()).collect();
+        assert_eq!(quiet.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(quiet[0]
+            .to_string()
+            .contains("experimental.future_thing is not used"));
+
+        cfg.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# trying this out\n[experimental]\nfuture_thing = 1\n",
+            "[experimental.nested]\na = 2\n",
+        ] {
+            assert!(saved.contains(kept), "{kept:?} not in\n{saved}");
+        }
+        assert_eq!(
+            NetwatchConfig::load_from(&path).unwrap().load_warnings,
+            cfg.load_warnings
+        );
+
+        // Empty, it has nothing to say and still stays.
+        fs::write(&path, "# later\n[experimental]\n").unwrap();
+        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.load_warnings, []);
+        cfg.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# later\n[experimental]\n"), "{saved}");
+
+        let fresh = toml::to_string_pretty(&NetwatchConfig::default()).unwrap();
+        assert!(!fresh.contains("experimental"), "{fresh}");
+
+        // Not a table is a value of the wrong type, like any other key.
+        fs::write(&path, "experimental = 5\n").unwrap();
+        assert!(matches!(
+            NetwatchConfig::load_from(&path),
+            Err(ConfigError::Parse { .. })
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// `*` is a named entry as well as an array's, for the policy's
     /// `[process.<name>]`.
     #[test]
@@ -1689,6 +1798,7 @@ sigmak = 9.0
             diagnose_probes: Default::default(),
             diagnose_targets: vec![],
             diagnose_thresholds: Default::default(),
+            experimental: Default::default(),
             load_warnings: vec![],
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();

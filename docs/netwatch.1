@@ -144,13 +144,18 @@ Which diagnostic checks have their inputs, and why the others do not.
 List recorded incident episodes.
 .TP
 .B diagnose replay
-Replay a recorded episode through the engine.
+Replay a recorded episode through the engine. Experimental: needs
+.BR \-\-unstable ,
+because the episode format can change in any release.
 .TP
 .B diagnose features
 Write the feature table of recorded episodes, with
 .B \-\-out
 and
 .BR \-\-schema .
+Experimental: needs
+.BR \-\-unstable ,
+because the table's columns can change in any release.
 .TP
 .B diagnose export
 Write a pseudonymised bundle of recent incidents. Nothing is uploaded.
@@ -160,6 +165,8 @@ For netwatch's developers: regenerate the pinned test corpus under
 .IR tests/diagnose/corpus ,
 or one entry with
 .BR \-\-only .
+Experimental: needs
+.BR \-\-unstable .
 .TP
 .B uptime
 Outage history from the uptime log the TUI and
@@ -264,6 +271,10 @@ Windows, install Npcap first.
 .I ~/.config/netwatch/config.toml
 Configuration. Create it with
 .BR "netwatch \-\-generate\-config" .
+A key netwatch does not read is reported and kept. The
+.B [experimental]
+table is outside the compatibility promise: a key in it can change or go away in
+any release.
 .TP
 .I ~/.config/netwatch/egress\-policy.toml
 Declared egress policy. Alerts fire for destinations blocked here; set
@@ -288,6 +299,16 @@ reads, one file per day, kept 90 days. Turn it off with
 on success,
 .B 1
 on a usage error or a failed command.
+.B diagnose run
+has its own statuses, listed above, and
+.BR "diagnose replay" ,
+.B diagnose features
+and
+.B diagnose corpus
+exit
+.B 3
+without
+.BR \-\-unstable .
 .SH SEE ALSO
 .BR tcpdump (1),
 .BR ss (8),

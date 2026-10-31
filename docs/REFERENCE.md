@@ -468,14 +468,19 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue. 1: at least one open issue. 2: no usable observation in the budget. 3: bad arguments or no session. |
 | `netwatch diagnose coverage [--json] [--seconds N] [--test ID]` | Which checks have their inputs on this host, and why the others do not. |
 | `netwatch diagnose episodes [DIR]` | List recorded incident episodes. |
-| `netwatch diagnose replay [--json] FILE\|DIR...` | Replay episodes through the engine and report any divergence. |
-| `netwatch diagnose features [--out FILE] [--schema FILE] FILE\|DIR...` | Write the feature table of recorded episodes. |
+| `netwatch diagnose replay --unstable [--json] FILE\|DIR...` | Experimental. Replay episodes through the engine and report any divergence. |
+| `netwatch diagnose features --unstable [--out FILE] [--schema FILE] FILE\|DIR...` | Experimental. Write the feature table of recorded episodes. |
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
+| `netwatch diagnose corpus --unstable [--only ID] [DIR]` | Experimental, for netwatch's developers. Regenerate the pinned test corpus. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
 | `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
+
+`diagnose replay`, `features` and `corpus` read and write episode, feature and corpus formats
+that can change in any release, so each needs `--unstable`. Without it, the command prints an
+error naming the flag and exits 3, the status `diagnose run` documents for bad arguments.
 
 TUI flags:
 
@@ -950,6 +955,12 @@ A key that gets renamed keeps working until 2.0. netwatch reads the old name as 
 warns `<old> was renamed <new> in <release>` in the same places. `netwatch doctor` leaves `config`
 `ready`, with reason `config_renamed_keys`. If the file sets both names, the new one wins. A save
 writes the new name. No key has been renamed so far. `geoip_online` below was removed.
+
+The `[experimental]` table is for settings that can still change, and is outside the 1.0
+compatibility promise: a key in it can change meaning or go away in any release. Nothing is in
+it yet. A key in it this version does not read is expected rather than a mistake, so it does not
+warn as unknown: stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
+`ready`, Settings lists it, and the TUI's bottom row says nothing. A save keeps the table.
 
 A save keeps those keys. Settings and `--generate-config` edit a file that loads in place, so
 comments stay too, and a value that has not changed keeps its spelling. `--generate-config`

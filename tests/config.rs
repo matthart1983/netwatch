@@ -209,6 +209,25 @@ mod cli {
         assert!(stderr.contains("no configured target"), "{stderr}");
     }
 
+    /// `[experimental]` is a note, not a warning, and nothing else in the file
+    /// is affected by it.
+    #[test]
+    fn an_unread_experimental_key_is_a_note() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.config(),
+            "[experimental]\nsomething = 'value-sentinel'\n",
+        )
+        .unwrap();
+        let (status, _, stderr) =
+            fixture.run(&["diagnose", "run", "--format", "json", "--target", "none"]);
+        assert_eq!(status.code(), Some(3), "{stderr}");
+        assert!(stderr.contains("note: "), "{stderr}");
+        assert!(stderr.contains("experimental.something"), "{stderr}");
+        assert!(!stderr.contains("warning:"), "{stderr}");
+        assert!(!stderr.contains("value-sentinel"), "{stderr}");
+    }
+
     #[test]
     fn generate_config_does_not_overwrite_it() {
         let fixture = Fixture::new();

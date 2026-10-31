@@ -49,14 +49,14 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 pub fn help() -> String {
-    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch geoip update [--city]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
+    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus --unstable [--only ID] [DIR]\n       netwatch diagnose replay --unstable [--json] <FILE|DIR>...\n       netwatch diagnose features --unstable [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch geoip update [--city]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
     for (name, value, description) in OPTIONS {
         text.push_str(&format!(
             "  {name:<19} {}{description}\n",
             if *value { "<value> " } else { "" }
         ));
     }
-    text.push_str("  --generate-config    Write default config and exit\n  --help, -h           Show help\n  --version, -V        Show version\n\nKeys: 1–9,0 tabs; V view; L Lite; q quit; Shift+R/F/E recorder\n");
+    text.push_str("  --unstable           Required by diagnose corpus, replay and features, whose\n                       formats can change in any release\n  --generate-config    Write default config and exit\n  --help, -h           Show help\n  --version, -V        Show version\n\nKeys: 1–9,0 tabs; V view; L Lite; q quit; Shift+R/F/E recorder\n");
     text
 }
 pub fn parse(args: &[String]) -> anyhow::Result<Command> {
@@ -346,6 +346,37 @@ mod tests {
             MAN.contains("\\-\\-city"),
             "man page is missing geoip update --city"
         );
+
+        // `--unstable` is not in OPTIONS either: the run parser refuses it, and only
+        // the subcommands it gates take it.
+        for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+            assert!(
+                text.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|w| w == "unstable"),
+                "{what} completion is missing --unstable"
+            );
+        }
+        assert!(
+            help().contains("\n  --unstable "),
+            "help does not list --unstable"
+        );
+        assert!(command("--unstable").is_err(), "gates nothing on a session");
+        for sub in crate::diagnose::episode::UNSTABLE_SUBCOMMANDS {
+            let usage = format!("netwatch diagnose {sub} --unstable ");
+            assert!(help().contains(&usage), "help is missing {usage}");
+            // The man page's entry for it, up to the next one.
+            let heading = format!(".B diagnose {sub}");
+            let entry: Vec<_> = MAN
+                .lines()
+                .skip_while(|l| l.trim_end() != heading)
+                .skip(1)
+                .take_while(|l| l.trim_end() != ".TP")
+                .collect();
+            assert!(
+                entry.iter().any(|l| l.contains("\\-\\-unstable")),
+                "man page's diagnose {sub} does not name --unstable: {entry:?}"
+            );
+        }
 
         for sub in crate::diagnose::episode::SUBCOMMANDS {
             for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {

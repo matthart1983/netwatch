@@ -755,7 +755,7 @@ pub fn render_config_notice(f: &mut Frame, app: &App, area: Rect) {
     if !showing || area.height == 0 {
         return;
     }
-    let mut warnings = app.config_warnings();
+    let mut warnings = app.config_warnings().filter(|warning| !warning.is_quiet());
     let Some(first) = warnings.next() else {
         return;
     };

@@ -1403,8 +1403,29 @@ pub const SUBCOMMANDS: &[&str] = &[
     "run", "coverage", "episodes", "replay", "features", "export", "corpus",
 ];
 
+/// The subcommands that refuse to run without `--unstable`, because what they
+/// read and write is experimental: episodes, the feature table and the corpus can
+/// change in any release, where a 1.0 interface could not.
+pub const UNSTABLE_SUBCOMMANDS: &[&str] = &["replay", "features", "corpus"];
+
 /// `netwatch diagnose <SUBCOMMAND>`, one of [`SUBCOMMANDS`].
 pub fn command(args: &[String]) -> anyhow::Result<()> {
+    let unstable = args
+        .first()
+        .is_some_and(|sub| UNSTABLE_SUBCOMMANDS.contains(&sub.as_str()));
+    if unstable && !args.iter().any(|arg| arg == "--unstable") {
+        eprintln!(
+            "error: netwatch diagnose {} needs --unstable: its format is experimental and can change in any release",
+            args[0]
+        );
+        std::process::exit(super::run::Outcome::Error as i32);
+    }
+    let args: Vec<String> = args
+        .iter()
+        .filter(|arg| !unstable || *arg != "--unstable")
+        .cloned()
+        .collect();
+    let args = &args[..];
     match args.first().map(String::as_str) {
         Some("coverage") => super::coverage::command(&args[1..]),
         Some("run") => super::run::command(&args[1..]),
@@ -1422,7 +1443,9 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
                     }
                     flag if flag.starts_with("--") => anyhow::bail!("unknown option {flag}"),
                     _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
-                    _ => anyhow::bail!("usage: netwatch diagnose corpus [--only ID] [DIR]"),
+                    _ => {
+                        anyhow::bail!("usage: netwatch diagnose corpus --unstable [--only ID] [DIR]")
+                    }
                 }
             }
             let dir = dir.unwrap_or_else(|| PathBuf::from(CORPUS_DIR));
@@ -1486,7 +1509,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         Some("features") => super::features::command(&args[1..]),
         Some("export") => super::export::command(&args[1..]),
         _ => anyhow::bail!(
-            "usage: netwatch diagnose run [--target NAME] [--budget 30s] [--format json|text]\n       netwatch diagnose coverage [--json] [--seconds N] [--test ID]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]"
+            "usage: netwatch diagnose run [--target NAME] [--budget 30s] [--format json|text]\n       netwatch diagnose coverage [--json] [--seconds N] [--test ID]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose replay --unstable [--json] <FILE|DIR>...\n       netwatch diagnose features --unstable [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch diagnose corpus --unstable [--only ID] [DIR]"
         ),
     }
 }
@@ -1792,7 +1815,7 @@ mod tests {
         if decisions != pinned {
             return Err(fail(format!(
                 "the engine now reaches different decisions; if that is intended, \
-                 run `cargo run -- diagnose corpus --only {}` and review the diff\n  \
+                 run `cargo run -- diagnose corpus --unstable --only {}` and review the diff\n  \
                  pinned:   {:?}\n  replayed: {:?}",
                 entry.id, pinned.issues, decisions.issues
             )));
@@ -1809,7 +1832,7 @@ mod tests {
         //
         // A semantic fix that changes them is expected to change these
         // files, reviewed in the same diff. Regenerate with:
-        //   cargo run -- diagnose corpus [--only ID]
+        //   cargo run -- diagnose corpus --unstable [--only ID]
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS_DIR);
         let manifest = Manifest::load(&dir).expect("corpus manifest");
         assert!(!manifest.entries.is_empty());
@@ -2465,7 +2488,7 @@ mod tests {
         );
         assert_eq!(list(&dir), vec![path.clone()]);
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        command(&args(&["replay", path.to_str().unwrap()])).unwrap();
+        command(&args(&["replay", "--unstable", path.to_str().unwrap()])).unwrap();
         command(&args(&["episodes", dir.to_str().unwrap()])).unwrap();
         assert!(render_report(&replay(&back), &path).contains("matches recording"));
         let _ = std::fs::remove_dir_all(&dir);

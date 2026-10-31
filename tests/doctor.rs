@@ -153,6 +153,27 @@ fn unknown_keys_degrade_config_and_are_named_without_their_values() {
     }
     assert_eq!(fs::read_to_string(&config).unwrap(), raw);
 
+    // A key under `[experimental]` is listed, and is no reason to call it degraded.
+    fs::write(&config, "[experimental]\nsomething = 'value-sentinel'\n").unwrap();
+    fs::remove_file(&policy).unwrap();
+    let output = fixture
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
+    let row = snapshot.get("config");
+    assert_eq!(row.state, State::Ready, "{}", row.detail);
+    assert_eq!(row.reason, "config_valid");
+    assert!(
+        row.detail.contains("experimental.something"),
+        "{}",
+        row.detail
+    );
+    assert!(!row.detail.contains("value-sentinel"), "{}", row.detail);
+    fs::write(&policy, "stirct = true\n").unwrap();
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+
     // A policy on its own, with no config.toml, is reported as well.
     fs::remove_file(&config).unwrap();
     let output = fixture

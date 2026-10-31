@@ -74,6 +74,7 @@ _netwatch() {
                         '--format=[Output format]:format:(text json)' \
                         '--only=[One corpus entry]:id:' \
                         '--include-beta[Count beta rules in the exit status]' \
+                        '--unstable[Required by replay, features and corpus]' \
                         '*:file:_files'
                     ;;
                 geoip)
