@@ -19,10 +19,12 @@
 #     dropping the interfaces and latency boxes, leaving the throughput graph
 #     and the connection table alone. That is the compact fallback, and it
 #     records the four-box layout as two. 1250x930 gives 133x47.
-#   - The netwatch theme must be RGB. The Lite demo pins `theme = "terminal"`
-#     so colours come from the user's palette — right there, fatal here. Dense
-#     encodes magnitude as a colour ramp, and a palette-deferring theme flattens
-#     every ramp to one token by design. `demo-dense-env.sh` pins `nord`.
+#   - The colours are the terminal's. `demo-dense-env.sh` pins `theme = "terminal"`
+#     and `Set Theme` below is diskwatch's `dark` palette, so the two tools' demos
+#     match. Graphs get the two-step gradient btop draws on a 16-colour terminal.
+#     Don't pin netwatch's `dark`: its graphs resolve ANSI blue to rgb(0,0,170),
+#     which hides the upload half on this background. brightBlack is a compromise,
+#     because it colours the borders, muted text and the selected row.
 #   - Traffic must start AFTER netwatch is capturing, or REMOTE shows raw IPs:
 #     the name comes from the ClientHello's SNI, so a handshake that predates
 #     capture is unreadable. Hence the delayed generator below.
@@ -38,13 +40,13 @@
 # Record on Linux with: vhs docs/media/demo-dense.tape
 # Needs: ./target/release/netwatch with capture permission, vhs, setsid,
 #        scripts/demo-dense-{env,traffic}.sh.
-# The 0.39.0 take uses a separate network/PID namespace for the terminal
+# The take uses a separate network/PID namespace for the terminal
 # session, with /proc and /sys mounted there. Keep the recorder outside it
 # so its browser sockets do not appear in the connection table. That needs no
 # setcap: a `bash` first on vhs's PATH execs this, with resolv.conf holding
 # `nameserver 10.0.2.3` and the wrapper's directory taken off PATH again:
 #
-#   pasta --config-net -q -t none -u none -T none -U none -I demo0 \
+#   pasta --config-net -q -t none -u none -T none -U none -m 1500 -I demo0 \
 #     -a 10.0.2.15 -n 24 -g 10.0.2.2 --dns-forward 10.0.2.3 -- \
 #     unshare --pid --fork --mount-proc --mount /usr/bin/bash -c \
 #     'mount -t sysfs sysfs /sys; mount --bind RESOLV /etc/resolv.conf;
@@ -54,8 +56,8 @@
 #     forwarded port and per forwarded DNS query, and they fill the connection
 #     table with unattributed 127.0.0.1 UDP rows.
 #   - pasta's default MTU shows `mss 43520` and a 10 Gb link. `-m 1500` gives a
-#     normal MSS. The 0.39.0 take kept the default because 0.39.0 read only a
-#     flow's first segment, so at 1500 its ClientHellos lost their hostnames.
+#     normal MSS. It needs a build newer than 0.39.0, which read only a flow's
+#     first segment, so at 1500 its ClientHellos lost their hostnames.
 
 # THEN RE-ENCODE IT, for the same reason the hero tape documents: vhs v0.11.0
 # ignores `Set Framerate` for the GIF and writes 25 fps whatever the tape says,
@@ -71,7 +73,7 @@
 #
 # `dither=none` is deliberate: terminal output is flat colour, so dithering
 # buys nothing visible and costs most of the inter-frame compression.
-# A full-frame palette keeps the static Nord accents; a 64-colour diff-only
+# A full-frame palette keeps the static accents; a 64-colour diff-only
 # palette spent too many entries on the graph and washed out those accents.
 
 Output docs/media/demo-dense.gif
@@ -80,7 +82,7 @@ Set Shell "bash"
 Set FontSize 14
 Set Width 1250
 Set Height 930
-Set Theme { "name": "Catppuccin Mocha, Crust background", "black": "#45475a", "red": "#f38ba8", "green": "#a6e3a1", "yellow": "#f9e2af", "blue": "#89b4fa", "magenta": "#f5c2e7", "cyan": "#94e2d5", "white": "#bac2de", "brightBlack": "#585b70", "brightRed": "#f38ba8", "brightGreen": "#a6e3a1", "brightYellow": "#f9e2af", "brightBlue": "#89b4fa", "brightMagenta": "#f5c2e7", "brightCyan": "#94e2d5", "brightWhite": "#a6adc8", "background": "#11111b", "foreground": "#cdd6f4", "selection": "#585b70", "cursor": "#f5e0dc" }
+Set Theme {"name": "diskwatch dark", "black": "#0c1418", "red": "#ff7878", "green": "#5cd989", "yellow": "#f0c060", "blue": "#5fdcff", "magenta": "#d97aff", "cyan": "#5fdcff", "white": "#c5d1d6", "brightBlack": "#5f747d", "brightRed": "#ff7878", "brightGreen": "#9ae6b4", "brightYellow": "#f0c060", "brightBlue": "#86e6ff", "brightMagenta": "#d97aff", "brightCyan": "#86e6ff", "brightWhite": "#ffffff", "background": "#0c1418", "foreground": "#e6f0f2", "selection": "#1a3340", "cursor": "#c5d1d6"}
 Set TypingSpeed 30ms
 Set Framerate 10
 Set Padding 10
