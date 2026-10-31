@@ -66,7 +66,7 @@ src/
 │   ├── processes.rs         — Per-process bandwidth via packets + connections
 │   ├── network_intel.rs     — Port scan / beaconing / DNS tunnel detection
 │   ├── incident.rs          — Flight recorder (rolling 5-minute capture window)
-│   ├── geoip.rs             — MaxMind DB + online GeoIP lookup
+│   ├── geo.rs               — Offline GeoIP lookups from .mmdb files
 │   └── insights.rs          — Ollama AI analysis (opt-in)
 └── ui/
     ├── mod.rs               — Tab dispatch: routes current_tab to the right renderer

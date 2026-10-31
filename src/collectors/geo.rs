@@ -1,8 +1,7 @@
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::mpsc as std_mpsc;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use super::lru::BoundedLru;
 
@@ -10,11 +9,6 @@ use super::lru::BoundedLru;
 /// looks up every public peer on every tick, and an LRU smaller than the set
 /// it cycles through evicts each entry before it is asked for again.
 const GEO_CACHE_MAX: usize = 16_384;
-
-/// Online lookups queued for the worker at most. A lookup that finds the
-/// queue full is dropped and asked again on a later lookup. The worker
-/// answers one every 1.4 s, so a full queue is six minutes of work.
-const GEO_QUEUE_MAX: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct GeoInfo {
@@ -25,8 +19,7 @@ pub struct GeoInfo {
 }
 
 impl GeoInfo {
-    /// Every field comes from a database file or an HTTP reply we did not
-    /// write (ip-api is cleartext, so anyone on path writes it), so each is
+    /// Every field comes from a database file we did not write, so each is
     /// made safe to draw on the way in.
     fn new(country_code: String, country: String, city: String, org: String) -> Self {
         use crate::ui::sanitize::display_owned;
@@ -43,10 +36,148 @@ impl GeoInfo {
 enum GeoEntry {
     Resolved(GeoInfo),
     Failed,
-    Pending,
 }
 
 // ── MaxMind offline reader ─────────────────────────────────
+
+/// The largest file read from where `netwatch geoip update` saves them. DB-IP's
+/// largest free database is 127 MiB.
+pub(crate) const MAX_DOWNLOADED_DATABASE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The largest file read from a path in the config. A commercial database can be
+/// far larger than a free one, and any size loaded before this limit existed.
+/// This only bounds what doctor and a session hold in memory.
+const MAX_CONFIGURED_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The attribution CC BY 4.0 asks of whatever shows DB-IP's data.
+pub const DBIP_ATTRIBUTION: &str = "IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0";
+
+/// What became of one database path. The database type and the error come
+/// from a file we did not write, so they are made safe to draw.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DbFile {
+    /// No path to open.
+    #[default]
+    NotConfigured,
+    Loaded {
+        path: String,
+        database_type: String,
+        build_epoch: u64,
+    },
+    Unreadable {
+        path: String,
+        error: String,
+    },
+}
+
+/// The databases a lookup can use, for doctor and Settings: a path that does
+/// not open otherwise looks the same as no path at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DbStatus {
+    pub city: DbFile,
+    pub asn: DbFile,
+}
+
+impl DbFile {
+    /// By the file's own `database_type`, because a path says nothing: a DB-IP
+    /// file can live anywhere, and a MaxMind one can have any name.
+    fn is_dbip(&self) -> bool {
+        matches!(self, DbFile::Loaded { database_type, .. } if database_type.starts_with("DBIP-"))
+    }
+}
+
+impl DbStatus {
+    /// Open both files to see what a session would make of them. Reads each
+    /// whole, so this is for a report, not for every frame.
+    pub fn open(city_path: &str, asn_path: &str) -> Self {
+        MaxMindReader::open(city_path, asn_path).1
+    }
+
+    /// The line to show beside these databases, if lookups answer with DB-IP's
+    /// data. A lookup starts from the Country or City file, so an ASN file with
+    /// none beside it shows nothing, and beside a MaxMind one it fills the
+    /// organisation names.
+    pub fn attribution(&self) -> Option<&'static str> {
+        let answers = matches!(self.city, DbFile::Loaded { .. });
+        (answers && (self.city.is_dbip() || self.asn.is_dbip())).then_some(DBIP_ATTRIBUTION)
+    }
+}
+
+/// Seconds since the epoch as a date, or `None` where chrono cannot represent
+/// them. A `build_epoch` is a u64 from a file we did not write, and chrono's
+/// `From<SystemTime>` panics on one that `SystemTime` holds and it does not.
+pub(crate) fn epoch_date(secs: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(i64::try_from(secs).ok()?, 0)
+}
+
+/// The size limit for a database at `path`, given where downloads are saved.
+fn database_limit(path: &Path, downloaded: Option<&Path>) -> u64 {
+    if downloaded.is_some_and(|dir| path.parent() == Some(dir)) {
+        MAX_DOWNLOADED_DATABASE_BYTES
+    } else {
+        MAX_CONFIGURED_DATABASE_BYTES
+    }
+}
+
+/// Read a database file whole. Only a regular file under `limit` is read:
+/// opening a FIFO blocks until something writes to it, and `/dev/zero` never
+/// ends, on a path taken from the config or the cache directory.
+pub(crate) fn read_database(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let over =
+        |bytes: u64| std::io::Error::other(format!("{bytes} bytes is over the {limit} byte limit"));
+    if metadata.len() > limit {
+        return Err(over(metadata.len()));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(over(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
+fn open_database(path: &str) -> (Option<maxminddb::Reader<Vec<u8>>>, DbFile) {
+    use crate::ui::sanitize::display_owned;
+    if path.is_empty() {
+        return (None, DbFile::NotConfigured);
+    }
+    let limit = database_limit(
+        Path::new(path),
+        crate::geoip_update::downloaded_dir().as_deref(),
+    );
+    let opened = read_database(Path::new(path), limit)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| maxminddb::Reader::from_source(bytes).map_err(|error| error.to_string()))
+        .and_then(|reader| {
+            let epoch = reader.metadata().build_epoch;
+            epoch_date(epoch)
+                .map(|_| reader)
+                .ok_or_else(|| format!("build_epoch {epoch} is out of range"))
+        });
+    match opened {
+        Ok(reader) => {
+            let file = DbFile::Loaded {
+                path: path.to_owned(),
+                database_type: display_owned(reader.metadata().database_type.clone()),
+                build_epoch: reader.metadata().build_epoch,
+            };
+            (Some(reader), file)
+        }
+        Err(error) => (
+            None,
+            DbFile::Unreadable {
+                path: path.to_owned(),
+                error: display_owned(error),
+            },
+        ),
+    }
+}
 
 struct MaxMindReader {
     city_reader: Option<maxminddb::Reader<Vec<u8>>>,
@@ -54,21 +185,16 @@ struct MaxMindReader {
 }
 
 impl MaxMindReader {
-    fn open(city_path: &str, asn_path: &str) -> Self {
-        let city_reader = if !city_path.is_empty() {
-            maxminddb::Reader::open_readfile(city_path).ok()
-        } else {
-            None
-        };
-        let asn_reader = if !asn_path.is_empty() {
-            maxminddb::Reader::open_readfile(asn_path).ok()
-        } else {
-            None
-        };
-        Self {
-            city_reader,
-            asn_reader,
-        }
+    fn open(city_path: &str, asn_path: &str) -> (Self, DbStatus) {
+        let (city_reader, city) = open_database(city_path);
+        let (asn_reader, asn) = open_database(asn_path);
+        (
+            Self {
+                city_reader,
+                asn_reader,
+            },
+            DbStatus { city, asn },
+        )
     }
 
     fn lookup(&self, addr: IpAddr) -> Option<GeoInfo> {
@@ -130,12 +256,7 @@ pub struct GeoCache {
     /// Keyed by [`lookup_addr`]'s canonical address.
     cache: Arc<Mutex<BoundedLru<IpAddr, GeoEntry>>>,
     mmdb: Arc<Option<MaxMindReader>>,
-    online_tx: std_mpsc::SyncSender<IpAddr>,
-    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<IpAddr>>>>,
-    /// Opt-in: without it, an IP with no offline DB hit simply has no geo
-    /// info rather than being sent to ip-api.com. See `geoip_online` in
-    /// `NetwatchConfig` for why this defaults to off.
-    online_enabled: bool,
+    db_status: Arc<DbStatus>,
 }
 
 impl Default for GeoCache {
@@ -145,81 +266,35 @@ impl Default for GeoCache {
 }
 
 impl GeoCache {
-    /// No offline DB, no online fallback — used by tests and any caller
-    /// that hasn't opted into `geoip_online`.
+    /// No database, so no lookup answers. Used by tests.
     pub fn new() -> Self {
         Self::with_mmdb("", "")
     }
 
-    /// No online fallback. Prefer `with_mmdb_and_online` when wiring up a
-    /// real config that may have `geoip_online` set.
+    /// Lookups answered from these files and nowhere else. An address no file
+    /// answers for has no geo info. Empty or unreadable paths are in
+    /// [`Self::db_status`].
     pub fn with_mmdb(city_path: &str, asn_path: &str) -> Self {
-        Self::with_mmdb_and_online(city_path, asn_path, false)
+        let (reader, status) = MaxMindReader::open(city_path, asn_path);
+        Self::with_reader(reader, status)
     }
 
-    pub fn with_mmdb_and_online(city_path: &str, asn_path: &str, online_enabled: bool) -> Self {
-        Self::with_reader(MaxMindReader::open(city_path, asn_path), online_enabled)
-    }
-
-    fn with_reader(reader: MaxMindReader, online_enabled: bool) -> Self {
+    fn with_reader(reader: MaxMindReader, status: DbStatus) -> Self {
         let has_db = reader.city_reader.is_some();
-        let mmdb = Arc::new(if has_db { Some(reader) } else { None });
-
-        let (tx, rx) = std_mpsc::sync_channel::<IpAddr>(GEO_QUEUE_MAX);
-        let cache = Arc::new(Mutex::new(BoundedLru::new(GEO_CACHE_MAX)));
-
         Self {
-            online_enabled,
-            cache,
-            mmdb,
-            online_tx: tx,
-            pending_rx: Arc::new(Mutex::new(Some(rx))),
+            cache: Arc::new(Mutex::new(BoundedLru::new(GEO_CACHE_MAX))),
+            mmdb: Arc::new(if has_db { Some(reader) } else { None }),
+            db_status: Arc::new(status),
         }
-    }
-
-    /// Start the prepared lookup worker once, shared across cache clones.
-    /// Construction only opens local resources and creates a request channel.
-    pub fn start(&self) -> bool {
-        let Some(rx) = self.pending_rx.lock().unwrap().take() else {
-            return false;
-        };
-        if !self.online_enabled {
-            // `lookup()` never sends on this channel when online lookups are
-            // disabled, so there is nothing for a worker to do — `rx` drops
-            // here. `pending_rx` was still taken above, so a second `start()`
-            // call correctly reports "already started" either way.
-            return true;
-        }
-        let resolver_cache = Arc::clone(&self.cache);
-
-        // Online fallback thread (ip-api.com) — only needed without a local DB
-        crate::sandbox::worker::spawn("geoip", move || {
-            let now = Instant::now();
-            let mut last_request = now.checked_sub(Duration::from_millis(1500)).unwrap_or(now);
-            while let Some(ip) = crate::sandbox::worker::receive(&rx) {
-                let elapsed = last_request.elapsed();
-                if elapsed < Duration::from_millis(1400) {
-                    thread::sleep(Duration::from_millis(1400) - elapsed);
-                }
-                last_request = Instant::now();
-
-                if crate::sandbox::worker::stopping() {
-                    break;
-                }
-                let result = lookup_geo_online(ip);
-                let mut c = resolver_cache.lock().unwrap();
-                match result {
-                    Some(info) => c.put(ip, GeoEntry::Resolved(info)),
-                    None => c.put(ip, GeoEntry::Failed),
-                }
-            }
-        });
-
-        true
     }
 
     pub fn has_offline_db(&self) -> bool {
         self.mmdb.is_some()
+    }
+
+    /// What this session opened when it started.
+    pub fn db_status(&self) -> &DbStatus {
+        &self.db_status
     }
 
     pub fn lookup(&self, ip: &str) -> Option<GeoInfo> {
@@ -231,46 +306,24 @@ impl GeoCache {
             match cache.get(&addr) {
                 Some(GeoEntry::Resolved(info)) => return Some(info.clone()),
                 Some(GeoEntry::Failed) => return None,
-                Some(GeoEntry::Pending) => return None,
                 None => {}
             }
         }
 
-        // Try offline MaxMind DB (instant, no rate limit)
-        if let Some(ref reader) = *self.mmdb {
-            let result = reader.lookup(addr);
-            let mut cache = self.cache.lock().unwrap();
-            match result {
-                Some(info) => {
-                    cache.put(addr, GeoEntry::Resolved(info.clone()));
-                    return Some(info);
-                }
-                None => {
-                    cache.put(addr, GeoEntry::Failed);
-                    return None;
-                }
-            }
-        }
-
-        // Fall back to online lookup (async via background thread) — opt-in
-        // only. Without a local DB and without this, an IP just has no geo
-        // info rather than being sent to ip-api.com.
-        if !self.online_enabled {
-            return None;
-        }
+        // No database, no answer. Nothing leaves this machine for a lookup.
+        let reader = (*self.mmdb).as_ref()?;
+        let result = reader.lookup(addr);
         let mut cache = self.cache.lock().unwrap();
-        match self.online_tx.try_send(addr) {
-            Ok(()) => cache.put(addr, GeoEntry::Pending),
-            // Queue full: record nothing, so the next lookup asks again.
-            Err(std_mpsc::TrySendError::Full(_)) => {}
-            // Worker gone: nothing will answer, so record the address as
-            // failed and log it once rather than on every later lookup.
-            Err(e @ std_mpsc::TrySendError::Disconnected(_)) => {
+        match result {
+            Some(info) => {
+                cache.put(addr, GeoEntry::Resolved(info.clone()));
+                Some(info)
+            }
+            None => {
                 cache.put(addr, GeoEntry::Failed);
-                tracing::error!(target: "netwatch::geo", error = %e, "online geo resolver thread is gone; falling back to local DB only");
+                None
             }
         }
-        None
     }
 }
 
@@ -427,44 +480,90 @@ pub fn is_private_ip(ip: &str) -> bool {
         || ip.starts_with("239.") // multicast v4
 }
 
-/// Cleartext because it has to be: ip-api.com serves HTTPS only on its paid
-/// tier. Anyone on the path sees which peers are looked up and can rewrite
-/// the answer. That is why `geoip_online` is off by default, and why doctor,
-/// Settings and the config reference call it cleartext.
-fn lookup_geo_online(ip: IpAddr) -> Option<GeoInfo> {
-    let url = format!(
-        "http://ip-api.com/json/{}?fields=status,country,countryCode,city,org,as",
-        ip
-    );
-    let body = crate::http::get_text(&url).ok()?;
-    parse_ip_api(&body)
-}
-
-fn parse_ip_api(body: &str) -> Option<GeoInfo> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-
-    if v.get("status")?.as_str()? != "success" {
-        return None;
-    }
-
-    Some(GeoInfo::new(
-        v.get("countryCode")?.as_str()?.to_string(),
-        v.get("country")?.as_str()?.to_string(),
-        v.get("city")?.as_str().unwrap_or("").to_string(),
-        v.get("org")
-            .or_else(|| v.get("as"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-    ))
-}
-
 #[cfg(test)]
 impl GeoCache {
     /// A cache whose database puts every address in Ashburn, United States,
     /// for tests outside this module.
     pub(crate) fn every_address_us_for_test() -> Self {
-        Self::with_reader(tests::every_address_us(), false)
+        Self::with_reader(tests::every_address_us(), DbStatus::default())
+    }
+}
+
+/// Small databases in the MaxMind format, for tests here and of the code that
+/// downloads them: one search-tree node whose two records both point at the
+/// only data record, so every address, v4 or v6, finds it.
+#[cfg(test)]
+pub(crate) mod test_db {
+    /// A UTF-8 string: type 2 in the top three bits, then its length.
+    fn text(s: &str) -> Vec<u8> {
+        let mut out = if s.len() < 29 {
+            vec![0x40 | s.len() as u8]
+        } else {
+            vec![0x40 | 29, (s.len() - 29) as u8]
+        };
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    fn build(data: &[u8], database_type: &str, build_epoch: u64) -> Vec<u8> {
+        // One node, 24-bit records. A record past the node count points into
+        // the data section, which starts 16 bytes after the tree:
+        // 1 + 16 + offset 0.
+        let mut db = vec![0, 0, 17, 0, 0, 17];
+        db.extend_from_slice(&[0; 16]);
+        db.extend_from_slice(data);
+        db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
+        let epoch = [&[0x08, 0x02][..], &build_epoch.to_be_bytes()].concat(); // uint64
+        let database_type = text(database_type);
+        let metadata: [(&str, &[u8]); 9] = [
+            ("binary_format_major_version", &[0xA1, 2]), // uint16
+            ("binary_format_minor_version", &[0xA0]),
+            ("build_epoch", &epoch),
+            ("database_type", &database_type),
+            ("description", &[0xE0]), // empty map
+            ("ip_version", &[0xA1, 6]),
+            ("languages", b"\x01\x04\x42en"), // array of one string
+            ("node_count", &[0xC1, 1]),       // uint32
+            ("record_size", &[0xA1, 24]),
+        ];
+        db.push(0xE0 | metadata.len() as u8);
+        for (key, value) in metadata {
+            db.extend(text(key));
+            db.extend_from_slice(value);
+        }
+        db
+    }
+
+    /// Every address is in Ashburn, United States.
+    pub(crate) fn city(database_type: &str, build_epoch: u64) -> Vec<u8> {
+        // {city: {names: {en: "Ashburn"}},
+        //  country: {iso_code: "US", names: {en: "United States"}}}
+        let mut data = vec![0xE2];
+        data.extend(text("city"));
+        data.push(0xE1);
+        data.extend(text("names"));
+        data.push(0xE1);
+        data.extend(text("en"));
+        data.extend(text("Ashburn"));
+        data.extend(text("country"));
+        data.push(0xE2);
+        data.extend(text("iso_code"));
+        data.extend(text("US"));
+        data.extend(text("names"));
+        data.push(0xE1);
+        data.extend(text("en"));
+        data.extend(text("United States"));
+        build(&data, database_type, build_epoch)
+    }
+
+    /// Every address is in AS 42, "Test Org".
+    pub(crate) fn asn(database_type: &str, build_epoch: u64) -> Vec<u8> {
+        let mut data = vec![0xE2];
+        data.extend(text("autonomous_system_number"));
+        data.extend_from_slice(&[0xC1, 42]); // uint32
+        data.extend(text("autonomous_system_organization"));
+        data.extend(text("Test Org"));
+        build(&data, database_type, build_epoch)
     }
 }
 
@@ -570,54 +669,23 @@ mod tests {
         assert!(cache.lookup("—").is_none());
     }
 
+    /// Without a database an address has no geo info, and nothing is recorded
+    /// or sent for it. There is no worker, queue or other path off this machine
+    /// to send it down, and this file holds no client to build one with.
     #[test]
-    fn geocache_no_db_returns_none_first_call() {
-        let cache = GeoCache::new();
-        // No DB and online lookups off (the default): nothing is queued,
-        // this just returns None.
-        assert!(cache.lookup("8.8.8.8").is_none());
-        assert!(cache
-            .pending_rx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .try_recv()
-            .is_err());
-    }
-
-    #[test]
-    fn geocache_online_disabled_by_default_does_not_queue() {
-        // Same IP, both constructors: without opting in, ip-api.com never
-        // sees a request queued for it.
+    fn lookup_never_queues_online() {
         for cache in [GeoCache::new(), GeoCache::with_mmdb("", "")] {
             assert!(cache.lookup("8.8.8.8").is_none());
-            assert!(cache
-                .pending_rx
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .try_recv()
-                .is_err());
+            assert_eq!(cache.cache.lock().unwrap().len(), 0);
         }
-    }
-
-    #[test]
-    fn geocache_online_opt_in_queues_the_lookup() {
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        assert!(cache.lookup("8.8.8.8").is_none());
-        assert_eq!(
-            cache
-                .pending_rx
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .try_recv()
-                .unwrap(),
-            IpAddr::from([8, 8, 8, 8])
-        );
+        let unreadable = GeoCache::with_mmdb("/nonexistent/path.mmdb", "");
+        assert!(unreadable.lookup("8.8.8.8").is_none());
+        assert_eq!(unreadable.cache.lock().unwrap().len(), 0);
+        // Assembled, so this test does not match itself.
+        let source = include_str!("geo.rs");
+        for client in [concat!("crate::", "http"), concat!("ureq", "::")] {
+            assert!(!source.contains(client), "{client}");
+        }
     }
 
     #[test]
@@ -632,103 +700,287 @@ mod tests {
         assert!(!cache.has_offline_db());
     }
 
+    /// `open_readfile(..).ok()` threw the reason away, so a wrong path looked
+    /// the same as none to everything that could have reported it.
+    #[test]
+    fn a_database_that_does_not_open_says_why() {
+        let status = DbStatus::open("/nonexistent/path.mmdb", "");
+        assert_eq!(status.asn, DbFile::NotConfigured);
+        let DbFile::Unreadable { path, error } = &status.city else {
+            panic!("{status:?}");
+        };
+        assert_eq!(path, "/nonexistent/path.mmdb");
+        assert!(!error.is_empty());
+        assert_eq!(
+            *GeoCache::with_mmdb("/nonexistent/path.mmdb", "").db_status(),
+            status
+        );
+        assert_eq!(DbStatus::open("", ""), DbStatus::default());
+    }
+
+    /// A file in a fresh directory, for the status a session would make of it.
+    fn status_of(write: impl FnOnce(&Path)) -> DbFile {
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.mmdb");
+        write(&path);
+        let status = DbStatus::open(path.to_str().unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+        status.city
+    }
+
+    /// The date fits `SystemTime` but not chrono, whose conversion panics. That
+    /// took doctor and every session down with exit 101 on one hand-made file.
+    #[test]
+    fn an_out_of_range_build_epoch_is_unreadable() {
+        for epoch in [9_000_000_000_000, i64::MAX as u64, u64::MAX] {
+            let file = status_of(|path| {
+                std::fs::write(path, test_db::city("DBIP-Country-Lite", epoch)).unwrap()
+            });
+            let DbFile::Unreadable { error, .. } = &file else {
+                panic!("{epoch}: {file:?}");
+            };
+            assert!(error.contains("build_epoch"), "{epoch}: {error}");
+        }
+        // Far off but representable is only a strange date. Windows' SystemTime
+        // stops at about 1.8e12 seconds, well short of chrono's limit.
+        let far = status_of(|path| {
+            std::fs::write(path, test_db::city("DBIP-Country-Lite", 1_000_000_000_000)).unwrap()
+        });
+        assert!(matches!(far, DbFile::Loaded { .. }), "{far:?}");
+    }
+
+    /// Opening a FIFO blocks until something writes to it, which held doctor
+    /// forever, and `/dev/zero` never ends. The thread is so a regression fails
+    /// here rather than hanging the run.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_is_not_regular_is_unreadable_without_being_read() {
+        let opened = |path: String| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(DbStatus::open(&path, "").city);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("reading it did not return")
+        };
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo.mmdb");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        for path in [fifo.to_str().unwrap(), "/dev/zero", dir.to_str().unwrap()] {
+            let file = opened(path.to_owned());
+            let DbFile::Unreadable { error, .. } = &file else {
+                panic!("{path}: {file:?}");
+            };
+            assert_eq!(error, "not a regular file", "{path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The limit is the file's place, not its name: a path in the config has
+    /// room for a commercial database, and only the download directory is held
+    /// to what the update writes.
+    #[test]
+    fn the_limit_depends_on_where_the_file_is() {
+        let downloads = Path::new("/cache/netwatch/geoip");
+        for (path, limit) in [
+            (
+                "/cache/netwatch/geoip/dbip-city-lite.mmdb",
+                MAX_DOWNLOADED_DATABASE_BYTES,
+            ),
+            ("/geo/GeoIP2-Enterprise.mmdb", MAX_CONFIGURED_DATABASE_BYTES),
+            ("/geo/dbip-city-lite.mmdb", MAX_CONFIGURED_DATABASE_BYTES),
+            (
+                "/cache/netwatch/geoip/sub/db.mmdb",
+                MAX_CONFIGURED_DATABASE_BYTES,
+            ),
+        ] {
+            assert_eq!(
+                database_limit(Path::new(path), Some(downloads)),
+                limit,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            database_limit(Path::new("/geo/db.mmdb"), None),
+            MAX_CONFIGURED_DATABASE_BYTES
+        );
+    }
+
+    /// Sparse, so this costs nothing, and too big to read by accident.
+    #[test]
+    fn a_file_over_the_limit_is_unreadable_without_being_read() {
+        let file = status_of(|path| {
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(MAX_CONFIGURED_DATABASE_BYTES + 1)
+                .unwrap()
+        });
+        let DbFile::Unreadable { error, .. } = &file else {
+            panic!("{file:?}");
+        };
+        assert!(error.contains("limit"), "{error}");
+
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.mmdb");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_DOWNLOADED_DATABASE_BYTES + 1)
+            .unwrap();
+        let error = read_database(&path, MAX_DOWNLOADED_DATABASE_BYTES).unwrap_err();
+        assert!(error.to_string().contains("limit"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commercial database larger than anything the update writes loaded at
+    /// any size before there was a limit, and still does. Padded inside the data
+    /// section, which nothing refers to, and sparse on disk.
+    #[test]
+    fn a_configured_database_over_the_download_limit_still_loads() {
+        use std::io::{Seek, Write};
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("commercial.mmdb");
+        let db = test_db::city("GeoIP2-Enterprise", 1_790_000_000);
+        let marker = db
+            .windows(14)
+            .rposition(|window| window == b"\xab\xcd\xefMaxMind.com")
+            .unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&db[..marker]).unwrap();
+        file.seek(std::io::SeekFrom::Start(MAX_DOWNLOADED_DATABASE_BYTES + 1))
+            .unwrap();
+        file.write_all(&db[marker..]).unwrap();
+        drop(file);
+        assert!(std::fs::metadata(&path).unwrap().len() > MAX_DOWNLOADED_DATABASE_BYTES);
+
+        let cache = GeoCache::with_mmdb(path.to_str().unwrap(), "");
+        assert!(
+            matches!(cache.db_status().city, DbFile::Loaded { .. }),
+            "{:?}",
+            cache.db_status().city
+        );
+        assert_eq!(cache.lookup("8.8.8.8").unwrap().country_code, "US");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_loaded_database_reports_its_type_and_date() {
+        let dir = std::env::temp_dir().join(format!("nw-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (city, asn) = (dir.join("city.mmdb"), dir.join("asn.mmdb"));
+        std::fs::write(&city, test_db::city("Ctrl\x1b-City", 1_790_000_000)).unwrap();
+        std::fs::write(&asn, test_db::asn("Test-ASN", 1_790_000_001)).unwrap();
+        let cache = GeoCache::with_mmdb(city.to_str().unwrap(), asn.to_str().unwrap());
+        assert_eq!(
+            cache.db_status().city,
+            DbFile::Loaded {
+                path: city.to_str().unwrap().to_owned(),
+                database_type: "Ctrl·-City".into(),
+                build_epoch: 1_790_000_000,
+            }
+        );
+        assert!(matches!(
+            cache.db_status().asn,
+            DbFile::Loaded {
+                build_epoch: 1_790_000_001,
+                ..
+            }
+        ));
+        // And the ASN shape reaches a lookup.
+        let info = cache.lookup("8.8.8.8").unwrap();
+        assert_eq!(
+            (info.country_code.as_str(), info.org.as_str()),
+            ("US", "Test Org")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only what a file says about itself counts. Its name does not, and an
+    /// ASN file that no lookup reaches puts nothing on screen to attribute.
+    #[test]
+    fn attribution_follows_the_database_type() {
+        let file = |database_type: &str| DbFile::Loaded {
+            path: "/geo/dbip-country-lite.mmdb".into(),
+            database_type: database_type.into(),
+            build_epoch: 1_790_000_000,
+        };
+        let status = |city, asn| DbStatus { city, asn };
+        let (dbip, asn_dbip) = (
+            file("DBIP-City-Lite"),
+            file("DBIP-ASN-Lite (compat=GeoLite2-ASN)"),
+        );
+        let maxmind = file("GeoLite2-City");
+        for attributed in [
+            status(dbip.clone(), DbFile::NotConfigured),
+            status(dbip.clone(), maxmind.clone()),
+            status(maxmind.clone(), asn_dbip.clone()),
+        ] {
+            assert_eq!(
+                attributed.attribution(),
+                Some(DBIP_ATTRIBUTION),
+                "{attributed:?}"
+            );
+        }
+        let unreadable = DbFile::Unreadable {
+            path: "/geo/dbip-city-lite.mmdb".into(),
+            error: "bad".into(),
+        };
+        for not in [
+            DbStatus::default(),
+            status(maxmind.clone(), DbFile::NotConfigured),
+            status(maxmind.clone(), file("GeoLite2-ASN")),
+            status(file("dbip-lowercase"), DbFile::NotConfigured),
+            status(DbFile::NotConfigured, asn_dbip.clone()),
+            status(unreadable, asn_dbip),
+        ] {
+            assert_eq!(not.attribution(), None, "{not:?}");
+        }
+    }
+
     #[test]
     fn with_mmdb_bad_path_falls_back() {
         let cache = GeoCache::with_mmdb("/nonexistent.mmdb", "/also-bad.mmdb");
         assert!(!cache.has_offline_db());
-        // Should still work via online fallback path
         assert!(cache.lookup("192.168.1.1").is_none()); // private
     }
 
     #[test]
-    fn ip_api_control_characters_are_replaced() {
-        let body = serde_json::json!({
-            "status": "success",
-            "countryCode": "AU",
-            "country": "Aus\u{202E}tralia",
-            "city": "Syd\u{1b}]52;c;AAAA\u{7}",
-            "org": "Evil\u{FEFF}Net",
-        })
-        .to_string();
-        let info = parse_ip_api(&body).unwrap();
+    fn control_characters_are_replaced() {
+        let info = GeoInfo::new(
+            "AU".into(),
+            "Aus\u{202E}tralia".into(),
+            "Syd\u{1b}]52;c;AAAA\u{7}".into(),
+            "Evil\u{FEFF}Net".into(),
+        );
         assert_eq!(info.country_code, "AU");
         assert_eq!(info.country, "Aus·tralia");
         assert_eq!(info.city, "Syd·]52;c;AAAA·");
         assert_eq!(info.org, "Evil·Net");
     }
 
-    /// A MaxMind DB that puts every address, v4 or v6, in Ashburn, United
-    /// States: one search-tree node whose two records both point at the only
-    /// data record. Enough to drive the offline path without a database file.
+    /// A reader that puts every address, v4 or v6, in Ashburn, United States.
+    /// Enough to drive the offline path without a database file.
     pub(super) fn every_address_us() -> MaxMindReader {
-        // A UTF-8 string shorter than 29 bytes: type 2 in the top three
-        // bits, length in the low five.
-        fn text(s: &str) -> Vec<u8> {
-            assert!(s.len() < 29);
-            let mut out = vec![0x40 | s.len() as u8];
-            out.extend_from_slice(s.as_bytes());
-            out
-        }
-        // One node, 24-bit records. A record past the node count points
-        // into the data section, which starts 16 bytes after the tree:
-        // 1 + 16 + offset 0.
-        let mut db = vec![0, 0, 17, 0, 0, 17];
-        db.extend_from_slice(&[0; 16]);
-        // {city: {names: {en: "Ashburn"}},
-        //  country: {iso_code: "US", names: {en: "United States"}}}
-        db.push(0xE2);
-        db.extend(text("city"));
-        db.push(0xE1);
-        db.extend(text("names"));
-        db.push(0xE1);
-        db.extend(text("en"));
-        db.extend(text("Ashburn"));
-        db.extend(text("country"));
-        db.push(0xE2);
-        db.extend(text("iso_code"));
-        db.extend(text("US"));
-        db.extend(text("names"));
-        db.push(0xE1);
-        db.extend(text("en"));
-        db.extend(text("United States"));
-        db.extend_from_slice(b"\xab\xcd\xefMaxMind.com");
-        let metadata: [(&str, &[u8]); 9] = [
-            ("binary_format_major_version", &[0xA1, 2]), // uint16
-            ("binary_format_minor_version", &[0xA0]),
-            ("build_epoch", &[0x04, 0x02, 0x68, 0xE7, 0xB7, 0x00]), // uint64
-            ("database_type", b"\x49Test-City"),
-            ("description", &[0xE0]), // empty map
-            ("ip_version", &[0xA1, 6]),
-            ("languages", b"\x01\x04\x42en"), // array of one string
-            ("node_count", &[0xC1, 1]),       // uint32
-            ("record_size", &[0xA1, 24]),
-        ];
-        db.push(0xE0 | metadata.len() as u8);
-        for (key, value) in metadata {
-            db.extend(text(key));
-            db.extend_from_slice(value);
-        }
         MaxMindReader {
-            city_reader: Some(maxminddb::Reader::from_source(db).unwrap()),
+            city_reader: Some(
+                maxminddb::Reader::from_source(test_db::city("Test-City", 1_760_016_128)).unwrap(),
+            ),
             asn_reader: None,
         }
-    }
-
-    /// What the online worker would be handed next, drained.
-    fn queued(cache: &GeoCache) -> Vec<String> {
-        let rx = cache.pending_rx.lock().unwrap();
-        rx.as_ref()
-            .unwrap()
-            .try_iter()
-            .map(|ip| ip.to_string())
-            .collect()
     }
 
     /// The offline path inserted with no eviction at all, so a long-running
     /// host with a database kept every distinct peer it ever saw.
     #[test]
     fn offline_cache_stays_bounded() {
-        let cache = GeoCache::with_reader(every_address_us(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default());
         assert!(cache.has_offline_db());
         for i in 0..100_000u32 {
             let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
@@ -743,7 +995,7 @@ mod tests {
     /// went back to the database.
     #[test]
     fn ten_thousand_peers_stay_cached() {
-        let cache = GeoCache::with_reader(every_address_us(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default());
         let peers: Vec<IpAddr> = (0..10_000u32)
             .map(|i| IpAddr::from(Ipv4Addr::from(0x0800_0000 + i)))
             .collect();
@@ -754,81 +1006,19 @@ mod tests {
         assert!(peers.iter().all(|peer| c.contains_key(peer)));
     }
 
-    /// The online queue had no limit, and a pending entry the cache evicted
-    /// was queued again on the next tick's lookup, so with more peers than
-    /// cache entries every tick queued every peer behind a worker that
-    /// answers one every 1.4 s.
-    #[test]
-    fn a_full_online_queue_drops_the_request_and_records_nothing() {
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        let peers: Vec<String> = (0..10_000u32)
-            .map(|i| Ipv4Addr::from(0x0800_0000 + i).to_string())
-            .collect();
-        // Two ticks: the second queues nothing new.
-        for _ in 0..2 {
-            for peer in &peers {
-                assert!(cache.lookup(peer).is_none());
-            }
-        }
-        assert_eq!(cache.cache.lock().unwrap().len(), GEO_QUEUE_MAX);
-        assert_eq!(queued(&cache).len(), GEO_QUEUE_MAX);
-        // With room again, a dropped request is asked for on its next lookup.
-        let dropped = peers.last().unwrap();
-        cache.lookup(dropped);
-        assert_eq!(queued(&cache), [dropped.as_str()]);
-    }
-
-    /// Once the worker has gone, after a panic or at shutdown while the UI
-    /// still ticks, a lookup that records nothing tries the send again next
-    /// time. The egress view looks up every public peer on every tick, so
-    /// that was an error in the log per peer per tick.
-    #[test]
-    fn a_gone_worker_is_logged_once_per_address() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tracing_subscriber::layer::{Context, SubscriberExt};
-
-        struct Count(Arc<AtomicUsize>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
-            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let events = Arc::new(AtomicUsize::new(0));
-        let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&events)));
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        drop(cache.pending_rx.lock().unwrap().take());
-        tracing::subscriber::with_default(subscriber, || {
-            for _tick in 0..10 {
-                for i in 0..100u32 {
-                    let ip = Ipv4Addr::from(0x0800_0000 + i).to_string();
-                    assert!(cache.lookup(&ip).is_none());
-                }
-            }
-        });
-        assert_eq!(events.load(Ordering::Relaxed), 100);
-    }
-
     #[test]
     fn v4_mapped_and_plain_share_one_entry() {
-        let cache = GeoCache::with_reader(every_address_us(), false);
+        let cache = GeoCache::with_reader(every_address_us(), DbStatus::default());
         assert!(cache.lookup("8.8.8.8").is_some());
         assert!(cache.lookup("::ffff:8.8.8.8").is_some());
         assert!(cache.lookup("[::ffff:8.8.8.8]").is_some());
         assert_eq!(cache.cache.lock().unwrap().len(), 1);
-
-        // Online, the mapped form is asked for once, as the IPv4 address.
-        let online = GeoCache::with_mmdb_and_online("", "", true);
-        online.lookup("::ffff:8.8.8.8");
-        online.lookup("8.8.8.8");
-        assert_eq!(queued(&online), ["8.8.8.8"]);
     }
 
     #[test]
     fn non_global_addresses_are_never_looked_up() {
         // Every address is in the fake database, so None means skipped.
-        let offline = GeoCache::with_reader(every_address_us(), false);
-        let online = GeoCache::with_mmdb_and_online("", "", true);
+        let offline = GeoCache::with_reader(every_address_us(), DbStatus::default());
         for ip in [
             "::ffff:192.168.1.5",
             "::ffff:10.0.0.1",
@@ -886,10 +1076,8 @@ mod tests {
             "not-an-ip",
         ] {
             assert!(offline.lookup(ip).is_none(), "{ip}");
-            online.lookup(ip);
         }
         assert_eq!(offline.cache.lock().unwrap().len(), 0);
-        assert!(queued(&online).is_empty());
 
         for ip in [
             "8.8.8.8",
@@ -919,32 +1107,5 @@ mod tests {
         ] {
             assert!(offline.lookup(ip).is_some(), "{ip}");
         }
-    }
-}
-
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-
-    #[test]
-    fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
-        // Online lookups must be opted into for this to exercise the
-        // worker-sharing path at all (see geo.rs's `online_enabled` gate).
-        let cache = GeoCache::with_mmdb_and_online("", "", true);
-        cache.lookup("8.8.8.8");
-        assert_eq!(
-            cache
-                .pending_rx
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .try_recv()
-                .unwrap(),
-            IpAddr::from([8, 8, 8, 8])
-        );
-        let clone = cache.clone();
-        assert!(clone.start());
-        assert!(!cache.start());
     }
 }

@@ -15,9 +15,11 @@ pub struct SandboxPaths {
     /// `~/.config/netwatch/` — config.toml read at startup and on
     /// settings-overlay edits.
     pub config_dir: Option<PathBuf>,
-    /// Exact City database file (legacy field name retained).
+    /// Exact City or Country database file (legacy field name retained),
+    /// the downloaded one when `geoip_db` is empty.
     pub geoip_db_dir: Option<PathBuf>,
-    /// Exact ASN database file (legacy field name retained).
+    /// Exact ASN database file (legacy field name retained), the downloaded
+    /// one when `geoip_asn_db` is empty.
     pub geoip_asn_db_dir: Option<PathBuf>,
     /// Exact keylog file; no parent-directory grant. Missing files are not granted.
     pub keylog_dir: Option<PathBuf>,
@@ -41,8 +43,9 @@ impl SandboxPaths {
         let cache_dir = dirs::cache_dir().map(|c| c.join("netwatch"));
         let config_dir = dirs::config_dir().map(|c| c.join("netwatch"));
 
-        let geoip_db_dir = file_if_set(&cfg.geoip_db);
-        let geoip_asn_db_dir = file_if_set(&cfg.geoip_asn_db);
+        let (geoip_db, geoip_asn_db) = cfg.geoip_paths();
+        let geoip_db_dir = file_if_set(&geoip_db);
+        let geoip_asn_db_dir = file_if_set(&geoip_asn_db);
         let keylog_dir = file_if_set(&cfg.tls_keylog_path);
 
         let cwd = cache_dir.as_ref().map(|p| p.join("exports"));

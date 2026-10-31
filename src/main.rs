@@ -42,6 +42,9 @@ fn main() -> Result<()> {
             return netwatch::diagnose::episode::command(&args)
         }
         netwatch::cli::Command::Uptime(args) => return netwatch::uptime::command(&args),
+        netwatch::cli::Command::GeoipUpdate { city } => {
+            return netwatch::geoip_update::command(city)
+        }
         netwatch::cli::Command::Doctor {
             json,
             check_capture,
@@ -125,6 +128,7 @@ fn main() -> Result<()> {
     // Installed after CLI flag handling so `--version` / `--help` don't
     // touch the cache dir.
     let _log_guard = netwatch::logging::init();
+    config.warn_removed_keys();
 
     // Headless daemon mode: `netwatch daemon` (or `--daemon`/`--headless`).
     // Runs the same collectors as the TUI with no rendering, streams to the

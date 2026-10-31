@@ -134,7 +134,8 @@ Application preparation is separate from explicit worker startup.
 - `src/collectors/process_bandwidth.rs` ranks processes by RX/TX activity
 - `src/collectors/traceroute.rs` runs traceroute jobs for overlays
 - `src/collectors/whois.rs` performs WHOIS/RDAP lookups
-- `src/collectors/geo.rs` resolves GeoIP data via MaxMind or online fallback
+- `src/collectors/geo.rs` resolves GeoIP data from local `.mmdb` databases
+- `src/geoip_update.rs` downloads those databases when asked
 - `src/collectors/network_intel.rs` generates alert events used by the dashboard and recorder
 - `src/collectors/incident.rs` manages the rolling flight recorder window and bundle export
 - `src/collectors/insights.rs` builds network snapshots for the optional Ollama analysis

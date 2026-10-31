@@ -50,15 +50,14 @@ pub fn role_for(name: &str) -> Role {
         // resolves names through NSS, and the runtime's blocking pool takes
         // any blocking job, a name lookup among them. The rest connect by
         // design.
-        "tokio-blocking" | "reverse-dns" | "whois" | "geoip" | "health" | "traceroute"
-        | "insights" | "remote" | "diagnose-active" | "diagnose-test" | "diagnose-targets" => {
-            Role::Network
-        }
+        "tokio-blocking" | "reverse-dns" | "whois" | "health" | "traceroute" | "insights"
+        | "remote" | "diagnose-active" | "diagnose-test" | "diagnose-targets" => Role::Network,
         "capture" => Role::Capture,
         "proc-broker" => Role::Broker,
         // keylog, metrics-listener, metrics-client, ebpf, connections,
         // tcp-info, traffic, process-cpu, terminal, logging, capture-export,
-        // policy-preflight and pktap, and any name added without a row here.
+        // policy-preflight, geoip-update and pktap, and any name added
+        // without a row here.
         // shutdown-deadline never enters; as a parser it relinquishes every
         // capability.
         _ => Role::Parser,
@@ -93,7 +92,6 @@ mod tests {
         ("tokio-blocking", Role::Network, false),
         ("reverse-dns", Role::Network, false),
         ("whois", Role::Network, false),
-        ("geoip", Role::Network, false),
         ("health", Role::Network, false),
         ("traceroute", Role::Network, false),
         ("insights", Role::Network, false),
@@ -115,6 +113,7 @@ mod tests {
         ("logging", Role::Parser, false),
         ("capture-export", Role::Parser, false),
         ("policy-preflight", Role::Parser, false),
+        ("geoip-update", Role::Parser, false),
         ("pktap", Role::Parser, false),
         ("shutdown-deadline", Role::Parser, false),
     ];
@@ -213,7 +212,8 @@ mod tests {
     #[test]
     fn unknown_name_is_parser() {
         // Fails closed: a worker added without a row loses the network.
-        for name in ["", "new-worker", "Capture", "whois ", "smoke"] {
+        // geoip was the online lookup worker, removed in 0.39. It has no row.
+        for name in ["", "new-worker", "Capture", "whois ", "smoke", "geoip"] {
             assert_eq!(role_for(name), Role::Parser, "{name:?}");
             assert!(!no_sockets(name), "{name:?}");
         }
