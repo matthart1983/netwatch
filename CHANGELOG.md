@@ -17,7 +17,8 @@ All notable changes to NetWatch will be documented in this file.
   value sets are closed and which can grow, and mark the fields a script should not
   rely on as `deprecated`, such as doctor's `network_restricted`, which is always
   false. Those stay until a major version. docs/REFERENCE.md has the rules. The
-  egress export stays `netwatch.egress.v1.1`, since no record gained a field.
+  egress export stays `netwatch.egress.v1.1`: as with the other outputs, an added
+  field does not change its tag, and only a break does.
   `uptime --csv` needs no version marker: its header row is the contract, so
   columns are not renamed or removed, and new ones are added at the end.
 
@@ -46,8 +47,9 @@ All notable changes to NetWatch will be documented in this file.
   destination.** It said `tls` for anything with a name, and a cleartext HTTP
   `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
   to anyone filtering on `proto`. Such a flow now says `other`, which is what the
-  field was documented to do. A destination in a baseline saved before this keeps
-  saying `tls` until a flow to it is seen again.
+  field was documented to do, and a destination that has seen both stays `other`.
+  A destination in a baseline saved before this keeps saying `tls` until a
+  cleartext flow to it is seen again.
 
 - **`doctor --json` says `"interface": null` when a capture check selects
   nothing.** With no `--interface` given and no interface up, or on Windows with no

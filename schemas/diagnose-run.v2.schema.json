@@ -22,7 +22,7 @@
     "ruleset": { "type": "integer", "minimum": 0, "description": "How many rules this build's catalogue holds. A count that grows between releases, not a version." },
     "outcome": {
       "enum": ["no_finding", "finding", "incomplete"],
-      "description": "Closed set: a new value needs netwatch 2.0, because each one is an exit status. no_finding is not a health claim, only that the rules that could be evaluated did not fire. incomplete means retry with a longer budget, and is not health either."
+      "description": "Closed set: a new value needs netwatch 2.0, because each one is an exit status. no_finding means the run had evidence and no Issue counted towards the exit status. It is not a health claim: a rule that could not be evaluated did not fire, and issues can still list a beta rule's Issue, which counts only with --include-beta. finding means at least one Issue counted. incomplete means no usable observation arrived and no Issue counted, and it can list a beta rule's Issue too. Retry it with a longer budget, and do not read it as health."
     },
     "exit": {
       "enum": [0, 1, 2],

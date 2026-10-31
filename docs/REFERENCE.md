@@ -461,7 +461,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch` | The TUI. Flags below. |
 | `netwatch daemon` (also `--daemon`, `--headless`) | The collectors with no screen. With `--metrics` or `--metrics-addr`, serves [Prometheus metrics](observability-export.md). |
 | `netwatch doctor [--json] [--check-capture] [--interface NAME]` | Read-only setup report: what this host lets netwatch see. `--check-capture` tries a real capture. See [doctor.md](doctor.md). |
-| `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue. 1: at least one open issue. 2: no usable observation in the budget. 3: bad arguments or no session. |
+| `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue counted. 1: at least one open issue counted. 2: no usable observation in the budget. 3: bad arguments or no session. |
 | `netwatch diagnose coverage [--json] [--seconds N] [--test ID]` | Which checks have their inputs on this host, and why the others do not. |
 | `netwatch diagnose episodes [DIR]` | List recorded incident episodes. |
 | `netwatch diagnose replay [--json] FILE\|DIR...` | Replay episodes through the engine and report any divergence. |
@@ -597,7 +597,7 @@ time.
 }
 ```
 
-`schema_version` is a string because the egress export's has a minor. Use this block in new code.
+`schema_version` is a string because the egress export's is `1.1`. Use this block in new code.
 The older markers stay, with their meanings unchanged. Mind `version`: in `diagnose run` it is the
 netwatch version, and in `diagnose export` it is the version of the bundle format.
 
@@ -605,8 +605,8 @@ netwatch version, and in `diagnose export` it is the version of the bundle forma
 know. No schema here closes an object, so a validator using one of these files keeps passing when
 that happens. A break needs netwatch 2.0 and a new schema file, and a published file is never
 removed or renamed. The files describe what 0.40 and later write. A field added after that is not
-made `required` in an existing file, so older documents stay valid. The egress export is the one
-output whose name changes for an added field: a new record field bumps its minor, and adds a file.
+made `required` in an existing file, so older documents stay valid. An added field changes no
+output's name or version, so `netwatch.egress.v1.1` stays that until a break, like the others.
 
 **Required and null.** A field is `required` only where netwatch always writes it. Some can be
 absent and some can be null, and the two are not interchangeable. An egress record leaves `sni`
@@ -648,7 +648,7 @@ TUI.
 - A `diagnose run` finding's `state` is an object, `{"state": "open"}`, so the value is at
   `.state.state`. A check's `state` is a plain string.
 - An egress record's `sni` holds the destination's name, which can be a cleartext HTTP `Host`. `proto`
-  says `tls` only when a ClientHello supplied it.
+  says `tls` only when a ClientHello supplied it and no flow to that destination carried a `Host`.
 - An egress record's `"matched_by": "sni"` also covers a rule that declares no name restriction at
   all, so it does not always mean one named endpoint. `matched_by` is an open set, so a minor can add
   a broader value for such a rule.

@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 /// the interface, not an implementation detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The run completed and found no Issue. Not a claim that the host is
-    /// healthy — only that the rules that could be evaluated did not fire.
-    /// Observations may still be listed.
+    /// The run completed and no Issue counted. Not a claim that the host is
+    /// healthy. A beta rule's Issue may be listed, since it counts only with
+    /// `--include-beta`, and Observations may be too.
     NoFinding = 0,
     /// The run completed and found at least one open Issue. An Observation,
     /// such as a symmetric NAT, never sets this.
@@ -828,6 +828,8 @@ mod tests {
         );
         assert_eq!(json["issues"][0]["beta"], true);
         assert_eq!(json["include_beta"], false);
+        // No finding, exit 0, and an Issue listed: the schema has to allow it.
+        crate::schemas::test_support::check(crate::schemas::DIAGNOSE_RUN.file, &json);
     }
 
     #[test]

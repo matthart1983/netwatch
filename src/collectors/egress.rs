@@ -76,9 +76,9 @@ const PERSIST_INTERVAL_SECS: u64 = 60;
 /// move meaningful volume in under a few seconds. Erring high would trade
 /// the feature's whole point for tidiness.
 const UNDECLARED_SETTLE_TICKS: u64 = 3;
-/// Schema tag stamped on the NDJSON export's `_meta` line. Bump the minor
-/// when adding a record field (additive/back-compatible), the major on a
-/// breaking change — the managed ingest keys off this.
+/// Schema tag stamped on the NDJSON export's `_meta` line. Additive fields do
+/// not change it, as with the other stable outputs: it stays v1.1 until a
+/// breaking change, which needs 2.0. The managed ingest keys off this.
 pub const EGRESS_EXPORT_SCHEMA: &str = "netwatch.egress.v1.1";
 
 /// One observed destination for a process.
@@ -109,12 +109,12 @@ pub struct EgressDest {
     /// must survive restarts, and the persisted baseline serializes them.
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
-    /// Number of observations (connection-refresh ticks this dest appeared).
-    ///
-    /// Because `observe` runs once per ~1 s connection tick, this is really a
-    /// *dwell time in ticks*, not an event count — a single long-lived
-    /// connection accrues one per second it stays open. The UI renders it as
-    /// a duration for exactly that reason; don't relabel it "hits".
+    /// Connection-ticks: `observe` runs once per ~1 s connection tick and adds
+    /// one for each connection to this dest. A single long-lived connection
+    /// accrues one per second it stays open, and six connections open for one
+    /// tick add six. So it is neither a count of connections nor a time. The UI
+    /// renders it as a duration, which holds for one connection at a time;
+    /// don't relabel it "hits".
     pub count: u64,
     /// Bytes attributed to this destination, accumulated from the per-tick
     /// rates on the connection table (`rate × elapsed`). Approximate by
@@ -232,8 +232,9 @@ pub struct EgressRecord {
     /// Most recent concrete remote IP for this destination.
     pub ip: String,
     pub port: u16,
-    /// Coarse L7 class: `tls` when a ClientHello named the destination,
-    /// else `other`, which includes a flow named by a cleartext HTTP `Host`.
+    /// Coarse L7 class: `tls` when a ClientHello named the destination and no
+    /// flow to it has carried a cleartext HTTP `Host`, else `other`. The `Host`
+    /// is sticky, so a destination that saw both stays `other`.
     /// Kept coarse on purpose — no payload inspection.
     pub proto: String,
     pub ech: bool,
@@ -529,8 +530,9 @@ impl EgressProfiler {
     /// Whether a process has been observed long enough for strict mode to
     /// report it as undeclared.
     ///
-    /// `count` is dwell in observation ticks, so the longest-lived
-    /// destination is how long the process has been talking. Because the
+    /// `count` adds one per connection per tick, so the busiest destination
+    /// stands in for how long the process has been talking, and several
+    /// connections in one tick reach the limit sooner. Because the
     /// baseline persists, a program seen for hours in a previous session is
     /// settled immediately on restart — which is right: it is not new.
     fn process_is_settled(&self, process: &str) -> bool {
@@ -2490,9 +2492,16 @@ block = {
         let geo = crate::collectors::geo::GeoCache::new();
         let mut p = EgressProfiler::new();
         p.observe(
-            &[mk(http("plain.example.com")), mk(tls("tls.example.com"))],
+            &[
+                mk(tls("both.example.com")),
+                mk(http("both.example.com")),
+                mk(http("plain.example.com")),
+                mk(tls("tls.example.com")),
+            ],
             &geo,
         );
+        // A later ClientHello does not undo the `Host` it has seen.
+        p.observe(&[mk(tls("both.example.com"))], &geo);
         let protos = |p: &EgressProfiler| -> Vec<(Option<String>, String)> {
             p.export_records()
                 .into_iter()
@@ -2500,6 +2509,7 @@ block = {
                 .collect()
         };
         let want = vec![
+            (Some("both.example.com".to_string()), "other".to_string()),
             (Some("plain.example.com".to_string()), "other".to_string()),
             (Some("tls.example.com".to_string()), "tls".to_string()),
         ];
@@ -2512,6 +2522,36 @@ block = {
         fresh.load_profiles(&path);
         assert_eq!(protos(&fresh), want);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The export's `count`, as schemas/egress.v1.1.schema.json describes it:
+    /// one per connection per tick, so it is not a time.
+    #[test]
+    fn count_adds_one_per_connection_per_tick() {
+        use crate::collectors::connections::Connection;
+        let connection = Connection {
+            protocol: "TCP".into(),
+            local_addr: "192.168.1.10:5000".into(),
+            remote_addr: "203.0.113.50:443".into(),
+            state: "ESTABLISHED".into(),
+            pid: Some(1),
+            process_name: Some("curl".into()),
+            handshake_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
+        };
+        let geo = crate::collectors::geo::GeoCache::new();
+        let mut p = EgressProfiler::new();
+        p.observe(&vec![connection.clone(); 6], &geo);
+        assert_eq!(p.export_records()[0].count, 6, "six connections, one tick");
+        p.observe(std::slice::from_ref(&connection), &geo);
+        p.observe(std::slice::from_ref(&connection), &geo);
+        assert_eq!(p.export_records()[0].count, 8, "and one more for two ticks");
     }
 
     #[test]

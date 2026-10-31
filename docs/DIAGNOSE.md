@@ -126,7 +126,7 @@ part of the interface:
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | completed, no issue — the rules that could be evaluated did not fire |
+| 0 | completed, and no issue counted; a beta rule's issue can still be listed |
 | 1 | completed, at least one open issue |
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |

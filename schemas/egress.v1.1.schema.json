@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/egress.v1.1.schema.json",
   "title": "netwatch egress NDJSON export, netwatch.egress.v1.1",
-  "description": "One line of the Egress tab's export. This validates a line, not a file. The first line is the header and every later line is a record. Later minors may add fields, so ignore any you do not know. A new record field bumps the minor in the schema name and adds a new schema file; a break needs netwatch 2.0. This file describes what netwatch 0.40 and later write; 0.39's header has no metadata block.",
+  "description": "One line of the Egress tab's export. This validates a line, not a file. The first line is the header and every later line is a record. Later minors may add fields, so ignore any you do not know. An added field does not change the schema name, which stays netwatch.egress.v1.1. A break needs netwatch 2.0 and a new schema file. This file describes what netwatch 0.40 and later write; 0.39's header has no metadata block.",
   "oneOf": [
     { "$ref": "#/$defs/header" },
     { "$ref": "#/$defs/record" }
@@ -40,19 +40,19 @@
       "required": ["process", "ip", "port", "proto", "ech", "first_seen", "last_seen", "count", "verdict", "matched_by", "bytes_out", "bytes_in"],
       "properties": {
         "process": { "type": "string" },
-        "sni": { "type": "string", "description": "The destination's name, whatever the field is called: a TLS or QUIC SNI, or a cleartext HTTP Host. proto says tls only when a ClientHello supplied it. Absent, not null, when the flow carried no readable name." },
+        "sni": { "type": "string", "description": "The destination's name, whatever the field is called: a TLS or QUIC SNI, or a cleartext HTTP Host. proto says tls only when a ClientHello supplied it and no flow to this destination carried a Host. Absent, not null, when the flow carried no readable name." },
         "asn_org": { "type": "string", "description": "Organisation of the remote address, from the ASN database. Absent, not null, when no database resolved it." },
         "ip": { "type": "string", "description": "The most recent remote address. Can be empty in a baseline restored from a file that never held one." },
         "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
         "proto": {
           "type": "string",
-          "description": "tls when a ClientHello named the destination, otherwise other, which includes a flow named by a cleartext HTTP Host. Before 0.40 such a flow said tls. Open set: a minor may split other into narrower values, so treat an unknown value as other.",
+          "description": "tls when a ClientHello named the destination and no flow to it has carried a cleartext HTTP Host. Otherwise other: the destination has no readable name, or a cleartext HTTP Host named it on some flow, after which it stays other whatever later flows do. Before 0.40 such a destination said tls. Open set: a minor may split other into narrower values, so treat an unknown value as other.",
           "examples": ["tls", "other"]
         },
         "ech": { "type": "boolean", "description": "A flow to this destination used Encrypted ClientHello. Stays true once seen." },
         "first_seen": { "type": "integer", "minimum": 0, "description": "Unix seconds." },
         "last_seen": { "type": "integer", "minimum": 0, "description": "Unix seconds." },
-        "count": { "type": "integer", "minimum": 0, "description": "Connection-table ticks, about one a second, in which this destination appeared. A time spent connected, not a number of connections." },
+        "count": { "type": "integer", "minimum": 0, "description": "Connection-ticks. Each connection-table tick, about one a second, adds 1 for every connection open to this destination, so one connection open for six ticks and six connections open for one tick both add 6. Neither a number of connections nor a time." },
         "verdict": {
           "type": "string",
           "description": "ok means a rule admitted it. drift means outside the process's allowlist. blocked means it matched a block entry. undeclared means no rule under a policy that declares itself complete. unchecked means nothing was compared, because the process has no rule or no policy is loaded. unreadable means Encrypted ClientHello hid the name. Open set: a minor may add a verdict, so treat an unknown value as not ok.",
