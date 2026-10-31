@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::collectors::geo::DbFile;
 use crate::config::NetwatchConfig;
 use crate::ui::widgets;
 use ratatui::{
@@ -208,16 +209,8 @@ const ROWS: &[Setting] = &[
         at: cursor::GEOIP_DB,
         label: "GeoIP DB Path",
         raw: |c| c.geoip_db.clone(),
-        // With `geoip_online` on, lookups go to ip-api.com, which has no
-        // HTTPS on its free tier, whenever no database answers: none is
-        // set, or the one set fails to open. Say so where geo is set, and
-        // before the path, so a long path cannot push it out of view.
-        show: Some(|c| match (c.geoip_db.is_empty(), c.geoip_online) {
-            (true, true) => "ip-api.com (cleartext)".into(),
-            (true, false) => "(none)".into(),
-            (false, true) => format!("ip-api.com (cleartext) if unreadable: {}", c.geoip_db),
-            (false, false) => c.geoip_db.clone(),
-        }),
+        // `draw` shows what the session opened, through `geoip_row`.
+        show: None,
         apply: |c, v| {
             c.geoip_db = v.to_string();
             Ok(())
@@ -228,7 +221,8 @@ const ROWS: &[Setting] = &[
         at: cursor::GEOIP_ASN_DB,
         label: "GeoIP ASN DB Path",
         raw: |c| c.geoip_asn_db.clone(),
-        show: Some(|c| or_placeholder(&c.geoip_asn_db, "(none)")),
+        // `draw` shows what the session opened, through `geoip_row`.
+        show: None,
         apply: |c, v| {
             c.geoip_asn_db = v.to_string();
             Ok(())
@@ -488,8 +482,10 @@ fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<String> {
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    let attribution = app.geo_cache.db_status().attribution();
+    // Wide enough for the attribution on one row, with its indent and borders.
     let popup_width = (area.width * 60 / 100)
-        .max(50)
+        .max(attribution.map_or(50, |line| line.len() as u16 + 4))
         .min(area.width.saturating_sub(4));
     let label_width = 22;
     // Sandbox enforcement state — read-only info rows. Surfaces whether
@@ -536,9 +532,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             .map(|(line, text)| (if line == 0 { 2 } else { 4 }, text))
         })
         .collect();
-    // +8 holds the rest below the settings, with one to spare: a blank, the doctor
-    // hint, a blank, the status row, the footer and two borders.
-    let popup_height = (SETTINGS_COUNT + 8 + sandbox_detail.len() + note_rows.len()) as u16;
+    // +9 holds the rest beside the settings, with one to spare: the attribution,
+    // a blank, the doctor hint, a blank, the status row, the footer and two borders.
+    let popup_height = (SETTINGS_COUNT + 9 + sandbox_detail.len() + note_rows.len()) as u16;
     let popup_height = popup_height.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
@@ -578,6 +574,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             format!("{}▏", app.ui.settings_edit_buf)
         } else if is_selected && row.cycles {
             format!("◀ {} ▶", row.shown(cfg))
+        } else if i == cursor::GEOIP_DB {
+            let (wanted, _) = cfg.geoip_paths();
+            geoip_row(&wanted, &app.geo_cache.db_status().city)
+        } else if i == cursor::GEOIP_ASN_DB {
+            let (_, wanted) = cfg.geoip_paths();
+            geoip_row(&wanted, &app.geo_cache.db_status().asn)
         } else {
             row.shown(cfg)
         };
@@ -600,6 +602,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(value_display, value_style),
         ]));
+
+        // Under the GeoIP rows, so a short terminal cuts it off last. A terminal
+        // too narrow for the popup to hold it gets it on two rows.
+        if let (cursor::GEOIP_ASN_DB, Some(line)) = (i, attribution) {
+            let parts: Vec<&str> = if line.len() + 2 <= inner.width as usize {
+                vec![line]
+            } else {
+                line.split_inclusive(", ").collect()
+            };
+            for part in parts {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", part.trim_end()),
+                    Style::default().fg(app.theme.text_muted),
+                )));
+            }
+        }
     }
 
     lines.push(Line::raw(""));
@@ -701,6 +719,28 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(footer, footer_area);
 }
 
+/// A GeoIP row's text: the database this session opened, type first so a long
+/// path cannot push it out of view. Databases open once, so a path changed
+/// since, or a download made since, is named as waiting for the next start.
+fn geoip_row(wanted: &str, opened: &DbFile) -> String {
+    let held = match opened {
+        DbFile::NotConfigured => "",
+        DbFile::Loaded { path, .. } | DbFile::Unreadable { path, .. } => path,
+    };
+    if wanted != held {
+        return format!("{} on next start", or_placeholder(wanted, "(none)"));
+    }
+    match opened {
+        DbFile::NotConfigured => "(none): run netwatch geoip update".into(),
+        DbFile::Unreadable { path, .. } => format!("unreadable: {path}"),
+        DbFile::Loaded {
+            path,
+            database_type,
+            ..
+        } => format!("{database_type}: {path}"),
+    }
+}
+
 /// Returns the raw config value for the setting at `cursor` position,
 /// suitable for pre-filling the edit buffer.
 pub fn get_edit_value(cfg: &NetwatchConfig, cursor: usize) -> String {
@@ -790,22 +830,142 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
 
+    fn loaded(path: &str) -> DbFile {
+        DbFile::Loaded {
+            path: path.into(),
+            database_type: "DBIP-Country-Lite".into(),
+            build_epoch: 1_790_000_000,
+        }
+    }
+
     #[test]
-    fn geoip_db_row_says_when_lookups_go_out_in_cleartext() {
-        let row = &ROWS[cursor::GEOIP_DB];
-        let mut cfg = NetwatchConfig::default();
-        assert_eq!(row.shown(&cfg), "(none)");
-        cfg.geoip_online = true;
-        assert_eq!(row.shown(&cfg), "ip-api.com (cleartext)");
-        // A database that fails to open sends every lookup to ip-api.com too,
-        // so a set path is no reason to drop the label.
-        cfg.geoip_db = "/usr/share/GeoIP/GeoLite2-City.mmdb".into();
+    fn geoip_row_says_which_database_is_loaded() {
         assert_eq!(
-            row.shown(&cfg),
-            "ip-api.com (cleartext) if unreadable: /usr/share/GeoIP/GeoLite2-City.mmdb"
+            geoip_row("", &DbFile::NotConfigured),
+            "(none): run netwatch geoip update"
         );
-        cfg.geoip_online = false;
-        assert_eq!(row.shown(&cfg), cfg.geoip_db);
+        assert_eq!(
+            geoip_row("/geo/db.mmdb", &loaded("/geo/db.mmdb")),
+            "DBIP-Country-Lite: /geo/db.mmdb"
+        );
+        let unreadable = DbFile::Unreadable {
+            path: "/geo/db.mmdb".into(),
+            error: "bad".into(),
+        };
+        assert_eq!(
+            geoip_row("/geo/db.mmdb", &unreadable),
+            "unreadable: /geo/db.mmdb"
+        );
+    }
+
+    /// Databases open once. A path edited in the overlay, or a file downloaded
+    /// while this session runs, is not what lookups are using yet.
+    #[test]
+    fn geoip_row_names_a_change_that_waits_for_a_restart() {
+        assert_eq!(
+            geoip_row("/geo/new.mmdb", &loaded("/geo/old.mmdb")),
+            "/geo/new.mmdb on next start"
+        );
+        assert_eq!(
+            geoip_row("/cache/dbip-country-lite.mmdb", &DbFile::NotConfigured),
+            "/cache/dbip-country-lite.mmdb on next start"
+        );
+        assert_eq!(
+            geoip_row("", &loaded("/geo/old.mmdb")),
+            "(none) on next start"
+        );
+    }
+
+    /// The rows of a drawn Settings overlay, in a session that opened a file
+    /// with this name and `database_type`.
+    fn drawn_with_database(name: &str, database_type: &str, width: u16) -> Vec<String> {
+        use crate::collectors::geo::test_db;
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = std::env::temp_dir().join(format!("nw-settings-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, test_db::city(database_type, 1_790_000_000)).unwrap();
+        let app = App::prepare_with_config(NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        buf.content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
+    /// Settings redraws the live capability snapshot, which is how a date chrono
+    /// cannot represent took the TUI down. The session reports the file instead.
+    #[test]
+    fn an_out_of_range_build_epoch_draws_as_unreadable() {
+        use crate::collectors::geo::test_db;
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = std::env::temp_dir().join(format!("nw-settings-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("far.mmdb");
+        std::fs::write(&path, test_db::city("DBIP-Country-Lite", 9_000_000_000_000)).unwrap();
+        let app = App::prepare_with_config(NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!app.geo_cache.has_offline_db());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        let drawn: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(drawn.contains("unreadable: "), "{drawn}");
+    }
+
+    /// DB-IP's data carries its attribution where the session shows what it
+    /// opened, wherever the file came from: here a name the download never
+    /// uses, in the narrowest popup and a wide one.
+    #[test]
+    fn settings_attributes_a_dbip_database() {
+        for width in [80, 120] {
+            let rows = drawn_with_database("own.mmdb", "DBIP-Country-Lite", width);
+            let at = |text: &str| rows.iter().position(|row| row.contains(text));
+            assert!(
+                at(crate::collectors::geo::DBIP_ATTRIBUTION).is_some(),
+                "{width} columns:\n{}",
+                rows.join("\n")
+            );
+            // Right under the rows it belongs to.
+            assert_eq!(
+                at(crate::collectors::geo::DBIP_ATTRIBUTION),
+                at("GeoIP ASN DB Path").map(|row| row + 1)
+            );
+        }
+    }
+
+    /// Too narrow for the popup to hold it on one row, none of it is cut off.
+    #[test]
+    fn settings_attribution_stays_whole_in_a_very_narrow_terminal() {
+        let rows = drawn_with_database("own.mmdb", "DBIP-Country-Lite", 60);
+        for part in ["IP geolocation by DB-IP (https://db-ip.com),", "CC BY 4.0"] {
+            assert!(
+                rows.iter().any(|row| row.contains(part)),
+                "{part}:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// A MaxMind file named as the download names its files is still MaxMind's.
+    #[test]
+    fn settings_does_not_attribute_another_database() {
+        for width in [80, 120] {
+            let rows = drawn_with_database("dbip-country-lite.mmdb", "GeoLite2-City", width);
+            let drawn = rows.join("\n");
+            assert!(drawn.contains("GeoLite2-City"), "{drawn}");
+            assert!(!drawn.contains("IP geolocation"), "{drawn}");
+            assert!(!drawn.contains("db-ip.com"), "{drawn}");
+        }
     }
 
     /// `get_edit_value` numbered rows without the View row, so Enter on

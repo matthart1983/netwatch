@@ -44,6 +44,25 @@ All notable changes to NetWatch will be documented in this file.
 - **Doctor and Settings say `running as root: containment limited`** when netwatch
   runs as root. Root keeps most file access whatever the sandbox does, and
   `SECURITY.md` scopes sandbox escapes to non-root runs.
+- **`netwatch geoip update [--city]` downloads the databases the GeoIP column
+  needs, and an empty `geoip_db` or `geoip_asn_db` now uses them.** Offline
+  lookups used to need a MaxMind account and two paths in the config. The
+  command fetches DB-IP's free Country and ASN databases, plus City with
+  `--city`, reports each file as updated or already current, and exits 0 when
+  every file is up to date and 1 otherwise. A path in the config still wins.
+  The gzip and the database are read on a worker thread with TCP denied from
+  Linux 6.7 on, and a file that fails its checks leaves the old one in place.
+  Nothing refreshes the files on its own, and the provider and file location
+  are not part of the stable interface.
+- **`netwatch doctor` reports a `geoip_db` capability, and Settings says which
+  database is loaded.** A path that did not open looked the same as no path:
+  the column stayed empty and nothing said why. `geoip_db` is now `ready`
+  (`db_loaded`), `degraded` (`db_stale`, over 60 days old), `unavailable`
+  (`db_unreadable`) or `disabled` (`not_configured`, with the command to run).
+  The Settings rows show the database type and path, or the path that waits for
+  the next start. When lookups answer with DB-IP's data, Settings and the
+  `geoip_db` detail carry its CC BY 4.0 attribution, judged by each file's own
+  `database_type` rather than its path.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
@@ -121,6 +140,12 @@ All notable changes to NetWatch will be documented in this file.
   the dropped list is longer, as the Security entries below say, CAP_NET_ADMIN no
   longer appears as retained, and CAP_NET_RAW is dropped on parser and capture threads
   in every mode and on every thread in daemon, Diagnose CLI and strict sessions.
+- **A `geoip_db` or `geoip_asn_db` file over 2 GiB, or anything but a regular
+  file, now reads as unreadable.** netwatch holds the whole file in memory, and
+  doctor now opens these files too, so a FIFO would hang it and `/dev/zero` would
+  read until memory ran out. Doctor and Settings name the cause. A database under
+  2 GiB loads as it did, commercial ones included. Files `netwatch geoip update`
+  saved are held to 256 MiB.
 
 ### Fixed
 - **One bad value in config.toml no longer throws the whole file away.** A
@@ -646,6 +671,19 @@ All notable changes to NetWatch will be documented in this file.
   which start `ss`, `ip` and `iw` and need netlink, or a descriptor opened earlier, a
   ring's included. `docs/THREAT-MODEL.md` lists those gaps. No new crate: the filter
   is about a dozen hand-written BPF instructions.
+- **netwatch no longer sends peer addresses to a third party for GeoIP.**
+  With `geoip_online = true` and no working database, every public peer address
+  a connection or packet touched went to ip-api.com over cleartext HTTP, where
+  anyone on the path could read which hosts you talk to and rewrite the answer.
+  Its free tier has no HTTPS, so this could not be made private. The lookup, its
+  worker thread and the parser are gone. A config that sets `geoip_online` still
+  loads; the setting is ignored, the log warns once per start, `netwatch doctor`
+  reports `online_geo` as `disabled` (`removed`), and the next save from Settings
+  drops the key. The GeoIP column stays empty until you run `netwatch geoip
+  update`. Organisation names now come from DB-IP's
+  `autonomous_system_organization`, so an egress policy's `allow_asn` entries
+  written for ip-api or MaxMind names (`CLOUDFLARENET`) need DB-IP's
+  (`Cloudflare, Inc.`) if you switch.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
@@ -751,6 +789,9 @@ All notable changes to NetWatch will be documented in this file.
   that make their own user namespace, on pull requests touching the sandbox or
   capture and once a week. It is separate from `ci.yml`, so it holds no tag, and the
   release checklist in `docs/PACKAGING.md` asks for a green run on the candidate.
+- **Two GeoIP checks.** `geoip_update_live`, ignored by default, runs
+  `netwatch geoip update` against DB-IP by hand at release, and a unit test fails
+  if the removed service's name comes back in the code or the docs.
 
 ## [0.38.0] - 2026-10-25
 

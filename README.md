@@ -87,6 +87,7 @@ netwatch diagnose run --budget 30s       # one bounded diagnosis; exit 0 clean, 
 netwatch diagnose run --format json      # the same, for scripts
 netwatch daemon --metrics                # headless; Prometheus /metrics on 127.0.0.1:9464
 netwatch uptime --since 7d               # outages this week: when, how long, and which hop failed
+netwatch geoip update                    # download the offline GeoIP databases
 netwatch --demo                          # replay a recorded Diagnose incident, no capture needed
 ```
 

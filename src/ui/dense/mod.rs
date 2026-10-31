@@ -2984,8 +2984,8 @@ mod tests {
 
     /// The detail label looked up the row's host, which is the SNI name when
     /// the connection sent one. A name is not an address, so a TLS or QUIC
-    /// row never showed its peer's org and city, and with `geoip_online` on
-    /// the name itself went to ip-api.com.
+    /// row never showed its peer's org and city, and with the online lookup
+    /// that 0.39 removed the name itself left the machine.
     #[test]
     fn detail_geo_label_looks_up_the_address_not_the_sni() {
         let mut app =
