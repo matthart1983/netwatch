@@ -1,0 +1,93 @@
+name: Sandbox lab
+
+# What the sandbox takes from real threads, as root in a user and network
+# namespace with a veth pair: tests/capture_authority.rs, and
+# scripts/capture-authority-audit.sh on the real `netwatch daemon`. Its own
+# workflow rather than a job in ci.yml, because the release guard waits on every
+# ci.yml run and a namespace flake should not hold a tag. The release checklist in
+# docs/PACKAGING.md asks for a green run on the release candidate instead.
+on:
+  pull_request:
+    paths:
+      - 'src/sandbox/**'
+      - 'src/collectors/packets/**'
+      - 'src/collectors/connections.rs'
+      - 'tests/capture_authority.rs'
+      - 'scripts/capture-authority-audit.sh'
+      - '.github/workflows/sandbox-lab.yml'
+  schedule:
+    - cron: '45 4 * * 1'
+  workflow_dispatch:
+
+# Read-only token for every job: nothing here writes to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sandbox-lab:
+    runs-on: ubuntu-latest
+    # A hung session would otherwise hold the runner for GitHub's six-hour
+    # default; the lab's own deadlines should fire long before this.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install libpcap and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev iproute2 util-linux
+
+      # Outside the namespace: cargo needs the network and the real home.
+      - name: Build the lab and the daemon
+        run: |
+          cargo build --bin netwatch
+          cargo test --lib --test doctor --no-run
+          lab="$(cargo test --test capture_authority --no-run --message-format=json \
+            | jq -r 'select(.target.name == "capture_authority" and .executable != null) | .executable')"
+          test -x "$lab"
+          echo "LAB=$lab" >> "$GITHUB_ENV"
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
+      # Without this the unshare below is refused. Checked, so the job cannot go
+      # green without running the lab.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --net true
+
+      - name: Run the lab, retrying once
+        shell: bash
+        run: |
+          set -o pipefail
+          run() {
+            NETWATCH_CAP_LAB=1 unshare --user --map-root-user --net "$LAB" \
+              && scripts/capture-authority-audit.sh target/debug/netwatch
+          }
+          run 2>&1 | tee sandbox-lab.log || {
+            echo "::warning title=Sandbox lab::failed once; retrying"
+            run 2>&1 | tee -a sandbox-lab.log
+          }
+
+      # These make their own user namespace and skip where they cannot, which on
+      # a runner that has not run the step above is every time.
+      - name: Run the sandbox tests that need a user namespace
+        run: |
+          cargo test --lib -- sandbox:: ui::settings::
+          cargo test --test doctor
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sandbox-lab
+          path: sandbox-lab.log
+          if-no-files-found: warn

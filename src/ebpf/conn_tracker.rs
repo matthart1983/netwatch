@@ -180,7 +180,8 @@ impl ConnTracker {
                 worker::note(
                     "ebpf-reader",
                     "confined by inheritance: the SDK reader thread takes this \
-                     worker's filesystem policy but has no entry hook of its own",
+                     worker's Landlock layers, TCP deny included, but has no \
+                     entry hook of its own",
                 );
             }
 

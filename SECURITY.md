@@ -62,7 +62,11 @@ metrics endpoint to the internet deliberately).
 - Worker entry points now apply Linux filesystem policy before processing;
   capture prepares its device before policy entry. Strict startup rejects required
   entry failures. Writable grants use dedicated application paths, and configured
-  inputs receive exact file grants. Network access remains unrestricted. Privileged
+  inputs receive exact file grants. Network policy is per thread: parser and capture
+  threads are denied TCP bind and connect from Linux 6.7, capture, keylog and the
+  metrics threads also get EPERM from socket(2), and main and the network workers keep
+  the network. `netwatch doctor --json` shows what this kernel gives a parser thread,
+  and a session's log what each of its threads got. Privileged
   capture/restart acceptance and some shutdown guarantees remain pending. See the
   [exact scope](docs/REFERENCE.md#landlock-sandbox-linux).
 - Treat TLS keylog files and exported incident bundles as secrets — they can

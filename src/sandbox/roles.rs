@@ -64,47 +64,83 @@ pub fn role_for(name: &str) -> Role {
     }
 }
 
+/// Whether the worker spawned as `name` takes the no-socket filter, on top of
+/// its role's layers, on Linux. These read packets, a keylog file or accepted
+/// streams and never open a socket after entry: capture opens its device
+/// first, the metrics listener binds first and accept4 is not socket(2).
+///
+/// Everything else goes without. connections, tcp-info and traffic start ss,
+/// ip and iw, which need netlink. The rest, terminal and ebpf among them, have not
+/// been audited for it. A name missing from the table goes without too: unlike
+/// the network, nothing here fails closed, because a worker that needs a socket
+/// would only find out when it failed.
+pub fn no_sockets(name: &str) -> bool {
+    matches!(
+        name,
+        "capture" | "keylog" | "metrics-listener" | "metrics-client"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every worker name and the role it must have. A spawn site using a
-    /// name that is not here fails `every_spawned_name_has_a_row`.
-    const KNOWN: &[(&str, Role)] = &[
-        ("tokio-blocking", Role::Network),
-        ("reverse-dns", Role::Network),
-        ("whois", Role::Network),
-        ("health", Role::Network),
-        ("traceroute", Role::Network),
-        ("insights", Role::Network),
-        ("remote", Role::Network),
-        ("diagnose-active", Role::Network),
-        ("diagnose-test", Role::Network),
-        ("diagnose-targets", Role::Network),
-        ("capture", Role::Capture),
-        ("proc-broker", Role::Broker),
-        ("keylog", Role::Parser),
-        ("metrics-listener", Role::Parser),
-        ("metrics-client", Role::Parser),
-        ("ebpf", Role::Parser),
-        ("connections", Role::Parser),
-        ("tcp-info", Role::Parser),
-        ("traffic", Role::Parser),
-        ("process-cpu", Role::Parser),
-        ("terminal", Role::Parser),
-        ("logging", Role::Parser),
-        ("capture-export", Role::Parser),
-        ("policy-preflight", Role::Parser),
-        ("geoip-update", Role::Parser),
-        ("pktap", Role::Parser),
-        ("shutdown-deadline", Role::Parser),
+    /// Every worker name, the role it must have, and whether it takes the
+    /// no-socket filter. A spawn site using a name that is not here fails
+    /// `every_spawned_name_has_a_row`.
+    const KNOWN: &[(&str, Role, bool)] = &[
+        ("tokio-blocking", Role::Network, false),
+        ("reverse-dns", Role::Network, false),
+        ("whois", Role::Network, false),
+        ("health", Role::Network, false),
+        ("traceroute", Role::Network, false),
+        ("insights", Role::Network, false),
+        ("remote", Role::Network, false),
+        ("diagnose-active", Role::Network, false),
+        ("diagnose-test", Role::Network, false),
+        ("diagnose-targets", Role::Network, false),
+        ("capture", Role::Capture, true),
+        ("proc-broker", Role::Broker, false),
+        ("keylog", Role::Parser, true),
+        ("metrics-listener", Role::Parser, true),
+        ("metrics-client", Role::Parser, true),
+        ("ebpf", Role::Parser, false),
+        ("connections", Role::Parser, false),
+        ("tcp-info", Role::Parser, false),
+        ("traffic", Role::Parser, false),
+        ("process-cpu", Role::Parser, false),
+        ("terminal", Role::Parser, false),
+        ("logging", Role::Parser, false),
+        ("capture-export", Role::Parser, false),
+        ("policy-preflight", Role::Parser, false),
+        ("geoip-update", Role::Parser, false),
+        ("pktap", Role::Parser, false),
+        ("shutdown-deadline", Role::Parser, false),
     ];
 
     #[test]
     fn every_known_worker_name_maps_to_its_role() {
-        for &(name, role) in KNOWN {
+        for &(name, role, sockets) in KNOWN {
             assert_eq!(role_for(name), role, "{name}");
+            assert_eq!(no_sockets(name), sockets, "{name}");
         }
+    }
+
+    #[test]
+    fn threat_model_lists_the_no_socket_workers() {
+        let doc = include_str!("../../docs/THREAT-MODEL.md");
+        let listed = doc
+            .split_once("<!-- policy:no-sockets -->")
+            .and_then(|(_, rest)| rest.split_once("<!-- /policy:no-sockets -->"))
+            .map(|(block, _)| block.trim())
+            .expect("the threat model has a policy:no-sockets block");
+        let filtered: Vec<_> = KNOWN
+            .iter()
+            .filter(|&&(_, _, sockets)| sockets)
+            .map(|&(name, _, _)| name)
+            .collect();
+        // `lines`, because a Windows checkout has CRLF endings.
+        assert_eq!(listed.lines().collect::<Vec<_>>(), filtered);
     }
 
     /// The name each `worker::` spawn, entry or relinquish call under `src`
@@ -157,13 +193,13 @@ mod tests {
         let found = spawned_names();
         let unlisted: Vec<_> = found
             .iter()
-            .filter(|(name, _)| !KNOWN.iter().any(|(known, _)| known == name))
+            .filter(|(name, _)| !KNOWN.iter().any(|(known, _, _)| known == name))
             .collect();
         assert!(
             unlisted.is_empty(),
             "give these names a row in role_for and KNOWN: {unlisted:?}"
         );
-        for &(name, role) in KNOWN {
+        for &(name, role, _) in KNOWN {
             if role == Role::Network {
                 assert!(
                     found.iter().any(|(spawned, _)| spawned == name),
@@ -179,6 +215,7 @@ mod tests {
         // geoip was the online lookup worker, removed in 0.39. It has no row.
         for name in ["", "new-worker", "Capture", "whois ", "smoke", "geoip"] {
             assert_eq!(role_for(name), Role::Parser, "{name:?}");
+            assert!(!no_sockets(name), "{name:?}");
         }
     }
 

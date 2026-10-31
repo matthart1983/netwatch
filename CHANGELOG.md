@@ -19,6 +19,31 @@ All notable changes to NetWatch will be documented in this file.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
+- **`netwatch doctor` says what Landlock does on this kernel.** Until now it
+  could not: static doctor applied no policy, and a capture check reported only one
+  number, the kernel's. Doctor now runs a parser thread's policy on a disposable
+  thread, tries a TCP bind and connect to its own loopback listener, and reports the
+  result in a top-level `landlock` object with the kernel's ABI, whether Landlock is
+  available, and the errata fixed. A new `landlock` capability sums it up:
+  `parser_network_denied`, `kernel_abi_below_4`, `landlock_not_enabled`,
+  `landlock_not_built`, `self_test_failed`, `sandbox_disabled` or
+  `platform_unsupported`. Each protection gains `landlock_kernel_abi`,
+  `network_policy`, `landlock_restrictions`, `capture_authority` and
+  `socket_filter`, and the snapshot gains `tasks_holding_net_raw`. All of this is
+  additive, and the JSON stays `schema_version` 1. `doctor` runs no session, so
+  `protections` is empty there, or the one capture check, and `tasks_holding_net_raw`
+  is null.
+- **A daemon or TUI session writes its sandbox report to its log.** Once, about five
+  ticks in, one `session protections` line gives each worker's protection and the
+  threads the startup audit found holding CAP_NET_RAW. No command prints these, so
+  until now a running session's per-thread results could not be read at all. The log's
+  default filter now keeps `info` on `netwatch::sandbox` for this.
+  `docs/doctor.md` says where each value can be read. Settings puts what it found on
+  rows of its own, such as `TCP denied on 13/13 parser workers`, and wraps them, so a
+  popup at 80 columns or wider shows all of it, given the height for every row.
+- **Doctor and Settings say `running as root: containment limited`** when netwatch
+  runs as root. Root keeps most file access whatever the sandbox does, and
+  `SECURITY.md` scopes sandbox escapes to non-root runs.
 - **`netwatch geoip update [--city]` downloads the databases the GeoIP column
   needs, and an empty `geoip_db` or `geoip_asn_db` now uses them.** Offline
   lookups used to need a MaxMind account and two paths in the config. The
@@ -101,6 +126,20 @@ All notable changes to NetWatch will be documented in this file.
   `ConnectionTimeline::tracked_len` and `tracked_cap`, and gain
   `ConnectionTimeline::closed_len`, `closed_trimmed` and `first_seen`, and
   `ConnectionCollector::connections_with_generation`.
+- **`landlock_abi` in doctor's protections now means the ABI a thread enforces,
+  not the kernel's.** It read the kernel's ABI, so on Linux 7.1 every thread reported
+  9, including threads with only the filesystem layer, which needs 3. It is now the
+  newest feature in force: 3 for main and the network workers, and 9 for parser and
+  capture threads on Linux 7.1. Anything reading it for the kernel's version should
+  read the new `landlock_kernel_abi`. A Landlock that cannot enforce now says why,
+  naming ENOSYS or a seccomp profile, EOPNOTSUPP or the ABI, rather than "present but
+  not enforced".
+  `network_restricted` stays false, because it describes the whole process.
+- **`caps_dropped` and `caps_retained` in doctor's protections hold different
+  values.** They name each capability where they used to say `CAP_OTHER`. Under root
+  the dropped list is longer, as the Security entries below say, CAP_NET_ADMIN no
+  longer appears as retained, and CAP_NET_RAW is dropped on parser and capture threads
+  in every mode and on every thread in daemon, Diagnose CLI and strict sessions.
 - **A `geoip_db` or `geoip_asn_db` file over 2 GiB, or anything but a regular
   file, now reads as unreadable.** netwatch holds the whole file in memory, and
   doctor now opens these files too, so a FIFO would hang it and `/dev/zero` would
@@ -619,6 +658,19 @@ All notable changes to NetWatch will be documented in this file.
   whose `net.ipv4.ping_group_range` leaves out the user netwatch runs as,
   the `ping` that health falls back to and the Diagnose PMTU probe now
   fail, and health measures over TCP instead.
+- **The capture, keylog and metrics threads can no longer open a socket with
+  socket(2) or through io_uring.** Landlock's TCP deny stops connect(2) and bind(2)
+  on TCP sockets only. A compromised parser could still open UDP, ICMP and netlink
+  sockets, and on Linux 7.1 an MPTCP socket reached a plain TCP listener past the
+  deny. These four workers now take a seccomp filter on Linux, on x86_64, aarch64 and
+  armv5te, that returns EPERM for socket(2) and io_uring_setup(2). The second is
+  there because `IORING_OP_SOCKET` makes a socket with no socket(2) call for a filter
+  to see, and netwatch opens no ring, so this costs nothing. A build for another
+  architecture skips the filter and says so in the sandbox report, and a kernel that
+  refuses it stops a strict start. The filter does not cover the other parser threads,
+  which start `ss`, `ip` and `iw` and need netlink, or a descriptor opened earlier, a
+  ring's included. `docs/THREAT-MODEL.md` lists those gaps. No new crate: the filter
+  is about a dozen hand-written BPF instructions.
 - **netwatch no longer sends peer addresses to a third party for GeoIP.**
   With `geoip_online = true` and no working database, every public peer address
   a connection or packet touched went to ip-api.com over cleartext HTTP, where
@@ -707,7 +759,7 @@ All notable changes to NetWatch will be documented in this file.
   daemon, a daemon that lost its packet socket, a run with no
   segmentation-offload frames, or a view whose p99 frame time passes
   33 ms. It records decode rate, drops and CPU for every phase. A full run
-  takes 75 minutes and `--smoke` five. No workflow runs it yet.
+  takes 75 minutes and `--smoke` five.
 - **The 10,000-socket poll and Diagnose's socket join are held to their
   budgets.** `scale_poll_real_sockets` fails past 150 ms at the median,
   times `NW_PERF_SLACK`, instead of printing it as pending.
@@ -719,6 +771,24 @@ All notable changes to NetWatch will be documented in this file.
 - **A test checks the metrics table in docs/observability-export.md
   against the exporter.** It fails when a metric is added, renamed or given
   another type without the table.
+- **A workflow runs the flood soak.** `.github/workflows/flood-soak.yml` runs
+  it in full once a week, or by hand with `minutes` and `scenarios`, and runs
+  `--smoke` on pull requests that touch the capture path, the detectors,
+  `src/app.rs` or the soak. It puts the gates and figures on the run's summary
+  page and keeps `flood-soak.json` and the JSONL. It is outside `ci.yml`, so
+  the release guard does not wait on it.
+- **The capture authority claims have a lab.** `tests/capture_authority.rs` runs
+  real daemon and TUI sessions as root in a user and network namespace with a veth
+  pair. It checks that capture still receives frames, what every thread holds, that
+  a stopped daemon cannot reopen capture and a TUI can, what capture, keylog and the
+  metrics threads get from socket(2) and io_uring_setup(2), and that a live capture
+  thread gets EACCES from TCP connect. `isolated_worker_boundaries`, a worker unit
+  test, covers TCP connect on keylog and the metrics threads. The lab skips unless
+  `NETWATCH_CAP_LAB=1`. `scripts/capture-authority-audit.sh` audits the real
+  `netwatch daemon` from outside. `sandbox-lab.yml` runs both, with the sandbox tests
+  that make their own user namespace, on pull requests touching the sandbox or
+  capture and once a week. It is separate from `ci.yml`, so it holds no tag, and the
+  release checklist in `docs/PACKAGING.md` asks for a green run on the candidate.
 - **Two GeoIP checks.** `geoip_update_live`, ignored by default, runs
   `netwatch geoip update` against DB-IP by hand at release, and a unit test fails
   if the removed service's name comes back in the code or the docs.
