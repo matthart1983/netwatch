@@ -13,8 +13,8 @@ and holds the fixed root-owned authority store lock until restoration or exit.
 No packet, attribution, remote or model workers start in this command.
 
 The shared live bootstrap also reports unresolved authority records without performing
-rollback. A session that is not root cannot read them, and reports nothing about a store
-the kernel refuses it. See [resolver adapter scope and validation](resolver-adapter.md).
+rollback. A session that is not root cannot read them. When the kernel refuses it the
+store, it logs one line saying so instead. See [resolver adapter scope and validation](resolver-adapter.md).
 
 ## PR06 implementation update
 

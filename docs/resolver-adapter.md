@@ -83,10 +83,12 @@ the same store under root authority. User cache/state journals are never promote
 into privileged recovery authority.
 
 The store is private to root, so the kernel refuses every other user once `set` or
-`recover` has run. TUI and daemon sessions that are not root treat that refusal as
-nothing to report, whatever the store holds. Root sessions report unresolved records,
-and `netwatch resolver status` tells anyone else that the journal is unavailable and
-to ask root. Any other failure to read the store is still reported to everyone.
+`recover` has run. Such a user cannot tell a resolved store from an unresolved one, so
+netwatch claims neither. Their TUI or daemon session keeps the Diagnose status line
+clear and writes one line to the log, at startup, saying the store exists, this user
+cannot read it, and to run `sudo netwatch resolver status`. `netwatch doctor` reports
+the same as `resolver_store`, `not_checked`. Root sessions report unresolved records on
+the status line. Any other failure to read the store is reported to everyone.
 
 The target must be a single-link regular file owned by root and not writable by
 group/others. Open uses no-follow/nonblocking flags. The adapter validates device,

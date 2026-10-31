@@ -68,8 +68,9 @@ in durable state, which no release has written. Its Unix writer provides synced 
 per-store OS lock; it does not grant resolver authority or a host-wide lease.
 The Linux resolver CLI uses a separate root-owned shared authority store/lease at
 `/var/lib/netwatch/resolver-v2`; normal startup as root reports its unresolved evidence but
-does not perform privileged rollback, and startup as anyone else cannot read that store and
-says nothing about it. `netwatch resolver recover` restores from that
+does not perform privileged rollback. Startup as anyone else cannot read that store, so it
+logs one line saying to run `sudo netwatch resolver status`, and `doctor` reports the same.
+`netwatch resolver recover` restores from that
 store and from nothing else. Windows v2 writes remain unavailable. Nothing has written
 the legacy journal since 0.31.0 and nothing restores from it, so an entry left open there
 is [restored by hand](recovery-store.md#legacy-journal); on Linux `resolver status` and

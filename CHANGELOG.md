@@ -31,9 +31,11 @@ All notable changes to NetWatch will be documented in this file.
   root then showed `resolver authority journal cannot be inspected: Permission denied`
   on the Diagnose status line and in the log, in place of the status it would have shown.
   It did this even when every record there was resolved, and that user could do nothing
-  to clear it. Those sessions now say nothing when the kernel refuses them this store.
-  Root sessions still report unresolved records, any other failure to read the store is
-  still reported, and `netwatch resolver status` still says the journal is unavailable.
+  to clear it. Such a session cannot tell resolved from unresolved, so it now leaves the
+  status line alone and logs one line at startup saying the store exists, this user cannot
+  read it, and to run `sudo netwatch resolver status`. `netwatch doctor` reports the same
+  as a new `resolver_store` capability. Root sessions still report unresolved records, and
+  any other failure to read the store is still reported to everyone.
 - **`netwatch resolver set` no longer leaves the resolver changed when its stdout is
   closed or full.** The line announcing the change was the first write after making it,
   so `sudo netwatch resolver set ... | head -0` or `> /dev/full` panicked there and exited

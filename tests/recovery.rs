@@ -158,6 +158,117 @@ fn assert_legacy_notice(stdout: &str) {
     assert!(stdout.contains("docs/recovery-store.md"), "{stdout}");
 }
 
+/// Run a command with `/var/lib/netwatch` refused by the kernel, as it is for
+/// anyone but root once `sudo netwatch resolver set` has run. A mount namespace
+/// puts a scratch tmpfs over `/var/lib`, holding a directory with mode 000, and
+/// the capabilities that would get past that mode go before the command runs.
+const REFUSED_STORE: &str = r#"
+mount -t tmpfs tmpfs /var/lib
+mkdir -m 000 /var/lib/netwatch
+exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all "$@"
+"#;
+
+fn with_store_refused(command: Command) -> Command {
+    let mut wrapped = Command::new("unshare");
+    wrapped
+        .args(["--user", "--map-current-user", "--keep-caps", "--mount"])
+        .args(["sh", "-ec", REFUSED_STORE, "sh"])
+        .arg(command.get_program())
+        .args(command.get_args());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => wrapped.env(key, value),
+            None => wrapped.env_remove(key),
+        };
+    }
+    wrapped
+}
+
+/// None where the runner has no such namespace, and for root, which is who this
+/// store is for.
+fn store_can_be_refused() -> bool {
+    let usable = !nix::unistd::geteuid().is_root()
+        && with_store_refused(Command::new("true"))
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+    if !usable {
+        eprintln!("skipped: no user and mount namespace to refuse the store in");
+    }
+    usable
+}
+
+/// A session that cannot read the store cannot say what is in it, resolved or
+/// not. It keeps that off the Diagnose status line, which reads the notice this
+/// checks for in the log, and writes one line saying what to run.
+#[test]
+fn a_session_the_store_is_refused_to_logs_one_line_and_no_notice() {
+    if !store_can_be_refused() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut daemon = fixture.command();
+    daemon.arg("daemon");
+    let mut child = with_store_refused(daemon)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.log().contains("resolver store") && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    // After the shutdown pass too, which must not repeat it.
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
+    child.wait().unwrap();
+    let log = fixture.log();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("resolver store"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(lines[0].contains("/var/lib/netwatch/resolver-v2"), "{log}");
+    assert!(lines[0].contains("sudo netwatch resolver status"), "{log}");
+    assert!(!log.contains("remediation recovery:"), "{log}");
+    assert!(!log.contains("cannot be inspected"), "{log}");
+}
+
+#[test]
+fn doctor_reports_a_store_the_kernel_refuses_this_user() {
+    if !store_can_be_refused() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut doctor = fixture.command();
+    doctor.args(["doctor", "--json"]);
+    let output = with_store_refused(doctor).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let store = report["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|capability| capability["id"] == "resolver_store")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert_eq!(store["state"], "not_checked", "{store}");
+    assert_eq!(store["reason"], "authority_store_unreadable", "{store}");
+    assert_eq!(
+        store["next_check"], "sudo netwatch resolver status",
+        "{store}"
+    );
+    let detail = store["detail"].as_str().unwrap();
+    assert!(detail.contains("/var/lib/netwatch/resolver-v2"), "{detail}");
+    assert!(detail.contains("unknown"), "{detail}");
+
+    let mut text = fixture.command();
+    text.arg("doctor");
+    let output = with_store_refused(text).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("sudo netwatch resolver status"), "{stdout}");
+}
+
 /// Stdout where a write fails: a pipe nobody reads, or a full disk.
 fn broken_stdouts() -> Vec<(&'static str, Stdio)> {
     let (reader, writer) = std::io::pipe().unwrap();

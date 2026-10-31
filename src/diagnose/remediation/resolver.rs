@@ -122,6 +122,19 @@ pub fn authority_notice() -> Option<String> {
     }
 }
 
+/// For the log and `doctor`, when the kernel refuses this user the root-owned
+/// store. Not a recovery notice: nothing here knows whether the store holds one.
+pub fn authority_refusal() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::authority_refusal()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// One line of a command's report. `println!` panics when stdout is closed or
 /// full, and these commands must finish whatever happens to their output: by its
 /// first line `set` has changed the resolver, and only it can put it back at the

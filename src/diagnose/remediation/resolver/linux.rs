@@ -407,15 +407,35 @@ fn authority_notice_at(directory: &Path, root: bool) -> Option<String> {
             let ids: Vec<_> = snapshot.operations.iter().filter(|o| o.state.unresolved()).map(|o| o.id.to_string()).collect();
             (!ids.is_empty()).then(|| format!("resolver authority recovery required: {}; journal: {}/journal.json; review with sudo netwatch resolver status", ids.join(", "), directory.display()))
         }
-        // `live_store` keeps this store private to root, so after one `set` or
-        // `recover` the kernel refuses every other user, whatever the store holds.
-        // That says nothing about recovery and they cannot act on it. Root reads
-        // the real state, and `status` still tells them to ask root. Only the
-        // kernel's refusal counts: the store's own ownership and privacy checks
-        // also report PermissionDenied, and those are worth reporting.
-        Err(error) if !root && error.raw_os_error() == Some(libc::EACCES) => None,
+        // See `refused`. This session cannot tell resolved from unresolved, and a
+        // line on the Diagnose screen it can do nothing about would not help:
+        // `authority_refusal` puts it in the log and `doctor` instead.
+        Err(error) if refused(&error, root) => None,
         Err(error) => Some(format!("resolver authority journal cannot be inspected: {error}; preserved at {}; review with sudo netwatch resolver status", directory.display())),
     }
+}
+
+/// `live_store` keeps the store private to root, so after one `set` or `recover`
+/// the kernel refuses every other user, whatever the store holds. Only the
+/// kernel's refusal counts: the store's own ownership and privacy checks also
+/// report PermissionDenied, and those are faults to report to anyone.
+fn refused(error: &io::Error, root: bool) -> bool {
+    !root && error.raw_os_error() == Some(libc::EACCES)
+}
+
+pub(super) fn authority_refusal() -> Option<String> {
+    authority_refusal_at(Path::new(STATE_DIR), nix::unistd::geteuid().is_root())
+}
+
+fn authority_refusal_at(directory: &Path, root: bool) -> Option<String> {
+    let error = store::inspect(directory).err()?;
+    refused(&error, root).then(|| {
+        format!(
+            "the root-owned resolver store {} exists and this user cannot read it, so whether \
+             it holds an unresolved change is unknown; run sudo netwatch resolver status",
+            directory.display()
+        )
+    })
 }
 
 /// Read the legacy journal for a command that may be running as root. Under a
@@ -818,10 +838,20 @@ mod tests {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
         let other_user = authority_notice_at(&directory, false);
         let root_refused = authority_notice_at(&directory, true);
+        let other_user_refusal = authority_refusal_at(&directory, false);
+        let root_refusal = authority_refusal_at(&directory, true);
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(other_user, None);
-        // A root session the kernel refuses (NFS root squash, say) still says so.
+        // The log and doctor say what is known, and claim neither state.
+        let line = other_user_refusal.unwrap();
+        assert!(line.contains(&directory.display().to_string()), "{line}");
+        assert!(line.contains("sudo netwatch resolver status"), "{line}");
+        assert!(line.contains("unknown"), "{line}");
+        // A root session the kernel refuses (NFS root squash, say) still says so
+        // on the screen, so it gets no second line.
         assert!(root_refused.unwrap().contains("cannot be inspected"));
+        assert_eq!(root_refusal, None);
+        assert_eq!(authority_refusal_at(&directory, false), None);
         // A session that can read it gets the record.
         let readable = authority_notice_at(&directory, false).unwrap();
         assert!(readable.contains("recovery required"), "{readable}");
@@ -837,10 +867,12 @@ mod tests {
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         let exposed = authority_notice_at(&directory, false).unwrap();
         assert!(exposed.contains("cannot be inspected"), "{exposed}");
+        assert_eq!(authority_refusal_at(&directory, false), None);
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(directory.join("journal.json"), b"corrupt").unwrap();
         let corrupt = authority_notice_at(&directory, false).unwrap();
         assert!(corrupt.contains("cannot be inspected"), "{corrupt}");
+        assert_eq!(authority_refusal_at(&directory, false), None);
     }
 
     #[test]
