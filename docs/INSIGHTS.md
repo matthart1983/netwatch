@@ -1,5 +1,8 @@
 # AI Insights
 
+Experimental: this can change or go away in any release, and is outside the 1.0 compatibility
+promise.
+
 Insights is optional AI commentary inside **Diagnose (tab `9`)**, below the
 findings. Tab `8` is Processes. Insights is off by default; deterministic
 rule detection, cause ranking and remediation do not require a model.

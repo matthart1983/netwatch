@@ -677,6 +677,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             "  Applies on next netwatch start.",
             Style::default().fg(app.theme.text_muted),
         )));
+    } else if matches!(
+        app.ui.settings_cursor,
+        cursor::AI_INSIGHTS | cursor::AI_MODEL | cursor::AI_ENDPOINT
+    ) {
+        lines.push(Line::from(Span::styled(
+            "  Experimental: can change in any release.",
+            Style::default().fg(app.theme.text_muted),
+        )));
     } else {
         lines.push(Line::raw(""));
     }
@@ -907,6 +915,34 @@ mod tests {
             .chunks(width as usize)
             .map(|row| row.iter().map(|c| c.symbol()).collect())
             .collect()
+    }
+
+    /// AI Insights says what it is on its own rows, and nowhere else: this is
+    /// the slot under the list that a selected row can use, and the running UI
+    /// is not where everything experimental needs a label.
+    #[test]
+    fn settings_label_ai_insights_experimental_on_its_rows_only() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let mut drawn = |cursor: usize| {
+            app.ui.settings_cursor = cursor;
+            let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+            terminal.draw(|f| render(f, &app, f.area())).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            text.contains("Experimental")
+        };
+        for row in [cursor::AI_INSIGHTS, cursor::AI_MODEL, cursor::AI_ENDPOINT] {
+            assert!(drawn(row), "row {row}");
+        }
+        for row in [cursor::THEME, cursor::SANDBOX, cursor::CONFIRM_QUIT] {
+            assert!(!drawn(row), "row {row}");
+        }
     }
 
     /// Where the keys a config got wrong stay listed after the session's first

@@ -125,8 +125,10 @@ share evidence with someone else, `netwatch diagnose export` writes a pseudonymi
 
 #### Export file format, version 1
 
-This layout is stable. Later versions may add options and comment keys; a change that removes
-or renames one, or changes its meaning, gets a new schema name.
+Classic PCAP and the PCAPNG blocks below are the standard formats, so any reader of them can open
+these files. The JSON in packet comments, `netwatch.annotation.v1`, is experimental and outside
+the 1.0 compatibility promise: its keys can change in any release. A change that removes or
+renames one, or changes its meaning, gets a new schema name, so a parser can tell.
 
 **Classic PCAP**: little-endian, magic `0xa1b2c3d4` (microsecond timestamps), version 2.4,
 snaplen 65535, and one link type for the whole file. A selection that mixes link types can
@@ -143,7 +145,7 @@ one little-endian section, with only these blocks:
 
 A block with options ends them with `opt_endofopt`; a block without has no options list.
 
-**Packet comments.** Each comment is one JSON object in UTF-8, schema
+**Packet comments.** Experimental. Each comment is one JSON object in UTF-8, schema
 `netwatch.annotation.v1`. Wireshark shows it under *Packet comments*, and
 `tshark -r FILE -T fields -e frame.comment` prints one per line.
 
@@ -474,7 +476,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose corpus --unstable [--only ID] [DIR]` | Experimental, for netwatch's developers. Regenerate the pinned test corpus. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
-| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
+| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. `set` and `recover` are experimental. |
 | `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
 
@@ -490,8 +492,8 @@ TUI flags:
 | `--demo` | Replay a recorded Diagnose incident instead of watching this host. |
 | `--no-sandbox`, `--sandbox-strict` | Turn the Linux sandbox off, or refuse to start unless it is enforced. |
 | `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Experimental. |
-| `--insecure-remote` | Allow an `http://` remote URL. |
-| `--api-key KEY` | Discouraged: the key shows in the process list. Use `NETWATCH_API_KEY`. |
+| `--insecure-remote` | Allow an `http://` remote URL. Experimental, with `--remote`. |
+| `--api-key KEY` | Deprecated: the key shows in the process list. Use `NETWATCH_API_KEY`. Keeps working until 2.0, and prints a warning that does not include the key. |
 | `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
 
 ### Uptime report
@@ -1076,6 +1078,8 @@ port_scan_window_secs = 30          # detection window
 
 ### AI Insights
 
+Experimental, like the feature: these three can change in any release.
+
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `insights_enabled` | `false` | `true` `false` | Adds an AI narrative block to the Diagnose tab. Opt-in — see [AI Insights](#ai-insights). |
@@ -1085,6 +1089,9 @@ port_scan_window_secs = 30          # detection window
 ---
 
 ## AI Insights
+
+Experimental: this can change or go away in any release, and is outside the 1.0 compatibility
+promise.
 
 Insights is opt-in commentary inside **Diagnose (`9`)**, below the findings.
 It sends a network snapshot to the configured Ollama-compatible `/api/chat`

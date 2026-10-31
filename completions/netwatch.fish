@@ -28,9 +28,9 @@ complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l json -d 'JSON ou
 complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l csv -d 'CSV output'
 
 # ── options ───────────────────────────────────────────────────────────
-complete -c netwatch -l remote -r -d 'Remote https:// URL (requires API key)'
-complete -c netwatch -l api-key -r -d 'Discouraged: use NETWATCH_API_KEY'
-complete -c netwatch -l insecure-remote -d 'Allow an http:// remote URL'
+complete -c netwatch -l remote -r -d 'Experimental: remote https:// URL (requires API key)'
+complete -c netwatch -l api-key -r -d 'Deprecated: use NETWATCH_API_KEY'
+complete -c netwatch -l insecure-remote -d 'Experimental: allow an http:// remote URL'
 complete -c netwatch -l view -x -a 'full lite dense' -d 'full, lite, or dense'
 complete -c netwatch -l lite -d 'Start in Lite view'
 complete -c netwatch -l demo -d 'Replay the Diagnose demo'

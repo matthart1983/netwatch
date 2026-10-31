@@ -46,7 +46,7 @@ below).
 .SH OPTIONS
 .TP
 .BI \-\-remote " URL"
-Remote URL for the fleet backend. Requires an API key, from the
+Experimental. Remote URL for the fleet backend. Requires an API key, from the
 .B NETWATCH_API_KEY
 environment variable or
 .BR \-\-api\-key .
@@ -57,13 +57,16 @@ unless
 is given.
 .TP
 .BI \-\-api\-key " KEY"
-Remote API key. Discouraged: any user on the host can read it in
+Remote API key. Deprecated: any user on the host can read it in
 .BR ps (1).
 Set the
 .B NETWATCH_API_KEY
-environment variable instead.
+environment variable instead. It keeps working until 2.0, and prints a warning
+that does not include the key.
 .TP
 .B \-\-insecure\-remote
+Experimental, with
+.BR \-\-remote .
 Allow an
 .B http://
 remote URL. The API key and every snapshot then cross the network in
@@ -204,12 +207,35 @@ the file location may change between releases. IP geolocation by DB\-IP
 Report the current DNS resolver and whether netwatch could change it.
 .TP
 .B resolver set
-Temporarily point the resolver at an address. Only for administrator-confirmed
-unmanaged files, and requires
+Experimental. Temporarily point the resolver at an address. Only for
+administrator-confirmed unmanaged files, and requires
 .BR \-\-unmanaged .
 .TP
 .B resolver recover
-Put a resolver changed by netwatch back.
+Experimental. Put a resolver changed by netwatch back.
+.SH EXPERIMENTAL
+These are outside the 1.0 compatibility promise and can change or go away in any
+release:
+.BR \-\-remote ,
+.B \-\-api\-key
+and the snapshots they send;
+.B resolver set
+and
+.BR "resolver recover" ;
+AI Insights
+.RB ( insights_enabled
+and the keys beside it); the JSON in PCAPNG packet comments
+.RB ( netwatch.annotation.v1 );
+the formats behind
+.BR "diagnose replay" ,
+.B diagnose features
+and
+.BR "diagnose corpus" ,
+which need
+.BR \-\-unstable ;
+and anything in the
+.B [experimental]
+configuration table.
 .SH KEYS
 .B 1
 to

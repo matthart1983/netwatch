@@ -1984,12 +1984,12 @@ block = {
     fn a_policy_key_it_does_not_read_is_recorded_at_every_depth() {
         use crate::config::ConfigWarningKind::UnknownKey;
         let path = scratch("unknown-keys.toml");
-        std::fs::write(
+        write_owner_only(
             &path,
-            "stirct = true\n[block]\nipp = ['192.0.2.1']\n\
-             [process.curl]\nallow_snis = ['a.example']\n\
-             [process.curl.block]\nport = [25]\n\
-             [process.'any name']\nallow_ports = [443]\n",
+            b"stirct = true\n[block]\nipp = ['192.0.2.1']\n\
+              [process.curl]\nallow_snis = ['a.example']\n\
+              [process.curl.block]\nport = [25]\n\
+              [process.'any name']\nallow_ports = [443]\n",
         )
         .unwrap();
         let policy = load_policy_file(&path).unwrap();
@@ -2021,7 +2021,7 @@ block = {
         profiler.reload_policy(&path);
         profiler.reload_policy(&path);
         assert_eq!(profiler.policy_warnings().len(), 4);
-        std::fs::write(&path, "strict = true\n").unwrap();
+        write_owner_only(&path, b"strict = true\n").unwrap();
         profiler.reload_policy(&path);
         assert_eq!(profiler.policy_warnings(), []);
         profiler.reload_policy(&scratch("no-such-policy.toml"));
@@ -2033,12 +2033,12 @@ block = {
     #[test]
     fn promotion_keeps_the_keys_of_a_rule_it_does_not_read() {
         let path = scratch("promote-unknown.toml");
-        std::fs::write(
+        write_owner_only(
             &path,
-            "stirct = true\n\
-             [process.curl]\nallow_snis = ['a.example']\nallow_sni = ['b.example']\n\
-             [process.curl.block]\nport = [25]\nports = [26]\n\
-             [process.inline]\nallow_sni = []\nfuture = { a = 1 }\n",
+            b"stirct = true\n\
+              [process.curl]\nallow_snis = ['a.example']\nallow_sni = ['b.example']\n\
+              [process.curl.block]\nport = [25]\nports = [26]\n\
+              [process.inline]\nallow_sni = []\nfuture = { a = 1 }\n",
         )
         .unwrap();
         let before = load_policy_file(&path).unwrap().load_warnings;

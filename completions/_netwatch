@@ -20,9 +20,9 @@ _netwatch() {
     typeset -A opt_args
 
     _arguments -C \
-        '--remote=[Remote https:// URL (requires API key)]:url:_urls' \
-        '--api-key=[Discouraged: use NETWATCH_API_KEY]:key:' \
-        '--insecure-remote[Allow an http:// remote URL]' \
+        '--remote=[Experimental: remote https:// URL (requires API key)]:url:_urls' \
+        '--api-key=[Deprecated: use NETWATCH_API_KEY]:key:' \
+        '--insecure-remote[Experimental: allow an http:// remote URL]' \
         '--view=[full, lite, or dense]:view:(full lite dense)' \
         '--lite[Start in Lite view]' \
         '--demo[Replay the Diagnose demo]' \

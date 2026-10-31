@@ -1,5 +1,8 @@
 # Linux resolver authority command
 
+Experimental: `netwatch resolver set` and `recover` can change or go away in any release, and
+are outside the 1.0 compatibility promise.
+
 The first adapter supports an explicitly administrator-confirmed unmanaged regular
 `/etc/resolv.conf` on Linux. It runs in a separate invocation before application
 runtime, packet capture, remote publishing, model workers, or parser confinement.

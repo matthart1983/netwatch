@@ -48,12 +48,28 @@ All notable changes to NetWatch will be documented in this file.
   `--unstable` gates only these three. `diagnose run`, `coverage`, `episodes` and
   `export` are unchanged, as are AI Insights, `--remote` and the resolver commands,
   which are opt-in already.
+- **`--api-key` prints a deprecation warning.** It has been discouraged because any
+  user on the host can read the key with `ps`. It now says so on stderr and in the log,
+  and points at `NETWATCH_API_KEY`. It keeps working until 2.0, and the warning does not
+  include the key.
+- **AI Insights, `--remote`, `--api-key`, `resolver set` and `recover`, and the JSON in
+  PCAPNG packet comments are labelled experimental.** They can change or go away in any
+  release, and are outside the 1.0 compatibility promise. Nothing about how they work
+  changes, and none is gated. `--help`, the man page, docs/REFERENCE.md,
+  docs/CAPABILITIES.md and the README now say so, and Settings says so under the AI
+  rows while one is selected. The running UI has no other new label. REFERENCE used to
+  call the whole export layout stable. PCAP and PCAPNG are still the standard formats,
+  and `netwatch.annotation.v1` still gets a new schema name if a key is removed, renamed
+  or changes meaning, but the comments' keys no longer carry a compatibility promise.
 
 ### Migration
 - **Add `--unstable` to `diagnose replay`, `diagnose features` and `diagnose corpus`.**
   `netwatch diagnose replay FILE` becomes `netwatch diagnose replay --unstable FILE`,
   and likewise `features` and `corpus`. A script that does not gets exit 3. The flag
   goes after the subcommand, in any position among its arguments.
+- **Move `--api-key KEY` to `NETWATCH_API_KEY=KEY`.** Nothing stops working, but the
+  flag now warns on stderr, so a wrapper that treats stderr output as failure sees it.
+  The units in `packaging/` already use the variable.
 
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1

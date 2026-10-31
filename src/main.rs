@@ -59,6 +59,10 @@ fn main() -> Result<()> {
     // not load stops the TUI and the daemon here, naming the file and the
     // cause: the defaults would drop every setting in it, the sandbox mode
     // and `record_uptime` included.
+    let api_key_flag = options.api_key.is_some();
+    if api_key_flag {
+        eprintln!("warning: {}", netwatch::cli::API_KEY_DEPRECATION);
+    }
     let config = NetwatchConfig::load()?;
     // The TUI is about to hide stderr, and these are back in view when it
     // quits. A daemon's go to the journal. Nothing else here reports them twice:
@@ -138,6 +142,9 @@ fn main() -> Result<()> {
         .load_warnings
         .iter()
         .for_each(netwatch::config::ConfigWarning::log);
+    if api_key_flag {
+        tracing::warn!(target: "netwatch::remote", "{}", netwatch::cli::API_KEY_DEPRECATION);
+    }
 
     // Headless daemon mode: `netwatch daemon` (or `--daemon`/`--headless`).
     // Runs the same collectors as the TUI with no rendering, streams to the
