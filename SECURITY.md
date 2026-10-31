@@ -78,3 +78,18 @@ See the [threat model](docs/THREAT-MODEL.md) for per-thread privileges, outbound
 traffic, unsupported boundaries and planned hardening, and [what netwatch sends
 off this machine](docs/REFERENCE.md#what-netwatch-sends-off-this-machine) for
 what leaves the host and when.
+
+## Unsafe code
+
+Unsafe Rust sits at the OS and FFI boundary: the platform backends, the seccomp
+filter, the recovery store and a few system calls elsewhere. The parsers under
+`src/dpi` have none. Unsafe code outside a module or item marked
+`allow(unsafe_code)` fails CI, and so does an unsafe block or impl with no
+`SAFETY:` comment saying what it relies on. The `[lints]` tables in `Cargo.toml`
+and `cargo clippy --all-targets -- -D warnings` check both. `ci.yml` runs them on
+Linux, macOS and Windows, and `tier3.yml` on FreeBSD, which does not hold a release.
+
+That proves the comment exists, not that it is right, which is for review. It
+says nothing about unsafe code in dependencies or the native libraries netwatch
+uses, such as libpcap and Npcap. The
+[contributor policy](CONTRIBUTING.md#unsafe-code-policy) has the rules.

@@ -396,6 +396,15 @@ FreeBSD use libpcap/BPF and platform collectors. See
 [capability matrix](CAPABILITIES.md). Memory safety in Rust does not eliminate
 unsafe FFI, native dependencies or resource-exhaustion failures.
 
+Unsafe Rust is allowed only in modules and items marked `allow(unsafe_code)`, and
+every unsafe block and impl has a `SAFETY:` comment.
+`cargo clippy --all-targets -- -D warnings` fails on a break of either. `ci.yml`
+runs it on Linux, macOS and Windows, and `tier3.yml` on FreeBSD, which does not
+hold a release. Nothing under `src/dpi` has that mark, so unsafe in a DPI parser
+fails the check. Clippy shows that a comment exists, not that it is right, and does
+not reach dependencies or native libraries. See the
+[contributor policy](../CONTRIBUTING.md#unsafe-code-policy).
+
 Actions are SHA-pinned, Cargo.lock records dependency versions, and releases
 include checksums, attestations, an SBOM and auditable binaries. These provide
 traceability, not proof that a maintainer, dependency or runner is uncompromised.
@@ -417,7 +426,7 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | E3 capture-error hint and package messages restrict the binary to a group before setcap | Included |
 | E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Included |
 | F1 doctor reports actual containment: kernel and enforced ABI, network policy, capture authority, `running as root` | Included |
-| Remaining unsafe-block audit | Later hardening; contributor safety policy applies now |
+| Unsafe-block audit and lints | Included: every site has its comment, and CI's clippy fails on a new one without |
 | Full-path LoadLibraryExW for Npcap | Deferred |
 | Trusted publishing, signed tags, pinned cargo tools, fuzz lock maintenance | Deferred |
 | Separate privileged capture process | After 1.0 |

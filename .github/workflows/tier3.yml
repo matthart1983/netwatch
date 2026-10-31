@@ -22,24 +22,28 @@ jobs:
   # No hosted FreeBSD runner exists, and cross-rs doesn't support FreeBSD, so
   # this boots a real FreeBSD VM via QEMU on the ubuntu-latest host — the
   # standard way Rust projects get genuine FreeBSD CI. Slower than the native
-  # matrix jobs above (no package cache survives the VM boundary, so every
+  # matrix jobs in ci.yml (no package cache survives the VM boundary, so every
   # run compiles every dependency from scratch) and intentionally
-  # lighter-weight: fmt/clippy are already enforced in `test`, so this job
+  # lighter-weight: fmt is already enforced in ci.yml's `test`, so this job
   # only proves the FreeBSD-specific code (src/platform/freebsd.rs, the
-  # sockstat connection parser, the sysctl-based procname lookup) actually
-  # builds and its tests pass on the real OS.
+  # sockstat connection parser, the sysctl-based procname lookup) passes
+  # clippy, builds, and passes its tests on the real OS. Clippy runs here
+  # because ci.yml's never compiles that code, so nothing else would catch an
+  # undocumented unsafe block in it. The action runs this script under
+  # `set -eu`, so a clippy failure fails the job.
   freebsd:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Build and test on FreeBSD
+      - name: Clippy, build and test on FreeBSD
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           usesh: true
           prepare: |
             pkg install -y rust libpcap pkgconf
           run: |
+            cargo clippy --all-targets -- -D warnings
             cargo build
             cargo test
 

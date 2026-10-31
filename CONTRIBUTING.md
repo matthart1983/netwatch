@@ -299,6 +299,29 @@ can violate. Null checks alone do not establish pointer validity.
 
 Changes to an unsafe boundary require tests for malformed or short inputs where
 those can be supplied safely, and checks on every affected platform. State any
-platform that was only type-checked or reviewed by inspection. Do not claim all
-legacy sites already satisfy this policy; the remaining audit is tracked in the
-[threat model](docs/THREAT-MODEL.md).
+platform that was only type-checked or reviewed by inspection.
+
+The `[lints]` tables in `Cargo.toml` enforce what a compiler can see:
+
+- `unsafe_code` flags unsafe outside a module or item that has
+  `allow(unsafe_code)`. Put the allow on the smallest item that needs it, or at
+  the top of a module that exists to wrap an FFI. Parsers under `src/dpi` do not
+  get one, because packet bytes reach them directly.
+- `clippy::undocumented_unsafe_blocks` flags a block or `unsafe impl` with no
+  `SAFETY:` comment directly above it or above the statement holding it, and
+  `clippy::unnecessary_safety_comment` and `unnecessary_safety_doc` flag one on
+  code with nothing unsafe.
+- `unsafe_op_in_unsafe_fn` requires a block, with its comment, inside an unsafe
+  function.
+- `missing_unsafe_on_extern` requires `unsafe extern`. Give that block a plain
+  comment on how its declarations were checked. Clippy rejects `SAFETY:` there.
+
+They are `warn`, so a `cargo install` on a newer toolchain never fails on them.
+`cargo clippy --all-targets -- -D warnings` turns them into failures. `ci.yml`
+runs it on Linux, macOS and Windows, and `tier3.yml` on FreeBSD. Clippy only reads
+what is compiled for its target, so unsafe in a macOS branch passes on Linux and
+fails the macOS job.
+
+The lints check that a comment exists. Whether it is true is for review, as is
+the `# Safety` section on an unsafe function that is not `pub`, which clippy
+does not ask for.

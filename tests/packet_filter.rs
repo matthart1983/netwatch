@@ -28,12 +28,18 @@ struct Counting;
 // const-initialised thread local without a destructor, so touching it
 // allocates nothing and is sound at any point in a thread's life.
 unsafe impl GlobalAlloc for Counting {
+    /// # Safety
+    ///
+    /// What [`GlobalAlloc::alloc`] requires.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
         // SAFETY: the caller's guarantees for `alloc` are passed on as they are.
         unsafe { System.alloc(layout) }
     }
 
+    /// # Safety
+    ///
+    /// What [`GlobalAlloc::dealloc`] requires.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: `ptr` came from `System` through `alloc` above, with `layout`.
         unsafe { System.dealloc(ptr, layout) }

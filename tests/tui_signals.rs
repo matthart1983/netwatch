@@ -7,6 +7,7 @@
 //! The last three tests take the terminal away or stop it reading, where the
 //! pty cannot be put back. A hangup must still exit 0, and SIGTERM must still
 //! end netwatch when its terminal has stopped reading.
+#![allow(unsafe_code)]
 use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::termios::{tcgetattr, LocalFlags, Termios};

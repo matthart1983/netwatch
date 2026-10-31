@@ -24,6 +24,7 @@
 // packet-pktap.c dissector. The kernel writes `pth_length` at offset 0 so
 // future header growth is forwards-compatible — we read up to the documented
 // fields and skip past pth_length bytes to reach the inner frame.
+#![allow(unsafe_code)]
 
 use crate::collectors::packets::{StreamKey, StreamProtocol};
 use std::collections::HashMap;
@@ -403,12 +404,12 @@ mod ffi {
 
     pub const PCAP_ERRBUF_SIZE: usize = 256;
 
-    // SAFETY: each declaration matches its prototype in libpcap's
-    // pcap/pcap.h, Apple's included (`pcap_geterr` returns `char *`, read
-    // here only through a const pointer). `pcap_pkthdr` above matches the C
-    // struct's leading fields, and is only read through pointers libpcap
-    // returns, never built or copied by value.
-    extern "C" {
+    // Each declaration matches its prototype in libpcap's pcap/pcap.h, Apple's
+    // included (`pcap_geterr` returns `char *`, read here only through a const
+    // pointer). `pcap_pkthdr` above matches the C struct's leading fields, and
+    // is only read through pointers libpcap returns, never built or copied by
+    // value.
+    unsafe extern "C" {
         pub fn pcap_create(source: *const c_char, errbuf: *mut c_char) -> *mut pcap_t;
         pub fn pcap_set_snaplen(p: *mut pcap_t, snaplen: c_int) -> c_int;
         pub fn pcap_set_timeout(p: *mut pcap_t, to_ms: c_int) -> c_int;

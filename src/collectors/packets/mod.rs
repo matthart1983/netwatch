@@ -505,6 +505,7 @@ fn host_mem_total() -> Option<u64> {
 /// This host's memory in bytes: its physical pages times the page size, as
 /// sysconf reports them.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[allow(unsafe_code)]
 fn host_mem_total() -> Option<u64> {
     // SAFETY: sysconf takes an integer name and reads no memory of ours.
     let pages = unsafe { nix::libc::sysconf(nix::libc::_SC_PHYS_PAGES) };
@@ -517,6 +518,7 @@ fn host_mem_total() -> Option<u64> {
 
 /// This host's memory in bytes, from `GlobalMemoryStatusEx`.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn host_mem_total() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut status = MEMORYSTATUSEX {

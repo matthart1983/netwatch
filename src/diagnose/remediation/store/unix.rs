@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use super::*;
 use nix::libc;
 use std::{

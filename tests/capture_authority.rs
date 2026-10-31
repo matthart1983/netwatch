@@ -668,7 +668,11 @@ mod lab {
     /// filter and its capabilities. That is how this looks inside a worker that
     /// has no test hook, the live capture thread among them, without adding one
     /// to the release code. Only async-signal-safe calls, and errno is put back.
-    extern "C" fn probe_handler(_signal: libc::c_int) {
+    ///
+    /// # Safety
+    ///
+    /// Only the kernel calls this, on the thread a [`Probe`] signals.
+    unsafe extern "C" fn probe_handler(_signal: libc::c_int) {
         // SAFETY: errno's location is valid for the thread's lifetime.
         let saved = unsafe { *libc::__errno_location() };
         for (slot, errno) in PROBE_SOCKETS.iter().zip(socket_errnos()) {
@@ -694,10 +698,10 @@ mod lab {
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                 )
             };
-            // SAFETY: errno's location is valid for the thread's lifetime.
             let errno = if connected == 0 {
                 0
             } else {
+                // SAFETY: errno's location is valid for the thread's lifetime.
                 unsafe { *libc::__errno_location() }
             };
             PROBE_CONNECT.store(errno, Ordering::SeqCst);

@@ -96,11 +96,10 @@ All notable changes to NetWatch will be documented in this file.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
-  what they assume.** Six places that read the effective user ID, and three
+  what they assume.** Seven places that read the effective user ID, and three
   in tests, call nix's safe wrapper instead of libc inside an `unsafe`
-  block. The sandbox's Landlock write-grant check still calls libc. On
-  Windows, the Npcap loader and doctor's query of the Npcap driver service
-  call the windows-sys declarations instead of hand-written ones, and on
+  block. On Windows, the Npcap loader and doctor's query of the Npcap driver
+  service call the windows-sys declarations instead of hand-written ones, and on
   macOS the process path lookup uses libc's declaration of `proc_pidpath`.
   Reading the Windows socket tables now checks that the buffer holds the
   whole table struct, a header and one row, before it reads the row count,
@@ -892,6 +891,13 @@ All notable changes to NetWatch will be documented in this file.
   Connections view cache. The scale tests also time Connections frames with a
   full stream tracker and Dashboard frames with socket verdicts against the
   frame budget, and print a tick with a capture running, with no budget.
+- **CI fails on unsafe code that does not follow the policy.** `[lints]` in
+  `Cargo.toml` flags unsafe outside a module or item that allows it, a block
+  with no `SAFETY:` comment, and an `extern` block not marked `unsafe`. They are
+  warnings, so `cargo install` on a newer toolchain still builds, and CI's
+  `-D warnings` makes them failures. The FreeBSD job now runs clippy too,
+  because no other job compiles FreeBSD's code. `SECURITY.md` and the threat
+  model state the policy and what these checks do not cover.
 
 ## [0.38.0] - 2026-10-25
 

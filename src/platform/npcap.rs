@@ -19,6 +19,7 @@
 //! Setting the directory also covers `Packet.dll`, which `wpcap.dll` imports
 //! and which lives beside it: the loader searches the `SetDllDirectoryW`
 //! directory when resolving a dependency, and would otherwise miss it too.
+#![allow(unsafe_code)]
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
