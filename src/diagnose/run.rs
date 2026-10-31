@@ -581,6 +581,8 @@ mod tests {
             ("coverage.rs", include_str!("coverage.rs")),
             ("config.rs", include_str!("../config.rs")),
         ] {
+            // A Windows checkout has CRLF endings.
+            let source = source.replace("\r\n", "\n");
             let (code, _tests) = source
                 .split_once(concat!("#[cfg(", "test)]\nmod tests"))
                 .unwrap();
