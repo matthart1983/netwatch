@@ -82,16 +82,24 @@ the cache. So `recover` can print `Recovered 0 resolver operations` and exit 0 w
 
 To deal with an entry by hand:
 
-1. Compare `/etc/resolv.conf` with the backup the notice names,
-   `/etc/resolv.conf.netwatch-<pid>.bak`. A pending entry with no backup file is a
-   write the sandbox refused, and nothing changed.
-2. If the file still holds netwatch's change, copy the backup over it as root.
-3. Remove the backup and `applied.json`. The notice goes with the next start.
+1. Open `applied.json` and find the entry. Its `installed` field is the exact text
+   netwatch wrote, and `backup` is where it said it kept the original.
+2. Compare `/etc/resolv.conf` with `installed`. If they differ, what is there now is not
+   netwatch's change: something else wrote the file later, or a pending entry's write
+   never landed, usually because the sandbox refused it. Leave the file alone, and only
+   check it reads as you expect.
+3. If they match and the backup exists, copy the backup over the file as root. If they
+   match and it does not exist, the original is gone, so set the resolver yourself.
+4. Remove `applied.json`, and the backup if there is one. The notice goes with the next
+   start.
 
-A session in another home does not see the journal, so a leftover backup is the
-other way to find one: `ls /etc/resolv.conf.netwatch-*.bak`. Check for one too when
-the notice says the journal is invalid or cannot be read, since then it cannot name
-a backup.
+A backup file does not mean an entry is open. No release removes
+`/etc/resolv.conf.netwatch-<pid>.bak`, so a session that quit cleanly and restored the
+file leaves one too, and copying an old one back would undo every edit since. Only the
+journal says what is open. A session in another home does not see that journal, so run
+`netwatch resolver status` as the account that ran 0.30, usually with `sudo`. When the
+notice says the journal is invalid or cannot be read it cannot name an entry. Read the
+file yourself if you can, and do not restore from a backup on the strength of the notice.
 
 A confined thread can write the cache, and under a `sudo` that keeps HOME the journal
 is in someone else's home. So every session and command reads it only as a regular,

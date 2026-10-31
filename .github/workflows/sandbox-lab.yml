@@ -12,6 +12,7 @@ on:
       - 'src/sandbox/**'
       - 'src/collectors/packets/**'
       - 'src/collectors/connections.rs'
+      - 'src/diagnose/remediation.rs'
       - 'src/diagnose/remediation/**'
       - 'tests/capture_authority.rs'
       - 'tests/recovery.rs'

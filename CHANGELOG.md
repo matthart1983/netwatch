@@ -66,8 +66,10 @@ All notable changes to NetWatch will be documented in this file.
   who wrote the file. Diagnose said `automatic rollback disabled` and gave the backup,
   but not the changed file or the next step, and nothing said that removing the journal
   is what clears the notice. It now says all three. The steps are in [the recovery document](docs/recovery-store.md#legacy-journal):
-  compare `/etc/resolv.conf` with the backup, copy the backup back as root, then remove
-  `applied.json`, which is what clears the notice. This only reaches someone whose 0.30
+  compare `/etc/resolv.conf` with the text the entry says netwatch wrote, copy the backup
+  back as root only if they match, then remove `applied.json`, which is what clears the
+  notice. A backup file alone proves nothing, since no release removes them, so a session
+  that quit cleanly leaves one too. This only reaches someone whose 0.30
   session was killed with a change in place. `netwatch resolver recover` restores what an
   interrupted `netwatch resolver set` left, and tests now hold that to a journal and backup
   a real 0.31.1 wrote.

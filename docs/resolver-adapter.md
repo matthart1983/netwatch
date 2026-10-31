@@ -49,7 +49,7 @@ unresolved record is left there and 1 when it refuses or a record stays unresolv
 this store. The notice names the file and the backup. It restores nothing and never
 changes the exit status: the journal is outside recovery authority, so a file a user
 can write cannot fail a root command. Exit 0 therefore says nothing about that
-journal. Read the output, or `ls /etc/resolv.conf.netwatch-*.bak`.
+journal, so read the output.
 
 A failed write to stdout changes nothing: a closed pipe or a full disk loses the text,
 and each command still finishes, with the same exit status and the same error on stderr.
