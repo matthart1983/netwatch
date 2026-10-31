@@ -587,7 +587,11 @@ fn render_side_column(
 /// Falls back to one line when the graph has no room for the box.
 fn render_connection_uptime(f: &mut Frame, app: &App, rect: Rect, inner: Rect) {
     let t = &app.theme;
-    let (state, headline, detail) = connection_text(app.uptime.connection(), chrono::Local::now());
+    let (state, headline, detail) = connection_text(
+        app.uptime.connection(),
+        app.health_prober.third_party_probes(),
+        chrono::Local::now(),
+    );
     let dot = match state {
         ConnState::Up => t.status_good,
         ConnState::Down => t.status_error,
@@ -630,6 +634,7 @@ enum ConnState {
 /// durations can be tested exactly.
 fn connection_text(
     conn: crate::uptime::Connection,
+    third_party_probes: bool,
     now: chrono::DateTime<chrono::Local>,
 ) -> (ConnState, String, String) {
     use crate::uptime::{duration, Connection};
@@ -664,6 +669,13 @@ fn connection_text(
             ConnState::Down,
             format!("down {}", ago(since)),
             format!("{} not answering", hop.name()),
+        ),
+        // With the switch off no probe is coming, so this is the final answer
+        // rather than a wait.
+        Connection::Unknown if !third_party_probes => (
+            ConnState::Unknown,
+            "not measured".to_string(),
+            crate::collectors::health::PROBES_OFF.to_string(),
         ),
         Connection::Unknown => (
             ConnState::Unknown,
@@ -915,7 +927,7 @@ mod tests {
             last_outage: None,
         };
         assert_eq!(
-            connection_text(up, now()),
+            connection_text(up, true, now()),
             (
                 ConnState::Up,
                 "up 3h 12m".into(),
@@ -931,7 +943,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            connection_text(after, now()),
+            connection_text(after, true, now()),
             (
                 ConnState::Up,
                 "up 10m 00s".into(),
@@ -949,7 +961,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            connection_text(yesterday, now()).2,
+            connection_text(yesterday, true, now()).2,
             "since Oct 23 (gateway, 1m 40s)"
         );
     }
@@ -961,7 +973,7 @@ mod tests {
             hop: Hop::Gateway,
         };
         assert_eq!(
-            connection_text(down, now()),
+            connection_text(down, true, now()),
             (
                 ConnState::Down,
                 "down 45s".into(),
@@ -969,8 +981,31 @@ mod tests {
             )
         );
         assert_eq!(
-            connection_text(Connection::Unknown, now()).0,
+            connection_text(Connection::Unknown, true, now()).0,
             ConnState::Unknown
+        );
+    }
+
+    /// `third_party_probes = false` never sends the probe, so "waiting" for it
+    /// would be on screen for the whole session. The switch does not change a
+    /// verdict the other hops can give.
+    #[test]
+    fn a_switched_off_internet_probe_reads_as_not_measured() {
+        assert_eq!(
+            connection_text(Connection::Unknown, false, now()),
+            (
+                ConnState::Unknown,
+                "not measured".into(),
+                "third_party_probes is off".into()
+            )
+        );
+        let down = Connection::Down {
+            since: ago(45),
+            hop: Hop::Gateway,
+        };
+        assert_eq!(
+            connection_text(down, false, now()).2,
+            "gateway not answering"
         );
     }
 

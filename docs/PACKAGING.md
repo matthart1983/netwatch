@@ -44,8 +44,10 @@ drives it, with maintainer scripts in `packaging/debian/`.
 No package grants capabilities. Capture needs `CAP_NET_RAW` (and `CAP_BPF` /
 `CAP_PERFMON` for eBPF attribution), and a package that hands those to a binary
 without asking takes a decision that belongs to the administrator. Every
-post-install prints the `setcap` line instead, and CI fails the release if an
-installed package ever comes with capabilities already applied.
+post-install prints the commands instead: restrict the binary to a `netwatch`
+group, then `setcap`. On a binary every account can run, the capabilities would
+let every local account capture. CI fails the release if an installed package
+ever comes with capabilities already applied.
 
 ## Per-release checklist
 
@@ -90,7 +92,7 @@ musl-static release binary on an Alpine base — about 26 MB.
 
 ```sh
 docker run --rm -it --net=host --pid=host \
-  --cap-add=NET_RAW --cap-add=NET_ADMIN \
+  --cap-add=NET_RAW \
   ghcr.io/matthart1983/netwatch
 ```
 
@@ -101,7 +103,9 @@ Each flag earns its place:
 | `--net=host` | netwatch sees the container's veth, not the host's traffic |
 | `--pid=host` | no process attribution: `/proc/<pid>/fd` is the container's |
 | `--cap-add=NET_RAW` | packet capture fails with `socket: Operation not permitted` |
-| `--cap-add=NET_ADMIN` | interface state and some probes degrade |
+
+`--cap-add=NET_ADMIN` is not needed. Nothing in netwatch uses it, and
+promiscuous capture opens with `NET_RAW` alone.
 
 The image is not `scratch`. netwatch shells out to `ss` and `ip` (iproute2)
 for the connection table and routes, `ping` (iputils) for gateway and internet

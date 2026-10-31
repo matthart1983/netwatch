@@ -36,6 +36,6 @@ ENV TERM=xterm-256color
 # Capture needs the host's network namespace and CAP_NET_RAW; process
 # attribution additionally needs the host PID namespace. See docs/PACKAGING.md.
 #   docker run --rm -it --net=host --pid=host \
-#     --cap-add=NET_RAW --cap-add=NET_ADMIN \
+#     --cap-add=NET_RAW \
 #     ghcr.io/matthart1983/netwatch
 ENTRYPOINT ["/usr/bin/netwatch"]

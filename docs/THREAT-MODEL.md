@@ -298,9 +298,10 @@ write: /dev/null
     reader, or a separate parser process
     ([worker startup](../src/sandbox/worker.rs#L1)).
 14. File capabilities on a world-executable binary let every local account invoke
-    capture. Restrict execution to the intended group as in the setup recipe. The
-    capture-error hint and the package install messages still give an in-place
-    `setcap` line without that restriction (E3 below).
+    capture. Restrict execution to the intended group as in the setup recipe, which
+    the capture-error hint and the package install messages also give. A package
+    prints the commands and never runs them, so nothing stops an administrator
+    granting a world-executable binary by hand.
 
 Capture drops CAP_NET_RAW on entry, and in sessions that never reopen every
 other thread drops it too, but that does not revoke the AF_PACKET descriptor
@@ -353,28 +354,37 @@ active-probe, load-test, WHOIS and GeoIP update endpoints. User-configured endpo
 can differ. DNS resolution itself can contact the system resolver. Health checks, one
 startup trace and any configured Diagnose targets run automatically; explicit
 experiments, traceroute, WHOIS and the GeoIP update require their respective user
-actions. See
+actions.
+
+`third_party_probes = false` stops the rows below that name it, and the three
+Diagnose tests that ask 1.1.1.1 (`dns.alt_resolver`,
+`path.internet_tracks_gateway` and `load.idle_vs_loaded`, which is the upload
+test). Their readings then show as not measured, and Diagnose opens no issue on
+them. It does not cover probes of the configured
+resolver and gateway, or traffic the user starts or configures: `T`, `W`, `t` on a
+coverage row, `netwatch geoip update`, configured Diagnose targets, Insights, remote, and `diagnose_probes.trace_refresh_secs`, whose
+default `trace_target` is 1.1.1.1. See
 [health](../src/collectors/health.rs#L177),
 [startup trace](../src/collectors/traceroute.rs#L37),
 [active defaults](../src/diagnose/active.rs#L35),
-[load test](../src/diagnose/next_test.rs#L378),
+[load test](../src/diagnose/next_test.rs#L403),
 [WHOIS](../src/collectors/whois.rs#L11), and
 [GeoIP update](../src/geoip_update.rs#L1).
 
 <!-- egress -->
 | Service | Destination and disclosure |
 | --- | --- |
-| Reference DNS | 1.1.1.1, querying dns.google |
-| Internet reachability | 1.1.1.1, TCP fallback on port 443 |
-| Startup trace | 1.1.1.1; TTL-limited trace (UDP, ICMP echo on Windows) on every TUI start, demo included; ignores trace_target |
-| STUN | stun.l.google.com:19302 and stun.cloudflare.com:3478; public mapping |
+| Reference DNS | 1.1.1.1, querying dns.google; off with third_party_probes = false |
+| Internet reachability | 1.1.1.1, TCP fallback on port 443; off with third_party_probes = false |
+| Startup trace | 1.1.1.1; TTL-limited trace (UDP, ICMP echo on Windows) on every TUI start, demo included; ignores trace_target; off with third_party_probes = false |
+| STUN | stun.l.google.com:19302 and stun.cloudflare.com:3478; public mapping; off with third_party_probes = false |
 | Traceroute on T | The selected peer on Connections or Topology; TTL-limited trace |
 | Dual-stack experiments | 1.1.1.1:443, [2606:4700:4700::1111]:443, 8.8.8.8:443, [2001:4860:4860::8888]:443 |
 | Captive portal | http://connectivitycheck.gstatic.com/generate_204 and http://cp.cloudflare.com/generate_204 |
-| Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB |
+| Explicit upload test | https://speed.cloudflare.com/__up; up to 25 MB, timing connections to 1.1.1.1:443; off with third_party_probes = false |
 | WHOIS on W | https://rdap.org/ip/ and the registry it redirects to; on Connections the selected remote address; on Packets the selected packet's source and destination, your own public address included; private ranges are not sent |
 | GeoIP update | https://download.db-ip.com/free/ ; only when `netwatch geoip update` runs; HTTPS only, no redirects; the file name and date, no addresses |
-| Insights, opt-in | Configured Ollama-compatible /api/chat endpoint; network and packet summaries |
+| Insights, opt-in | Configured Ollama-compatible /api/chat endpoint; network and packet summaries; an http:// endpoint off this host is sent to, and flagged cleartext_off_host in Diagnose, Settings and doctor |
 | Remote, opt-in | Configured ingestion endpoint; metrics; HTTPS unless explicitly allowed insecure |
 | Other probes | Configured resolver, gateway, trace/PMTU targets and `[[diagnose_targets]]`, which run on their own schedule; targets and traffic depend on configuration |
 <!-- /egress -->
@@ -404,8 +414,8 @@ unversioned. Fuzz dependencies have a separate lockfile. See
 | D1 seccomp no-socket filter on capture, keylog and the metrics threads | Included; other parser threads and descriptors opened earlier remain open (items 4 and 6) |
 | C2 `netwatch geoip update`, downloads parsed on a parser thread | Included |
 | E2 online GeoIP fallback | Removed: lookups read local files, and `geoip_online` is ignored |
-| E3 capture-error hint and package messages still setcap a world-executable binary | Later 0.39 work |
-| E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Later 0.39 work |
+| E3 capture-error hint and package messages restrict the binary to a group before setcap | Included |
+| E4 probe opt-out, covering the startup trace, and cleartext Insights warning | Included |
 | F1 doctor reports actual containment: kernel and enforced ABI, network policy, capture authority, `running as root` | Included |
 | Remaining unsafe-block audit | Later hardening; contributor safety policy applies now |
 | Full-path LoadLibraryExW for Npcap | Deferred |

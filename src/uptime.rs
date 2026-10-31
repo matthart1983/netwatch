@@ -233,7 +233,7 @@ fn now_unix() -> u64 {
 /// The connection as of now, for the Topology view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Connection {
-    /// No verdict yet, or the internet probe cannot be sent.
+    /// No verdict yet, or the internet probe cannot be sent or is switched off.
     Unknown,
     /// Up since `since`; `last_outage` is the one before, if this session
     /// saw one.
@@ -448,8 +448,10 @@ pub struct Summary {
     pub up_secs: u64,
     pub unknown_secs: u64,
     pub unmonitored_secs: u64,
-    /// Up as a share of the time known to be up or down; `None` when there
-    /// is none.
+    /// Up as a share of the time known to be up or down. `None` when there
+    /// is none, or when the internet hop was never measured in the period:
+    /// only that hop can say up, so the share would be 0% however long the
+    /// connection held and however short an outage the log has.
     pub uptime_pct: Option<f64>,
 }
 
@@ -547,6 +549,8 @@ struct Accumulator {
     monitored: u64,
     outages: Vec<Outage>,
     open: Option<Outage>,
+    /// Some in-window time had the internet hop up or down.
+    internet_measured: bool,
 }
 
 impl Accumulator {
@@ -558,6 +562,7 @@ impl Accumulator {
             monitored: 0,
             outages: Vec::new(),
             open: None,
+            internet_measured: false,
         }
     }
 
@@ -587,6 +592,10 @@ impl Accumulator {
         }
         let secs = b - a;
         self.monitored += secs;
+        self.internet_measured |= matches!(
+            states.get(&Hop::Internet),
+            Some(HopState::Up | HopState::Down)
+        );
         match state {
             Overall::Up => self.summary.up_secs += secs,
             Overall::Down => self.summary.down_secs += secs,
@@ -621,8 +630,8 @@ impl Accumulator {
         self.summary.unmonitored_secs = period.saturating_sub(self.monitored);
         self.summary.outages = self.outages.len();
         let known = self.summary.up_secs + self.summary.down_secs;
-        self.summary.uptime_pct =
-            (known > 0).then(|| self.summary.up_secs as f64 * 100.0 / known as f64);
+        self.summary.uptime_pct = (known > 0 && self.internet_measured)
+            .then(|| self.summary.up_secs as f64 * 100.0 / known as f64);
         Report {
             since: self.since,
             until: self.until,
@@ -1220,6 +1229,134 @@ mod tests {
             }
         }
         assert!(!m.is_recording());
+    }
+
+    /// With `third_party_probes` off the internet hop is never asked. That is
+    /// an unknown connection, not an up one and not an outage, and the cycle
+    /// stamp must keep marking cycles or "no resolver counts as DNS failing"
+    /// would stop firing.
+    #[test]
+    fn a_switched_off_internet_probe_reads_as_unknown() {
+        use crate::collectors::health::PROBES_OFF;
+        let mut m = Monitor::new(None);
+        let mut status = (*crate::collectors::health::HealthProber::new().status()).clone();
+        let t0 = std::time::Instant::now();
+        status.internet_loss = Loss::Unmeasured(PROBES_OFF);
+        status.gateway_loss = Loss::Measured(0.0);
+        status.dns_loss = Loss::Measured(0.0);
+        for i in 0..5u64 {
+            let at = t0 + std::time::Duration::from_secs(i * 5);
+            status.completed.internet = Some(at);
+            status.completed.gateway = Some(at);
+            status.completed.dns = Some(at);
+            m.observe_at(&status, true, true, 1000 + i * 5);
+        }
+        assert!(matches!(m.connection(), Connection::Unknown), "unknown");
+
+        // Nothing but a missing resolver: still counted, by the same stamp.
+        let mut m = Monitor::new(None);
+        for i in 0..5u64 {
+            let at = t0 + std::time::Duration::from_secs(i * 5);
+            status.completed.internet = Some(at);
+            status.completed.gateway = Some(at);
+            m.observe_at(&status, true, false, 1000 + i * 5);
+        }
+        assert!(matches!(m.connection(), Connection::Down { .. }));
+
+        // And the report has no uptime figure to claim from it.
+        let records = vec![
+            Record::Start {
+                t: 0,
+                version: "x".into(),
+            },
+            hop(0, Hop::Gateway, HopState::Up),
+            hop(0, Hop::Dns, HopState::Up),
+            hop(0, Hop::Internet, HopState::Unknown),
+            Record::Stop { t: 100 },
+        ];
+        let report = report(records, 0, 100);
+        assert_eq!(report.summary.up_secs, 0);
+        assert_eq!(report.summary.down_secs, 0);
+        assert_eq!(report.summary.unknown_secs, 100);
+        assert_eq!(report.summary.uptime_pct, None);
+    }
+
+    /// Three days with `third_party_probes = false` and one 15 s gateway
+    /// outage. The internet hop never reads up, so the old share was 0 of 15
+    /// seconds: `0.00% up`, over a connection that held for three days.
+    #[test]
+    fn no_uptime_figure_from_a_log_that_never_measured_the_internet() {
+        const DAYS: u64 = 3 * 86_400;
+        let mut recs = vec![
+            start(0),
+            hop(0, Hop::Gateway, HopState::Up),
+            hop(0, Hop::Dns, HopState::Up),
+            hop(0, Hop::Internet, HopState::Unknown),
+            hop(86_400, Hop::Gateway, HopState::Down),
+            hop(86_415, Hop::Gateway, HopState::Up),
+            Record::Stop { t: DAYS },
+        ];
+        recs.extend(beats(60, DAYS));
+        let r = report(recs, 0, DAYS);
+        assert_eq!(r.summary.outages, 1);
+        assert_eq!(r.summary.down_secs, 15);
+        assert_eq!(r.summary.up_secs, 0);
+        assert_eq!(r.summary.unknown_secs, DAYS - 15);
+        assert_eq!(r.summary.uptime_pct, None);
+
+        let shown = text(&r, Path::new("/nowhere"));
+        assert!(!shown.contains("% up"), "{shown}");
+        assert!(shown.contains("1 outage, 15s down"), "{shown}");
+        assert!(shown.contains("unmeasured"), "{shown}");
+
+        // Schema 1 as it stands: the same keys, and the null this field has
+        // always had when there is no figure.
+        let json = json(&r);
+        assert_eq!(json["schema"], 1);
+        assert!(json["summary"]["uptime_pct"].is_null(), "{json}");
+        assert_eq!(json["summary"]["up_secs"], 0);
+        assert_eq!(json["summary"]["unknown_secs"], DAYS - 15);
+
+        // The CSV has outage rows and no totals, so there is no figure in it.
+        let csv = csv(&r);
+        assert_eq!(csv.lines().count(), 2, "{csv}");
+        assert!(
+            csv.starts_with("start,end,duration_secs,hop,ended\n"),
+            "{csv}"
+        );
+        assert!(
+            csv.lines().nth(1).unwrap().contains(",15,gateway,"),
+            "{csv}"
+        );
+    }
+
+    /// A probe that ran and got nothing is a measurement, and 0% is true.
+    #[test]
+    fn an_internet_hop_down_for_the_whole_period_is_still_zero_percent() {
+        let mut recs = vec![start(0), hop(0, Hop::Internet, HopState::Down)];
+        recs.extend(beats(60, 600));
+        recs.push(Record::Stop { t: 600 });
+        let r = report(recs, 0, 600);
+        assert_eq!(r.summary.down_secs, 600);
+        assert_eq!(r.summary.uptime_pct, Some(0.0));
+        assert!(text(&r, Path::new("/nowhere")).contains("0.00% up"));
+    }
+
+    /// Measured for part of the period, as when the switch is flipped: the
+    /// figure stands on the time that was, and the rest reads as unmeasured.
+    #[test]
+    fn an_internet_hop_measured_for_part_of_the_period_keeps_its_figure() {
+        let mut recs = vec![
+            start(0),
+            hop(0, Hop::Internet, HopState::Up),
+            hop(300, Hop::Internet, HopState::Unknown),
+            Record::Stop { t: 600 },
+        ];
+        recs.extend(beats(60, 600));
+        let r = report(recs, 0, 600);
+        assert_eq!(r.summary.up_secs, 300);
+        assert_eq!(r.summary.unknown_secs, 300);
+        assert_eq!(r.summary.uptime_pct, Some(100.0));
     }
 
     #[test]
