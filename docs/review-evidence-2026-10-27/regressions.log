@@ -1,0 +1,46 @@
+   Compiling netwatch-tui v0.38.0 (/tmp/netwatch-code-review)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running tests/review_regressions.rs (/home/matt/netwatch-039/soak/target/debug/deps/review_regressions-c5e5d150f8b7a633)
+
+running 5 tests
+test review_budget_overflow_is_rejected_without_panicking ... 
+thread 'review_budget_overflow_is_rejected_without_panicking' (28199) panicked at src/diagnose/run.rs:154:16:
+attempt to multiply with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'review_budget_overflow_is_rejected_without_panicking' (28199) panicked at tests/review_regressions.rs:55:5:
+invalid CLI duration panicked
+FAILED
+test review_config_error_must_not_silently_disable_strict_mode ... 
+thread 'review_config_error_must_not_silently_disable_strict_mode' (28200) panicked at tests/review_regressions.rs:72:5:
+assertion `left == right` failed: unrelated invalid setting silently reset security policy; uptime recording is true
+  left: "on"
+ right: "strict"
+FAILED
+test review_ip_padding_must_not_become_dns_payload ... 
+thread 'review_ip_padding_must_not_become_dns_payload' (28201) panicked at tests/review_regressions.rs:38:5:
+padding classified as Some(Dns { qname: "a", qtype: 1, rcode: None })
+FAILED
+test review_noninitial_fragment_must_not_invent_udp_ports ... 
+thread 'review_noninitial_fragment_must_not_invent_udp_ports' (28202) panicked at tests/review_regressions.rs:29:5:
+assertion `left == right` failed: fragment payload became a UDP header
+  left: Some(12345)
+ right: None
+FAILED
+test review_retry_delay_can_reach_more_than_one_second ... 
+thread 'review_retry_delay_can_reach_more_than_one_second' (28203) panicked at tests/review_regressions.rs:49:5:
+largest delay after 20 failures: 999.999999ms
+FAILED
+
+failures:
+
+failures:
+    review_budget_overflow_is_rejected_without_panicking
+    review_config_error_must_not_silently_disable_strict_mode
+    review_ip_padding_must_not_become_dns_payload
+    review_noninitial_fragment_must_not_invent_udp_ports
+    review_retry_delay_can_reach_more_than_one_second
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test review_regressions`

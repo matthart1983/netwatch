@@ -93,6 +93,11 @@ All notable changes to NetWatch will be documented in this file.
   to go when that row is too short. Once the Timeline has evicted closed
   connections, its events title reads `closed: last N`, with the number it still
   holds.
+- **`docs/PERFORMANCE.md` publishes measured numbers.** It gives the 512 MiB
+  memory ceiling and its conditions, the flood soak's decode rates, drops and
+  frame times on two machines, 0% drops at 50,000 and 100,000 packets a second,
+  and frame times at 2,000, 10,000 and 50,000 connections, including the one case
+  that misses its target.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
