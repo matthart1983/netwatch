@@ -115,6 +115,9 @@ fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
     Ok((file, metadata))
 }
 
+/// More than `config.toml` or `egress-policy.toml` would hold by hand.
+pub const MAX_USER_FILE: u64 = 4 << 20;
+
 fn read_limited(file: File, limit: u64) -> io::Result<String> {
     let mut text = String::new();
     file.take(limit + 1).read_to_string(&mut text)?;
@@ -132,6 +135,24 @@ fn read_limited(file: File, limit: u64) -> io::Result<String> {
 pub fn read_saved(path: &Path, limit: u64) -> io::Result<String> {
     let (file, _) = open_regular(path)?;
     read_limited(file, limit)
+}
+
+/// [`read_saved`] for a file the user wrote, up to [`MAX_USER_FILE`]. That may be
+/// a symlink into a dotfiles repository, so this follows one, and it still takes
+/// only a regular file: opened on a FIFO it doesn't wait for a writer.
+pub fn read_user_file(path: &Path) -> io::Result<String> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    read_limited(file, MAX_USER_FILE)
 }
 
 /// [`read_saved`], and also only from a file this user owns under one name. For
@@ -301,6 +322,39 @@ mod tests {
         std::fs::hard_link(&file, root.join("second")).unwrap();
         assert!(read_owned(&file, 4).is_err());
         assert_eq!(read_saved(&file, 4).unwrap(), "1234");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_user_file_may_be_a_symlink_but_not_a_fifo_or_too_big() {
+        let root = scratch("user-file");
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("dotfile");
+        std::fs::write(&real, "theme = \"dark\"\n").unwrap();
+        let link = root.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_user_file(&link).unwrap(), "theme = \"dark\"\n");
+
+        let fifo = root.join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(read_user_file(&fifo).is_err());
+
+        let big = root.join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_USER_FILE + 1)
+            .unwrap();
+        assert!(read_user_file(&big).is_err());
+
+        let gone = root.join("gone");
+        assert_eq!(
+            read_user_file(&gone).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
