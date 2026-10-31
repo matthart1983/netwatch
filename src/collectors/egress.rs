@@ -2703,6 +2703,14 @@ block = {
             1
         );
 
+        // `matched_by` is an open set, so the broader value a rule with no name
+        // restriction may get in a minor has to pass the file as published.
+        let mut broader = lines[1].clone();
+        broader["verdict"] = serde_json::json!("ok");
+        broader["matched_by"] = serde_json::json!("any_destination");
+        let published = schema::compile(&schema::load(EGRESS.file));
+        assert_eq!(schema::errors(&published, &broader), Vec::<String>::new());
+
         // And the file refuses what the writer must not write.
         let record = &lines[1];
         for (what, change) in [

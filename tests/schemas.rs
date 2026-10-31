@@ -142,6 +142,10 @@ fn every_listed_value_set_says_whether_a_minor_can_add_to_it() {
                 .unwrap_or_default();
             if map.contains_key("examples") {
                 assert!(description.contains("Open set"), "{}: {node}", output.file);
+                // Any of these would refuse a value a minor is allowed to add.
+                for keyword in ["enum", "const", "pattern", "format"] {
+                    assert!(!map.contains_key(keyword), "{}: {node}", output.file);
+                }
             }
             if map.contains_key("enum") {
                 assert!(
@@ -152,6 +156,42 @@ fn every_listed_value_set_says_whether_a_minor_can_add_to_it() {
             }
         });
     }
+}
+
+/// A deprecated field keeps being written until a major version, so a file says
+/// that wherever it marks one, and never requires one.
+#[test]
+fn a_deprecated_field_is_optional_and_goes_only_in_a_major_version() {
+    let mut marked = 0;
+    for output in schemas::ALL {
+        let schema = load(output.file);
+        walk(&schema, &mut |node| {
+            let Value::Object(map) = node else { return };
+            if map.get("deprecated") == Some(&json!(true)) {
+                marked += 1;
+                let description = map["description"].as_str().unwrap_or_default();
+                assert!(
+                    description.contains("only in a major version"),
+                    "{}: {node}",
+                    output.file
+                );
+            }
+            let (Some(Value::Array(required)), Some(Value::Object(properties))) =
+                (map.get("required"), map.get("properties"))
+            else {
+                return;
+            };
+            for name in required {
+                let property = name.as_str().and_then(|name| properties.get(name));
+                assert!(
+                    property.is_none_or(|p| p.get("deprecated").is_none()),
+                    "{}: {name} is required and deprecated",
+                    output.file
+                );
+            }
+        });
+    }
+    assert_eq!(marked, 10, "one in doctor, nine in diagnose run");
 }
 
 /// `strict` turns `examples` into the whole set, so a value a test reaches
@@ -352,12 +392,10 @@ fn a_live_snapshot_matches_the_doctor_schema() {
 
 const UPTIME: &str = schemas::UPTIME.file;
 
-/// A log with one outage ended each way: a reply, netwatch stopping, and still
-/// down now.
-#[test]
-fn uptime_with_outages_matches_its_schema() {
+/// A log under `home` with one outage ended each way: a reply, netwatch stopping,
+/// and still down now.
+fn uptime_log_with_outages(home: &Home) -> PathBuf {
     use netwatch::uptime::{Hop, HopState, Log, Record};
-    let home = Home::new();
     let dir = home.0.join("uptime");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -402,7 +440,13 @@ fn uptime_with_outages_matches_its_schema() {
     for record in &records {
         log.append(record).unwrap();
     }
+    dir
+}
 
+#[test]
+fn uptime_with_outages_matches_its_schema() {
+    let home = Home::new();
+    let dir = uptime_log_with_outages(&home);
     let output = home
         .netwatch(&["uptime", "--json", dir.to_str().unwrap()])
         .output()
@@ -436,6 +480,47 @@ fn uptime_with_outages_matches_its_schema() {
     let mut bad = doc;
     bad["summary"].as_object_mut().unwrap().remove("up_secs");
     assert_rejected(UPTIME, &bad, "a summary with no up_secs");
+}
+
+/// `uptime --csv` has no version marker, so this row is its contract. A column
+/// is never renamed or removed. A new one goes at the end, and this constant
+/// gains it there.
+#[test]
+fn the_uptime_csv_header_row_is_pinned() {
+    const HEADER: &str = "start,end,duration_secs,hop,ended";
+    let home = Home::new();
+    let dir = uptime_log_with_outages(&home);
+    let csv = |dir: &std::path::Path| -> String {
+        let output = home
+            .netwatch(&["uptime", "--csv", dir.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let text = csv(&dir);
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some(HEADER));
+
+    // Read by header name, as the documentation tells a consumer to.
+    let columns: Vec<&str> = HEADER.split(',').collect();
+    let cell = |row: &str, name: &str| -> String {
+        let at = columns.iter().position(|c| *c == name).unwrap();
+        row.split(',').nth(at).unwrap().to_string()
+    };
+    let rows: Vec<(String, String)> = lines.map(|r| (cell(r, "hop"), cell(r, "ended"))).collect();
+    let expected = [
+        ("internet", "recovered"),
+        ("gateway", "monitoring_stopped"),
+        ("dns", "ongoing"),
+    ]
+    .map(|(hop, ended)| (hop.to_string(), ended.to_string()));
+    assert_eq!(rows, expected);
+
+    // With no outages it is the header row alone.
+    let empty = home.0.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(csv(&empty), format!("{HEADER}\n"));
 }
 
 /// Nothing in the log: no outages and no percentage to give.

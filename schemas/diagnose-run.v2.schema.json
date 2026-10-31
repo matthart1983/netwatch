@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/diagnose-run.v2.schema.json",
   "title": "netwatch diagnose run --format json, schema 2",
-  "description": "One bounded diagnosis. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated is outside that promise and can go in a minor. A finding with beta true comes from a rule with no reviewed contract: its shape follows this schema, but the rule can change thresholds or disappear. Exit 3, for bad arguments or a session that could not start, prints no JSON at all. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
+  "description": "One bounded diagnosis. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated tells you nothing useful, so do not rely on it. It goes only in a major version. A finding with beta true comes from a rule with no reviewed contract: its shape follows this schema, but the rule can change thresholds or disappear. Exit 3, for bad arguments or a session that could not start, prints no JSON at all. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
   "type": "object",
   "required": ["metadata", "schema", "version", "ruleset", "outcome", "exit", "include_beta", "target", "started_at", "window_seconds", "samples", "evidence", "completeness", "coverage", "issues", "observations"],
   "properties": {
@@ -31,7 +31,7 @@
     "include_beta": { "type": "boolean", "description": "Whether --include-beta was given. Without it a beta rule's issue is listed but does not set the exit status." },
     "target": { "type": ["string", "null"], "description": "The --target name. Null for a run about the host." },
     "started_at": { "type": "string", "format": "date-time", "description": "RFC 3339 with this host's UTC offset. Finding timestamps have no offset, so read it from here." },
-    "window_seconds": { "type": "number", "minimum": 0, "description": "How long the run sampled." },
+    "window_seconds": { "type": "number", "minimum": 0, "description": "How long the run sampled, in seconds, which can have a fraction. A different thing from window_secs on a finding's evidence." },
     "samples": { "type": "integer", "minimum": 0 },
     "evidence": { "type": "boolean", "description": "Whether the run saw a usable observation of what it was asked about." },
     "completeness": { "type": "string", "description": "What the outcome can be taken to mean, in words. The wording is not stable." },
@@ -86,7 +86,7 @@
     "local_time": {
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$",
-      "description": "Local wall-clock time on the host, with no UTC offset. started_at has the offset."
+      "description": "Local wall-clock time on the host, with no UTC offset. This is not UTC, so do not parse it as UTC. started_at in the same document has the host's offset."
     },
     "rule_id": {
       "type": "string",
@@ -128,7 +128,7 @@
         "beta": { "type": "boolean", "description": "Opened by a rule with no reviewed contract." },
         "state": {
           "type": "object",
-          "description": "An object holding the state, unlike a check's state, which is a string.",
+          "description": "An object, so the value is at state.state. A check's state is a plain string. Schema 2 keeps this shape.",
           "required": ["state"],
           "properties": {
             "state": {
@@ -149,7 +149,7 @@
               "unit": { "type": "string", "description": "A display suffix such as ms or %, which can be empty." },
               "baseline": { "type": ["number", "null"], "description": "The learned baseline, when one exists." },
               "sigma": { "type": ["number", "null"], "description": "The baseline's standard deviation. Present exactly when baseline is." },
-              "window_secs": { "type": "integer", "minimum": 0, "description": "Seconds of data the value summarises." },
+              "window_secs": { "type": "integer", "minimum": 0, "description": "Seconds of data the value summarises, as an integer. A different thing from the top-level window_seconds, which is how long the run sampled." },
               "samples": { "type": "integer", "minimum": 0 }
             }
           }
@@ -216,28 +216,28 @@
               "key": {
                 "type": ["string", "null"],
                 "deprecated": true,
-                "description": "The TUI hotkey. A run applies nothing, and keybindings are outside the promise."
+                "description": "The TUI hotkey. A run applies nothing, and keybindings can change in any release. Do not rely on it. It goes only in a major version."
               },
               "action": {
                 "type": ["object", "null"],
                 "deprecated": true,
-                "description": "What the TUI would do for an apply step. A run applies nothing."
+                "description": "What the TUI would do for an apply step. A run applies nothing. Do not rely on it. It goes only in a major version."
               },
               "reversible": {
                 "type": "boolean",
                 "deprecated": true,
-                "description": "Whether the TUI could undo an apply step. A run applies nothing."
+                "description": "Whether the TUI could undo an apply step. A run applies nothing. Do not rely on it. It goes only in a major version."
               },
               "requires": {
                 "type": "string",
                 "deprecated": true,
-                "description": "The privilege an apply step needs in the TUI. A run applies nothing. Open set, like the field itself.",
+                "description": "The privilege an apply step needs in the TUI. A run applies nothing. Open set: a minor may add a privilege. Do not rely on it. It goes only in a major version.",
                 "examples": ["none", "root", "cap_net_admin"]
               },
               "applied": {
                 "type": ["object", "null"],
                 "deprecated": true,
-                "description": "What became of an apply step in the TUI. Always null from a run."
+                "description": "What became of an apply step in the TUI. Always null from a run. Do not rely on it. It goes only in a major version."
               }
             }
           }
@@ -266,24 +266,24 @@
         "artifacts": {
           "type": "array",
           "deprecated": true,
-          "description": "Files a session's report attached. Always empty from a run.",
+          "description": "Files a session's report attached. Always empty from a run. Do not rely on it. It goes only in a major version.",
           "items": { "type": "string" }
         },
         "suppressed_by": {
           "type": ["string", "null"],
           "deprecated": true,
-          "description": "The finding hiding this one. Always null from a run, which lists only findings nothing hides."
+          "description": "The finding hiding this one. Always null from a run, which lists only findings nothing hides. Do not rely on it. It goes only in a major version."
         },
         "tests": {
           "type": "array",
           "deprecated": true,
-          "description": "Discriminating tests run from the TUI. Always empty from a run.",
+          "description": "Discriminating tests run from the TUI. Always empty from a run. Do not rely on it. It goes only in a major version.",
           "items": { "type": "object" }
         },
         "verification": {
           "type": ["object", "null"],
           "deprecated": true,
-          "description": "Whether a step the user carried out in the TUI worked. Always null from a run."
+          "description": "Whether a step the user carried out in the TUI worked. Always null from a run. Do not rely on it. It goes only in a major version."
         }
       }
     },

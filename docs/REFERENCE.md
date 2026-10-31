@@ -524,9 +524,11 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   measured, the text leaves the figure out and `--json` gives `"uptime_pct": null`, outages or
   not.
 
-`--json` and `--csv` carry the same outages for an ISP ticket or a chart. Both are versioned
-(`"schema": 1` in JSON) and covered by the 1.0 compatibility promise, and
-[`schemas/uptime.v1.schema.json`](../schemas/uptime.v1.schema.json) describes the JSON. Each
+`--json` and `--csv` carry the same outages for an ISP ticket or a chart, and the 1.0 compatibility
+promise covers both. The JSON is versioned (`"schema": 1`), and
+[`schemas/uptime.v1.schema.json`](../schemas/uptime.v1.schema.json) describes it. The CSV has no
+version marker and is covered by its header row, `start,end,duration_secs,hop,ended`: columns are
+not renamed or removed, and new ones are added at the end, so read columns by header name. Each
 outage's `ended` is `recovered`, `monitoring_stopped` (netwatch stopped while it was still down)
 or `ongoing`.
 
@@ -624,12 +626,15 @@ validator must not refuse a new value. The schema lists the values known today u
 description says `Open set`, and it says what to do with a value you do not know. An existing value
 keeps its meaning.
 
+**Deprecated fields.** A field marked `deprecated` in a schema tells a consumer nothing useful, so do
+not rely on it. netwatch keeps writing it, and it goes only in a major version. The schema leaves it
+out of `required`. In `doctor` that is `network_restricted`, which is always false. In `diagnose run`
+it is a finding's `artifacts`, `suppressed_by`, `tests` and `verification`, which a run leaves empty,
+and a remediation step's `key`, `action`, `reversible`, `requires` and `applied`, which belong to the
+TUI.
+
 **What is outside the promise.**
 
-- A field marked `deprecated` in a schema can go in a minor. In `doctor` that is
-  `network_restricted`, which is always false. In `diagnose run` it is a finding's `artifacts`,
-  `suppressed_by`, `tests` and `verification`, which a run leaves empty, and a remediation step's
-  `key`, `action`, `reversible`, `requires` and `applied`, which belong to the TUI.
 - Text in words, such as `detail`, `title`, `completeness` and `redaction`, can be reworded. Each
   such field says so. `reason` is a stable code in `doctor` and free text in `diagnose run`'s
   `coverage`.
@@ -638,10 +643,33 @@ keeps its meaning.
 - Each entry in `diagnose export`'s `episodes` is a recording in the episode format, which is
   experimental. The schema covers the bundle around them and each one's `schema_version`.
 
-**Times.** `started_at` in `diagnose run` and every time in `uptime` are RFC 3339 with the host's
-UTC offset. A `diagnose run` finding's `since` and `last_seen`, and `created` in `diagnose export`,
-are local wall-clock time with no offset. `first_seen` and `last_seen` in the egress export are Unix
-seconds.
+**Names that stay as they are.** These read oddly and are frozen anyway, so read them as described.
+
+- A `diagnose run` finding's `state` is an object, `{"state": "open"}`, so the value is at
+  `.state.state`. A check's `state` is a plain string.
+- An egress record's `sni` holds the destination's name, which can be a cleartext HTTP `Host`. `proto`
+  says `tls` only when a ClientHello supplied it.
+- An egress record's `"matched_by": "sni"` also covers a rule that declares no name restriction at
+  all, so it does not always mean one named endpoint. `matched_by` is an open set, so a minor can add
+  a broader value for such a rule.
+- `ruleset` in `diagnose run` is how many rules the build's catalogue holds. It grows between releases
+  and is not a version.
+- `window_seconds` at the top level of `diagnose run` is how long the run sampled, and can have a
+  fraction. `window_secs` on a finding's evidence is an integer, the seconds of data that value
+  summarises.
+
+**Times.** Four formats are in use, and one name can differ between outputs: `since` is RFC 3339 in
+`uptime` and local time in a `diagnose run` finding.
+
+| Format | Fields |
+|---|---|
+| Local wall-clock time with no UTC offset, such as `2026-11-01 08:58:52`. This is not UTC, so do not parse it as UTC. | `diagnose run`: a finding's `since`, `last_seen` and `stale_since`. `diagnose export`: `created`. The deprecated `tests` and `verification` use it too, but a run leaves them empty. |
+| RFC 3339 with the host's UTC offset | `diagnose run`: `started_at`. `uptime`: `since`, `until`, and an outage's `start` and `end`. |
+| Unix seconds | Egress record: `first_seen` and `last_seen`. |
+| Unix milliseconds | `doctor`: `attribution_coverage.completed_at_utc_ms`. |
+
+In `diagnose run`, `started_at` gives the host's offset for the rest of the document. `diagnose export`
+gives none. A minor can add fields that carry an offset, and the fields above keep their format.
 
 `diagnose run` prints no JSON for exit 3, which means bad arguments or a session that could not
 start, so there is nothing to validate.

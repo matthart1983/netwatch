@@ -22,7 +22,7 @@
     "created": {
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$",
-      "description": "Local wall-clock time on the host that wrote the bundle, with no UTC offset."
+      "description": "Local wall-clock time on the host that wrote the bundle, with no UTC offset. This is not UTC, so do not parse it as UTC."
     },
     "install": {
       "type": "string",

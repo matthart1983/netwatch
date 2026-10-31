@@ -40,7 +40,7 @@
       "required": ["process", "ip", "port", "proto", "ech", "first_seen", "last_seen", "count", "verdict", "matched_by", "bytes_out", "bytes_in"],
       "properties": {
         "process": { "type": "string" },
-        "sni": { "type": "string", "description": "The destination's name: a TLS or QUIC SNI, or a cleartext HTTP Host. Absent, not null, when the flow carried no readable name." },
+        "sni": { "type": "string", "description": "The destination's name, whatever the field is called: a TLS or QUIC SNI, or a cleartext HTTP Host. proto says tls only when a ClientHello supplied it. Absent, not null, when the flow carried no readable name." },
         "asn_org": { "type": "string", "description": "Organisation of the remote address, from the ASN database. Absent, not null, when no database resolved it." },
         "ip": { "type": "string", "description": "The most recent remote address. Can be empty in a baseline restored from a file that never held one." },
         "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
@@ -60,7 +60,7 @@
         },
         "matched_by": {
           "type": ["string", "null"],
-          "description": "What admitted an ok verdict: sni for a declared hostname, which also covers a rule that declares no name restriction at all, ip for a declared address, and asn for a whole autonomous system. Null for every other verdict. Open set: a minor may add a way of matching, so treat an unknown value as broad.",
+          "description": "What admitted an ok verdict: sni for a declared hostname, ip for a declared address, and asn for a whole autonomous system. sni also covers a rule that declares no name restriction at all, so it does not always mean one named endpoint. Null for every other verdict. Open set: a minor may add a way of matching, including a broader value for such a rule, so treat an unknown value as broad.",
           "examples": ["sni", "ip", "asn"]
         },
         "bytes_out": { "type": "integer", "minimum": 0, "description": "Approximate, from per-tick rates. Zero when no capture ran, which does not mean no traffic." },

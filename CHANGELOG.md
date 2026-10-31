@@ -16,8 +16,10 @@ All notable changes to NetWatch will be documented in this file.
   schemas leave every object open, because a minor can add fields. They say which
   value sets are closed and which can grow, and mark the fields a script should not
   rely on as `deprecated`, such as doctor's `network_restricted`, which is always
-  false. docs/REFERENCE.md has the rules. The egress export stays
-  `netwatch.egress.v1.1`, since no record gained a field.
+  false. Those stay until a major version. docs/REFERENCE.md has the rules. The
+  egress export stays `netwatch.egress.v1.1`, since no record gained a field.
+  `uptime --csv` needs no version marker: its header row is the contract, so
+  columns are not renamed or removed, and new ones are added at the end.
 
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1

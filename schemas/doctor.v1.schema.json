@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/doctor.v1.schema.json",
   "title": "netwatch doctor --json, schema_version 1",
-  "description": "A capability snapshot, which describes what this host lets netwatch see. It says nothing about network health. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated is outside that promise and can go in a minor. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
+  "description": "A capability snapshot, which describes what this host lets netwatch see. It says nothing about network health. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated tells you nothing useful, so do not rely on it. It goes only in a major version. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
   "type": "object",
   "required": ["metadata", "schema_version", "scope", "platform", "interface", "capabilities", "protections", "attribution_coverage", "landlock", "tasks_holding_net_raw"],
   "properties": {
@@ -41,7 +41,7 @@
     "network_restricted": {
       "type": "boolean",
       "deprecated": true,
-      "description": "Always false, because it describes the whole process and main and the network workers keep the network. It carries no information. Read each protection's network_policy instead."
+      "description": "Always false, because it describes the whole process and main and the network workers keep the network. It carries no information. Read each protection's network_policy instead. Do not rely on it. It goes only in a major version."
     },
     "attribution_coverage": {
       "description": "Null from netwatch doctor. Only a live session has coverage to report.",
