@@ -6,8 +6,9 @@ the isolated check's results. Live Settings and startup use the same capability
 model with runtime observations; static configuration is never a health verdict.
 
 This matrix describes the implementation as of 18 October 2026 (0.35.4); the
-FreeBSD column dates from 0.35, and the Windows process-attribution cell from
-0.38 (earlier versions polled `netstat -ano` and `tasklist`). It is not a claim
+FreeBSD column dates from 0.35, the Windows process-attribution cell from
+0.38 (earlier versions polled `netstat -ano` and `tasklist`), and the capture
+authority row from 0.39. It is not a claim
 that every backend was exercised on every supported OS. Linux unit tests do not
 establish macOS or Windows runtime parity.
 
@@ -15,6 +16,7 @@ establish macOS or Windows runtime parity.
 | --- | --- | --- | --- | --- |
 | Interface/configuration collection | Linux system counters and network tools | macOS network tools | IP Helper API (adapters, DNS servers, counters, routes), with `ipconfig`/PowerShell/`route print` fallbacks | `getifaddrs` up-state, `netstat`/`ifconfig` |
 | Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required | Base-system libpcap/BPF; `/dev/bpf` access required |
+| Capture authority | File capabilities on a binary restricted to a group, the systemd unit, or root. With the sandbox on, the daemon and Diagnose CLI drop `CAP_NET_RAW` from every thread once capture opens, and so does strict mode; the open descriptor keeps its access | No capability model; `/dev/bpf` access is checked at `open()`, and an open descriptor keeps its access | Npcap's install options decide who can capture; no capability model | No capability model; `/dev/bpf` access is checked at `open()`, and an open descriptor keeps its access |
 | Process attribution | Verified procfs socket ownership; eBPF hints require corroboration; the SDK reader inherits filesystem policy but retains load capabilities | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified polling of the kernel socket tables through IP Helper; names from a process snapshot | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
 | Process in PCAPNG packet comments | When two verified owner checks bracket the packet | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified |
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |

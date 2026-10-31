@@ -256,7 +256,11 @@ impl CapabilitySnapshot {
             "probes",
             State::NotChecked,
             "no_active_probes",
-            "Gateway, DNS and Internet probes were not sent",
+            if config.third_party_probes {
+                "Gateway, DNS and Internet probes were not sent"
+            } else {
+                "Gateway and DNS probes were not sent; third_party_probes is off, so a live session sends no Internet probe, STUN or resolver cross-check"
+            },
             Some("Open a live session and inspect Diagnose coverage"),
         );
         let tcp_supported = cfg!(any(target_os = "linux", target_os = "macos"));
@@ -319,6 +323,7 @@ impl CapabilitySnapshot {
             "Insights configured; endpoint not contacted",
             Some("Review external-service settings before live use"),
         );
+        snapshot.flag_cleartext_insights(config);
         snapshot.put(
             "whois",
             State::NotChecked,
@@ -349,6 +354,26 @@ impl CapabilitySnapshot {
         );
         snapshot.put("resolver",if cfg!(target_os="linux") {State::NotChecked} else {State::Unavailable},"authority_not_granted","Automatic TUI edits disabled; Linux requires separate confirmed-unmanaged root command",Some("netwatch resolver status"));
         snapshot
+    }
+    /// Insights going out unencrypted to another machine is what to report,
+    /// whatever the model is doing: every request carries the snapshot. The
+    /// endpoint stays out of it, as elsewhere in this report.
+    fn flag_cleartext_insights(&mut self, config: &NetwatchConfig) {
+        use crate::collectors::insights::{cleartext_off_host, CLEARTEXT_OFF_HOST};
+        if !config.insights_enabled || !cleartext_off_host(&config.insights_endpoint) {
+            return;
+        }
+        let detail = format!(
+            "{CLEARTEXT_OFF_HOST}: the endpoint is http:// on another host, so DNS names, peer addresses and packet summaries cross the network unencrypted. {}",
+            self.get("insights").detail
+        );
+        self.put(
+            "insights",
+            State::Degraded,
+            "cleartext_off_host",
+            &detail,
+            Some("Use an https:// endpoint, or one on this host"),
+        );
     }
     pub fn get(&self, id: &str) -> &Capability {
         self.capabilities
@@ -500,18 +525,22 @@ impl CapabilitySnapshot {
         }
         snapshot.attribution_coverage = Some(coverage);
         let health = app.health_prober.status();
+        // A skipped internet probe still stamps its cycle. That is no
+        // completion here: with the switch off, two targets is all of them.
+        let third_party = app.health_prober.third_party_probes();
         let times = [
             health.completed.gateway,
             health.completed.dns,
-            health.completed.internet,
+            health.completed.internet.filter(|_| third_party),
         ];
+        let targets = if third_party { 3 } else { 2 };
         let fresh = times
             .iter()
             .filter(|t| t.is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
             .count();
         snapshot.put(
             "probes",
-            if fresh == 3 {
+            if fresh == targets {
                 State::Ready
             } else if fresh > 0 {
                 State::Degraded
@@ -522,7 +551,12 @@ impl CapabilitySnapshot {
             },
             "probe_completions",
             &format!(
-                "{fresh}/3 probe targets have fresh completions; completion does not imply success"
+                "{fresh}/{targets} probe targets have fresh completions; completion does not imply success{}",
+                if third_party {
+                    ""
+                } else {
+                    "; third_party_probes is off, so the Internet probe, STUN and resolver cross-check are not measured"
+                }
             ),
             Some("Inspect Diagnose for RTT, loss and target coverage"),
         );
@@ -626,6 +660,7 @@ impl CapabilitySnapshot {
                 detail,
                 Some("Review Insights settings and data sharing"),
             );
+            snapshot.flag_cleartext_insights(&app.user_config);
         } else {
             snapshot.put(
                 "insights",
@@ -967,6 +1002,20 @@ fn wrap(lines: &mut Vec<String>, value: &str) {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
+    // A fix's commands take a row each. This wraps by the column, and a row
+    // broken inside a command pastes as a different one.
+    match crate::platform::fix_commands(&clean) {
+        Some((sentence, commands)) => {
+            wrap_row(lines, sentence);
+            for command in commands {
+                wrap_row(lines, command);
+            }
+        }
+        None => wrap_row(lines, &clean),
+    }
+}
+
+fn wrap_row(lines: &mut Vec<String>, clean: &str) {
     let mut line = String::from("  ");
     for ch in clean.chars() {
         if unicode_width::UnicodeWidthStr::width(line.as_str())
@@ -1813,6 +1862,135 @@ mod tests {
             assert_eq!(online.detail.contains("is ignored"), geoip_online);
             assert_eq!(online.next_check.as_deref(), Some("netwatch geoip update"));
         }
+    }
+    fn insights_config(endpoint: &str) -> NetwatchConfig {
+        NetwatchConfig {
+            insights_enabled: true,
+            insights_endpoint: endpoint.into(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn insights_cleartext_is_degraded() {
+        let endpoint = "http://10.0.0.5:11434";
+        let config = insights_config(endpoint);
+        let snapshot = CapabilitySnapshot::configured(&config);
+        let cap = snapshot.get("insights");
+        assert_eq!(cap.state, State::Degraded);
+        assert_eq!(cap.reason, "cleartext_off_host");
+        assert!(cap.detail.contains("cleartext, off-host"), "{}", cap.detail);
+        assert!(!cap.detail.contains(endpoint), "{}", cap.detail);
+
+        // Live, whatever the collector says: a model that answers makes the
+        // data no less readable on the way there.
+        let app = App::prepare_with_config(config);
+        let cap = CapabilitySnapshot::live(&app);
+        let cap = cap.get("insights");
+        assert_eq!(cap.state, State::Degraded);
+        assert_eq!(cap.reason, "cleartext_off_host");
+        assert!(
+            cap.detail.contains("endpoint not verified"),
+            "{}",
+            cap.detail
+        );
+
+        // Nothing is sent with the feature off, or to this host, or over TLS.
+        let off = NetwatchConfig {
+            insights_enabled: false,
+            ..insights_config(endpoint)
+        };
+        assert_eq!(
+            CapabilitySnapshot::configured(&off).get("insights").state,
+            State::Disabled
+        );
+        for fine in [
+            "local",
+            "http://127.0.0.1:11434",
+            "https://ollama.example.com",
+        ] {
+            let snapshot = CapabilitySnapshot::configured(&insights_config(fine));
+            let cap = snapshot.get("insights");
+            assert_eq!(cap.state, State::NotChecked, "{fine}");
+            assert_eq!(cap.reason, "configuration_only", "{fine}");
+        }
+    }
+    /// `--check-capture` prints the refused-capture error as text, and the
+    /// header's pointer sends people here. Wrapped by the column, a row ended
+    /// in `sudo groupadd -f net`, which pastes as a group named net.
+    #[test]
+    fn doctor_text_keeps_each_fix_command_on_a_row_of_its_own() {
+        let fix = crate::platform::LINUX_CAPTURE_FIX;
+        let mut snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        snapshot.put(
+            "capture",
+            State::Unavailable,
+            "capture_open_failed",
+            &format!("not permitted — {fix}"),
+            None,
+        );
+        let text = snapshot.text();
+        let rows: Vec<&str> = text.lines().map(str::trim).collect();
+        let at = rows.iter().position(|r| *r == "not permitted").unwrap();
+        for (i, command) in fix.split_inclusive(" && ").enumerate() {
+            assert_eq!(rows[at + 1 + i], command.trim_end(), "{text}");
+        }
+        // And the JSON, which the pointer names, holds the line as one string.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["detail"].as_str().is_some_and(|d| d.contains(fix))));
+    }
+    /// A completion stamp on a probe that was skipped is not a probe target
+    /// answering, so doctor must not count it among the fresh ones.
+    #[test]
+    fn a_skipped_internet_probe_is_not_a_fresh_completion() {
+        let config = NetwatchConfig {
+            third_party_probes: false,
+            ..Default::default()
+        };
+        assert!(CapabilitySnapshot::configured(&config)
+            .get("probes")
+            .detail
+            .contains("third_party_probes is off"));
+        let app = App::prepare_with_config(config);
+        let mut status = (*app.health_prober.status()).clone();
+        let now = Instant::now();
+        status.completed.gateway = Some(now);
+        status.completed.internet = Some(now);
+        app.health_prober.publish_for_test(status.clone());
+        let snapshot = CapabilitySnapshot::live(&app);
+        let probes = snapshot.get("probes");
+        assert_eq!(probes.state, State::Degraded);
+        assert!(
+            probes.detail.starts_with("1/2 probe targets"),
+            "{}",
+            probes.detail
+        );
+        assert!(
+            probes.detail.contains("third_party_probes is off"),
+            "{}",
+            probes.detail
+        );
+
+        status.completed.dns = Some(now);
+        app.health_prober.publish_for_test(status);
+        let snapshot = CapabilitySnapshot::live(&app);
+        assert_eq!(snapshot.get("probes").state, State::Ready);
+
+        // And with the switch on, the same two local stamps are not all of them.
+        let app = App::prepare_with_config(NetwatchConfig::default());
+        let mut status = (*app.health_prober.status()).clone();
+        status.completed.gateway = Some(now);
+        status.completed.dns = Some(now);
+        app.health_prober.publish_for_test(status);
+        let snapshot = CapabilitySnapshot::live(&app);
+        assert_eq!(snapshot.get("probes").state, State::Degraded);
+        assert!(snapshot
+            .get("probes")
+            .detail
+            .starts_with("2/3 probe targets"));
     }
     /// Since 0.32.2 eBPF loads inside the sandbox policy, so the default
     /// configuration must not report it switched off by that policy.

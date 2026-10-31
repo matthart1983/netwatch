@@ -656,7 +656,7 @@ impl App {
             interface_info,
             connection_collector,
             config_collector,
-            health_prober: HealthProber::new(),
+            health_prober: HealthProber::with_third_party_probes(user_config.third_party_probes),
             uptime: crate::uptime::Monitor::new(None),
             packet_collector,
             session_started_at: std::time::Instant::now(),
@@ -1653,6 +1653,16 @@ pub fn draw_frame(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Kick off a one-shot traceroute so the topology view's ISP gateway hop is
+/// populated without requiring the user to press T first. Its target is a
+/// public server, so `third_party_probes = false` leaves it to the T press.
+fn start_startup_trace(app: &App) {
+    if app.user_config.third_party_probes {
+        app.traceroute_runner
+            .run(crate::collectors::traceroute::STARTUP_TARGET);
+    }
+}
+
 // Backends name their own error type since ratatui 0.30; anyhow takes any of
 // them that can cross threads.
 pub async fn run<B: Backend>(
@@ -1704,10 +1714,7 @@ where
 
     // Initial data collection
     crate::runtime::bootstrap::prime_collectors(&mut app);
-    // Kick off a one-shot traceroute so the topology view's ISP gateway hop
-    // is populated without requiring the user to press T first.
-    app.traceroute_runner
-        .run(crate::collectors::traceroute::STARTUP_TARGET);
+    start_startup_trace(&app);
 
     // Event loop design:
     //   1. Render  — draw current app state to the terminal
@@ -3388,7 +3395,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('t') if app.ui.current_tab == Tab::Diagnose => {
             if let Some(id) = selected_issue_id(app) {
                 let suggestion = app.diagnose.engine.get(&id).and_then(|i| {
-                    crate::diagnose::next_test::suggest(i, app.diagnose.capability, &i.last_seen)
+                    crate::diagnose::next_test::suggest(
+                        i,
+                        app.diagnose.capability,
+                        app.user_config.third_party_probes,
+                        &i.last_seen,
+                    )
                 });
                 let status = match suggestion {
                     Some(s) => app
@@ -4385,6 +4397,21 @@ mod view_cycle_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The startup trace goes to a public server on every TUI start, so the
+    /// switch has to cover it. With it on, the same call starts a real trace,
+    /// which a test should not.
+    #[test]
+    fn the_startup_trace_waits_for_t_with_third_party_probes_off() {
+        use crate::collectors::traceroute::TracerouteStatus;
+        let app = super::App::prepare_with_config(crate::config::NetwatchConfig {
+            third_party_probes: false,
+            ..Default::default()
+        });
+        super::start_startup_trace(&app);
+        let result = app.traceroute_runner.result.lock().unwrap();
+        assert!(matches!(result.status, TracerouteStatus::Idle));
+    }
+
     #[test]
     fn preparing_an_app_does_not_start_capture_or_optional_workers() {
         let config = crate::config::NetwatchConfig {
@@ -5467,7 +5494,128 @@ mod render_safety_tests {
             crate::platform::capture_fix()
         ));
         let row = banner(&mut app).expect("no capture banner on the dashboard");
-        assert!(row.contains(crate::platform::capture_fix()), "{row}");
+        assert!(row.contains("capture off"), "{row}");
+
+        // With the room for it, this platform's whole fix.
+        let rows = rows(&draw_at(&mut app, 200, 60));
+        let first = rows.iter().position(|r| r.contains("capture off")).unwrap();
+        let shown = failure_rows_from(&rows, first).join(" ");
+        assert!(shown.contains(crate::platform::capture_fix()), "{shown}");
+    }
+
+    fn draw_at(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_frame(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The failure's rows, from the first down to the header's border, trimmed.
+    fn failure_rows_from(rows: &[String], first: usize) -> Vec<&str> {
+        rows[first..]
+            .iter()
+            .take_while(|r| !r.starts_with('─'))
+            .map(|r| r.trim())
+            .collect()
+    }
+
+    /// All of the recipe, broken only between commands, or a pointer to it.
+    /// Through `draw_frame`, so these are the rows the header really gets: the
+    /// layout used to shrink it, leaving 2 of the 4 rows at 80x24, ending in
+    /// `sudo usermod -aG netwatch "$USER" &&`, and no failure at all on Packets
+    /// at 26 rows and under. Below 56 columns rows broke inside commands, and
+    /// pasting those ran `netwatch` inside `$(...)`. The Linux recipe on every
+    /// OS, as the rows do not depend on which OS printed them.
+    #[test]
+    fn a_refused_capture_draws_the_whole_fix_or_a_pointer_at_every_size() {
+        use crate::platform::{fix_commands, LINUX_CAPTURE_FIX};
+        use crate::ui::widgets::CAPTURE_FIX_POINTER;
+        let error = format!("not permitted — {LINUX_CAPTURE_FIX}");
+        let (_, commands) = fix_commands(&error).unwrap();
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        *app.packet_collector.error.lock().unwrap() = Some(error.clone());
+
+        let mut drew = std::collections::HashMap::new();
+        for tab in [Tab::Dashboard, Tab::Packets] {
+            app.ui.current_tab = tab;
+            for width in [
+                50u16, 56, 57, 58, 60, 70, 76, 77, 78, 80, 100, 120, 160, 200, 400,
+            ] {
+                for height in [
+                    10u16, 16, 20, 23, 24, 26, 27, 28, 30, 31, 33, 36, 37, 38, 40, 43, 50, 60,
+                ] {
+                    let rows = rows(&draw_at(&mut app, width, height));
+                    let at = format!("{tab:?} at {width}x{height}");
+                    let first = rows
+                        .iter()
+                        .position(|r| r.contains("capture off"))
+                        .unwrap_or_else(|| panic!("{at} shows no failure:\n{}", rows.join("\n")));
+                    let failure = failure_rows_from(&rows, first);
+                    let screen = rows.join("\n");
+                    let recipe = ["sudo ", "readlink", "setcap", "chown", "usermod"]
+                        .iter()
+                        .any(|word| screen.contains(word));
+                    if !recipe {
+                        assert!(
+                            failure.join(" ").contains(CAPTURE_FIX_POINTER),
+                            "{at} has neither the fix nor the pointer:\n{screen}"
+                        );
+                        drew.insert((tab, width, height), "pointer");
+                        continue;
+                    }
+                    assert!(
+                        failure[0].ends_with("not permitted. Run:"),
+                        "{at}:\n{screen}"
+                    );
+                    assert_eq!(
+                        failure[1..].join(" "),
+                        LINUX_CAPTURE_FIX,
+                        "{at} draws part of the fix:\n{screen}"
+                    );
+                    // Every row is whole commands, so it ends in a command's
+                    // `&&` or is the last.
+                    let mut next = commands.iter();
+                    for row in &failure[1..] {
+                        let mut row = *row;
+                        while !row.is_empty() {
+                            let command = next.next().expect("a command");
+                            row = row
+                                .strip_prefix(command)
+                                .unwrap_or_else(|| {
+                                    panic!("{at} breaks inside {command}:\n{screen}")
+                                })
+                                .trim_start();
+                        }
+                    }
+                    assert!(next.next().is_none(), "{at}");
+                    drew.insert((tab, width, height), "whole");
+                }
+            }
+        }
+        // Under 10 rows nothing below the header can spare any, so the rule is
+        // only that none of the recipe shows.
+        for tab in [Tab::Dashboard, Tab::Packets] {
+            app.ui.current_tab = tab;
+            for width in [50u16, 80, 200] {
+                for height in 1u16..10 {
+                    let screen = rows(&draw_at(&mut app, width, height)).join("\n");
+                    for word in ["sudo ", "readlink", "setcap", "chown", "usermod"] {
+                        assert!(
+                            !screen.contains(word),
+                            "{tab:?} at {width}x{height}:\n{screen}"
+                        );
+                    }
+                }
+            }
+        }
+        // Neither branch is vacuous, and the sizes named in the review land
+        // where they should.
+        for tab in [Tab::Dashboard, Tab::Packets] {
+            assert_eq!(drew[&(tab, 80, 24)], "pointer", "{tab:?}");
+            assert_eq!(drew[&(tab, 50, 60)], "pointer", "{tab:?}");
+            assert_eq!(drew[&(tab, 50, 24)], "pointer", "{tab:?}");
+            assert_eq!(drew[&(tab, 200, 60)], "whole", "{tab:?}");
+            assert_eq!(drew[&(tab, 80, 60)], "whole", "{tab:?}");
+        }
     }
 
     fn unsafe_cells(buf: &Buffer) -> Vec<String> {

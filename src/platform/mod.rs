@@ -28,14 +28,39 @@ pub mod socket_table;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-/// The `setcap` line the capture error and the Dashboard banner give for
-/// capture without root on Linux. CAP_BPF and CAP_PERFMON are for eBPF
-/// attribution (`sandbox/mod.rs`). It grants the binary in place, for every
-/// account that can run it. The README, REFERENCE.md and the man page first
-/// restrict the binary to a group; E3 in docs/THREAT-MODEL.md is the work
-/// that makes this line and the package messages match them.
-pub const LINUX_CAPTURE_FIX: &str =
-    r#"sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)""#;
+/// The command the capture error and the Dashboard banner give for capture
+/// without root on Linux. CAP_BPF and CAP_PERFMON are for eBPF attribution
+/// (`sandbox/mod.rs`). It restricts the binary to a group before granting it,
+/// because file capabilities on a world-executable binary let every local
+/// account capture. `setcap` comes last, as `chown` clears file capabilities.
+///
+/// It finds the binary once, first. Once `chmod` has taken it away from an
+/// account not yet in the group, another `which netwatch` finds a different
+/// netwatch further down `PATH`, or none, and `setcap` would grant that one.
+/// Each `&&` stops the chain before a binary is granted anything unrestricted,
+/// such as where a Nix store refuses the `chown`. REFERENCE.md has the longer
+/// recipe that copies a binary like that one.
+///
+/// `usermod` does not change the groups of a session already running, and
+/// `chmod` has just taken execute away from it. Until a new login the next
+/// `netwatch` gets permission denied, and pasting this again stops at `which`,
+/// so the last step says so. It is a step and not a note after the command, so
+/// the two cannot be separated, and it fits one row of 80 columns.
+pub const LINUX_CAPTURE_FIX: &str = r#"b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b" && echo 'Log in again to join the group: netwatch cannot start until you do'"#;
+
+/// A message ending in a chain of commands, as the refused-capture error does
+/// on Linux: what comes before the chain, and each command with its `&&`. A
+/// row broken inside a command pastes as a different command, so whatever
+/// draws this breaks only between them. `None` for a message that is all prose.
+pub fn fix_commands(message: &str) -> Option<(&str, Vec<&str>)> {
+    let (sentence, chain) = message.split_once(" — ")?;
+    chain.contains(" && ").then(|| {
+        (
+            sentence,
+            chain.split_inclusive(" && ").map(str::trim_end).collect(),
+        )
+    })
+}
 
 /// What [`capture_fix`] says on Windows. Named so doctor's Npcap wording can
 /// use it, and be tested, on every platform rather than only on Windows.
@@ -414,13 +439,17 @@ mod interface_name_tests {
 mod capture_fix_tests {
     use super::LINUX_CAPTURE_FIX;
 
-    /// The banner, the docs and the packages grant the same capabilities.
-    /// The docs also restrict the binary to a group first, which the
-    /// banner's one line cannot; E3 in docs/THREAT-MODEL.md brings the
-    /// banner and the packages in line, and this goes back to checking
-    /// the docs give the banner's exact line.
+    const CAPS: &str = "'cap_net_raw,cap_bpf,cap_perfmon+eip'";
+
+    /// The banner, the docs and the packages grant the same capabilities, and
+    /// none of them to a binary every local account can run.
     #[test]
     fn the_fix_line_matches_the_docs_and_packages() {
+        assert!(LINUX_CAPTURE_FIX.contains(CAPS));
+        assert!(
+            include_str!("../../docs/REFERENCE.md").contains(LINUX_CAPTURE_FIX),
+            "REFERENCE.md does not give the line the capture error prints"
+        );
         for (doc, text) in [
             ("README.md", include_str!("../../README.md")),
             ("docs/REFERENCE.md", include_str!("../../docs/REFERENCE.md")),
@@ -431,28 +460,174 @@ mod capture_fix_tests {
                 "{doc} gives another capability set"
             );
             assert!(
-                !text.contains(LINUX_CAPTURE_FIX),
+                !text.contains(r#"sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which"#),
                 "{doc} grants capabilities to a world-executable binary"
             );
         }
-        let caps = LINUX_CAPTURE_FIX.split_whitespace().nth(2).unwrap();
-        assert_eq!(caps, "'cap_net_raw,cap_bpf,cap_perfmon+eip'");
-        for (file, text) in [
+    }
+
+    /// Each post-install prints the steps in the order that works: `chown`
+    /// clears file capabilities, so `setcap` has to come after it.
+    #[test]
+    fn the_packages_restrict_the_binary_before_granting_it() {
+        let spec = include_str!("../../packaging/rpm/netwatch.spec");
+        let between = |from: &str, to: &str| {
+            let rest = spec.split_once(from).unwrap().1;
+            rest.split_once(to).unwrap().0.to_string()
+        };
+        // Printed to whoever installed it, for their own shell, where `sudo`
+        // keeps `$USER` theirs. The description says "as root", where `$USER`
+        // in a `su -` shell is root, so it has to name the account instead.
+        let own_shell = r#"sudo usermod -aG netwatch "$USER""#;
+        for (file, text, bin, member) in [
             (
                 "debian/postinst",
-                include_str!("../../packaging/debian/postinst"),
-            ),
-            (
-                "rpm/netwatch.spec",
-                include_str!("../../packaging/rpm/netwatch.spec"),
+                include_str!("../../packaging/debian/postinst").to_string(),
+                "/usr/bin/netwatch",
+                own_shell,
             ),
             (
                 "rpm/post_install.sh",
-                include_str!("../../packaging/rpm/post_install.sh"),
+                include_str!("../../packaging/rpm/post_install.sh").to_string(),
+                "/usr/bin/netwatch",
+                own_shell,
+            ),
+            (
+                "rpm/netwatch.spec %post",
+                between("%post", "%files"),
+                "/usr/bin/netwatch",
+                own_shell,
+            ),
+            (
+                "rpm/netwatch.spec %description",
+                between("%description", "%prep"),
+                "%{_bindir}/netwatch",
+                "usermod -aG netwatch YOUR_USER",
             ),
         ] {
-            assert!(text.contains(caps), "{file} grants other capabilities");
+            let at = |line: String| {
+                text.find(&line)
+                    .unwrap_or_else(|| panic!("{file} does not say {line:?}"))
+            };
+            let group = at("groupadd -f netwatch".to_string());
+            let member = at(member.to_string());
+            let owner = at(format!("chown root:netwatch {bin}"));
+            let mode = at(format!("chmod 0750 {bin}"));
+            let grant = at(format!("setcap {CAPS} {bin}"));
+            assert!(
+                group < member && member < owner && owner < mode && mode < grant,
+                "{file} gives the steps out of order"
+            );
         }
+        assert!(
+            !between("%description", "%prep").contains("$USER"),
+            "the spec's as-root steps would add root to the group in a su - shell"
+        );
+    }
+
+    /// The line run by `sh` for an account not yet in the group, which is
+    /// everyone the first time: once `chmod` has run, `which` cannot find the
+    /// binary. A second, later `netwatch` on PATH stands in for the one
+    /// another `which` would hand to `setcap`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_fix_line_grants_the_binary_it_found_first() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("netwatch-fix-{}", uuid::Uuid::new_v4())));
+        let root = scratch.0.as_path();
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let dirs: Vec<_> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        for tool in ["readlink", "chmod"] {
+            let found = dirs
+                .iter()
+                .map(|dir: &std::path::PathBuf| dir.as_path())
+                .chain([
+                    std::path::Path::new("/usr/bin"),
+                    std::path::Path::new("/bin"),
+                ])
+                .map(|dir| dir.join(tool))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| panic!("no {tool}"));
+            std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
+        }
+        const SHIMS: &str = r#"
+which() {
+  old=$IFS; IFS=:
+  for dir in $PATH; do
+    [ -x "$dir/$1" ] && { IFS=$old; echo "$dir/$1"; return 0; }
+  done
+  IFS=$old; return 1
+}
+sudo() {
+  case $1 in
+    groupadd | usermod) echo "$1" ;;
+    chmod) chmod 0600 "$3"; echo "chmod $3" ;;
+    chown | setcap) echo "$1 $3" ;;
+  esac
+}
+"#;
+        let run = || {
+            let path = ["first", "second"]
+                .map(|dir| root.join(dir).display().to_string())
+                .join(":");
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{SHIMS}{LINUX_CAPTURE_FIX}"))
+                .env_clear()
+                .env("PATH", format!("{path}:{}", tools.display()))
+                .env("USER", "user")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.replace(&format!("{}/", root.display()), ""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        // With no netwatch on PATH nothing runs, group changes included.
+        std::fs::create_dir(root.join("first")).unwrap();
+        std::fs::create_dir(root.join("second")).unwrap();
+        assert_eq!(run(), "");
+
+        for dir in ["first", "second"] {
+            let bin = root.join(dir).join("netwatch");
+            std::fs::write(&bin, "").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            run(),
+            "groupadd, usermod, chown first/netwatch, chmod first/netwatch, setcap first/netwatch, \
+             Log in again to join the group: netwatch cannot start until you do"
+        );
+
+        // The state that message is for: the only netwatch has just been taken
+        // away from this session, so pasting the line again finds nothing,
+        // and running it would be permission denied.
+        std::fs::remove_file(root.join("second").join("netwatch")).unwrap();
+        assert_eq!(run(), "");
+    }
+
+    /// What the banner and doctor show is this constant, so both say it too.
+    #[test]
+    fn the_fix_line_says_to_log_in_again() {
+        let error = format!("not permitted — {LINUX_CAPTURE_FIX}");
+        let (_, commands) = super::fix_commands(&error).unwrap();
+        let last = commands.last().unwrap();
+        assert!(last.starts_with("echo 'Log in again"), "{last}");
+        assert!(last.contains("cannot start"), "{last}");
+        // Ending the chain, so it only says so once the steps have worked.
+        assert!(commands[commands.len() - 2].contains("setcap"));
     }
 
     /// The group-restricted recipe in REFERENCE.md and the man page, run by
