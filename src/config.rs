@@ -2351,6 +2351,10 @@ api_only = 1
             saved_after(TWO_TARGETS, toggled("web"), Some(reordered)),
             reordered.replace("enabled = true", "enabled = false")
         );
+        assert_eq!(
+            saved_after(TWO_TARGETS, toggled("api"), Some(reordered)),
+            reordered.replace("api_only = 1\n", "api_only = 1\nenabled = false\n")
+        );
     }
 
     /// A target added or edited by hand survives a save of anything else, or of
