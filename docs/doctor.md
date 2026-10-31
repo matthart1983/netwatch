@@ -183,7 +183,17 @@ session reads the connection table. It is `ready` (`ss_found`) when `ss` is on
 it is `unavailable` (`no_connection_table`) and the table will be empty. Static
 doctor does not run `ss`, so one that is present but fails shows only in a live
 session. There Settings shows a `connections: degraded` row with the reason, and
-the log records the fallback and why. States are `ready`, `not_checked`,
+the log records the fallback and why. `geoip_db` reads the databases a session
+would open. It is `ready` (`db_loaded`) when they open, `degraded` (`db_stale`)
+when one was built over 60 days ago, `unavailable` (`db_unreadable`) when the
+Country or City file does not open, and `degraded` (`db_unreadable`) when only the
+ASN file does not. A file does not open when it is not a regular file, is over
+its size limit (2 GiB for a path in the config, 256 MiB for a file `netwatch geoip
+update` saved), is not a MaxMind database, or has a build date out of range. With no Country or City database it is `disabled`
+(`not_configured`), and `next_check` suggests `netwatch geoip update`. When
+lookups answer with DB-IP's data, judged by each file's own `database_type`, the
+`detail` starts with `IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0`. A
+live session reports what it opened at startup. States are `ready`, `not_checked`,
 `unavailable`, `disabled`, `degraded` and `stale`. Consumers should tolerate new
 capabilities and reason codes. A report is a point-in-time observation.
 
