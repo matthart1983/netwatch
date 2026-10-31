@@ -1403,7 +1403,11 @@ fn write_config(path: &Path, contents: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, contents)?;
+    crate::atomic_file::replace(
+        path,
+        contents.as_bytes(),
+        crate::atomic_file::Access::KeepExisting,
+    )?;
     Ok(())
 }
 

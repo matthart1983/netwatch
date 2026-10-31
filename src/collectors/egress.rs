@@ -2043,6 +2043,44 @@ block = {
         assert_eq!(profiler.policy_warnings(), []);
     }
 
+    /// A policy is a trust anchor, and losing it silences every rule. The write
+    /// limit stands in for a full disk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_policy_write_that_fails_keeps_the_old_policy() {
+        const CHILD: &str = "NETWATCH_POLICY_WRITE_TEST_FILE";
+        let rules = |host: &str| {
+            let rule = ProcessRule {
+                allow_sni: (0..200).map(|n| format!("{n}.{host}")).collect(),
+                ..Default::default()
+            };
+            vec![("curl".to_string(), rule)]
+        };
+        if let Some(path) = std::env::var_os(CHILD) {
+            let err =
+                merge_rules_into_policy_file(&rules("b.example"), Path::new(&path)).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(nix::libc::EFBIG), "{err}");
+            return;
+        }
+        let path = scratch("failed-write.toml");
+        let old = "# mine\n[process.curl]\nallow_sni = ['a.example']\n";
+        write_owner_only(&path, old.as_bytes()).unwrap();
+        let this_test = "collectors::egress::tests::a_policy_write_that_fails_keeps_the_old_policy";
+        let output = std::process::Command::new("sh")
+            .args(["-c", "trap '' XFSZ; ulimit -f 1; exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", this_test])
+            .env(CHILD, &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+    }
+
     /// Promotion rewrote the rule from the four lists and `block`, so a key it
     /// did not know was gone from the file, and the warning about it with it.
     #[test]

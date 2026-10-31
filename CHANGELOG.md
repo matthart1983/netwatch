@@ -119,6 +119,14 @@ All notable changes to NetWatch will be documented in this file.
   file is not touched. A save that does write drops a byte-order mark and ends every line
   in LF. Removing `geoip_online` also removes a comment directly above it. If the result
   would not read back as the file plus those changes, the save fails and the file stays.
+- **A save that cannot finish keeps the old file.** `config.toml` and `egress-policy.toml`
+  were truncated and then written, so a full disk could leave half a file. A config cut
+  off at `view = "ful` then stopped netwatch starting, and a lost policy silences every
+  rule. The new contents now go to a temporary file beside the old one, are synced and are
+  renamed over it. The file keeps its mode, a symlink stays and its target is what changes,
+  and a file you made read-only stays refused. Where a rename cannot work, in a directory
+  you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
+  place, as before. The learned egress baseline is written the same way.
 - **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
   thing that writes defaults. A new file gets every key. A file that exists gains the
   keys it lacks and keeps what it has, values included. It no longer writes

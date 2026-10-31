@@ -228,6 +228,64 @@ mod cli {
         assert!(!stderr.contains("value-sentinel"), "{stderr}");
     }
 
+    /// The review's reproduction: a write limit standing in for a full disk left
+    /// a config that ended mid-line, and netwatch then refused to start. Through
+    /// `--generate-config`, which shares its writer with a Settings save.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_that_cannot_finish_keeps_the_old_file() {
+        let fixture = Fixture::new();
+        let old = "# mine\ntheme = 'nord'\nsandbox = 'strict'\n";
+        fs::write(fixture.config(), old).unwrap();
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                "trap '' XFSZ; ulimit -f 1; exec \"$0\" --generate-config",
+            ])
+            .arg(env!("CARGO_BIN_EXE_netwatch"))
+            .env("HOME", &fixture.0)
+            .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert_eq!(fs::read_to_string(fixture.config()).unwrap(), old);
+        let names: Vec<_> = fs::read_dir(fixture.config().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"], "a temporary file was left behind");
+        // And it still starts on it.
+        let (status, _, stderr) = fixture.run(&["doctor"]);
+        assert!(status.success(), "{stderr}");
+    }
+
+    /// The mode and the link are the user's, through the real path.
+    #[test]
+    fn a_save_keeps_the_mode_and_follows_a_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let fixture = Fixture::new();
+        let elsewhere = fixture.0.join("dotfiles.toml");
+        fs::write(&elsewhere, "theme = 'nord'\n").unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::remove_file(fixture.config()).unwrap();
+        symlink(&elsewhere, fixture.config()).unwrap();
+
+        let (status, _, stderr) = fixture.run(&["--generate-config"]);
+        assert!(status.success(), "{stderr}");
+        assert!(fs::symlink_metadata(fixture.config())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let saved = fs::read_to_string(&elsewhere).unwrap();
+        assert!(saved.starts_with("theme = 'nord'\n"), "{saved}");
+        assert!(saved.contains("default_tab"), "{saved}");
+        assert_eq!(
+            fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
     #[test]
     fn generate_config_does_not_overwrite_it() {
         let fixture = Fixture::new();

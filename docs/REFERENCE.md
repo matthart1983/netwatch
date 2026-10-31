@@ -973,8 +973,10 @@ and the session changed the same key, the session's value wins for that key alon
 the file no longer has fails and leaves the file; press `r` to reload. `--view` is for one run, and
 a save does not write it. With nothing to write, the file is not touched.
 
-A save that does write drops a byte-order mark and ends every line in LF. Removing
-`geoip_online` also removes a comment directly above it.
+A save that does write keeps the old file until the new one is complete and synced, so a full
+disk leaves the settings you had, and keeps the file's mode and any symlink to it. It drops a
+byte-order mark and ends every line in LF. Removing `geoip_online` also removes a comment directly
+above it.
 
 `--generate-config` is the one thing that writes defaults. A new file gets every key. A file that
 exists gains the keys it lacks, and keeps every value and comment it has. It leaves out

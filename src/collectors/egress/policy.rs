@@ -406,28 +406,10 @@ pub fn save_policy_file(policy: &EgressPolicy, path: &Path) -> std::io::Result<(
 /// a trust anchor: `load_policy_file` refuses a group/world-writable one, so
 /// our OWN writes must be tight or promote-then-reload would refuse the file
 /// we just wrote (which looked like "promote didn't take"). No-op perms on
-/// non-unix; the byte write still happens.
+/// non-unix. A write that fails leaves the old file, which a policy needs more
+/// than most: losing it silences every rule.
 pub(super) fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)?;
-        // Re-assert mode in case the file pre-existed with looser perms
-        // (create+mode only applies to newly-created files).
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    crate::atomic_file::replace(path, bytes, crate::atomic_file::Access::OwnerOnly)
 }
 
 const POLICY_HEADER: &str = "# netwatch egress policy (observe → promote → warn).\n\
