@@ -397,10 +397,12 @@ netwatch --sandbox-strict     # reject unverified required startup entries
 netwatch --no-sandbox         # explicitly disable Netwatch policy
 ```
 
-- **Capabilities:** selected BPF/admin capability removals are verified in effective,
-  permitted and inheritable sets. Strict also drops `CAP_NET_RAW`; best-effort
-  retains it for capture reopening. Effective retained capabilities are recorded.
-  This is not a claim that every elevated capability is removed.
+- **Capabilities:** removals are verified in the effective, permitted, inheritable
+  and ambient sets. Parser and capture threads drop `CAP_NET_RAW` in every mode. A
+  best-effort TUI keeps it on main and the network workers to reopen capture (`c`,
+  `i`, `Shift+R`); the daemon, `diagnose run`, `diagnose coverage` and strict drop it
+  on every thread once capture has opened. Effective retained capabilities are
+  recorded. This is not a claim that every elevated capability is removed.
 - **Writable paths:** owned private config/cache/state directories, dedicated
   `netwatch/exports` and `netwatch/scratch` cache subdirectories, and `/dev/null`.
   There is no whole-CWD, shared `/tmp` or `/run/user` write grant. Directories are
@@ -416,8 +418,26 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   nonzero exit. After the main thread drops raw-socket authority, capture restart
   may fail; it never retries unsandboxed. macOS/Windows have no backend and reject
   strict startup. Best-effort reports degradation on those platforms.
-- **Network:** no network restrictions are installed. Settings reports policy-entry
-  results, not an independent proof that the entire process is exploit-proof.
+- **Network:** policy is per thread, and only on Linux.
+
+  | Threads | TCP bind and connect | socket(2) |
+  | --- | --- | --- |
+  | Main and the network workers (reverse DNS, WHOIS, GeoIP, health, traceroute, Insights, remote, Diagnose probes, blocking pool) | Allowed | Allowed |
+  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink, and the others have not been audited for the filter |
+  | Capture, keylog, metrics listener and client | Denied from Linux 6.7 | EPERM |
+
+  `netwatch doctor --json` reports the kernel's ABI and what a parser thread enforces
+  on it. What each thread of a running session got, its `network_policy` included, is
+  in that session's log, and Settings has the totals; `doctor` shows `protections`
+  empty and `tasks_holding_net_raw` null
+  ([where each value can be read](doctor.md#where-each-value-can-be-read)). A kernel
+  below Linux 6.7 runs best-effort without
+  the deny and refuses `--sandbox-strict`. A denied thread still has other routes:
+  UDP, ICMP and netlink on threads with socket(2), any descriptor opened earlier, and
+  the rest of the [threat model's list](THREAT-MODEL.md#what-containment-does-not-cover).
+  Settings reports policy-entry results, not an independent proof that the entire
+  process is exploit-proof.
+- **Root:** Settings and `doctor` say `running as root: containment limited`.
 
 Linux denial tests exercise actual lookup/Insights/keylog workers and keylog restart.
 Privileged capture/restart and macOS/Windows runtime validation remain release checks.

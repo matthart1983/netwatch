@@ -55,10 +55,117 @@ without reading packets. This can require capture permissions and temporarily
 enable promiscuous capture, following the normal capture path.
 
 The parent gives the isolated check process five seconds to finish, then kills
-and reaps it on timeout. The check reports sandbox enforcement for that process
-only. It does not prove enforcement in live workers, successful packet delivery,
-process attribution or network health. No active probes or cloud calls are made.
-Platform interface discovery may invoke local system helpers.
+and reaps it on timeout. The check takes the capture thread's policy and reports
+it for that process only, in a `capture-check` protection. Its `network_policy` is
+what the check saw: after the capture layer it tries a TCP bind, and a connect to a
+loopback listener it binds itself, and a deny the layer reports but the kernel does
+not give becomes a warning. It does not prove enforcement in live workers,
+successful packet delivery, process attribution or network health. No active probes
+or cloud calls are made. Platform interface discovery may invoke local system
+helpers.
+
+## Landlock
+
+On Linux, static doctor checks what this kernel gives a parser thread. It starts a
+disposable thread, applies the parser policy there, even with the sandbox disabled,
+tries a TCP bind and a connect to its own loopback listener, and lets the thread
+end. It starts no worker, touches nothing else in the process and sends nothing off
+the machine. The result is the top-level `landlock` object, null off Linux:
+
+```json
+"landlock": {
+  "kernel_abi": 9,
+  "availability": "available",
+  "errata": [1, 2, 3],
+  "parser_check": {
+    "enforced_abi": 9,
+    "restrictions": ["filesystem", "tcp_bind", "tcp_connect",
+      "abstract_unix_socket", "signal", "pathname_unix_socket"],
+    "tcp_bind": "denied",
+    "tcp_connect": "denied"
+  }
+}
+```
+
+`availability` is `available`, `not_enabled` (built into the kernel, left out of its
+`lsm=` list), `not_built`, or `unknown` if the check could not ask. `not_built` also
+covers something such as a container's seccomp profile blocking Landlock's syscalls:
+the crate netwatch uses reads any errno but `EOPNOTSUPP` as a kernel without it. `errata` lists
+the fixes the kernel reports, by the numbers in the kernel's Landlock documentation.
+`tcp_bind` and `tcp_connect` are `denied`, `allowed` or `error`, for any other
+outcome. In a session's log `parser_check` comes from a parser worker's entry report
+and no connection is tried, so it says what the layer enforced.
+
+`protections` is empty and `tasks_holding_net_raw` is null in that report, because
+static doctor runs no session. [Where each value can be read](#where-each-value-can-be-read)
+says where those are.
+
+The `landlock` capability sums that up:
+
+| State | Reason | Meaning |
+| --- | --- | --- |
+| `ready` | `parser_network_denied` | The kernel denied a parser thread TCP bind and connect. |
+| `degraded` | `kernel_abi_below_4` | The kernel cannot deny TCP (Linux older than 6.7). Parser threads keep the network, and `--sandbox-strict` refuses to start. |
+| `unavailable` | `landlock_not_enabled` | Built in but not enabled at boot (`EOPNOTSUPP`). |
+| `unavailable` | `landlock_not_built` | The kernel has no Landlock (`ENOSYS`), or something such as a container's seccomp profile blocks it. Netwatch cannot tell which. |
+| `unavailable` | `self_test_failed` | The kernel can deny TCP and the check did not see it do so. |
+| `disabled` | `sandbox_disabled` | The configuration turns the sandbox off. The object above still says what the kernel offers. |
+| `unavailable` | `platform_unsupported` | Not Linux. |
+
+Each entry in `protections` describes one thread. Static doctor has none, and
+`--check-capture` has one, `capture-check`. A session's log has one for main and for
+each worker:
+
+| Field | Meaning |
+| --- | --- |
+| `landlock_abi` | The Landlock ABI of what this thread enforces, 0 if nothing: the newest feature in force. The filesystem layer alone is 3 at most, TCP needs 4, the abstract socket and signal scopes 6, pathname Unix sockets 9. Before 0.39 this was the kernel's ABI, which on Linux 7.1 read 9 on threads that enforce 3. |
+| `landlock_kernel_abi` | The ABI the kernel reports. |
+| `network_policy` | `denied` when this thread's TCP bind and connect are, `allowed` when it entered and they are not, as for main and the network workers, and `not_entered` when it has no report. That last one is a capture that failed to open, a worker just started, or `ebpf-reader`, the note for the eBPF SDK's reader thread, which inherits `denied` from the `ebpf` worker. `denied` does not mean no network: see the [threat model](THREAT-MODEL.md), items 4 and 6. |
+| `landlock_restrictions` | Any of `filesystem`, `filesystem_write` (capture's layer has no write grant), `tcp_bind`, `tcp_connect`, `abstract_unix_socket`, `signal`, `pathname_unix_socket`, and `socket_create` for the seccomp filter on capture, keylog and the metrics threads. |
+| `capture_authority` | CAP_NET_RAW on this thread: `dropped`, `retained_for_reopen`, `not_held` or `not_applicable`. |
+| `socket_filter` | The no-socket filter: `installed`, `unknown_arch` (this build has no syscall table for it), `failed` or `not_applicable`. |
+
+The top-level `tasks_holding_net_raw` is process-wide, because capabilities are per
+thread and only a session has threads to audit. It lists `{tid, comm}` for each
+thread that held CAP_NET_RAW when startup audited the process. It is null in every
+`doctor` report, `--check-capture` included, and off Linux. A session's log has the
+real list, which is empty in a daemon session with the sandbox on.
+
+`network_restricted` stays false. It describes the whole process, and main and the
+network workers keep the network.
+
+As root, the `sandbox` capability's detail and Settings say `running as root:
+containment limited`. Root still owns most files whatever the sandbox does, and
+[SECURITY.md](../SECURITY.md) scopes sandbox escapes to non-root runs.
+
+## Where each value can be read
+
+No command prints a running session's snapshot as JSON. `doctor` is a separate
+process and cannot see into one, so a session reports on itself in Settings and in
+its log:
+
+| Value | `doctor --json` | `doctor --json --check-capture` | Settings in a session | Session log | `scripts/capture-authority-audit.sh` |
+| --- | --- | --- | --- | --- | --- |
+| `landlock` object | The disposable thread's check | The same check | No | From a parser worker's entry report | No |
+| `landlock` capability | Yes | Yes | No | No | No |
+| `protections` | `[]` | One entry, `capture-check` | Totals only: `TCP denied on N/M parser workers`, `N/M worker entries verified`, and a row for up to three workers with a warning | `main`, and every worker that has started | No |
+| `tasks_holding_net_raw` | `null` | `null` | No | The list startup's audit found | Reads every task's four sets from `/proc/<pid>/task` itself, and holds the log's list to being empty |
+| CAP_NET_RAW on main | No | No | `CAP_NET_RAW kept on main` or `dropped once capture opened` | `capture_authority` on `main` | The same `/proc` read |
+| `socket_filter` | No | On `capture-check` | Only if skipped: `no-socket filter skipped` | On each worker | No |
+
+A daemon or TUI session writes the log line once, when its first health cycle has
+started its workers, five ticks in:
+
+```sh
+grep 'session protections' ~/.cache/netwatch/netwatch.log.* | tail -1 | sed 's/.*report=//' | jq .
+```
+
+It holds `landlock`, `protections` and `tasks_holding_net_raw`. It is `info` on the
+target `netwatch::sandbox`, which the default log filter keeps, so a `RUST_LOG` that
+leaves that target out drops it. A session that ends before those five ticks writes
+none. A worker that starts later, such as a Diagnose probe or an export, is not in it.
+The audit script needs a user namespace and runs a daemon of its own, so it checks
+this build rather than a session you already have.
 
 ## Output contract
 
@@ -66,6 +173,8 @@ JSON uses `schema_version: 1`, a `scope` (`static` or `capture_check`), `platfor
 selected `interface`, `capabilities`, `protections` and `network_restricted`.
 The additive `attribution_coverage` field is null in doctor reports; only runtime
 snapshots contain observed coverage. See [attribution evidence](attribution.md).
+The additive `landlock` and `tasks_holding_net_raw` fields are described under
+[Landlock](#landlock).
 Each capability has an `id`, `state`, machine-readable `reason`, explanatory
 `detail` and optional `next_check`. On Linux, `connections` names where a live
 session reads the connection table. It is `ready` (`ss_found`) when `ss` is on
@@ -87,7 +196,9 @@ Live startup and Settings use the same model with actual capture, attribution,
 probe completion, TCP freshness and component protection observations. A separate
 doctor process cannot inspect that live process; its report describes setup or
 its own isolated capture check. Neither a ready capture backend nor completed
-probes imply a healthy network. Network containment is not provided.
+probes imply a healthy network. Network containment is per thread and partial:
+parser and capture threads are denied TCP bind and connect, and main and the network
+workers are not.
 
 ## Verification scope
 
