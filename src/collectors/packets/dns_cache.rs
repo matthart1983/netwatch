@@ -106,8 +106,8 @@ impl DnsCache {
     pub fn set_peers<'a>(&self, addrs: impl IntoIterator<Item = &'a str>) {
         let peers: HashSet<IpAddr> = addrs
             .into_iter()
-            .filter_map(|addr| crate::app::parse_addr_parts(addr).0)
-            .filter_map(|ip| parse_ip(&ip))
+            .filter_map(|addr| crate::app::addr_parts(addr).0)
+            .filter_map(parse_ip)
             .filter(|ip| !ip.is_unspecified())
             .collect();
         *crate::app::safe_lock(&self.peers, "dns_cache::set_peers") = peers;

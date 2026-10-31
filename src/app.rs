@@ -24,6 +24,7 @@ use crate::ui;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::prelude::*;
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -836,13 +837,19 @@ impl App {
 
     /// Kernel TCP state for a flow, keyed the way the connection table renders
     /// addresses. `None` when the platform has no collector, when the dump
-    /// hasn't run yet, or when the flow simply isn't established — all three
-    /// render the same dim `--`, because all three mean "we don't know".
+    /// hasn't run yet, when the flow simply isn't established, or when another
+    /// row shares its endpoints on another device, so the flow may be that
+    /// row's — all of them render the same dim `--`, because all of them mean
+    /// "we don't know".
     pub fn tcp_info_for(
         &self,
         local: &str,
         remote: &str,
     ) -> Option<crate::collectors::tcp_info::TcpInfo> {
+        let conns = self.connection_collector.connections();
+        if crate::diagnose::live::scope_collides(&conns, local, remote) {
+            return None;
+        }
         self.tcp_info.get(local, remote)
     }
 
@@ -999,7 +1006,7 @@ impl App {
         if self.ui.connection_collapsed.toggle(&key) {
             // Collapsing removes the rows below the cursor, so park it on the
             // header to keep the selection on something visible.
-            let view = crate::ui::connections::build_view(self);
+            let view = crate::ui::connections::current_view(self);
             let rows = view.rows(&self.ui.connection_collapsed);
             if let Some(idx) = rows.iter().position(|r| {
                 matches!(r, crate::ui::connections::ConnRow::Parent { group, .. }
@@ -1388,6 +1395,11 @@ impl App {
     /// derives from it. The scale tests time this, which is why the egress
     /// baseline save, a file write, stays in `tick`.
     pub(crate) fn observe_connections(&mut self) {
+        // The Connections tab's view holds the table it was built from, which
+        // no other screen needs kept alive.
+        if self.ui.view_mode != ViewMode::Full || self.ui.current_tab != Tab::Connections {
+            *safe_lock(&self.caches.conn_view, "app::observe_connections") = None;
+        }
         let conns = self.connection_collector.connections();
         // Reverse DNS resolves only the addresses in these connections,
         // this host's and its peers', not every address a packet claims
@@ -1533,20 +1545,28 @@ impl App {
 /// a blank IP, which then rendered as an unnamed row and warned as policy
 /// drift against a rule it could never match.
 pub(crate) fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
+    let (host, port) = addr_parts(addr);
+    (host.map(str::to_string), port.map(str::to_string))
+}
+
+/// [`parse_addr_parts`] without the copies, for a pass over the whole table.
+pub(crate) fn addr_parts(addr: &str) -> (Option<&str>, Option<&str>) {
     /// `"*"` is the wildcard ss/lsof print for "unbound"; empty is a
     /// malformed or partially-populated address. Neither is a value.
-    fn part(s: &str) -> Option<String> {
+    fn part(s: &str) -> Option<&str> {
         if s == "*" || s.is_empty() {
             None
         } else {
-            Some(s.to_string())
+            Some(s)
         }
     }
 
     if addr == "*:*" || addr.is_empty() {
         return (None, None);
     }
-    if let Some(bracket_end) = addr.rfind("]:") {
+    // Looking for the byte first: a substring search has to set itself up on
+    // each call, and most addresses are IPv4 and have no bracket to find.
+    if let Some(bracket_end) = addr.contains(']').then(|| addr.rfind("]:")).flatten() {
         // macOS lsof prints a link-local endpoint with no opening bracket
         // (`fe80:16::1]:1024`), so the first character is not always one.
         let host = addr[..bracket_end].trim_start_matches('[');
@@ -2208,24 +2228,39 @@ fn update_top_conn_history(
     history: &mut HashMap<(String, String), VecDeque<u64>>,
     conns: &[Connection],
 ) {
-    let mut current_groups: HashMap<(String, String), f64> = HashMap::new();
+    // Each group's rate, and whether its sample has been taken.
+    let mut current_groups: HashMap<(&str, &str), (f64, Cell<bool>)> =
+        HashMap::with_capacity(conns.len());
     for c in conns {
         if c.state == "LISTEN" || c.state == "CLOSED" || c.remote_addr.is_empty() {
             continue;
         }
-        let proc = c.process_name.clone().unwrap_or_else(|| "—".into());
+        let proc = c.process_name.as_deref().unwrap_or("—");
         let host = top_conn_host(&c.remote_addr);
-        let entry = current_groups.entry((proc, host)).or_insert(0.0);
-        *entry += c.rx_rate.unwrap_or(0.0);
+        let entry = current_groups.entry((proc, host)).or_default();
+        entry.0 += c.rx_rate.unwrap_or(0.0);
     }
 
-    history.retain(|k, _| current_groups.contains_key(k));
-
-    for (key, rate) in current_groups {
-        let buf = history.entry(key).or_default();
+    let push = |buf: &mut VecDeque<u64>, rate: f64| {
         buf.push_back(rate.round() as u64);
         if buf.len() > TOP_CONN_HISTORY_LEN {
             buf.pop_front();
+        }
+    };
+    // Most groups are already in the history. A pair of Strings to look each
+    // one up took most of this pass on a 10,000-row table.
+    history.retain(|(proc, host), buf| {
+        let Some((rate, taken)) = current_groups.get(&(proc.as_str(), host.as_str())) else {
+            return false;
+        };
+        taken.set(true);
+        push(buf, *rate);
+        true
+    });
+    for (&(proc, host), (rate, taken)) in &current_groups {
+        if !taken.get() {
+            let key = (proc.to_string(), host.to_string());
+            push(history.entry(key).or_default(), *rate);
         }
     }
 }
@@ -2238,16 +2273,17 @@ fn update_top_conn_history(
 /// exactly the same way — Dense split addresses with its own helper, which
 /// strips the brackets this keeps, so the sparkline lookup missed on every
 /// IPv6 row and those rows drew a flat baseline as if they were idle.
-pub(crate) fn top_conn_host(addr: &str) -> String {
+pub(crate) fn top_conn_host(addr: &str) -> &str {
     if let Some(stripped) = addr.strip_prefix('[') {
         if let Some(end) = stripped.find("]:") {
-            return format!("[{}]", &stripped[..end]);
+            // Through the closing bracket: the `[` and the `]` are one byte each.
+            return &addr[..end + 2];
         }
     }
     if let Some(colon) = addr.rfind(':') {
-        addr[..colon].to_string()
+        &addr[..colon]
     } else {
-        addr.to_string()
+        addr
     }
 }
 
@@ -2412,7 +2448,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         // Against the *row* list, not the connection list —
                         // under a group mode those differ by the header rows,
                         // and indexing the wrong one is issue #28 again.
-                        let view = crate::ui::connections::build_view(app);
+                        let view = crate::ui::connections::current_view(app);
                         let rows = view.rows(&app.ui.connection_collapsed);
                         if rows.is_empty() {
                             return;
@@ -5965,5 +6001,370 @@ mod interface_list_tests {
         app.ui.selected_interface = Some(0);
         scroll_tab(&mut app, 100);
         assert_eq!(app.ui.selected_interface, Some(19));
+    }
+}
+
+/// The Connections tab reads its rows from one cached view, so what could go
+/// wrong is a view that outlives what it was built from. Each change here is
+/// made as a user makes it, through the key and mouse handlers where one
+/// exists, and each is followed by the same check of what the cursor is on.
+#[cfg(test)]
+mod conn_view_tests {
+    use super::*;
+    use crate::testutil::connections::synthetic_connections;
+    use crate::ui::connections::{
+        compute_window_top, current_view, fresh_view_for_test, selected_connection,
+        selected_group_key, table_inner_area, ConnRow, ConnView,
+    };
+    use crossterm::event::{KeyEvent, MouseEvent};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn press(app: &mut App, code: KeyCode) {
+        assert!(!handle_key(app, KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, row: u16) {
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind,
+                column: 10,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+
+    fn app_with(rows: Vec<Connection>) -> App {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Connections;
+        app.ui.connection_collapsed = crate::ui::tree::FoldState::new(false);
+        app.ui.show_geo = false;
+        app.connection_collector.publish_for_test(rows);
+        app
+    }
+
+    /// Each row of a view, as much of it as two views have to agree on.
+    fn listing(view: &ConnView, app: &App) -> Vec<String> {
+        view.rows(&app.ui.connection_collapsed)
+            .iter()
+            .map(|row| match row {
+                ConnRow::Parent { group, collapsed } => format!(
+                    "{} {collapsed} {} {}",
+                    group.key, group.rollup.conns, group.rollup.rx_rate
+                ),
+                ConnRow::Conn { conn } => {
+                    format!(
+                        "{} {} {:?}",
+                        conn.local_addr, conn.remote_addr, conn.rx_rate
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// The cached view lists what a view built from scratch lists, and the
+    /// row the cursor is on is the same to the table, the detail strip and
+    /// the key handlers.
+    fn check(app: &mut App, step: &str) {
+        let fresh = fresh_view_for_test(app);
+        assert_eq!(
+            listing(&current_view(app), app),
+            listing(&fresh, app),
+            "{step}: the cached view is stale"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        terminal.draw(|f| draw_frame(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let line = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let screen: Vec<String> = (0..buffer.area.height).map(line).collect();
+
+        let rows = fresh.rows(&app.ui.connection_collapsed);
+        let inner = table_inner_area(buffer.area);
+        let highlighted = (inner.y + 1..inner.y + inner.height)
+            .find(|&y| buffer[(inner.x + 1, y)].bg == app.theme.selection_bg);
+        if rows.is_empty() {
+            assert_eq!(highlighted, None, "{step}: a highlight on an empty table");
+            assert_eq!(selected_connection(app).map(|c| c.local_addr), None);
+            assert_eq!(selected_group_key(app), None, "{step}");
+            assert!(screen.iter().any(|l| l.contains("No connections match")));
+            return;
+        }
+        let selected = app.ui.scroll.connection_scroll.min(rows.len() - 1);
+        let visible = inner.height as usize - 1;
+        let top = compute_window_top(selected, rows.len(), visible);
+        let y = inner.y + 1 + (selected - top) as u16;
+        assert_eq!(
+            highlighted,
+            Some(y),
+            "{step}: the highlight is on another row"
+        );
+        let drawn = &screen[y as usize];
+
+        match &rows[selected] {
+            ConnRow::Parent { group, .. } => {
+                assert!(selected_connection(app).is_none(), "{step}");
+                assert_eq!(selected_group_key(app).as_ref(), Some(&group.key), "{step}");
+                assert!(drawn.contains(&group.key), "{step}: {drawn}");
+                let title = format!(
+                    " detail  {}  {} connections ",
+                    group.key, group.rollup.conns
+                );
+                assert!(
+                    screen.iter().any(|l| l.contains(&title)),
+                    "{step}: no {title}"
+                );
+            }
+            ConnRow::Conn { conn } => {
+                let chosen = selected_connection(app).expect("the cursor is on a connection");
+                assert_eq!(chosen.local_addr, conn.local_addr, "{step}");
+                assert_eq!(chosen.remote_addr, conn.remote_addr, "{step}");
+                // Under `group: remote` a child shows only its port, and the
+                // parent the host.
+                let cell = match app.ui.connection_group {
+                    ConnectionGroup::Remote => conn
+                        .remote_addr
+                        .rsplit_once(':')
+                        .map_or(String::new(), |(_, port)| format!(":{port}")),
+                    _ => conn.remote_addr.clone(),
+                };
+                assert!(drawn.contains(&cell), "{step}: {cell} not on {drawn}");
+                // Each row has its own local address, so this is one row.
+                let flow = format!("{}  →  {}", conn.local_addr, conn.remote_addr);
+                assert!(
+                    screen.iter().any(|l| l.contains(&flow)),
+                    "{step}: the detail strip does not show {flow}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_selected_row_is_the_drawn_row_after_every_change() {
+        let table = synthetic_connections(400, 3);
+        let mut app = app_with(table.clone());
+        check(&mut app, "first draw");
+
+        // Every group mode, at the top, in the middle and at the end.
+        for _ in 0..3 {
+            let mode = app.ui.connection_group.label();
+            for scroll in [0, 7, 150, usize::MAX] {
+                app.ui.scroll.connection_scroll = scroll;
+                check(&mut app, &format!("group {mode}, cursor at {scroll}"));
+            }
+            press(&mut app, KeyCode::Char('G'));
+            app.ui.scroll.connection_scroll = 3;
+            check(&mut app, &format!("group after {mode}"));
+        }
+        assert_eq!(app.ui.connection_group, ConnectionGroup::Process);
+
+        // The state chips.
+        app.ui.scroll.connection_scroll = 20;
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('f'));
+            app.ui.scroll.connection_scroll = 5;
+            let chip = app.ui.connection_state_filter.label();
+            check(&mut app, &format!("state filter {chip}"));
+        }
+
+        // The text filter, as it is typed and once it is applied.
+        press(&mut app, KeyCode::Char('/'));
+        for c in "proc-01".chars() {
+            press(&mut app, KeyCode::Char(c));
+            check(&mut app, &format!("typing {c} of the filter"));
+        }
+        press(&mut app, KeyCode::Enter);
+        check(&mut app, "filter applied");
+        app.ui.scroll.connection_scroll = 12;
+        check(&mut app, "filter applied, cursor moved");
+        app.ui.connection_filter_active = Some("no such process".into());
+        check(&mut app, "a filter nothing matches");
+        press(&mut app, KeyCode::Esc);
+        app.ui.connection_filter_active = None;
+        app.ui.connection_filter_text.clear();
+        check(&mut app, "filter cleared");
+
+        // The sort picker's order, which shows under `group: none`.
+        app.ui.connection_group = ConnectionGroup::None;
+        for column in 0..crate::ui::connections::COLUMNS.len() {
+            for ascending in [true, false] {
+                app.ui
+                    .sort_states
+                    .insert(Tab::Connections, TabSortState { column, ascending });
+                app.ui.scroll.connection_scroll = 11;
+                check(&mut app, &format!("sort {column} {ascending}"));
+            }
+        }
+
+        // Folding, from a header and from a child, one group and all of them.
+        app.ui.connection_group = ConnectionGroup::Process;
+        app.ui.scroll.connection_scroll = 2;
+        check(&mut app, "before a fold");
+        press(&mut app, KeyCode::Char(' '));
+        check(&mut app, "folded from a child");
+        press(&mut app, KeyCode::Char(' '));
+        check(&mut app, "unfolded from the header");
+        press(&mut app, KeyCode::Char('z'));
+        app.ui.scroll.connection_scroll = 4;
+        check(&mut app, "folded all");
+        press(&mut app, KeyCode::Char('z'));
+        check(&mut app, "unfolded all");
+
+        // New snapshots: the rates move rows, a row goes, the table empties.
+        app.ui.scroll.connection_scroll = 30;
+        let mut next = table.clone();
+        for (i, row) in next.iter_mut().enumerate() {
+            row.rx_rate = Some((i % 11) as f64 * 1000.0);
+        }
+        next.rotate_left(13);
+        app.connection_collector.publish_for_test(next.clone());
+        check(&mut app, "a table with new rates");
+        next.truncate(10);
+        app.connection_collector.publish_for_test(next);
+        check(&mut app, "a shorter table, with the cursor past its end");
+        app.connection_collector.publish_for_test(Vec::new());
+        check(&mut app, "an empty table");
+        app.connection_collector.publish_for_test(table);
+        check(&mut app, "the table back");
+    }
+
+    #[test]
+    fn mouse_clicks_and_scrolling_land_on_the_drawn_rows() {
+        let mut app = app_with(synthetic_connections(400, 3));
+        for mode in [
+            ConnectionGroup::Process,
+            ConnectionGroup::Remote,
+            ConnectionGroup::None,
+        ] {
+            app.ui.connection_group = mode;
+            app.ui.scroll.connection_scroll = 0;
+            check(&mut app, "before scrolling");
+            let inner = table_inner_area(app.ui.last_area);
+
+            for _ in 0..30 {
+                mouse(&mut app, MouseEventKind::ScrollDown, inner.y + 1);
+            }
+            assert_eq!(app.ui.scroll.connection_scroll, 90);
+            check(&mut app, "scrolled down");
+            mouse(&mut app, MouseEventKind::ScrollUp, inner.y + 1);
+            assert_eq!(app.ui.scroll.connection_scroll, 87);
+            check(&mut app, "scrolled up");
+
+            // A click selects the row drawn where it lands: the one in the
+            // window the renderer computes, not an offset from the cursor.
+            let view = current_view(&app);
+            let rows = view.rows(&app.ui.connection_collapsed).len();
+            let visible = inner.height as usize - 1;
+            let top = compute_window_top(87, rows, visible);
+            drop(view);
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                inner.y + 1 + 3,
+            );
+            assert_eq!(app.ui.scroll.connection_scroll, top + 3);
+            check(&mut app, "clicked a row");
+        }
+
+        // A click on a header folds it, and the rows below close up.
+        app.ui.connection_group = ConnectionGroup::Process;
+        app.ui.scroll.connection_scroll = 0;
+        check(&mut app, "at the first header");
+        let before = current_view(&app).rows(&app.ui.connection_collapsed).len();
+        let inner = table_inner_area(app.ui.last_area);
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            inner.y + 1,
+        );
+        assert!(current_view(&app).rows(&app.ui.connection_collapsed).len() < before);
+        check(&mut app, "clicked a header");
+    }
+
+    /// One build per table: a frame's four readers, and the keys and the mouse
+    /// between frames, all get the same view until something it was built from
+    /// changes. A fold changes which rows are listed, and is not one of those.
+    #[test]
+    fn the_view_is_rebuilt_only_when_what_it_was_built_from_changes() {
+        let table = synthetic_connections(200, 3);
+        let mut app = app_with(table.clone());
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        terminal.draw(|f| draw_frame(f, &mut app)).unwrap();
+        let view = current_view(&app);
+
+        terminal.draw(|f| draw_frame(f, &mut app)).unwrap();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('z'));
+        mouse(&mut app, MouseEventKind::ScrollDown, 10);
+        selected_connection(&app);
+        selected_group_key(&app);
+        assert!(
+            Arc::ptr_eq(&view, &current_view(&app)),
+            "rebuilt with nothing changed"
+        );
+
+        fn rebuilds(app: &mut App, step: &str, change: impl FnOnce(&mut App)) {
+            let before = current_view(app);
+            change(app);
+            assert!(!Arc::ptr_eq(&before, &current_view(app)), "{step}");
+        }
+        rebuilds(&mut app, "group", |app| {
+            app.ui.connection_group = ConnectionGroup::Remote;
+        });
+        rebuilds(&mut app, "state filter", |app| {
+            app.ui.connection_state_filter = ConnectionStateFilter::Established;
+        });
+        rebuilds(&mut app, "applied filter", |app| {
+            app.ui.connection_filter_active = Some("proc".into());
+        });
+        rebuilds(&mut app, "no filter", |app| {
+            app.ui.connection_filter_active = None;
+        });
+        rebuilds(&mut app, "typed filter", |app| {
+            app.ui.connection_filter_input = true;
+            app.ui.connection_filter_text = "p".into();
+        });
+        rebuilds(&mut app, "filter typed further", |app| {
+            app.ui.connection_filter_text = "pr".into();
+        });
+        rebuilds(&mut app, "sort", |app| {
+            app.ui.sort_states.insert(
+                Tab::Connections,
+                TabSortState {
+                    column: 2,
+                    ascending: false,
+                },
+            );
+        });
+        rebuilds(&mut app, "publish", |app| {
+            app.connection_collector.publish_for_test(table);
+        });
+    }
+
+    /// The view holds a table alive, which only its own tab has any use for.
+    #[test]
+    fn another_tab_does_not_keep_the_view() {
+        let mut app = app_with(synthetic_connections(50, 3));
+        current_view(&app);
+        app.observe_connections();
+        assert!(safe_lock(&app.caches.conn_view, "test").is_some());
+
+        app.ui.current_tab = Tab::Dashboard;
+        app.observe_connections();
+        assert!(safe_lock(&app.caches.conn_view, "test").is_none());
+
+        app.ui.current_tab = Tab::Connections;
+        current_view(&app);
+        app.ui.view_mode = ViewMode::Dense;
+        app.observe_connections();
+        assert!(safe_lock(&app.caches.conn_view, "test").is_none());
     }
 }

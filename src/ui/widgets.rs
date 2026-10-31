@@ -314,6 +314,19 @@ pub fn interface_recently_active(iface: &crate::collectors::traffic::InterfaceTr
     rx.chain(tx).any(|&r| r > 0)
 }
 
+/// A count with thousands separators: `1,280`.
+pub fn format_count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
 /// Unpadded rate for inline use. Zero → "-", integers only.
 pub fn format_bytes_rate(bytes_per_sec: f64) -> String {
     if bytes_per_sec < 1.0 {
@@ -1125,6 +1138,21 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Hi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_count_groups_thousands() {
+        for (n, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (1_280, "1,280"),
+            (10_000, "10,000"),
+            (123_456, "123,456"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(format_count(n), text);
+        }
+    }
+
     use super::*;
 
     fn failure_rows(error: &str, width: u16, spare: u16) -> Vec<String> {

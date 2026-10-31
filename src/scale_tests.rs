@@ -23,22 +23,25 @@
 //! Budgets apply at 10,000 rows only and are multiplied by `NW_PERF_SLACK`
 //! (1 on the reference machine, 3 in CI). The 2,000 and 50,000 rows are
 //! printed but not judged; 50,000 has to work, not to be fast. Diagnose's
-//! whole socket pass is printed at every size and has no budget. A budget
-//! today's code misses is `Pending` on the branch expected to meet it, and
-//! that branch makes it `Enforced`. A missed `Pending` budget fails like any
-//! other, so the command above, like a release candidate's run, passes only
-//! when every budget is met. `NW_PERF_STRICT=0`, which the perf workflow
-//! sets, prints it as pending and does not fail the test.
+//! whole socket pass and a tick with a capture running are printed at every
+//! size and have no budget. A budget today's code misses is `Pending` on the
+//! branch expected to meet it, and that branch makes it `Enforced`. A missed
+//! `Pending` budget fails like any other, so the command above, like a release
+//! candidate's run, passes only when every budget is met. `NW_PERF_STRICT=0`,
+//! which the perf workflow sets, prints it as pending and does not fail the
+//! test.
 
 use crate::app::{draw_frame, handle_key, App, ConnectionGroup, Tab, ViewMode};
 use crate::collectors::attribution::MAX_MATCH_AGE;
 use crate::collectors::connections::{Connection, ConnectionTimeline, MAX_CLOSED_HISTORY};
+use crate::collectors::packets::export::CaptureMetadata;
+use crate::collectors::packets::{StreamProtocol, MAX_STREAMS, STREAM_EVICT_BATCH};
 use crate::collectors::tcp_info::{normalize_endpoint, FlowMap, TcpInfo};
 use crate::config::NetwatchConfig;
 use crate::diagnose::live::rows_by_endpoints;
 use crate::sort::TabSortState;
 use crate::testutil::connections::synthetic_connections;
-use crate::ui::connections::{build_view, selected_connection, ConnRow, COLUMNS};
+use crate::ui::connections::{current_view, selected_connection, ConnRow, COLUMNS};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
 use std::borrow::Cow;
@@ -47,9 +50,6 @@ use std::time::{Duration, Instant};
 
 /// The size the budgets are for.
 const BUDGET_ROWS: usize = 10_000;
-
-/// The branch expected to meet the budgets today's code misses.
-const VIEW_CACHE: &str = "perf/conn-view-cache";
 
 #[derive(Clone, Copy)]
 enum Stat {
@@ -77,14 +77,14 @@ const fn budget(stat: Stat, ms: f64, gate: Gate) -> Budget {
 }
 
 const FRAME_MS: f64 = 33.0;
-const CONNECTIONS_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Pending(VIEW_CACHE));
+const CONNECTIONS_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const FILTERED_CONNECTIONS_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const DASHBOARD_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
-const DENSE_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Pending(VIEW_CACHE));
+const DENSE_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const TOPOLOGY_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
 const TIMELINE_FRAME: Budget = budget(Stat::P99, FRAME_MS, Gate::Enforced);
-const SCROLL_KEY: Budget = budget(Stat::P99, 5.0, Gate::Pending(VIEW_CACHE));
-const TICK_CONSUMERS: Budget = budget(Stat::P50, 15.0, Gate::Pending(VIEW_CACHE));
+const SCROLL_KEY: Budget = budget(Stat::P99, 5.0, Gate::Enforced);
+const TICK_CONSUMERS: Budget = budget(Stat::P50, 15.0, Gate::Enforced);
 const DIAGNOSE_JOIN: Budget = budget(Stat::P50, 2.0, Gate::Enforced);
 #[cfg(target_os = "linux")]
 const POLL: Budget = budget(Stat::P50, 150.0, Gate::Enforced);
@@ -273,6 +273,51 @@ impl Host {
         self
     }
 
+    /// Put a packet of a running capture in the ring, so a tick records the
+    /// poll for the annotations of the packets that follow.
+    fn with_capture(self) -> Self {
+        // Ethernet, IPv4 and UDP headers, nothing else.
+        const FRAME: [u8; 42] = [
+            0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0x08, 0x00, 0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0,
+            0, 192, 0, 2, 10, 198, 18, 0, 1, 4, 210, 0, 53, 0, 8, 0, 0,
+        ];
+        let capture = CaptureMetadata {
+            session: "scale".into(),
+            interface: "eth0".into(),
+            link_type: 1,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            original_len: FRAME.len() as u32,
+        };
+        self.app
+            .packet_collector
+            .ingest_captured_frame_for_test(&FRAME, Some(capture))
+            .expect("the frame did not decode");
+        self
+    }
+
+    /// Track more flows than the running capture's stream tracker holds.
+    fn fill_stream_tracker(&self) {
+        self.app.packet_collector.mark_capturing_for_test();
+        let mut tracker = self.app.packet_collector.stream_tracker.lock().unwrap();
+        for i in 0..=MAX_STREAMS + STREAM_EVICT_BATCH {
+            let src = format!("10.0.{}.{}", i / 256, i % 256);
+            tracker.track_packet(
+                &src,
+                12345,
+                "198.18.0.1",
+                443,
+                StreamProtocol::Tcp,
+                b"",
+                i as u64,
+                "t",
+                None,
+                None,
+                i as u64,
+            );
+        }
+        assert!(tracker.session_dropped_flows() > 0);
+    }
+
     /// Publish the table again with fresh evidence, as the next poll would.
     /// Rows older than `MAX_MATCH_AGE` show as unattributed, and
     /// `connections()` copies the whole table when they go stale to say so,
@@ -451,10 +496,10 @@ fn ten_thousand_rows_render_true_count() {
     // Every row can be scrolled to: the table holds each connection once,
     // the cursor stops on the last row and not before, and the table there
     // draws the last page with the cursor on its bottom row. Stepping there
-    // a key at a time rebuilds the view per key, which a debug build cannot
+    // a key at a time lists the rows per key, which a debug build cannot
     // afford at this size; the clamp is what decides whether the end is
     // reachable.
-    let view = build_view(app);
+    let view = current_view(app);
     let rows = view.rows(&app.ui.connection_collapsed);
     let listed: Vec<RowKey> = rows
         .iter()
@@ -531,7 +576,7 @@ fn strict_fails_a_missed_pending_budget() {
     assert!(strict_from(Some("1")));
     assert!(!strict_from(Some("0")));
 
-    let pending = budget(Stat::P50, 10.0, Gate::Pending(VIEW_CACHE));
+    let pending = budget(Stat::P50, 10.0, Gate::Pending("perf/some-branch"));
     let samples = || vec![Duration::from_millis(20); 10];
     let mut report = Report {
         over: Vec::new(),
@@ -553,7 +598,7 @@ fn strict_fails_a_missed_pending_budget() {
     report.record("missed", BUDGET_ROWS, samples(), pending);
     assert_eq!(
         report.over,
-        ["missed: p50 20.00 ms, budget 10.0 ms owner=perf/conn-view-cache"]
+        ["missed: p50 20.00 ms, budget 10.0 ms owner=perf/some-branch"]
     );
 }
 
@@ -638,6 +683,15 @@ fn scale_connections_frames() {
             let samples = host.frames(iterations(n));
             report.record(&format!("frame/connections/{mode}"), n, samples, budget);
         }
+
+        // A capture has overflowed the stream tracker, so each new table also
+        // counts the rows that have a rate and that could.
+        host.fill_stream_tracker();
+        host.app.ui.connection_group = ConnectionGroup::Process;
+        host.app.ui.connection_filter_active = None;
+        host.app.ui.show_geo = false;
+        let samples = host.frames(iterations(n));
+        report.record("frame/connections/capped", n, samples, CONNECTIONS_FRAME);
     }
     report.finish();
 }
@@ -657,8 +711,12 @@ fn scale_view_frames() {
             let samples = host.frames(iterations(n));
             report.record(case, n, samples, budget);
         }
-        // Only the Dense view asks the kernel for TCP state.
+        // Only the Dense view asks the kernel for TCP state, and the verdicts
+        // that come of it show on the Dashboard too.
         let mut host = host.with_kernel_flows();
+        host.app.ui.current_tab = Tab::Dashboard;
+        let samples = host.frames(iterations(n));
+        report.record("frame/dashboard/verdicts", n, samples, DASHBOARD_FRAME);
         host.app.ui.view_mode = ViewMode::Dense;
         let samples = host.frames(iterations(n));
         report.record("frame/dense", n, samples, DENSE_FRAME);
@@ -710,6 +768,11 @@ fn scale_tick_consumers() {
             samples.push(started.elapsed());
         }
         report.record("tick/churn", n, samples, TICK_CONSUMERS);
+
+        // With a capture running, each poll is also kept for PCAPNG annotations.
+        let mut host = Host::new(n).with_capture();
+        let samples = host.time(iterations(n), App::observe_connections);
+        report.show("tick/capture", n, samples);
     }
     report.finish();
 }
