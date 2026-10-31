@@ -52,9 +52,9 @@ Only `diagnose replay`, `features` and `corpus` are gated. The rest are opt-in a
 would break setups that work today. Rules marked beta are separate, and show their marker wherever
 a rule does.
 
-## Platform tiers (draft for 1.0)
+## Platform tiers
 
-What 1.0 is expected to promise per platform. Until 1.0 this is a draft, and
+What 1.0 promises per platform, as part of [STABILITY](../STABILITY.md). Until 1.0
 every tier is best-effort.
 
 | Tier | Platforms | Meaning |

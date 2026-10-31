@@ -5,6 +5,12 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`STABILITY.md` says what 1.0 promises.** Subcommands, long flags, `config.toml`
+  and `egress-policy.toml` keys, the versioned JSON outputs, `diagnose run` exit
+  codes and metric names won't break without a 2.0, and it lists what stays
+  experimental or isn't covered. `tests/stability.rs` fails if a stable key, flag
+  or metric name is removed or renamed. `SECURITY.md` now gives a support window,
+  and the library is declared internal.
 - **Each stable JSON output has a published JSON Schema, and names it in a
   `metadata` block.** `schemas/` holds one file for `diagnose run --format json`,
   `doctor --json`, the egress NDJSON export, `diagnose export` and `uptime --json`,
