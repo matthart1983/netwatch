@@ -743,9 +743,9 @@ mod tests {
             assert!(error.contains("build_epoch"), "{epoch}: {error}");
         }
         // Far off but representable is only a strange date. Windows' SystemTime
-        // stops at about 1.8e12 seconds, well short of chrono's limit.
+        // stops at about 9e11 seconds, well short of chrono's limit.
         let far = status_of(|path| {
-            std::fs::write(path, test_db::city("DBIP-Country-Lite", 1_000_000_000_000)).unwrap()
+            std::fs::write(path, test_db::city("DBIP-Country-Lite", 100_000_000_000)).unwrap()
         });
         assert!(matches!(far, DbFile::Loaded { .. }), "{far:?}");
     }
