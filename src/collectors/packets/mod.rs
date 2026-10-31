@@ -249,6 +249,7 @@ impl Stream {
             app_protocol: None,
             app_protocol_attempted: false,
             quic_crypto_buf: Vec::new(),
+            tcp_hello: None,
             quic_client_random: None,
             quic_decrypt: QuicDecryptState::default(),
             held_bytes: 0,
@@ -342,6 +343,47 @@ pub struct QuicDecryptState {
     pub disabled: bool,
 }
 
+/// The bytes of a ClientHello seen so far, and where the next ones must start.
+#[derive(Debug, Clone)]
+struct TcpHello {
+    buf: Vec<u8>,
+    record_len: usize,
+    next_seq: u32,
+    a_to_b: bool,
+}
+
+/// Add one TCP segment to the ClientHello in `slot`, returning the record once
+/// it is whole. A retransmit changes nothing. A gap, or data from the other side,
+/// means the missing bytes were sent and never captured, so the wait ends.
+fn collect_client_hello(
+    slot: &mut Option<TcpHello>,
+    a_to_b: bool,
+    seq: Option<u32>,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let hello = slot.as_mut()?;
+    let ahead = seq
+        .filter(|_| a_to_b == hello.a_to_b)
+        .map(|seq| seq.wrapping_sub(hello.next_seq) as i32);
+    match ahead {
+        Some(0) => {}
+        Some(ahead) if ahead < 0 => return None,
+        _ => {
+            *slot = None;
+            return None;
+        }
+    }
+    let wanted = hello.record_len - hello.buf.len();
+    hello
+        .buf
+        .extend_from_slice(&payload[..payload.len().min(wanted)]);
+    hello.next_seq = hello.next_seq.wrapping_add(payload.len() as u32);
+    if hello.buf.len() < hello.record_len {
+        return None;
+    }
+    slot.take().map(|hello| hello.buf)
+}
+
 #[derive(Debug, Clone)]
 pub struct Stream {
     #[allow(dead_code)]
@@ -368,6 +410,9 @@ pub struct Stream {
     /// whenever it lands in fragment 2+. Capped at MAX_QUIC_CRYPTO_BUF
     /// bytes; reset to empty once we've extracted the SNI.
     quic_crypto_buf: Vec<u8>,
+    /// A TLS ClientHello whose record runs past the TCP segment it started
+    /// in. `None` once it is whole, or once it can no longer be.
+    tcp_hello: Option<TcpHello>,
     /// ClientHello random from this QUIC connection's reassembled CRYPTO
     /// frames — the key into the SSLKEYLOGFILE keystore for the flow's
     /// 1-RTT secrets (QUIC 1-RTT decryption, Phase 2). `None` until the
@@ -942,10 +987,14 @@ impl StreamTracker {
 
         // DPI classification.
         //
-        // Two paths:
+        // Three paths:
         // - TCP and "first payload on UDP" → stateless `classify_once`.
         //   This covers TLS / HTTP / DNS / SSH and the single-Initial
         //   QUIC case.
+        // - TCP ClientHello longer than its first segment → label the flow
+        //   from what that segment holds, then collect the rest of the record
+        //   and classify it whole. A post-quantum key share puts a ClientHello
+        //   past 1,500 bytes, so without segmentation offload this is routine.
         // - UDP + QUIC Initial (any time on the flow) → also merge any
         //   CRYPTO-frame fragments into the per-stream buffer and
         //   retry SNI extraction. Handles Chrome-class ClientHellos
@@ -953,25 +1002,70 @@ impl StreamTracker {
         const MAX_CLASSIFY_BYTES: usize = 4096;
         const MAX_QUIC_CRYPTO_BUF: usize = 16 * 1024;
         let is_tcp = matches!(protocol, StreamProtocol::Tcp);
-        // The label and the CRYPTO buffer below are charged as they grow and
+        // The label and the two buffers below are charged as they grow and
         // given back as they shrink.
         let extras = |s: &Stream| {
-            s.app_protocol.as_ref().map_or(0, label_bytes) + s.quic_crypto_buf.capacity()
+            s.app_protocol.as_ref().map_or(0, label_bytes)
+                + s.quic_crypto_buf.capacity()
+                + s.tcp_hello.as_ref().map_or(0, |hello| hello.buf.capacity())
         };
         let extras_held = extras(stream);
 
         if !stream.app_protocol_attempted && payload.len() >= 16 {
-            let slice = &payload[..payload.len().min(MAX_CLASSIFY_BYTES)];
-            stream.app_protocol = crate::dpi::classify_once(slice, is_tcp, src_port, dst_port);
-            // Settle the flag only on a confident answer. A bare
-            // `Quic { sni: None }` means "we know this is QUIC but
-            // haven't extracted the hostname yet" — keep trying on
-            // subsequent Initial packets.
-            stream.app_protocol_attempted = match stream.app_protocol {
-                Some(crate::dpi::AppProtocol::Quic { sni: None, .. }) => false,
-                Some(_) => true,
-                None => true,
-            };
+            let hello_len = is_tcp
+                .then(|| crate::dpi::tls::client_hello_record_len(payload))
+                .flatten();
+            match hello_len {
+                Some(record_len) if record_len > payload.len() => {
+                    // The parser needs the whole record. The first segment
+                    // usually holds the SNI, and it is all there will be if the
+                    // rest is never captured, so label the flow from it now.
+                    stream.app_protocol = Some(crate::dpi::AppProtocol::Tls {
+                        sni: extract_sni(&payload[5..]),
+                        alpn: None,
+                        ech: false,
+                        ja4: None,
+                    });
+                    stream.app_protocol_attempted = true;
+                    stream.tcp_hello = tcp_seq.map(|seq| {
+                        let mut buf = Vec::with_capacity(record_len);
+                        buf.extend_from_slice(payload);
+                        TcpHello {
+                            buf,
+                            record_len,
+                            next_seq: seq.wrapping_add(payload.len() as u32),
+                            a_to_b: is_a_to_b,
+                        }
+                    });
+                }
+                _ => {
+                    // A whole ClientHello is parsed whole, however long it is.
+                    let window = hello_len.unwrap_or(MAX_CLASSIFY_BYTES);
+                    let slice = &payload[..payload.len().min(window)];
+                    stream.app_protocol =
+                        crate::dpi::classify_once(slice, is_tcp, src_port, dst_port);
+                    // Settle the flag only on a confident answer. A bare
+                    // `Quic { sni: None }` means "we know this is QUIC but
+                    // haven't extracted the hostname yet" — keep trying on
+                    // subsequent Initial packets.
+                    stream.app_protocol_attempted = match stream.app_protocol {
+                        Some(crate::dpi::AppProtocol::Quic { sni: None, .. }) => false,
+                        Some(_) => true,
+                        None => true,
+                    };
+                }
+            }
+        } else if !payload.is_empty() && stream.tcp_hello.is_some() {
+            if let Some(whole) =
+                collect_client_hello(&mut stream.tcp_hello, is_a_to_b, tcp_seq, payload)
+            {
+                if let Some(label) = crate::dpi::classify_once(&whole, true, src_port, dst_port) {
+                    stream.app_protocol = Some(label);
+                }
+                if stream.tls_client_random.is_none() {
+                    stream.tls_client_random = crate::dpi::tls::extract_client_random(&whole);
+                }
+            }
         }
 
         // TLS decryption (1.3 and 1.2): opportunistically capture
@@ -5553,6 +5647,252 @@ mod tests {
         hello.extend(&(body.len() as u32).to_be_bytes()[1..]);
         hello.extend(body);
         hello
+    }
+
+    /// A TLS record holding a ClientHello that names `sni`, padded to about
+    /// 1,600 bytes as a post-quantum key share pads a real one, so it spans two
+    /// segments at a 1500 byte MTU.
+    fn large_client_hello(sni: &[u8]) -> Vec<u8> {
+        let be16 = |n: usize| (n as u16).to_be_bytes();
+        let mut exts = vec![0x00, 0x00];
+        exts.extend(be16(sni.len() + 5));
+        exts.extend(be16(sni.len() + 3));
+        exts.push(0x00); // host_name
+        exts.extend(be16(sni.len()));
+        exts.extend(sni);
+        exts.extend([0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02]); // ALPN
+        exts.extend(b"h2");
+        exts.extend([0x00, 0x15]); // padding
+        exts.extend(be16(1_500));
+        exts.extend([0; 1_500]);
+        let mut body = vec![0x03, 0x03];
+        body.extend([0x42; 32]); // random
+        body.push(0); // session id
+        body.extend([0x00, 0x02, 0x13, 0x01]); // one cipher suite
+        body.extend([0x01, 0x00]); // null compression
+        body.extend(be16(exts.len()));
+        body.extend(exts);
+        let mut hello = vec![0x01];
+        hello.extend(&(body.len() as u32).to_be_bytes()[1..]);
+        hello.extend(body);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend(be16(hello.len()));
+        record.extend(hello);
+        record
+    }
+
+    /// One client-to-server TCP segment, with the sequence number the stream
+    /// tracker reads for retransmits and reassembly.
+    fn client_segment(tracker: &mut StreamTracker, seq: u32, payload: &[u8], id: u64) -> u32 {
+        tracker.track_packet(
+            "192.0.2.10",
+            50_443,
+            "198.51.100.20",
+            443,
+            StreamProtocol::Tcp,
+            payload,
+            id,
+            "00:00:00.000",
+            None,
+            Some(seq),
+            u64::from(seq),
+        )
+    }
+
+    fn server_segment(tracker: &mut StreamTracker, seq: u32, payload: &[u8], id: u64) -> u32 {
+        tracker.track_packet(
+            "198.51.100.20",
+            443,
+            "192.0.2.10",
+            50_443,
+            StreamProtocol::Tcp,
+            payload,
+            id,
+            "00:00:00.000",
+            None,
+            Some(seq),
+            u64::from(seq),
+        )
+    }
+
+    fn tls_label(tracker: &StreamTracker, idx: u32) -> (Option<String>, Option<String>, bool) {
+        match &tracker.all_streams[&idx].app_protocol {
+            Some(crate::dpi::AppProtocol::Tls { sni, alpn, ja4, .. }) => {
+                (sni.clone(), alpn.clone(), ja4.is_some())
+            }
+            other => panic!("expected TLS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_client_hello_across_two_segments_is_classified_whole() {
+        let hello = large_client_hello(b"example.com");
+        let (first, rest) = hello.split_at(1_460);
+        let mut tracker = StreamTracker::new();
+        let idx = client_segment(&mut tracker, 1_000, first, 1);
+        // The first segment alone already names the host.
+        assert_eq!(
+            tls_label(&tracker, idx),
+            (Some("example.com".into()), None, false)
+        );
+        assert_eq!(tracker.all_streams[&idx].tls_client_random, None);
+        client_segment(&mut tracker, 1_000 + 1_460, rest, 2);
+        // The whole record adds what only a full parse gives.
+        assert_eq!(
+            tls_label(&tracker, idx),
+            (Some("example.com".into()), Some("h2".into()), true)
+        );
+        assert_eq!(
+            tracker.all_streams[&idx].tls_client_random,
+            Some([0x42; 32])
+        );
+    }
+
+    #[test]
+    fn a_client_hello_split_past_its_sni_keeps_waiting_for_the_name() {
+        let hello = large_client_hello(b"example.com");
+        let (first, rest) = hello.split_at(60);
+        let mut tracker = StreamTracker::new();
+        let idx = client_segment(&mut tracker, 1_000, first, 1);
+        assert_eq!(tls_label(&tracker, idx).0, None);
+        client_segment(&mut tracker, 1_060, rest, 2);
+        assert_eq!(tls_label(&tracker, idx).0, Some("example.com".into()));
+    }
+
+    #[test]
+    fn a_client_hello_across_three_segments_survives_a_retransmit() {
+        let hello = large_client_hello(b"example.com");
+        let mut tracker = StreamTracker::new();
+        let idx = client_segment(&mut tracker, 1_000, &hello[..500], 1);
+        client_segment(&mut tracker, 1_000, &hello[..500], 2);
+        client_segment(&mut tracker, 1_500, &hello[500..1_000], 3);
+        client_segment(&mut tracker, 1_500, &hello[500..1_000], 4);
+        client_segment(&mut tracker, 2_000, &hello[1_000..], 5);
+        assert_eq!(
+            tls_label(&tracker, idx),
+            (Some("example.com".into()), Some("h2".into()), true)
+        );
+    }
+
+    /// The sequence space wraps once in 4 GiB, and a flow can start anywhere.
+    #[test]
+    fn a_client_hello_reassembles_across_a_sequence_wrap() {
+        let hello = large_client_hello(b"example.com");
+        let (first, rest) = hello.split_at(1_460);
+        let mut tracker = StreamTracker::new();
+        let start = u32::MAX - 100;
+        let idx = client_segment(&mut tracker, start, first, 1);
+        client_segment(&mut tracker, start.wrapping_add(1_460), rest, 2);
+        assert_eq!(tls_label(&tracker, idx).1, Some("h2".into()));
+    }
+
+    /// With a segment missing there is no whole record to parse, so the label
+    /// stays what the first segment gave and the buffer goes.
+    #[test]
+    fn a_gap_keeps_the_first_segments_label_and_frees_the_buffer() {
+        let hello = large_client_hello(b"example.com");
+        let mut tracker = StreamTracker::new();
+        let idx = client_segment(&mut tracker, 1_000, &hello[..500], 1);
+        assert!(tracker.all_streams[&idx].tcp_hello.is_some());
+        client_segment(&mut tracker, 2_000, &hello[1_000..], 2);
+        assert!(tracker.all_streams[&idx].tcp_hello.is_none());
+        assert_eq!(
+            tls_label(&tracker, idx),
+            (Some("example.com".into()), None, false)
+        );
+    }
+
+    /// An answer from the server means the rest of the hello was sent and never
+    /// captured, and nothing further will complete it.
+    #[test]
+    fn a_server_reply_ends_the_wait_for_the_rest_of_a_client_hello() {
+        let hello = large_client_hello(b"example.com");
+        let mut tracker = StreamTracker::new();
+        let idx = client_segment(&mut tracker, 1_000, &hello[..500], 1);
+        server_segment(&mut tracker, 9_000, &[0x17; 40], 2);
+        assert!(tracker.all_streams[&idx].tcp_hello.is_none());
+        assert_eq!(tls_label(&tracker, idx).0, Some("example.com".into()));
+    }
+
+    #[test]
+    fn the_client_hello_buffer_is_charged_and_given_back() {
+        let hello = large_client_hello(b"example.com");
+        let (first, rest) = hello.split_at(1_460);
+        let mut tracker = StreamTracker::new();
+        let idx = client_segment(&mut tracker, 1_000, first, 1);
+        let held = tracker.all_streams[&idx].held_bytes;
+        let buffered = tracker.all_streams[&idx]
+            .tcp_hello
+            .as_ref()
+            .unwrap()
+            .buf
+            .capacity();
+        assert!(buffered >= first.len());
+        client_segment(&mut tracker, 2_460, rest, 2);
+        assert!(tracker.all_streams[&idx].tcp_hello.is_none());
+        // The second segment's own bytes are charged; the buffer no longer is.
+        assert!(tracker.all_streams[&idx].held_bytes < held + rest.len() + 256);
+        assert_eq!(
+            tracker.held_bytes,
+            tracker
+                .all_streams
+                .values()
+                .map(|s| s.held_bytes)
+                .sum::<usize>()
+        );
+    }
+
+    /// A record length is the sender's to claim. A claim past the largest TLS
+    /// record, or one its handshake header disagrees with, buffers nothing, and
+    /// the flow is treated as it always was.
+    #[test]
+    fn a_hostile_record_length_buffers_nothing() {
+        for bytes in [
+            // Claims 65535 bytes, past the 16 KiB a record may hold.
+            {
+                let mut b = vec![0x16, 0x03, 0x01, 0xff, 0xff, 0x01, 0x00, 0xff, 0xfb];
+                b.extend([0; 100]);
+                b
+            },
+            // The handshake header says 16 bytes in a record of 4 KiB.
+            {
+                let mut b = vec![0x16, 0x03, 0x01, 0x10, 0x00, 0x01, 0x00, 0x00, 0x10];
+                b.extend([0; 100]);
+                b
+            },
+        ] {
+            let mut tracker = StreamTracker::new();
+            let idx = client_segment(&mut tracker, 1_000, &bytes, 1);
+            let stream = &tracker.all_streams[&idx];
+            assert!(stream.tcp_hello.is_none());
+            assert_eq!(stream.app_protocol, None);
+        }
+    }
+
+    /// A hello too large for the 4 KiB classification window but whole in one
+    /// offloaded frame used to fail the parser.
+    #[test]
+    fn a_client_hello_past_the_classify_window_in_one_frame_is_classified() {
+        let be16 = |n: usize| (n as u16).to_be_bytes();
+        let mut hello = large_client_hello(b"example.com");
+        // Grow the padding, the extensions and both lengths by 6,000 bytes.
+        let grown = |at: usize, hello: &mut Vec<u8>| {
+            let n = u16::from_be_bytes([hello[at], hello[at + 1]]) as usize + 6_000;
+            hello[at..at + 2].copy_from_slice(&be16(n));
+        };
+        hello.extend([0; 6_000]);
+        grown(3, &mut hello);
+        let body = (u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize + 6_000) as u32;
+        hello[6..9].copy_from_slice(&body.to_be_bytes()[1..]);
+        grown(5 + 4 + 2 + 32 + 1 + 4 + 2, &mut hello);
+        let pad = hello.len() - 6_000 - 1_500 - 2;
+        grown(pad, &mut hello);
+        let mut tracker = StreamTracker::new();
+        let idx = client_segment(&mut tracker, 1_000, &hello, 1);
+        assert_eq!(
+            tls_label(&tracker, idx),
+            (Some("example.com".into()), Some("h2".into()), true)
+        );
     }
 
     #[test]

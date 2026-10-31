@@ -30,6 +30,7 @@
 #5 HTTPS 192.0.2.10:50443 -> 198.51.100.20:443 len=120 expert=Chat
   info: 192.0.2.10:50443 → 198.51.100.20:443 [PSH,ACK] Seq=1001 Win=64240 Ack=5001 Payload=66
   stream: 2
+  app: Tls { sni: None, alpn: None, ech: false, ja4: None }
   | Frame: 120 bytes on wire
   | Ethernet: 02:00:00:00:00:01 → 02:00:00:00:00:02, Type: IPv4 (0x0800)
   | IPv4: 192.0.2.10 → 198.51.100.20, TTL: 64, Proto: TCP (6), Len: 257

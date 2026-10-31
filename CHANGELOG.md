@@ -2,6 +2,23 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **A TLS connection keeps its hostname when its ClientHello spans two TCP
+  segments.** netwatch read only a flow's first segment, and its TLS parser needs
+  the whole record. A ClientHello with a post-quantum key share, the default in
+  OpenSSL 3.5 and current browsers, is over 1,500 bytes, so on a capture with no
+  segmentation offload the flow had no TLS label. Connections showed a raw IP for
+  REMOTE, no SNI, ALPN or JA4, and SSLKEYLOGFILE decryption had no client random
+  to look the keys up with. netwatch now labels the flow from the first segment
+  and collects the rest of the record, up to the 16 KiB a TLS record may hold,
+  charged to the stream budget. If a later segment is never captured, the flow
+  keeps the SNI from the first one, with no ALPN or JA4. A ClientHello split
+  across TLS records, or whose segments arrive out of order, is still not
+  reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
+  either.
+
 ## [0.39.0] - 2026-10-31
 
 ### Added
