@@ -477,7 +477,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. `set` and `recover` are experimental. |
-| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Keeps your comments and any key it does not read; delete the file first for a clean one. Refuses to replace a `config.toml` that does not load. |
+| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. To a file that exists it adds only the keys the file lacks, and keeps what is there; delete the file first for a clean one. Refuses to touch a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
 
 `diagnose replay`, `features` and `corpus` read and write episode, feature and corpus formats
@@ -927,8 +927,8 @@ exist until you write one.
 Two ways to write it. From the shell:
 
 ```bash
-netwatch --generate-config    # writes every key at its default value, then exits. Keeps
-                              # your comments and any key it does not read
+netwatch --generate-config    # writes every key at its default value, then exits. To a
+                              # file that exists, adds only the keys it lacks
 ```
 
 Or live in the TUI: `,` opens Settings, `↑`/`↓` moves, `←`/`→` cycles the enum-valued rows
@@ -937,8 +937,8 @@ the free-text ones, `S` saves. Most changes apply the moment you make them — `
 exception, because Landlock and dropped capabilities can't be undone inside a running
 process, so it takes effect on the next launch.
 
-Both leave out the `[diagnose_thresholds]` table while it holds its defaults, so a later
-release can retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
+Neither writes the `[diagnose_thresholds]` table unless you changed it, so a later release can
+retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
 
 A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
 out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
@@ -964,10 +964,21 @@ it yet. A key in it this version does not read is expected rather than a mistake
 warn as unknown. stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
 `ready`, Settings lists it, and the TUI's bottom row says nothing. A save keeps the table.
 
-A save keeps those keys. Settings and `--generate-config` edit a file that loads in place, so
-comments stay too, and a value that has not changed keeps its spelling. `--generate-config`
-sets every key netwatch reads to its default, and empties `diagnose_targets`; what it does not
-read, it leaves.
+A save writes only what the session changed, compared with what it loaded. Settings' `S` and the
+Diagnose tab's `d` change those keys in the file, and a target is found by its `name`, wherever
+it now sits. Everything else stays as the file has it: a key you edited by hand while netwatch
+ran, a value the session clamped or fell back from, a key netwatch does not read, a table at its
+defaults, comments, and any default you never set, which a later release can still change. If you
+and the session changed the same key, the session's value wins for that key alone. `d` on a target
+the file no longer has fails and leaves the file; press `r` to reload. `--view` is for one run, and
+a save does not write it. With nothing to write, the file is not touched.
+
+A save that does write drops a byte-order mark and ends every line in LF. Removing
+`geoip_online` also removes a comment directly above it.
+
+`--generate-config` is the one thing that writes defaults. A new file gets every key. A file that
+exists gains the keys it lacks, and keeps every value and comment it has. It leaves out
+`diagnose_targets` while there are none, so you can append `[[diagnose_targets]]` to the file.
 
 A file netwatch cannot read or parse is different. If the TOML is broken, or a key has a value
 of the wrong type (`refresh_rate_ms = "fast"`), `netwatch` and `netwatch daemon` print the

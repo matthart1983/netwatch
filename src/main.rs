@@ -26,7 +26,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         netwatch::cli::Command::GenerateConfig => {
-            NetwatchConfig::default().save()?;
+            NetwatchConfig::generate()?;
             println!(
                 "Config written to {}",
                 NetwatchConfig::path()

@@ -6,7 +6,9 @@ of this implementation.
 
 ## Developer targets
 
-Add targets to netwatch's `config.toml`; reload with **r** in TUI coverage or restart:
+Add targets to netwatch's `config.toml`; reload with **r** in TUI coverage or restart.
+A file from `--generate-config` before 0.40 has a `diagnose_targets = []` line. Delete
+it first: TOML does not allow that and `[[diagnose_targets]]` in one file.
 
 ```toml
 diagnose_record_episodes = true
@@ -210,9 +212,9 @@ recorded episode keeps the thresholds it ran with, so a replay judges it by the
 same numbers. An episode recorded before a threshold existed replays with that
 threshold's default: one from before 0.34 is judged against the σ and delta
 floors and the 2σ close line it ran without.
-`--generate-config` and the Settings editor's save write the table only once it
-differs from the defaults. Then they write every key, and a key in the file
-keeps its value when a later release retunes that default.
+`--generate-config` leaves the table out, and nothing else in netwatch changes a
+threshold, so a key you did not set follows the default when a later release
+retunes it. A key you set keeps its value.
 
 Every σ is floored before it is used. A resolver that answers from cache in
 1.2 ms, give or take 0.05 ms, is judged as if σ were 0.5 ms, so 3σ is 2.7 ms

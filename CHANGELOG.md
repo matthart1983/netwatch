@@ -69,9 +69,11 @@ All notable changes to NetWatch will be documented in this file.
 - **Move `--api-key KEY` to `NETWATCH_API_KEY=KEY`.** Nothing stops working, but the
   flag now warns on stderr, so a wrapper that treats stderr output as failure sees it.
   The units in `packaging/` already use the variable.
-- **Delete `config.toml` before `--generate-config` if you want a clean file.** It
-  still sets every key netwatch reads to its default, but it now keeps your comments and
-  any key netwatch does not read, where it used to overwrite the whole file.
+- **Delete `config.toml` before `--generate-config` if you want to start again.** It used
+  to overwrite the file with the defaults. It now adds the keys the file lacks and keeps
+  what it has, so it no longer resets anything.
+- **Delete `diagnose_targets = []` from a generated file before adding a target.** Older
+  releases wrote that line, and TOML does not allow it and `[[diagnose_targets]]` together.
 - **Fix or remove any key netwatch now warns about.** The setting never did anything. A
   wrapper that treats stderr output as failure will see the warning.
 - **If you parse the JSON in PCAPNG packet comments, check `schema`.** REFERENCE used to
@@ -100,16 +102,28 @@ All notable changes to NetWatch will be documented in this file.
   across TLS records, or whose segments arrive out of order, is still not
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
-- **Saving config.toml no longer deletes what netwatch does not read.** Settings,
-  `--generate-config` and a Diagnose target toggle rewrote the whole file from the
-  struct, so a key from a newer version or a typo went, and so did the warning about
-  it, with every comment in the file. A save now edits a file that loads in place.
-  Those keys stay, comments stay, a value that has not changed keeps its spelling,
-  and a changed one keeps its line's comment. `--generate-config` still sets every
-  key netwatch reads to its default, and still empties `diagnose_targets`, whose
-  entries take their own keys with them. A removed key such as `geoip_online` still
-  goes on a save. If the result would not read back as the config being saved, the
-  save fails and the file stays.
+- **A save writes only what the session changed.** Settings and the Diagnose target
+  toggle rewrote the whole file from the session's copy. A key netwatch does not read
+  went, with the warning about it and every comment in the file. So did a hand edit made
+  while netwatch ran, which is how `sandbox = "strict"` could go back to `on` when a
+  session saved a theme. `refresh_rate_ms = 50` became 100 and `view = "future_view"`
+  became `full` on an unrelated save. Every save also wrote every default, growing a
+  one-line file to 49 lines and holding today's defaults there when a release changed
+  one. Now a save compares the session's values with what it loaded and changes those
+  keys in the file, keeping the line's comment. Everything else stays as the file has it.
+  If you and the session changed the same key, the session's value wins for that key
+  alone. A target is found by `name`, so entries reordered by hand keep their own
+  comments and keys, a target added by hand survives, and `d` changes only that target's
+  `enabled`. `d` on a target the file no longer has fails and leaves the file. `--view`
+  is for one run, and a save no longer makes it the default. With nothing to write, the
+  file is not touched. A save that does write drops a byte-order mark and ends every line
+  in LF. Removing `geoip_online` also removes a comment directly above it. If the result
+  would not read back as the file plus those changes, the save fails and the file stays.
+- **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
+  thing that writes defaults. A new file gets every key. A file that exists gains the
+  keys it lacks and keeps what it has, values included. It no longer writes
+  `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
+  append a TOML error, so the file then failed to load with `config_invalid`.
 - **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
   rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key
   in the rule was lost. Comments inside a promoted rule are still lost.

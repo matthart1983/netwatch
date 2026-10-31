@@ -1740,8 +1740,8 @@ where
         app.ui.view_mode = v;
         // Keep the settings modal honest: it renders the in-memory config, and
         // showing "full" while the screen is plainly Dense makes the row look
-        // broken. Nothing is written to disk unless the user presses `S`.
-        app.user_config.view = v.name().to_string();
+        // broken. A save does not write it, unless the View row is changed too.
+        app.user_config.set_view_for_this_run(v.name());
     }
 
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
@@ -3388,9 +3388,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 Ok(config) => {
                     app.diagnose.target_prober.cancel();
                     app.diagnose.active_prober.cancel();
-                    app.user_config.diagnose_targets = config.diagnose_targets;
-                    app.user_config.diagnose_probes = config.diagnose_probes;
-                    app.user_config.load_warnings = config.load_warnings;
+                    app.user_config.reload_diagnose_settings(config);
                     app.diagnose.target_selected = 0;
                     app.diagnose.set_status(
                         "Diagnose configuration reloaded; changed targets learn separate baselines",

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 /// User-facing persistent configuration, stored as `netwatch/config.toml`
 /// under the platform config directory (`dirs::config_dir()`): `~/.config` on
@@ -167,6 +167,9 @@ pub struct NetwatchConfig {
     /// ```
     #[serde(default)]
     pub diagnose_probes: crate::diagnose::active::Config,
+    /// Left out of a file while empty: `diagnose_targets = []` is a key, and the
+    /// `[[diagnose_targets]]` someone appends after it is then a TOML error.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnose_targets: Vec<crate::diagnose::targets::TargetConfig>,
 
     /// The Diagnose engine's thresholds, e.g.
@@ -182,9 +185,9 @@ pub struct NetwatchConfig {
     /// is logged and replaced by its default. Read at startup: an episode
     /// records the thresholds it ran with, so they do not change mid-run.
     ///
-    /// Saved only once it differs from the defaults. `--generate-config` and
-    /// the Settings editor write the whole config, and a table of today's
-    /// defaults in the file would hold them there when a release retunes one.
+    /// `--generate-config` leaves it out while it holds the defaults. Every other
+    /// key it writes, and a table of today's defaults in the file would hold them
+    /// there when a release retunes one.
     #[serde(default, skip_serializing_if = "is_default_thresholds")]
     pub diagnose_thresholds: crate::diagnose::detectors::Thresholds,
 
@@ -197,6 +200,14 @@ pub struct NetwatchConfig {
     /// from or written to a file; see [`ConfigWarning`].
     #[serde(skip)]
     pub load_warnings: Vec<ConfigWarning>,
+
+    /// The values this session started from, set by loading and by each save. A
+    /// save writes only what differs from these. `None` for a config built in
+    /// code, which started from the defaults. Never read from or written to a
+    /// file. Public because the rest of the crate and the examples build this
+    /// struct with `..Default::default()`, which needs every field visible.
+    #[serde(skip)]
+    pub loaded: Option<toml::Table>,
 }
 
 /// `[experimental]` in config.toml: where a setting goes while it can still
@@ -307,6 +318,7 @@ impl Default for NetwatchConfig {
             confirm_quit: false,
             experimental: ExperimentalConfig::default(),
             load_warnings: Vec::new(),
+            loaded: None,
         }
     }
 }
@@ -523,88 +535,560 @@ pub(crate) fn from_toml_reporting_unread<T: serde::de::DeserializeOwned>(
 
 const EXPERIMENTAL_TABLE: &str = "experimental";
 
-/// A config file as read: its text, with any renamed keys moved, the config it
-/// holds, and the keys that were not read.
+/// A config file as read: its text, with any renamed keys moved, and the config
+/// it holds.
 struct ParsedConfig {
     text: String,
     config: NetwatchConfig,
-    unread: Vec<KeyPath>,
 }
 
-/// Bring `old`, a table as the file has it, up to `new`, what the config would
-/// write. Comments and layout stay, and so does a value that has not changed,
-/// however it is spelled. What netwatch read but does not write back goes: a
-/// removed key such as `geoip_online`, a table back at its defaults. A key it
-/// did not read stays, because it may belong to another version or be a typo
-/// the user has yet to fix. `keep` lists those, and `at` is where `old` is.
-fn merge_table(old: &mut dyn TableLike, new: &Table, at: &mut KeyPath, keep: &[KeyPath]) {
-    let gone: Vec<String> = old
-        .iter()
-        .map(|(key, _)| key.to_owned())
-        .filter(|key| !new.contains_key(key))
-        .collect();
-    for key in gone {
-        at.push(key.clone());
-        // A key not read, or inside a table not read, is left exactly as it is.
-        if !keep.iter().any(|kept| at.starts_with(kept)) {
-            if keep.iter().any(|kept| kept.starts_with(at)) {
-                if let Some(table) = old.get_mut(&key).and_then(Item::as_table_like_mut) {
-                    merge_table(table, &Table::new(), at, keep);
+/// A list of keys that changed: where each is, and its value now, or `None` for
+/// an optional key that no longer has one.
+type KeyChanges = Vec<(KeyPath, Option<toml::Value>)>;
+
+/// One change to `diagnose_targets`. A target is known by its `name`, and by `nth`
+/// among any that share it, because its place in the file can change while a
+/// session runs: entries reordered by hand must not take each other's keys.
+#[derive(Debug, Clone, PartialEq)]
+enum TargetChange {
+    Added {
+        name: String,
+        nth: usize,
+        entry: toml::Table,
+    },
+    Removed {
+        name: String,
+        nth: usize,
+    },
+    Fields {
+        name: String,
+        nth: usize,
+        fields: KeyChanges,
+    },
+}
+
+/// What a session changed: the values it holds now against the ones it started
+/// from. This, and not the session's whole config, is what a save writes, so a
+/// hand edit made while it ran stays, and so does a value `validate` corrected
+/// for the session but nobody asked to rewrite. If the file changed the same key,
+/// the session's change wins for that key alone.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Changes {
+    keys: KeyChanges,
+    targets: Vec<TargetChange>,
+}
+
+impl Changes {
+    fn between(now: &toml::Table, was: &toml::Table) -> Self {
+        let (mut plain_now, mut plain_was) = (now.clone(), was.clone());
+        plain_now.remove(TARGETS_KEY);
+        plain_was.remove(TARGETS_KEY);
+        let mut keys = KeyChanges::new();
+        diff_tables(&plain_now, &plain_was, &mut KeyPath::new(), &mut keys);
+
+        let (targets_now, targets_was) = (target_entries(now), target_entries(was));
+        let mut targets = Vec::new();
+        for (name, nth, entry) in &targets_now {
+            let (name, nth) = (name.clone(), *nth);
+            match targets_was.iter().find(|t| t.0 == name && t.1 == nth) {
+                None => targets.push(TargetChange::Added {
+                    name,
+                    nth,
+                    entry: (*entry).clone(),
+                }),
+                Some((_, _, old)) => {
+                    let mut fields = KeyChanges::new();
+                    diff_tables(entry, old, &mut KeyPath::new(), &mut fields);
+                    if !fields.is_empty() {
+                        targets.push(TargetChange::Fields { name, nth, fields });
+                    }
                 }
-            } else {
-                old.remove(&key);
             }
+        }
+        for (name, nth, _) in &targets_was {
+            if !targets_now.iter().any(|t| t.0 == *name && t.1 == *nth) {
+                targets.push(TargetChange::Removed {
+                    name: name.clone(),
+                    nth: *nth,
+                });
+            }
+        }
+        Self { keys, targets }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.targets.is_empty()
+    }
+
+    /// Make these changes in `doc`, or in `appended` for what has to go after
+    /// everything already in the file.
+    fn write_into(
+        &self,
+        doc: &mut DocumentMut,
+        appended: &mut DocumentMut,
+        file: &Path,
+    ) -> anyhow::Result<()> {
+        for (path, value) in &self.keys {
+            match value {
+                Some(value) => {
+                    let item = item_of(value)?;
+                    write_key(doc.as_table_mut(), false, path, path, &item, appended);
+                }
+                None => remove_key(doc.as_table_mut(), path),
+            }
+        }
+        for change in &self.targets {
+            match change {
+                TargetChange::Fields { name, nth, fields } => {
+                    // Writing `enabled` alone would make an entry with no host.
+                    let entry = target_in_file(doc, name, *nth).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "target {name} is no longer in {}; press r in Diagnose coverage to reload",
+                            file.display()
+                        )
+                    })?;
+                    write_target_fields(entry, fields)?;
+                }
+                TargetChange::Added { name, nth, entry } => {
+                    if let Some(found) = target_in_file(doc, name, *nth) {
+                        let fields: KeyChanges = entry
+                            .iter()
+                            .map(|(key, value)| (vec![key.clone()], Some(value.clone())))
+                            .collect();
+                        write_target_fields(found, &fields)?;
+                    } else {
+                        append_target(doc, appended, entry)?;
+                    }
+                }
+                TargetChange::Removed { name, nth } => remove_target(doc, name, *nth),
+            }
+        }
+        Ok(())
+    }
+
+    /// `values` as they should read once these changes are made. A second, plain
+    /// statement of what [`Self::write_into`] does, for the check after a save.
+    fn applied_to(&self, mut values: toml::Table) -> toml::Table {
+        for (path, value) in &self.keys {
+            set_plain(&mut values, path, value.as_ref());
+        }
+        if self.targets.is_empty() {
+            return values;
+        }
+        let mut list = match values.remove(TARGETS_KEY) {
+            Some(toml::Value::Array(list)) => list,
+            _ => Vec::new(),
+        };
+        let find = |list: &[toml::Value], name: &str, nth: usize| {
+            list.iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.get("name").and_then(toml::Value::as_str) == Some(name))
+                .map(|(index, _)| index)
+                .nth(nth)
+        };
+        for change in &self.targets {
+            match change {
+                TargetChange::Fields { name, nth, fields } => {
+                    if let Some(index) = find(&list, name, *nth) {
+                        if let Some(entry) = list[index].as_table_mut() {
+                            for (path, value) in fields {
+                                set_plain(entry, path, value.as_ref());
+                            }
+                        }
+                    }
+                }
+                TargetChange::Added { name, nth, entry } => match find(&list, name, *nth) {
+                    Some(index) => list[index] = toml::Value::Table(entry.clone()),
+                    None => list.push(toml::Value::Table(entry.clone())),
+                },
+                TargetChange::Removed { name, nth } => {
+                    if let Some(index) = find(&list, name, *nth) {
+                        list.remove(index);
+                    }
+                }
+            }
+        }
+        if !list.is_empty() {
+            values.insert(TARGETS_KEY.to_owned(), toml::Value::Array(list));
+        }
+        values
+    }
+}
+
+const TARGETS_KEY: &str = "diagnose_targets";
+const THRESHOLDS_KEY: &str = "diagnose_thresholds";
+
+/// Keys netwatch no longer reads, which a save takes out of the file. A comment
+/// on the line above one goes with it.
+const REMOVED_KEYS: &[&str] = &["geoip_online"];
+
+fn diff_tables(now: &toml::Table, was: &toml::Table, at: &mut KeyPath, out: &mut KeyChanges) {
+    for (key, value) in now {
+        at.push(key.clone());
+        match (value, was.get(key)) {
+            (toml::Value::Table(value), Some(toml::Value::Table(old))) => {
+                diff_tables(value, old, at, out);
+            }
+            (toml::Value::Table(value), None) => {
+                diff_tables(value, &toml::Table::new(), at, out);
+            }
+            (value, Some(old)) if values_match(value, old) => {}
+            (value, _) => out.push((at.clone(), Some(value.clone()))),
         }
         at.pop();
     }
-    for (key, item) in new.iter() {
+    for (key, old) in was {
+        if !now.contains_key(key) {
+            at.push(key.clone());
+            match old {
+                toml::Value::Table(old) => diff_tables(&toml::Table::new(), old, at, out),
+                _ => out.push((at.clone(), None)),
+            }
+            at.pop();
+        }
+    }
+}
+
+/// `==`, except that a NaN is the same as itself. A hand-written `nan` must not
+/// count as a change on every save.
+fn values_match(a: &toml::Value, b: &toml::Value) -> bool {
+    match (a, b) {
+        (toml::Value::Float(a), toml::Value::Float(b)) => a == b || (a.is_nan() && b.is_nan()),
+        (toml::Value::Table(a), toml::Value::Table(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, a)| b.get(key).is_some_and(|b| values_match(a, b)))
+        }
+        (toml::Value::Array(a), toml::Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| values_match(a, b))
+        }
+        _ => a == b,
+    }
+}
+
+/// Each target with its name and its place among any sharing the name.
+fn target_entries(values: &toml::Table) -> Vec<(String, usize, &toml::Table)> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    values
+        .get(TARGETS_KEY)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .map(|entry| {
+            let name = entry
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("");
+            let nth = seen.entry(name).or_insert(0);
+            let at = *nth;
+            *nth += 1;
+            (name.to_owned(), at, entry)
+        })
+        .collect()
+}
+
+fn set_plain(table: &mut toml::Table, path: &[String], value: Option<&toml::Value>) {
+    match path {
+        [] => {}
+        [leaf] => match value {
+            Some(value) => {
+                table.insert(leaf.clone(), value.clone());
+            }
+            None => {
+                table.remove(leaf);
+            }
+        },
+        [head, rest @ ..] => {
+            let child = table
+                .entry(head.clone())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let Some(child) = child.as_table_mut() {
+                set_plain(child, rest, value);
+            }
+        }
+    }
+}
+
+/// `value` as the item a file would hold, laid out as a generated file lays it out.
+fn item_of(value: &toml::Value) -> anyhow::Result<Item> {
+    const KEY: &str = "key";
+    let mut one = toml::Table::new();
+    one.insert(KEY.to_owned(), value.clone());
+    let doc: DocumentMut = toml::to_string_pretty(&one)?.parse()?;
+    doc.as_table()
+        .get(KEY)
+        .map(without_positions)
+        .ok_or_else(|| anyhow::anyhow!("no value for a changed key"))
+}
+
+/// Put `item` at `path` under `table`, the rest of `full`. A value already there
+/// keeps its line's comment, and stays exactly as written if it means the same. A
+/// new table goes in `appended`, after everything the file has, so that comments
+/// at the end of the file stay after what they followed. `inline` says `table` is
+/// an inline table, which nothing can be appended to.
+fn write_key(
+    table: &mut dyn TableLike,
+    inline: bool,
+    path: &[String],
+    full: &[String],
+    item: &Item,
+    appended: &mut DocumentMut,
+) {
+    let [head, rest @ ..] = path else {
+        return;
+    };
+    if rest.is_empty() {
+        if let (Some(Item::Value(current)), Item::Value(new)) = (table.get_mut(head), item) {
+            if !same_value(current, new) {
+                let decor = current.decor().clone();
+                *current = new.clone();
+                *current.decor_mut() = decor;
+            }
+            return;
+        }
+        table.remove(head);
+        if inline || item.is_value() {
+            table.insert(head, without_positions(item));
+        } else {
+            append_at(appended.as_table_mut(), full, item);
+        }
+        return;
+    }
+    match table.get_mut(head) {
+        Some(child) if child.is_table_like() => {
+            let child_inline = child.is_value();
+            if let Some(child) = child.as_table_like_mut() {
+                write_key(child, child_inline, rest, full, item, appended);
+            }
+        }
+        _ if inline => {
+            table.insert(head, Item::Value(Value::InlineTable(InlineTable::new())));
+            if let Some(child) = table.get_mut(head).and_then(Item::as_table_like_mut) {
+                write_key(child, true, rest, full, item, appended);
+            }
+        }
+        _ => append_at(appended.as_table_mut(), full, item),
+    }
+}
+
+fn remove_key(table: &mut dyn TableLike, path: &[String]) {
+    match path {
+        [] => {}
+        [leaf] => {
+            table.remove(leaf);
+        }
+        [head, rest @ ..] => {
+            if let Some(child) = table.get_mut(head).and_then(Item::as_table_like_mut) {
+                remove_key(child, rest);
+            }
+        }
+    }
+}
+
+/// Add `item` at `path` to what goes after the file. The tables on the way write
+/// no header of their own unless they get a value, as the file may have one.
+fn append_at(table: &mut Table, path: &[String], item: &Item) {
+    match path {
+        [] => {}
+        [leaf] => {
+            table.insert(leaf, without_positions(item));
+        }
+        [head, rest @ ..] => {
+            let child = table.entry(head).or_insert_with(|| {
+                let mut child = Table::new();
+                child.set_implicit(true);
+                Item::Table(child)
+            });
+            if let Some(child) = child.as_table_mut() {
+                append_at(child, rest, item);
+            }
+        }
+    }
+}
+
+/// The entry in the file for this target, by name.
+fn target_in_file<'a>(
+    doc: &'a mut DocumentMut,
+    name: &str,
+    nth: usize,
+) -> Option<&'a mut dyn TableLike> {
+    tables_in(doc.get_mut(TARGETS_KEY)?)?
+        .into_iter()
+        .filter(|entry| entry.get("name").and_then(Item::as_str) == Some(name))
+        .nth(nth)
+}
+
+/// A target's own keys are all plain values, so nothing goes in `appended`.
+fn write_target_fields(entry: &mut dyn TableLike, fields: &KeyChanges) -> anyhow::Result<()> {
+    let mut unused = DocumentMut::new();
+    for (path, value) in fields {
+        match value {
+            Some(value) => {
+                let item = item_of(value)?;
+                write_key(&mut *entry, false, path, path, &item, &mut unused);
+            }
+            None => remove_key(&mut *entry, path),
+        }
+    }
+    Ok(())
+}
+
+/// A target the file does not have. After the file's other entries, or in place
+/// of an empty `diagnose_targets = []`, or in an array of inline tables if that is
+/// how the file writes them.
+fn append_target(
+    doc: &mut DocumentMut,
+    appended: &mut DocumentMut,
+    entry: &toml::Table,
+) -> anyhow::Result<()> {
+    let list = item_of(&toml::Value::Array(vec![toml::Value::Table(entry.clone())]))?;
+    let Some(table) = list.as_array_of_tables().and_then(|list| list.get(0)) else {
+        anyhow::bail!("a target did not serialize as a table");
+    };
+    if let Some(Item::Value(Value::Array(values))) = doc.get_mut(TARGETS_KEY) {
+        if !values.is_empty() {
+            values.push_formatted(Value::InlineTable(table.clone().into_inline_table()));
+            return Ok(());
+        }
+        doc.remove(TARGETS_KEY);
+    }
+    let slot = appended
+        .as_table_mut()
+        .entry(TARGETS_KEY)
+        .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    if let Some(entries) = slot.as_array_of_tables_mut() {
+        entries.push(table.clone());
+    }
+    Ok(())
+}
+
+fn remove_target(doc: &mut DocumentMut, name: &str, nth: usize) {
+    let named = |entry: &dyn TableLike| entry.get("name").and_then(Item::as_str) == Some(name);
+    match doc.get_mut(TARGETS_KEY) {
+        Some(Item::ArrayOfTables(entries)) => {
+            let index = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| named(*entry))
+                .map(|(index, _)| index)
+                .nth(nth);
+            if let Some(index) = index {
+                entries.remove(index);
+            }
+        }
+        Some(Item::Value(Value::Array(values))) => {
+            let index = values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| {
+                    value.as_inline_table().is_some_and(|entry| {
+                        entry.get("name").and_then(Value::as_str) == Some(name)
+                    })
+                })
+                .map(|(index, _)| index)
+                .nth(nth);
+            if let Some(index) = index {
+                values.remove(index);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The defaults `file` has no key for, at any depth, in the order a generated file
+/// has them. A list the file has at all counts as set.
+fn missing_defaults(
+    file: &dyn TableLike,
+    defaults: &Table,
+    at: &mut KeyPath,
+    out: &mut Vec<(KeyPath, Item)>,
+) {
+    for (key, item) in defaults.iter() {
         at.push(key.to_owned());
-        let merged = old
-            .get_mut(key)
-            .is_some_and(|current| merge_item(current, item, at, keep));
-        if !merged {
-            // New to the file, or now a different kind of thing, such as the
-            // `diagnose_targets = []` of a reset. The key goes too, as a table's
-            // has none of the spacing a value's needs.
-            old.remove(key);
-            old.insert(key, without_positions(item));
+        match (file.get(key), item) {
+            (None, _) => out.push((at.clone(), item.clone())),
+            (Some(current), Item::Table(defaults)) => {
+                if let Some(table) = current.as_table_like() {
+                    missing_defaults(table, defaults, at, out);
+                }
+            }
+            _ => {}
         }
         at.pop();
     }
 }
 
-/// Whether `new` could be written into `current` where it is.
-fn merge_item(current: &mut Item, new: &Item, at: &mut KeyPath, keep: &[KeyPath]) -> bool {
-    match new {
-        Item::Table(new) => match current.as_table_like_mut() {
-            Some(table) => merge_table(table, new, at, keep),
-            None => return false,
-        },
-        // An entry at a time while there are as many as the file has. Only a
-        // reset or a hand edit changes the number.
-        Item::ArrayOfTables(new) => {
-            let Some(tables) = tables_in(current).filter(|tables| tables.len() == new.len()) else {
-                return false;
-            };
-            for (index, (table, new)) in tables.into_iter().zip(new.iter()).enumerate() {
-                at.push(index.to_string());
-                merge_table(table, new, at, keep);
-                at.pop();
-            }
-        }
-        Item::Value(new) => {
-            let Item::Value(value) = current else {
-                return false;
-            };
-            if !same_value(value, new) {
-                let decor = value.decor().clone();
-                *value = new.clone();
-                *value.decor_mut() = decor;
-            }
-        }
-        Item::None => return false,
+/// The file as `parsed` holds it, or nothing yet, with renamed keys under their new
+/// names, removed keys gone, `changes` made, and with `add_defaults` every missing
+/// key added. `None` if that leaves the file as it is, so that it is not written.
+fn edited_file(
+    parsed: Option<&ParsedConfig>,
+    changes: &Changes,
+    add_defaults: bool,
+    file: &Path,
+) -> anyhow::Result<Option<String>> {
+    let text = parsed.map_or("", |parsed| parsed.text.as_str());
+    let mut doc: DocumentMut = text.parse()?;
+    let mut appended = DocumentMut::new();
+    let mut tidied = parsed.is_some_and(|parsed| {
+        parsed
+            .config
+            .load_warnings
+            .iter()
+            .any(|warning| matches!(warning.kind, ConfigWarningKind::RenamedKey { .. }))
+    });
+    for key in REMOVED_KEYS {
+        tidied |= doc.remove(key).is_some();
     }
-    true
+    changes.write_into(&mut doc, &mut appended, file)?;
+    let mut missing = Vec::new();
+    if add_defaults {
+        let defaults: DocumentMut = toml::to_string_pretty(&NetwatchConfig::default())?.parse()?;
+        missing_defaults(
+            doc.as_table(),
+            defaults.as_table(),
+            &mut KeyPath::new(),
+            &mut missing,
+        );
+        for (path, item) in &missing {
+            write_key(doc.as_table_mut(), false, path, path, item, &mut appended);
+        }
+    }
+    if changes.is_empty() && missing.is_empty() && !tidied {
+        return Ok(None);
+    }
+    let mut edited = doc.to_string();
+    let tail = appended.to_string();
+    let tail = tail.trim_start_matches(['\r', '\n']);
+    if !tail.is_empty() {
+        if !edited.is_empty() {
+            if !edited.ends_with('\n') {
+                edited.push('\n');
+            }
+            edited.push('\n');
+        }
+        edited.push_str(tail);
+    }
+    check_reads_back(text, &edited, changes)?;
+    Ok(Some(edited))
+}
+
+/// Refuse an edit that does not mean what it should: the file as it was, plus
+/// `changes`, and nothing else. The file it would replace does load, so a bug in
+/// the editing must not cost anyone that file.
+fn check_reads_back(before: &str, after: &str, changes: &Changes) -> anyhow::Result<()> {
+    let before: NetwatchConfig = toml::from_str(before)?;
+    let after: NetwatchConfig = toml::from_str(after)?;
+    let wanted = changes.applied_to(before.values()?);
+    anyhow::ensure!(
+        values_match(
+            &toml::Value::Table(after.values()?),
+            &toml::Value::Table(wanted)
+        ),
+        "cannot update it in place; not overwriting it"
+    );
+    Ok(())
 }
 
 /// The tables of an array of tables, or of an array of inline tables.
@@ -621,11 +1105,18 @@ fn tables_in(item: &mut Item) -> Option<Vec<&mut dyn TableLike>> {
     }
 }
 
-fn same_value(a: &Value, b: &Value) -> bool {
+/// Whether two values mean the same, however each is written: `'a'` and `"a"`,
+/// `1_000` and `1000`, and `30` and `30.0`, as a float key reads either.
+pub(crate) fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => a.value() == b.value(),
         (Value::Integer(a), Value::Integer(b)) => a.value() == b.value(),
-        (Value::Float(a), Value::Float(b)) => a.value() == b.value(),
+        (Value::Float(a), Value::Float(b)) => {
+            a.value() == b.value() || (a.value().is_nan() && b.value().is_nan())
+        }
+        (Value::Integer(a), Value::Float(b)) | (Value::Float(b), Value::Integer(a)) => {
+            *a.value() as f64 == *b.value()
+        }
         (Value::Boolean(a), Value::Boolean(b)) => a.value() == b.value(),
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| same_value(a, b))
@@ -718,14 +1209,71 @@ impl NetwatchConfig {
                 position: source.span().map(|span| line_column(&contents, span.start)),
                 source: Box::new(source),
             })?;
+        // After `validate`, so that a value it corrected is not a change this
+        // session made. The file keeps what it says until someone edits that key.
         parsed.config.validate();
+        parsed.config.loaded = parsed.config.values().ok();
         Ok(Some(parsed))
     }
 
     /// `text`, the contents of `file`, with [`load_warnings`](Self::load_warnings)
     /// filled in. Not validated: that is for what a session will run on.
     pub fn from_toml(text: &str, file: &Path) -> Result<Self, toml::de::Error> {
-        Self::parse(text, file, RENAMED_KEYS).map(|parsed| parsed.config)
+        Self::parse(text, file, RENAMED_KEYS).map(|mut parsed| {
+            parsed.config.loaded = parsed.config.values().ok();
+            parsed.config
+        })
+    }
+
+    /// Every value as TOML, with the thresholds there even at their defaults, so
+    /// that changing one is a change to that one key.
+    fn values(&self) -> Result<toml::Table, toml::ser::Error> {
+        let mut values = toml::Table::try_from(self)?;
+        if !values.contains_key(THRESHOLDS_KEY) {
+            values.insert(
+                THRESHOLDS_KEY.to_owned(),
+                toml::Value::try_from(self.diagnose_thresholds)?,
+            );
+        }
+        Ok(values)
+    }
+
+    /// What a save compares against.
+    fn baseline(&self) -> Result<toml::Table, toml::ser::Error> {
+        match &self.loaded {
+            Some(values) => Ok(values.clone()),
+            None => Self::default().values(),
+        }
+    }
+
+    /// `--view` is a decision about this run, not a change to the saved default,
+    /// so a save leaves the file's `view` alone unless someone also changes it in
+    /// Settings. The Settings row still shows what is on screen.
+    pub fn set_view_for_this_run(&mut self, view: &str) {
+        self.view = view.to_owned();
+        if let Ok(mut baseline) = self.baseline() {
+            baseline.insert("view".to_owned(), toml::Value::String(view.to_owned()));
+            self.loaded = Some(baseline);
+        }
+    }
+
+    /// Take the Diagnose settings from `fresh`, the file read again, for the
+    /// Diagnose tab's `r`. What they now hold is what the file says, so a later
+    /// save has nothing to write for them. Other unsaved changes stay unsaved.
+    pub fn reload_diagnose_settings(&mut self, fresh: Self) {
+        let (Ok(mut baseline), Ok(values)) = (self.baseline(), fresh.values()) else {
+            return;
+        };
+        for key in [TARGETS_KEY, "diagnose_probes"] {
+            match values.get(key) {
+                Some(value) => baseline.insert(key.to_owned(), value.clone()),
+                None => baseline.remove(key),
+            };
+        }
+        self.loaded = Some(baseline);
+        self.diagnose_targets = fresh.diagnose_targets;
+        self.diagnose_probes = fresh.diagnose_probes;
+        self.load_warnings = fresh.load_warnings;
     }
 
     fn parse(
@@ -753,7 +1301,6 @@ impl NetwatchConfig {
         Ok(ParsedConfig {
             text: text.into_owned(),
             config,
-            unread,
         })
     }
 
@@ -786,7 +1333,8 @@ impl NetwatchConfig {
         }
     }
 
-    /// Write current config to disk, creating parent directories as needed.
+    /// Write what this session changed to the platform location, creating parent
+    /// directories as needed. See [`save_to`](Self::save_to).
     pub fn save(&mut self) -> anyhow::Result<()> {
         let path =
             Self::path().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
@@ -798,55 +1346,65 @@ impl NetwatchConfig {
         Ok(())
     }
 
-    /// [`save`](Self::save) to `path`. A file already there that does not
-    /// load is left alone, by Settings and `--generate-config` alike: it holds
-    /// settings nothing has read, such as a hand edit made while netwatch ran.
+    /// [`save`](Self::save) to `path`. A file already there that does not load
+    /// is left alone: it holds settings nothing has read, such as a hand edit
+    /// made while netwatch ran.
     ///
-    /// One that does load is edited in place, not replaced, so a key this
-    /// version does not read, from a newer one or misspelled, is still there
-    /// and still warned about afterwards. So are the file's comments. A renamed
-    /// key moves to its new name, and is not written under both.
-    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        let existing = Self::read_file(path).map_err(|e| {
-            let context = format!("{} does not load; not overwriting it", path.display());
-            anyhow::Error::new(e).context(context)
-        })?;
-        let contents = match existing {
-            Some(parsed) => self.merged_into(&parsed.text, &parsed.unread)?,
-            None => toml::to_string_pretty(self)?,
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    /// One that does load has only the keys this session changed written to it,
+    /// by name for a target. Everything else stays as the file has it: another
+    /// key edited by hand since this session started, a value `validate` corrected
+    /// for the session, a key this version does not read, a table at its defaults,
+    /// comments, and any default the file does not set, which a later release can
+    /// still change. If the file changed a key the session also changed, the
+    /// session's value wins for that key. A renamed key moves to its new name, and
+    /// a removed one goes. With nothing to write the file is not touched.
+    pub fn save_to(&mut self, path: &Path) -> anyhow::Result<()> {
+        let now = self.values()?;
+        let changes = Changes::between(&now, &self.baseline()?);
+        let existing = Self::read_existing(path)?;
+        if let Some(contents) = edited_file(existing.as_ref(), &changes, false, path)? {
+            write_config(path, &contents)?;
         }
-        fs::write(path, contents)?;
+        self.loaded = Some(now);
         Ok(())
     }
 
-    /// `text` with this config's values in it and the keys in `unread` left
-    /// alone. Refuses a result that does not read back as this config, because
-    /// the file it would replace does.
-    fn merged_into(&self, text: &str, unread: &[KeyPath]) -> anyhow::Result<String> {
-        let wanted = toml::to_string_pretty(self)?;
-        let new: DocumentMut = wanted.parse()?;
-        let mut doc: DocumentMut = text.parse()?;
-        // The table stays even with nothing in it this version reads, or nothing
-        // in it at all: the comment above a setting someone switched off.
-        let mut keep = unread.to_vec();
-        keep.push(vec![EXPERIMENTAL_TABLE.to_owned()]);
-        merge_table(
-            doc.as_table_mut(),
-            new.as_table(),
-            &mut KeyPath::new(),
-            &keep,
-        );
-        let merged = doc.to_string();
-        let back: Self = toml::from_str(&merged)?;
-        anyhow::ensure!(
-            toml::to_string_pretty(&back)? == wanted,
-            "cannot update it in place; not overwriting it"
-        );
-        Ok(merged)
+    /// `--generate-config` at the platform location. See
+    /// [`generate_at`](Self::generate_at).
+    pub fn generate() -> anyhow::Result<()> {
+        let path =
+            Self::path().ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
+        Self::generate_at(&path)
     }
+
+    /// Write every key at its default: a whole new file, or to a file that loads,
+    /// the keys it does not have, keeping everything it does. The one thing that
+    /// writes defaults, because someone asked for them. A file that does not load
+    /// is left alone, as in [`save_to`](Self::save_to).
+    pub fn generate_at(path: &Path) -> anyhow::Result<()> {
+        match Self::read_existing(path)? {
+            None => write_config(path, &toml::to_string_pretty(&Self::default())?),
+            Some(parsed) => match edited_file(Some(&parsed), &Changes::default(), true, path)? {
+                Some(contents) => write_config(path, &contents),
+                None => Ok(()),
+            },
+        }
+    }
+
+    fn read_existing(path: &Path) -> anyhow::Result<Option<ParsedConfig>> {
+        Self::read_file(path).map_err(|e| {
+            let context = format!("{} does not load; not overwriting it", path.display());
+            anyhow::Error::new(e).context(context)
+        })
+    }
+}
+
+fn write_config(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, contents)?;
+    Ok(())
 }
 
 // ── Keys with a new name ───────────────────────────────────
@@ -1146,7 +1704,7 @@ show_geo = false
         let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&events)));
         tracing::subscriber::with_default(subscriber, || {
             // Loading and saving say nothing. A session does both repeatedly.
-            let cfg = NetwatchConfig::load_from(&path).unwrap();
+            let mut cfg = NetwatchConfig::load_from(&path).unwrap();
             assert!(cfg.geoip_online);
             assert_eq!(cfg.theme, "nord");
             cfg.save_to(&path).unwrap();
@@ -1282,14 +1840,14 @@ hostname = "b.example"
     /// load has nothing to say. Saving again changes nothing.
     #[test]
     fn a_save_moves_a_renamed_key_to_its_new_name() {
+        let file = Path::new("config.toml");
         let parsed = parse_renamed(
             "# mine\ncolour_theme = 'nord' # why\n[alerts]\nbandwidth_limit = 5\ntypo = 1\n",
             RENAMES,
         );
-        let saved = parsed
-            .config
-            .merged_into(&parsed.text, &parsed.unread)
-            .unwrap();
+        let saved = edited_file(Some(&parsed), &Changes::default(), false, file)
+            .unwrap()
+            .expect("a rename is worth a write");
         for gone in ["colour_theme", "bandwidth_limit"] {
             assert!(!saved.contains(gone), "{gone} in\n{saved}");
         }
@@ -1306,11 +1864,8 @@ hostname = "b.example"
         assert_eq!(unknown_keys(&again.config), ["alerts.typo"]);
         assert_eq!(again.config.load_warnings.len(), 1, "{saved}");
         assert_eq!(
-            again
-                .config
-                .merged_into(&again.text, &again.unread)
-                .unwrap(),
-            saved
+            edited_file(Some(&again), &Changes::default(), false, file).unwrap(),
+            None
         );
     }
 
@@ -1325,7 +1880,7 @@ hostname = "b.example"
             "typo = 1\n# trying this out\n[experimental]\nfuture_thing = 1\n[experimental.nested]\na = 2\n",
         )
         .unwrap();
-        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
         assert_eq!(unknown_keys(&cfg), ["typo"]);
         let quiet: Vec<_> = cfg.load_warnings.iter().filter(|w| w.is_quiet()).collect();
         assert_eq!(quiet.len(), 2, "{:?}", cfg.load_warnings);
@@ -1333,6 +1888,7 @@ hostname = "b.example"
             .to_string()
             .contains("experimental.future_thing is not used"));
 
+        cfg.confirm_quit = true;
         cfg.save_to(&path).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         for kept in [
@@ -1348,8 +1904,9 @@ hostname = "b.example"
 
         // Empty, it has nothing to say and still stays.
         fs::write(&path, "# later\n[experimental]\n").unwrap();
-        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
         assert_eq!(cfg.load_warnings, []);
+        cfg.confirm_quit = true;
         cfg.save_to(&path).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("# later\n[experimental]\n"), "{saved}");
@@ -1519,16 +2076,33 @@ expect_status = 200
         );
     }
 
+    /// A session's save, from a file read at the start of it and possibly edited
+    /// since: load, `change`, optionally `edit` the file by hand, save.
+    fn saved_after(
+        original: &str,
+        change: impl FnOnce(&mut NetwatchConfig),
+        edited: Option<&str>,
+    ) -> String {
+        let dir = scratch("session");
+        let path = dir.join("config.toml");
+        fs::write(&path, original).unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
+        change(&mut cfg);
+        if let Some(edited) = edited {
+            fs::write(&path, edited).unwrap();
+        }
+        cfg.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        saved
+    }
+
     /// What a save did to these until 0.40: rewrote the file from the struct,
     /// so a key netwatch does not read was gone with no word, and with it the
     /// warning about it. A key from a newer version went the same way.
     #[test]
-    fn a_save_keeps_unknown_keys_and_comments_and_changes_what_changed() {
-        let dir = scratch("save_unknown");
-        let path = dir.join("config.toml");
-        fs::write(
-            &path,
-            r#"# my settings
+    fn a_save_keeps_unknown_keys_and_comments_and_changes_only_what_changed() {
+        let original = r#"# my settings
 sandbox_mode = "strict"  # typo, fix me
 theme = 'nord' # the good one
 refresh_rate_ms = 1_000
@@ -1546,191 +2120,862 @@ from_a_newer_version = { a = 1 }
 
 [stray]
 anything = "goes"
-"#,
+"#;
+        let saved = saved_after(
+            original,
+            |cfg| {
+                cfg.theme = "ocean".into();
+                cfg.diagnose_targets[0].enabled = false;
+            },
+            None,
+        );
+        let wanted = original
+            .replace(
+                "theme = 'nord' # the good one",
+                "theme = \"ocean\" # the good one",
+            )
+            .replace(
+                "from_a_newer_version = { a = 1 }\n",
+                "from_a_newer_version = { a = 1 }\nenabled = false\n",
+            );
+        assert_eq!(saved, wanted);
+    }
+
+    /// The bad one: a strict sandbox set by hand while a session ran went back to
+    /// `on` when that session saved a theme.
+    #[test]
+    fn a_save_leaves_a_hand_edit_made_while_the_session_ran() {
+        let saved = saved_after(
+            "theme = 'nord'\nsandbox = 'on'\n",
+            |cfg| cfg.theme = "ocean".into(),
+            Some("theme = 'nord'\nsandbox = 'strict'\n# added by hand\nnew_key = 1\n"),
+        );
+        assert_eq!(
+            saved,
+            "theme = \"ocean\"\nsandbox = 'strict'\n# added by hand\nnew_key = 1\n"
+        );
+    }
+
+    /// If both changed the same key the session's explicit change wins, for that
+    /// key alone.
+    #[test]
+    fn a_session_change_beats_a_hand_edit_of_that_key_only() {
+        let saved = saved_after(
+            "theme = 'nord'\nview = 'lite'\n",
+            |cfg| cfg.theme = "ocean".into(),
+            Some("theme = 'dracula'\nview = 'dense'\n"),
+        );
+        assert_eq!(saved, "theme = \"ocean\"\nview = 'dense'\n");
+    }
+
+    /// `validate` corrects these for the session. That is not a change anyone
+    /// asked to write: a later release may accept `future_view`, and an unrelated
+    /// save used to turn it into `full`.
+    #[test]
+    fn a_save_does_not_write_what_validate_corrected() {
+        let original = "refresh_rate_ms = 50\nview = \"future_view\"\ntheme = \"\"\n";
+        let saved = saved_after(original, |cfg| cfg.confirm_quit = true, None);
+        assert_eq!(saved, format!("{original}confirm_quit = true\n"));
+
+        // Until someone sets one of them.
+        let saved = saved_after(original, |cfg| cfg.refresh_rate_ms = 200, None);
+        assert!(saved.contains("refresh_rate_ms = 200\n"), "{saved}");
+        assert!(saved.contains("view = \"future_view\"\n"), "{saved}");
+    }
+
+    /// Every save used to write every default, which grew this to 49 lines, and
+    /// held today's defaults there when a release changed one.
+    #[test]
+    fn a_save_writes_no_defaults_and_a_target_can_be_appended_afterwards() {
+        let saved = saved_after("theme = 'nord'\n", |cfg| cfg.theme = "ocean".into(), None);
+        assert_eq!(saved, "theme = \"ocean\"\n");
+
+        // Nothing to start from, too: `diagnose_targets = []` from a save made the
+        // `[[diagnose_targets]]` DIAGNOSE.md says to append a TOML error.
+        let dir = scratch("no_file");
+        let path = dir.join("netwatch/config.toml");
+        let mut cfg = NetwatchConfig {
+            confirm_quit: true,
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let mut text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "confirm_quit = true\n");
+        text.push_str("[[diagnose_targets]]\nname = \"api\"\nhost = \"a.example\"\n");
+        fs::write(&path, text).unwrap();
+        assert_eq!(
+            NetwatchConfig::load_from(&path).unwrap().diagnose_targets[0].name,
+            "api"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing changed, nothing written, down to the bytes: a table at its
+    /// defaults, Windows line endings, a byte-order mark. A second save with
+    /// nothing new leaves what the first one wrote.
+    #[test]
+    fn a_save_with_nothing_to_write_does_not_touch_the_file() {
+        let dir = scratch("untouched");
+        let path = dir.join("config.toml");
+        let original = "\u{feff}# mine\r\n[diagnose_thresholds]\r\nsigma_k = 3.0\r\n# the end\r\n";
+        fs::write(&path, original).unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        let dir2 = scratch("no_file_no_change");
+        let missing = dir2.join("config.toml");
+        NetwatchConfig::default().save_to(&missing).unwrap();
+        assert!(!missing.exists(), "nothing changed, so nothing to write");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    /// A first save of a key in a table the file lacks goes after everything,
+    /// comments at the end of the file included, which used to end up below it.
+    #[test]
+    fn a_new_table_goes_after_the_comments_at_the_end_of_the_file() {
+        let original = "theme = 'nord'\n\n[stray]\na = 1\n# about stray\n\n# the end\n";
+        let saved = saved_after(original, |cfg| cfg.alerts.bandwidth_threshold = 5, None);
+        assert_eq!(
+            saved,
+            format!("{original}\n[alerts]\nbandwidth_threshold = 5\n")
+        );
+    }
+
+    /// Changing one threshold writes that one, in a table of its own if need be.
+    #[test]
+    fn changing_a_threshold_writes_only_that_threshold() {
+        let saved = saved_after(
+            "theme = 'nord'\n",
+            |cfg| cfg.diagnose_thresholds.sigma_k = 4.0,
+            None,
+        );
+        assert_eq!(
+            saved,
+            "theme = 'nord'\n\n[diagnose_thresholds]\nsigma_k = 4.0\n"
+        );
+        let saved = saved_after(
+            "[diagnose_thresholds]\n# keep\ndns_ceiling_ms = 30\n",
+            |cfg| cfg.diagnose_thresholds.sigma_k = 4.0,
+            None,
+        );
+        assert_eq!(
+            saved,
+            "[diagnose_thresholds]\n# keep\ndns_ceiling_ms = 30\nsigma_k = 4.0\n"
+        );
+    }
+
+    /// `30` and `30.0` are the same to a float key, so writing 30.0 over a file
+    /// that says `30` leaves it. A different number still goes in.
+    #[test]
+    fn a_numerically_equal_value_is_left_as_written() {
+        let saved = saved_after(
+            "[diagnose_thresholds]\ndns_ceiling_ms = 25\n",
+            |cfg| cfg.diagnose_thresholds.dns_ceiling_ms = 30.0,
+            Some("[diagnose_thresholds]\ndns_ceiling_ms = 30 # by hand\n"),
+        );
+        assert_eq!(
+            saved,
+            "[diagnose_thresholds]\ndns_ceiling_ms = 30 # by hand\n"
+        );
+        let saved = saved_after(
+            "[diagnose_thresholds]\ndns_ceiling_ms = 25\n",
+            |cfg| cfg.diagnose_thresholds.dns_ceiling_ms = 31.0,
+            None,
+        );
+        assert_eq!(saved, "[diagnose_thresholds]\ndns_ceiling_ms = 31.0\n");
+    }
+
+    const TWO_TARGETS: &str = r#"[[diagnose_targets]]
+# the api
+name = "api"
+host = "a.example"
+api_only = 1
+
+[[diagnose_targets]]
+# the web
+name = "web"
+host = "b.example"
+enabled = true
+web_only = 2
+"#;
+
+    fn toggled(name: &str) -> impl FnOnce(&mut NetwatchConfig) + '_ {
+        move |cfg| {
+            let target = cfg
+                .diagnose_targets
+                .iter_mut()
+                .find(|t| t.name == name)
+                .unwrap();
+            target.enabled = !target.enabled;
+        }
+    }
+
+    /// `d` in Diagnose changes that target's `enabled` and no other line.
+    #[test]
+    fn toggling_a_target_changes_only_its_enabled() {
+        assert_eq!(
+            saved_after(TWO_TARGETS, toggled("web"), None),
+            TWO_TARGETS.replace("enabled = true", "enabled = false")
+        );
+        assert_eq!(
+            saved_after(TWO_TARGETS, toggled("api"), None),
+            TWO_TARGETS.replace("api_only = 1\n", "api_only = 1\nenabled = false\n")
+        );
+    }
+
+    /// Entries reordered by hand while a session ran. By position, the first
+    /// entry's comment and unknown keys would have gone to the wrong target, as
+    /// a whole entry was rewritten from the session's list by index.
+    #[test]
+    fn a_target_is_found_by_name_after_the_file_reorders_them() {
+        let reordered = r#"[[diagnose_targets]]
+# the web
+name = "web"
+host = "b.example"
+enabled = true
+web_only = 2
+
+[[diagnose_targets]]
+# the api
+name = "api"
+host = "a.example"
+api_only = 1
+"#;
+        assert_eq!(
+            saved_after(TWO_TARGETS, toggled("web"), Some(reordered)),
+            reordered.replace("enabled = true", "enabled = false")
+        );
+    }
+
+    /// A target added or edited by hand survives a save of anything else, or of
+    /// a toggle of another target. The file's host stays, as the session changed
+    /// only `enabled`.
+    #[test]
+    fn a_target_added_or_edited_by_hand_survives_a_save() {
+        let edited = format!(
+            "{}\n[[diagnose_targets]]\nname = \"new\"\nhost = \"c.example\"\n",
+            TWO_TARGETS.replace("host = \"b.example\"", "host = \"moved.example\"")
+        );
+        assert_eq!(
+            saved_after(TWO_TARGETS, |cfg| cfg.confirm_quit = true, Some(&edited)),
+            format!("confirm_quit = true\n{edited}")
+        );
+        assert_eq!(
+            saved_after(TWO_TARGETS, toggled("api"), Some(&edited)),
+            edited.replace("api_only = 1\n", "api_only = 1\nenabled = false\n")
+        );
+    }
+
+    /// A target deleted by hand cannot take a toggle: `enabled` alone would be an
+    /// entry with no host, and a file that no longer loads. The save says so.
+    #[test]
+    fn toggling_a_target_the_file_lost_fails_and_leaves_the_file() {
+        let dir = scratch("target_gone");
+        let path = dir.join("config.toml");
+        fs::write(&path, TWO_TARGETS).unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
+        cfg.diagnose_targets[1].enabled = false;
+        let kept = "[[diagnose_targets]]\nname = \"api\"\nhost = \"a.example\"\n";
+        fs::write(&path, kept).unwrap();
+        let err = cfg.save_to(&path).unwrap_err().to_string();
+        assert!(err.contains("target web is no longer in"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Targets the session adds or removes, which only a caller in code does, and
+    /// the forms a file can hold them in.
+    #[test]
+    fn a_session_can_add_and_remove_targets() {
+        let target: crate::diagnose::targets::TargetConfig =
+            toml::from_str("name = \"new\"\nhost = \"c.example\"").unwrap();
+
+        let saved = saved_after(
+            TWO_TARGETS,
+            |cfg| {
+                cfg.diagnose_targets.remove(0);
+                cfg.diagnose_targets.push(target.clone());
+            },
+            None,
+        );
+        let back: NetwatchConfig = toml::from_str(&saved).unwrap();
+        let names: Vec<_> = back
+            .diagnose_targets
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["web", "new"], "{saved}");
+        assert!(saved.contains("web_only = 2"), "{saved}");
+        assert!(!saved.contains("api_only"), "{saved}");
+
+        // In place of the `diagnose_targets = []` older releases generated.
+        let saved = saved_after(
+            "diagnose_targets = []\ntheme = 'nord'\n",
+            |cfg| cfg.diagnose_targets.push(target.clone()),
+            None,
+        );
+        assert!(!saved.contains("diagnose_targets = []"), "{saved}");
+        let back: NetwatchConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(back.diagnose_targets[0].name, "new", "{saved}");
+
+        // Inside an array of inline tables, where a `[[...]]` could not follow.
+        let saved = saved_after(
+            "diagnose_targets = [{ name = \"api\", host = \"a.example\", typo = 1 }]\n",
+            |cfg| cfg.diagnose_targets.push(target.clone()),
+            None,
+        );
+        let back = NetwatchConfig::from_toml(&saved, Path::new("c")).unwrap();
+        assert_eq!(back.diagnose_targets.len(), 2, "{saved}");
+        assert_eq!(unknown_keys(&back), ["diagnose_targets.0.typo"], "{saved}");
+    }
+
+    /// The other ways TOML writes a table. An unknown key in each stays, and a
+    /// changed value goes where the file has its table.
+    #[test]
+    fn a_save_writes_into_inline_and_dotted_tables() {
+        let original = "alerts = { bandwidth_threshold = 5, typo = 1 }\n\
+             diagnose_probes.trace_target = \"9.9.9.9\"\n\
+             diagnose_probes.typo = 2\n\
+             diagnose_targets = [{ name = \"api\", host = \"a.example\", typo = 3 }]\n";
+        let saved = saved_after(
+            original,
+            |cfg| {
+                cfg.alerts.bandwidth_threshold = 6;
+                cfg.alerts.port_scan_threshold = 7;
+                cfg.diagnose_probes.trace_target = "8.8.8.8".into();
+                cfg.diagnose_probes.trace_refresh_secs = Some(60);
+                cfg.diagnose_targets[0].port = 8443;
+            },
+            None,
+        );
+        let back = NetwatchConfig::from_toml(&saved, Path::new("c")).unwrap();
+        assert_eq!(back.load_warnings.len(), 3, "{saved}");
+        assert_eq!(back.alerts.bandwidth_threshold, 6, "{saved}");
+        assert_eq!(back.alerts.port_scan_threshold, 7, "{saved}");
+        assert_eq!(back.diagnose_probes.trace_target, "8.8.8.8", "{saved}");
+        assert_eq!(back.diagnose_probes.trace_refresh_secs, Some(60), "{saved}");
+        assert_eq!(back.diagnose_targets[0].port, 8443, "{saved}");
+        assert!(!saved.contains("[alerts]"), "{saved}");
+    }
+
+    /// A list the session changed goes in whole, in place of the old one, and a
+    /// table new to the file comes after its parent.
+    #[test]
+    fn a_changed_list_replaces_the_old_one() {
+        let pair: crate::diagnose::active::Pair =
+            toml::from_str("v4 = \"192.0.2.1:443\"\nv6 = \"[2001:db8::1]:443\"\n").unwrap();
+        let saved = saved_after(
+            "[diagnose_probes]\ntrace_target = \"9.9.9.9\"\n\n[stray]\na = 1\n",
+            |cfg| cfg.diagnose_probes.ipv6_pairs = vec![pair.clone()],
+            None,
+        );
+        assert_eq!(
+            saved,
+            "[diagnose_probes]\ntrace_target = \"9.9.9.9\"\n\n[stray]\na = 1\n\n\
+             [[diagnose_probes.ipv6_pairs]]\nv4 = \"192.0.2.1:443\"\nv6 = \"[2001:db8::1]:443\"\n"
+        );
+    }
+
+    /// An optional key the session no longer has goes, and nothing else.
+    #[test]
+    fn clearing_an_optional_key_removes_it() {
+        let saved = saved_after(
+            "[diagnose_probes]\n# why\npmtu_url = \"http://a.example/big\"\ntypo = 1\n",
+            |cfg| cfg.diagnose_probes.pmtu_url = None,
+            None,
+        );
+        assert!(!saved.contains("pmtu_url"), "{saved}");
+        assert!(saved.contains("typo = 1\n"), "{saved}");
+    }
+
+    /// The check at the end of a save. Nothing a user does should reach it, so it
+    /// gets an edit that went wrong each way it could: a value not written, and a
+    /// value written that nobody changed.
+    #[test]
+    fn an_edit_that_does_not_read_back_is_refused() {
+        let changes = Changes {
+            keys: vec![(
+                vec!["theme".to_owned()],
+                Some(toml::Value::String("ocean".into())),
+            )],
+            targets: vec![],
+        };
+        let before = "theme = 'nord'\nview = 'lite'\n";
+        check_reads_back(before, "theme = 'ocean'\nview = 'lite'\n", &changes).unwrap();
+        for wrong in [
+            "theme = 'nord'\nview = 'lite'\n",
+            "theme = 'ocean'\nview = 'dense'\n",
+            "theme = 'ocean'\ntheme = 'ocean'\n",
+        ] {
+            assert!(
+                check_reads_back(before, wrong, &changes).is_err(),
+                "{wrong}"
+            );
+        }
+    }
+
+    /// `--generate-config` is the one thing that writes defaults. On a new file it
+    /// writes them all, and on an old one it adds what is missing and keeps the
+    /// rest, values and all.
+    #[test]
+    fn generate_writes_every_default_and_keeps_what_the_file_has() {
+        let dir = scratch("generate");
+        let path = dir.join("netwatch/config.toml");
+        NetwatchConfig::generate_at(&path).unwrap();
+        let fresh = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            fresh,
+            toml::to_string_pretty(&NetwatchConfig::default()).unwrap()
+        );
+        assert!(!fresh.contains("diagnose_targets"), "{fresh}");
+
+        // Run again, and over an empty file: the same.
+        NetwatchConfig::generate_at(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), fresh);
+        fs::write(&path, "").unwrap();
+        NetwatchConfig::generate_at(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), fresh);
+
+        // A target can be appended to what it wrote.
+        let mut text = fresh.clone();
+        text.push_str("[[diagnose_targets]]\nname = \"api\"\nhost = \"a.example\"\n");
+        fs::write(&path, text).unwrap();
+        assert_eq!(
+            NetwatchConfig::load_from(&path)
+                .unwrap()
+                .diagnose_targets
+                .len(),
+            1
+        );
+
+        fs::write(
+            &path,
+            "# mine\nsandbox = \"strict\"\nrefresh_rate_ms = 50\ntypo = 1\n\n[alerts]\n\
+             port_scan_threshold = 7 # low\n\n[[diagnose_targets]]\nname = \"api\"\n\
+             host = \"a.example\"\n\n[diagnose_thresholds]\nsigma_k = 9.0\n# the end\n",
         )
         .unwrap();
-
-        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
-        cfg.theme = "ocean".into();
-        cfg.diagnose_targets[0].enabled = false;
-        cfg.save_to(&path).unwrap();
+        NetwatchConfig::generate_at(&path).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         for kept in [
-            "# my settings\n",
-            "sandbox_mode = \"strict\"  # typo, fix me\n",
-            "refresh_rate_ms = 1_000\n",
-            "# watch the uplink\n",
-            "bandwidth_threshold = 1_000\n",
-            "bandwidth_thresold = 5\n",
-            "# the api\n",
-            "from_a_newer_version = { a = 1 }\n",
-            "[stray]\nanything = \"goes\"\n",
-            // A changed value keeps its line's comment.
-            "theme = \"ocean\" # the good one\n",
+            "# mine\nsandbox = \"strict\"\nrefresh_rate_ms = 50\ntypo = 1\n",
+            "port_scan_threshold = 7 # low\n",
+            "[[diagnose_targets]]\nname = \"api\"\nhost = \"a.example\"\n",
+            "sigma_k = 9.0\n# the end\n",
+            // Filled in where the file's table is.
+            "port_scan_window_secs = 30\n",
+            // New tables after the comments at the end.
+            "# the end\n\n[diagnose_probes]\n",
+            // A key the file left out, at the end of the keys it has.
+            "show_geo = true\n",
         ] {
             assert!(saved.contains(kept), "{kept:?} not in\n{saved}");
         }
-
         let back = NetwatchConfig::load_from(&path).unwrap();
-        assert_eq!(back.theme, "ocean");
-        assert!(!back.diagnose_targets[0].enabled);
-        assert_eq!(cfg.load_warnings, back.load_warnings, "\n{saved}");
-
-        // Again, unchanged: nothing is written twice or moves.
-        back.save_to(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The other ways TOML writes a table. An unknown key in each stays.
-    #[test]
-    fn a_save_keeps_unknown_keys_in_inline_and_dotted_tables() {
-        let dir = scratch("save_forms");
-        let path = dir.join("config.toml");
-        fs::write(
-            &path,
-            "alerts = { bandwidth_threshold = 5, typo = 1 }\n\
-             diagnose_probes.trace_target = \"9.9.9.9\"\n\
-             diagnose_probes.typo = 2\n\
-             diagnose_targets = [{ name = \"api\", host = \"a.example\", typo = 3 }]\n",
-        )
-        .unwrap();
-        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
-        let unknown = cfg.load_warnings.clone();
-        assert_eq!(unknown.len(), 3);
-        cfg.alerts.bandwidth_threshold = 6;
-        cfg.diagnose_probes.trace_target = "8.8.8.8".into();
-        cfg.diagnose_targets[0].port = 8443;
-        cfg.save_to(&path).unwrap();
-
-        let saved = fs::read_to_string(&path).unwrap();
-        let back = NetwatchConfig::load_from(&path).unwrap();
-        assert_eq!(back.load_warnings, unknown, "\n{saved}");
-        assert_eq!(back.alerts.bandwidth_threshold, 6, "\n{saved}");
-        assert_eq!(back.alerts.port_scan_threshold, 20, "\n{saved}");
-        assert_eq!(back.diagnose_probes.trace_target, "8.8.8.8", "\n{saved}");
-        assert_eq!(back.diagnose_targets[0].port, 8443, "\n{saved}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Tables new to the file go after what is there, a table's own entries after
-    /// it, and the user's stay in their order, wherever the new ones came from.
-    #[test]
-    fn a_save_adds_tables_after_the_ones_the_file_has() {
-        let dir = scratch("save_tables");
-        let path = dir.join("config.toml");
-        fs::write(
-            &path,
-            "[stray_1]\na = 1\n[stray_2]\na = 1\n[stray_3]\na = 1\n[stray_4]\na = 1\n\
-             [stray_5]\na = 1\n[diagnose_probes]\ntrace_target = \"9.9.9.9\"\n",
-        )
-        .unwrap();
-        let cfg = NetwatchConfig::load_from(&path).unwrap();
-        cfg.save_to(&path).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        let at = |needle: &str| {
-            saved
-                .find(needle)
-                .unwrap_or_else(|| panic!("{needle} not in\n{saved}"))
-        };
-        assert!(at("[stray_1]") < at("[stray_5]"), "{saved}");
-        assert!(at("[stray_5]") < at("[diagnose_probes]"), "{saved}");
-        assert!(
-            at("[diagnose_probes]") < at("[[diagnose_probes.ipv6_pairs]]"),
-            "{saved}"
-        );
-        assert!(at("[stray_5]") < at("[alerts]"), "{saved}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The check at the end of a save: a merge that would change what the file
-    /// means is refused, and the file stays. Nothing a user can do should reach
-    /// this, so it takes a list of keys to keep that names a key netwatch reads:
-    /// the table should go, as it holds what a default config does not.
-    #[test]
-    fn a_merge_that_does_not_read_back_is_refused() {
-        let text = "[diagnose_thresholds]\nsigma_k = 9.0\n";
-        let keep = [vec!["diagnose_thresholds".to_owned()]];
-        let err = NetwatchConfig::default()
-            .merged_into(text, &keep)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("cannot update it in place"),
-            "{err}"
-        );
-        assert!(NetwatchConfig::default().merged_into(text, &[]).is_ok());
-    }
-
-    /// `--generate-config` resets what netwatch reads. It cannot reset what it
-    /// does not, and a list it empties takes the entries' own keys with it.
-    #[test]
-    fn a_reset_sets_known_keys_to_their_defaults_and_keeps_the_rest() {
-        let dir = scratch("save_reset");
-        let path = dir.join("config.toml");
-        fs::write(
-            &path,
-            r#"# mine
-sandbox = "strict"
-typo = 1
-[[diagnose_targets]]
-name = "api"
-host = "a.example"
-intervl = 5
-[diagnose_thresholds]
-sigma_k = 9.0
-sigmak = 9.0
-"#,
-        )
-        .unwrap();
-        NetwatchConfig::default().save_to(&path).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("# mine\n"), "{saved}");
-        assert!(saved.contains("sandbox = \"on\"\n"), "{saved}");
-        assert!(saved.contains("diagnose_targets = []\n"), "{saved}");
-        // The table holds its defaults again, so only what was not read is left.
-        assert!(
-            saved.contains("[diagnose_thresholds]\nsigmak = 9.0\n"),
-            "{saved}"
-        );
-        let back = NetwatchConfig::load_from(&path).unwrap();
-        assert_eq!(back.sandbox, "on");
-        assert_eq!(back.diagnose_targets, []);
-        assert_eq!(back.diagnose_thresholds, Default::default());
-        let mut keys = unknown_keys(&back);
-        keys.sort();
-        assert_eq!(keys, ["diagnose_thresholds.sigmak", "typo"]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A first save has nothing to keep, and an empty file should end up the
-    /// same as no file. A file with Windows line endings stays loadable.
-    #[test]
-    fn a_save_over_nothing_lays_the_file_out_as_generated() {
-        let dir = scratch("save_layout");
-        let path = dir.join("config.toml");
-        let cfg = NetwatchConfig::default();
-        cfg.save_to(&path).unwrap();
-        let fresh = fs::read_to_string(&path).unwrap();
-        assert_eq!(fresh, toml::to_string_pretty(&cfg).unwrap());
-        cfg.save_to(&path).unwrap();
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            fresh,
-            "a save of itself"
-        );
-        fs::write(&path, "").unwrap();
-        cfg.save_to(&path).unwrap();
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            fresh,
-            "over an empty file"
-        );
-
-        fs::write(&path, "# mine\r\ntypo = 1\r\ntheme = \"nord\"\r\n").unwrap();
-        cfg.save_to(&path).unwrap();
-        let back = NetwatchConfig::load_from(&path).unwrap();
-        assert_eq!(back.theme, "dark");
+        assert_eq!(back.sandbox, "strict");
+        assert_eq!(back.alerts.port_scan_threshold, 7);
+        assert_eq!(back.diagnose_thresholds.sigma_k, 9.0);
         assert_eq!(unknown_keys(&back), ["typo"]);
+
+        // With nothing missing it does not write, and it still refuses a bad file.
+        NetwatchConfig::generate_at(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        fs::write(&path, "refresh_rate_ms = 'oops'\n").unwrap();
+        assert!(NetwatchConfig::generate_at(&path).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "refresh_rate_ms = 'oops'\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--view dense` is about this run. A save does not make it the default, and
+    /// changing the View row in Settings does.
+    #[test]
+    fn view_for_this_run_is_not_saved() {
+        let saved = saved_after(
+            "view = 'lite'\n",
+            |cfg| {
+                cfg.set_view_for_this_run("dense");
+                cfg.confirm_quit = true;
+            },
+            None,
+        );
+        assert_eq!(saved, "view = 'lite'\nconfirm_quit = true\n");
+        let saved = saved_after(
+            "view = 'lite'\n",
+            |cfg| {
+                cfg.set_view_for_this_run("dense");
+                cfg.view = "full".into();
+            },
+            None,
+        );
+        assert_eq!(saved, "view = \"full\"\n");
+    }
+
+    /// What `r` read in the Diagnose tab is what the file says, so a later save has
+    /// nothing to do for it, and unsaved Settings changes are still unsaved.
+    #[test]
+    fn reloading_diagnose_settings_moves_the_baseline() {
+        let dir = scratch("reload");
+        let path = dir.join("config.toml");
+        fs::write(&path, TWO_TARGETS).unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
+        cfg.theme = "ocean".into();
+
+        let edited = "[[diagnose_targets]]\nname = \"only\"\nhost = \"c.example\"\n# new\n";
+        fs::write(&path, edited).unwrap();
+        cfg.reload_diagnose_settings(NetwatchConfig::from_toml(edited, &path).unwrap());
+        assert_eq!(cfg.diagnose_targets[0].name, "only");
+
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("theme = \"ocean\"\n{edited}")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A second save starts from what the first wrote, so a hand edit of a key the
+    /// first one wrote survives the next, and a failed save stays pending.
+    #[test]
+    fn each_save_moves_the_baseline_and_a_failed_one_does_not() {
+        let dir = scratch("twice");
+        let path = dir.join("config.toml");
+        fs::write(&path, "theme = 'nord'\n").unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
+        cfg.theme = "ocean".into();
+        cfg.save_to(&path).unwrap();
+        fs::write(&path, "theme = 'dracula'\n").unwrap();
+        cfg.confirm_quit = true;
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "theme = 'dracula'\nconfirm_quit = true\n"
+        );
+
+        cfg.view = "dense".into();
+        fs::write(&path, "refresh_rate_ms = 'oops'\n").unwrap();
+        assert!(cfg.save_to(&path).is_err());
+        fs::write(&path, "theme = 'dracula'\n").unwrap();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "theme = 'dracula'\nview = \"dense\"\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `geoip_online` goes on a save with a comment directly above it, because
+    /// that comment is about it. Nothing else moves.
+    #[test]
+    fn a_save_drops_a_removed_key_with_the_comment_above_it() {
+        let saved = saved_after(
+            "# keep\ntheme = 'nord'\n# why online\ngeoip_online = true\n# also keep\nview = 'lite'\n",
+            |_| {},
+            None,
+        );
+        assert_eq!(
+            saved,
+            "# keep\ntheme = 'nord'\n# also keep\nview = 'lite'\n"
+        );
+    }
+
+    /// Enough of a random number generator to make these files. The seed is in
+    /// every failure message.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            from[self.below(from.len() as u64) as usize]
+        }
+    }
+
+    /// A config.toml a person might have: known keys in odd spellings, values out
+    /// of range, comments everywhere, keys netwatch does not read at every depth.
+    fn generated_file(rng: &mut Rng) -> String {
+        const ROOT: &[&str] = &[
+            "theme = 'nord'",
+            "theme = \"ocean\" # mine",
+            "refresh_rate_ms = 1_000",
+            "refresh_rate_ms = 50",
+            "refresh_rate_ms = 0x3e8",
+            "view = \"future_view\"",
+            "view = 'lite'",
+            "sandbox = 'strict'",
+            "sandbox = \"on\"  # for now",
+            "show_geo = false",
+            "packet_follow = true",
+            "confirm_quit = false",
+            "insights_model = \"\"",
+            "bpf_filter = 'tcp port 443'",
+            "geoip_online = false",
+            "unknown_root = 1",
+            "sandbox_mode = \"strict\"",
+            "# a comment about nothing",
+            "",
+        ];
+        let mut text = String::new();
+        let mut used = std::collections::HashSet::new();
+        for _ in 0..rng.below(10) {
+            let line = rng.pick(ROOT);
+            // A key once, as TOML wants.
+            let key = line.split(['=', ' ']).next().unwrap_or("");
+            if line.starts_with('#') || line.is_empty() || used.insert(key) {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        if rng.chance(60) {
+            text.push_str("\n# the alerts\n[alerts]\n");
+            if rng.chance(70) {
+                text.push_str("bandwidth_threshold = 1_000 # low\n");
+            }
+            if rng.chance(30) {
+                text.push_str("bandwidth_thresold = 2\n");
+            }
+            if rng.chance(30) {
+                text.push_str("# scans\nport_scan_threshold = 99\n");
+            }
+        }
+        if rng.chance(30) {
+            text.push_str(
+                "\n[diagnose_thresholds]\nsigma_k = 3.0\ndns_ceiling_ms = 30\ntypo = 1\n",
+            );
+        }
+        if rng.chance(30) {
+            text.push_str("\n[stray]\nanything = 'goes'\n[stray.deeper]\nb = 2\n");
+        }
+        if rng.chance(20) {
+            text.push_str("\n[experimental]\nsomething = 1\n");
+        }
+        for (name, comment) in [("api", "# the api\n"), ("web", ""), ("db", "# the db\n")] {
+            if rng.chance(40) {
+                text.push_str(&format!(
+                    "\n[[diagnose_targets]]\n{comment}name = \"{name}\"\nhost = \"{name}.example\"\n"
+                ));
+                if rng.chance(40) {
+                    text.push_str(&format!("{name}_unknown = 1\n"));
+                }
+                if rng.chance(30) {
+                    text.push_str("enabled = true\n");
+                }
+            }
+        }
+        if rng.chance(50) {
+            text.push_str("\n# the end of the file\n");
+        }
+        text
+    }
+
+    /// A hand edit made while the session ran: one more line in the root table,
+    /// and sometimes the targets in another order. They are the last tables a
+    /// generated file has, so each block runs to the next one, and the comment at
+    /// the end of the file moves with the last, as it would in an editor.
+    fn hand_edited(text: &str, rng: &mut Rng) -> String {
+        let text = format!("hand_edit = {}\n{text}", rng.below(1000));
+        if rng.chance(50) {
+            let mut blocks: Vec<&str> = text.split("\n[[diagnose_targets]]").collect();
+            if blocks.len() > 2 {
+                let head = blocks.remove(0);
+                blocks.reverse();
+                let mut edited = head.to_owned();
+                for block in blocks {
+                    edited.push_str("\n[[diagnose_targets]]");
+                    edited.push_str(block.trim_end_matches('\n'));
+                    edited.push('\n');
+                }
+                return edited;
+            }
+        }
+        text
+    }
+
+    /// `text` without `geoip_online`, the one other key a save takes out, and the
+    /// comments and blank lines directly above it, which go with it.
+    fn without_removed_key(text: &str) -> String {
+        let mut kept: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with("geoip_online") {
+                while kept
+                    .last()
+                    .is_some_and(|l| l.is_empty() || l.starts_with('#'))
+                {
+                    kept.pop();
+                }
+            } else {
+                kept.push(line);
+            }
+        }
+        kept.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    /// The lines of `before` not in `changed` still appear in `after`, in order.
+    fn missing_lines<'a>(before: &'a str, after: &str, changed: &str) -> Vec<&'a str> {
+        let mut rest = after.lines();
+        before
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(changed))
+            .filter(|line| !rest.any(|l| l == *line))
+            .collect()
+    }
+
+    /// Generated files, one change by a session, with or without a hand edit. The
+    /// file then means what it meant plus that change, and every other line is
+    /// still there in its order. A second save writes nothing.
+    #[test]
+    fn a_save_changes_one_key_and_nothing_else_in_generated_files() {
+        let iterations = std::env::var("NETWATCH_SAVE_FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(400u64);
+        let dir = scratch("fuzz");
+        let path = dir.join("config.toml");
+        for seed in 1..=iterations {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let original = generated_file(&mut rng);
+            fs::write(&path, &original).unwrap();
+            let Ok(mut cfg) = NetwatchConfig::load_from(&path) else {
+                panic!("seed {seed}: a generated file did not load\n{original}");
+            };
+
+            let target_names: Vec<String> = cfg
+                .diagnose_targets
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            let key = match rng.below(if target_names.is_empty() { 6 } else { 8 }) {
+                0 => {
+                    cfg.theme = "dracula".into();
+                    "theme"
+                }
+                1 => {
+                    cfg.refresh_rate_ms = 777;
+                    "refresh_rate_ms"
+                }
+                2 => {
+                    cfg.confirm_quit = !cfg.confirm_quit;
+                    "confirm_quit"
+                }
+                3 => {
+                    cfg.alerts.bandwidth_threshold = 12345;
+                    "bandwidth_threshold"
+                }
+                4 => {
+                    cfg.alerts.port_scan_threshold = 321;
+                    "port_scan_threshold"
+                }
+                5 => {
+                    cfg.insights_endpoint = "http://a.example".into();
+                    "insights_endpoint"
+                }
+                _ => {
+                    let at = rng.below(target_names.len() as u64) as usize;
+                    cfg.diagnose_targets[at].enabled = !cfg.diagnose_targets[at].enabled;
+                    "enabled"
+                }
+            };
+            let toggled = cfg
+                .diagnose_targets
+                .iter()
+                .find(|t| !t.enabled)
+                .map(|t| t.name.clone());
+
+            let before = if rng.chance(50) {
+                let edited = hand_edited(&original, &mut rng);
+                fs::write(&path, &edited).unwrap();
+                edited
+            } else {
+                original.clone()
+            };
+            let context = || format!("seed {seed}, changed {key}\n--- before\n{before}");
+            cfg.save_to(&path)
+                .unwrap_or_else(|e| panic!("{e:#}: {}", context()));
+            let after = fs::read_to_string(&path).unwrap();
+            let context = || format!("{}--- after\n{after}", context());
+
+            let kept = without_removed_key(&before);
+            let lost = missing_lines(&kept, &after, key);
+            assert_eq!(lost, Vec::<&str>::new(), "{}", context());
+
+            // Nothing written but that key, and the table it may need.
+            let added: Vec<_> = {
+                let mut old = kept.lines().peekable();
+                after
+                    .lines()
+                    .filter(|line| {
+                        if old.peek() == Some(line) {
+                            old.next();
+                            return false;
+                        }
+                        old.clone().all(|l| l != *line)
+                    })
+                    .filter(|line| !line.is_empty())
+                    .collect()
+            };
+            assert!(
+                added
+                    .iter()
+                    .all(|line| line.starts_with(key) || *line == "[alerts]"),
+                "{added:?}: {}",
+                context()
+            );
+
+            // It means what it meant, with that one change.
+            let read = |text: &str| -> toml::Table {
+                toml::from_str::<NetwatchConfig>(text)
+                    .unwrap()
+                    .values()
+                    .unwrap()
+            };
+            let changes = Changes::between(&read(&after), &read(&before));
+            let one = if key == "enabled" {
+                assert!(changes.keys.is_empty(), "{changes:?}: {}", context());
+                changes.targets.len() <= 1
+                    && changes.targets.iter().all(|change| match change {
+                        TargetChange::Fields { name, fields, .. } => {
+                            fields.len() == 1
+                                && fields[0].0 == ["enabled"]
+                                && (fields[0].1 == Some(toml::Value::Boolean(false))
+                                    && Some(name) == toggled.as_ref()
+                                    || fields[0].1 == Some(toml::Value::Boolean(true)))
+                        }
+                        _ => false,
+                    })
+            } else {
+                changes.targets.is_empty()
+                    && changes.keys.len() <= 1
+                    && changes
+                        .keys
+                        .iter()
+                        .all(|(path, _)| path.last().is_some_and(|k| k == key))
+            };
+            assert!(one, "{changes:?}: {}", context());
+
+            // The same keys it could not read, and nothing left to write.
+            let unread = |text: &str| -> Vec<KeyPath> {
+                let (_, mut keys): (NetwatchConfig, Vec<KeyPath>) =
+                    from_toml_reporting_unread(text).unwrap();
+                keys.sort();
+                keys
+            };
+            assert_eq!(unread(&after), unread(&before), "{}", context());
+            cfg.save_to(&path).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), after, "{}", context());
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1848,6 +3093,7 @@ sigmak = 9.0
             diagnose_thresholds: Default::default(),
             experimental: Default::default(),
             load_warnings: vec![],
+            loaded: None,
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();
@@ -1871,9 +3117,9 @@ sigmak = 9.0
     /// config.toml is a file people edit by hand and keep in their dotfiles,
     /// and `--generate-config` writes the one they start from. A toml release
     /// that laid it out differently (tables inlined, strings quoted another
-    /// way, a float losing its `.0`) would show up as a rewrite of that file
-    /// on the next Settings save. This pins what toml decides about the
-    /// layout rather than the list of keys, so adding a key does not fail it.
+    /// way, a float losing its `.0`) would show up in those files, and in the
+    /// lines a save adds. This pins what toml decides about the layout rather
+    /// than the list of keys, so adding a key does not fail it.
     #[test]
     fn saved_config_layout_is_stable() {
         let text = toml::to_string_pretty(&NetwatchConfig::default()).unwrap();
@@ -1884,7 +3130,6 @@ sigmak = 9.0
             "refresh_rate_ms = 1000\n",
             "capture_interface = \"\"\n",
             "show_geo = true\n",
-            "diagnose_targets = []\n",
         ] {
             let at = text
                 .find(line)
@@ -1902,6 +3147,7 @@ sigmak = 9.0
             assert!(text.contains(block), "{block:?} in\n{text}");
         }
         assert!(!text.contains('{'), "an inline table in\n{text}");
+        assert!(!text.contains("diagnose_targets"), "{text}");
 
         let text = toml::to_string_pretty(&NetwatchConfig {
             bpf_filter: "host \"a\"".into(),
@@ -2244,7 +3490,7 @@ consecutive_n = 5
     fn save_to_leaves_a_file_that_does_not_load_alone() {
         let dir = scratch("save");
         let path = dir.join("netwatch/config.toml");
-        let cfg = NetwatchConfig {
+        let mut cfg = NetwatchConfig {
             theme: "nord".into(),
             ..Default::default()
         };
@@ -2253,12 +3499,13 @@ consecutive_n = 5
         cfg.save_to(&path).unwrap();
         assert_eq!(NetwatchConfig::load_from(&path).unwrap().theme, "nord");
 
-        // A valid file is replaced, as Settings has always done.
+        // A valid file takes the change.
         fs::write(&path, "theme = 'ocean'\n").unwrap();
+        cfg.theme = "dracula".into();
         cfg.save_to(&path).unwrap();
-        assert_eq!(NetwatchConfig::load_from(&path).unwrap().theme, "nord");
+        assert_eq!(NetwatchConfig::load_from(&path).unwrap().theme, "dracula");
 
-        // One that does not load is not.
+        // One that does not load is not touched.
         let broken = "sandbox = 'strict'\nrefresh_rate_ms = 'oops'\n";
         fs::write(&path, broken).unwrap();
         let err = NetwatchConfig::default().save_to(&path).unwrap_err();
