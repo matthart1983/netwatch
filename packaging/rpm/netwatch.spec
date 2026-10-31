@@ -10,7 +10,7 @@
 # below must match Cargo.toml. `spec_version_matches_the_crate` in
 # tests/packaging.rs fails the build if they drift.
 Name:           netwatch
-Version:        0.38.0
+Version:        0.39.0
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -96,6 +96,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Sat Oct 31 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.39.0-1
+- hardening and evidence: seccomp and a Landlock network deny on parser threads, CAP_NET_RAW dropped where capture never reopens, offline GeoIP replacing the online lookup, a threat model, and a one-hour flood soak with published numbers
+
 * Sun Oct 25 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.38.0-1
 - native Windows collectors, PCAPNG exports, IPv6 stream joins and refreshed dependencies
 

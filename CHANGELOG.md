@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.39.0] - 2026-10-31
 
 ### Added
 - **`netwatch daemon --metrics` exports the capture's packet counts.**
