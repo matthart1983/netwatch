@@ -93,7 +93,7 @@ netwatch geoip update                    # download the offline GeoIP databases
 netwatch --demo                          # replay a recorded Diagnose incident, no capture needed
 ```
 
-`daemon` runs the same collectors with no screen; a [systemd unit](packaging/systemd/netwatch.service) and a [launchd agent](packaging/launchd/com.netwatch.agent.plist) ship with it, and [Prometheus export](docs/observability-export.md) lists the metrics. `--remote URL` with `NETWATCH_API_KEY` streams snapshots to a backend you run; it is experimental and its wire format may change. So are AI Insights, `netwatch resolver set` and `recover`, and the JSON in PCAPNG packet comments: [what that covers](docs/CAPABILITIES.md#experimental). [Every command and flag](docs/REFERENCE.md#command-line).
+`daemon` runs the same collectors with no screen; a [systemd unit](packaging/systemd/netwatch.service) and a [launchd agent](packaging/launchd/com.netwatch.agent.plist) ship with it, and [Prometheus export](docs/observability-export.md) lists the metrics. `--remote URL` with `NETWATCH_API_KEY` streams snapshots to a backend you run. Both stay accepted through 1.x, and what they do is experimental: the wire format may change. So are AI Insights, `netwatch resolver set` and `recover`, and the JSON in PCAPNG packet comments: [what that covers](docs/CAPABILITIES.md#experimental). [Every command and flag](docs/REFERENCE.md#command-line).
 
 ## The tabs
 

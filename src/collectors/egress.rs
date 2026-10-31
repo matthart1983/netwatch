@@ -2081,6 +2081,54 @@ block = {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
     }
 
+    /// Comments above a rule and in it stay through a promotion, as the docstring
+    /// has always said, and the file's header above the first rule. Only the list
+    /// that gains an entry changes, keeping its line's comment. A suggestion
+    /// replaces the last one rather than piling up.
+    #[test]
+    fn promotion_keeps_comments_above_and_in_a_rule() {
+        let path = scratch("promote-comments.toml");
+        let original = "# my policy\n\n# why curl is here\n[process.curl]\n# hosts\n\
+                        allow_sni = ['a.example'] # keep short\n\
+                        allow_ports = [443] # tls only\n\n\
+                        # why ssh is here\n[process.ssh]\nallow_ports = [22]\n";
+        write_owner_only(&path, original.as_bytes()).unwrap();
+        let rule = |hosts: &[&str]| ProcessRule {
+            allow_sni: hosts.iter().map(|h| (*h).to_owned()).collect(),
+            allow_ports: vec![443],
+            ..Default::default()
+        };
+        merge_rules_into_policy_file(&[("curl".into(), rule(&["b.example"]))], &path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# my policy\n\n# why curl is here\n[process.curl]\n# hosts\n",
+            "allow_sni = [\"a.example\", \"b.example\"] # keep short\n",
+            "allow_ports = [443] # tls only\n",
+            "# why ssh is here\n[process.ssh]\nallow_ports = [22]\n",
+        ] {
+            assert!(body.contains(kept), "{kept:?} not in\n{body}");
+        }
+
+        // A suggestion goes below the comment, and is replaced, not added to.
+        let hosts = ["x.a.example", "y.a.example", "z.a.example"];
+        merge_rules_into_policy_file(&[("curl".into(), rule(&hosts))], &path).unwrap();
+        let more = ["w.a.example"];
+        merge_rules_into_policy_file(&[("curl".into(), rule(&more))], &path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("# why curl is here\n# suggestion:"), "{body}");
+        assert_eq!(body.matches("# suggestion:").count(), 1, "{body}");
+        assert!(body.contains("would cover 4 entries"), "{body}");
+        assert!(body.starts_with("# my policy\n"), "{body}");
+
+        // With nothing new the rule is as it was, down to how it spells a list.
+        let path = scratch("promote-same.toml");
+        let same = "# why\n[process.curl]\nallow_sni = ['a.example']\nallow_asn = []\n\
+                    allow_ip = []\nallow_ports = [\n  443, # tls\n]\n";
+        write_owner_only(&path, same.as_bytes()).unwrap();
+        merge_rules_into_policy_file(&[("curl".into(), rule(&["a.example"]))], &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), same);
+    }
+
     /// Promotion rewrote the rule from the four lists and `block`, so a key it
     /// did not know was gone from the file, and the warning about it with it.
     #[test]

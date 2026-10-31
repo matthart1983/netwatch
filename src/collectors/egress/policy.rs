@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    apply_renames, from_toml_reporting_unread, ConfigWarning, ConfigWarningKind, RenamedKey,
+    apply_renames, from_toml_reporting_unread, same_value, ConfigWarning, ConfigWarningKind,
+    RenamedKey,
 };
 
 /// Every `egress-policy.toml` key that has been renamed, none so far. A rename
@@ -552,12 +553,33 @@ fn leading_comment_block(src: &str) -> String {
 /// The keys of a rule that promotion writes.
 const ALLOW_KEYS: [&str; 4] = ["allow_sni", "allow_asn", "allow_ip", "allow_ports"];
 
-/// Upsert `rules` into the policy file, preserving everything else — hand
-/// edits, comments, and rules for processes not being promoted. Promotion
-/// is additive per process: it unions the observed entries with those already
-/// declared (it never shrinks or deletes an allowlist). Removal is
-/// `remove_rules_from_policy_file`. Refuses (rather than clobbers) a file that
-/// no longer parses, so a broken hand edit is never silently thrown away.
+/// How a comment promotion wrote starts, so that the next one can replace it.
+const SUGGESTION: &str = "# suggestion:";
+
+/// One of a rule's lists. Left as written if it holds what it should, in that
+/// order; otherwise rewritten on one line, keeping that line's comment.
+fn set_list(rule: &mut toml_edit::Table, key: &str, list: toml_edit::Array) {
+    let list = toml_edit::Value::Array(list);
+    match rule.get_mut(key) {
+        Some(toml_edit::Item::Value(current)) => {
+            if !same_value(current, &list) {
+                let decor = current.decor().clone();
+                *current = list;
+                *current.decor_mut() = decor;
+            }
+        }
+        _ => rule[key] = toml_edit::Item::Value(list),
+    }
+}
+
+/// Upsert `rules` into the policy file, preserving everything else: hand edits,
+/// comments in a rule and above it, and rules for processes not being promoted. A
+/// list that gains an entry is rewritten on one line, so a comment inside that
+/// list goes. Promotion is additive per process: it unions the observed entries
+/// with those already declared (it never shrinks or deletes an allowlist).
+/// Removal is `remove_rules_from_policy_file`. Refuses (rather than clobbers) a
+/// file that no longer parses, so a broken hand edit is never silently thrown
+/// away.
 pub fn merge_rules_into_policy_file(
     rules: &[(String, ProcessRule)],
     path: &Path,
@@ -594,16 +616,22 @@ pub fn merge_rules_into_policy_file(
         let ports = union_ports(existing, "allow_ports", &rule.allow_ports);
 
         // Everything else in the rule stays where it is: a hand-written
-        // `[process.<name>.block]`, which promotion must never drop, and any key
-        // this version does not read. Only the four lists are promotion's.
-        let mut t = toml_edit::Table::new();
-        if let Some(rule) = existing.and_then(toml_edit::Item::as_table_like) {
-            for (key, item) in rule.iter() {
-                if !ALLOW_KEYS.contains(&key) {
-                    t[key] = item.clone();
+        // `[process.<name>.block]`, which promotion must never drop, any key this
+        // version does not read, and comments. Only the four lists are promotion's.
+        let mut t = match existing.and_then(toml_edit::Item::as_table) {
+            Some(rule) => rule.clone(),
+            None => {
+                let mut rule = toml_edit::Table::new();
+                if let Some(other_form) = existing.and_then(toml_edit::Item::as_table_like) {
+                    for (key, item) in other_form.iter() {
+                        if !ALLOW_KEYS.contains(&key) {
+                            rule[key] = item.clone();
+                        }
+                    }
                 }
+                rule
             }
-        }
+        };
         // Wildcard suggestions land as a comment above the rule — visible
         // exactly where the human reviews, applied only by their hand.
         // Computed on the *unioned* set so the suggestion reflects the file.
@@ -614,20 +642,44 @@ pub fn merge_rules_into_policy_file(
             allow_ports: ports.clone(),
             ..Default::default()
         };
+        // Below whatever comment is already above the rule, in place of the last
+        // promotion's suggestion. The file's header is above the first rule.
+        let above = t.decor().prefix().and_then(|prefix| prefix.as_str());
+        let mut comment: Option<String> = above.map(|above| {
+            above
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with(SUGGESTION))
+                .collect()
+        });
         let suggestions = wildcard_suggestions(&unioned);
         if !suggestions.is_empty() {
-            t.decor_mut()
-                .set_prefix(format!("# suggestion: {}\n", suggestions.join("; ")));
+            comment
+                .get_or_insert_default()
+                .push_str(&format!("{SUGGESTION} {}\n", suggestions.join("; ")));
         }
-        t["allow_sni"] =
-            toml_edit::value(toml_edit::Array::from_iter(sni.iter().map(String::as_str)));
-        t["allow_asn"] =
-            toml_edit::value(toml_edit::Array::from_iter(asn.iter().map(String::as_str)));
-        t["allow_ip"] =
-            toml_edit::value(toml_edit::Array::from_iter(ip.iter().map(String::as_str)));
-        t["allow_ports"] = toml_edit::value(toml_edit::Array::from_iter(
-            ports.iter().map(|p| i64::from(*p)),
-        ));
+        if let Some(comment) = comment {
+            t.decor_mut().set_prefix(comment);
+        }
+        set_list(
+            &mut t,
+            "allow_sni",
+            toml_edit::Array::from_iter(sni.iter().map(String::as_str)),
+        );
+        set_list(
+            &mut t,
+            "allow_asn",
+            toml_edit::Array::from_iter(asn.iter().map(String::as_str)),
+        );
+        set_list(
+            &mut t,
+            "allow_ip",
+            toml_edit::Array::from_iter(ip.iter().map(String::as_str)),
+        );
+        set_list(
+            &mut t,
+            "allow_ports",
+            toml_edit::Array::from_iter(ports.iter().map(|p| i64::from(*p))),
+        );
         doc["process"][name.as_str()] = toml_edit::Item::Table(t);
     }
 

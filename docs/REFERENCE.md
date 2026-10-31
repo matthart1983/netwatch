@@ -491,9 +491,9 @@ TUI flags:
 | `--view full\|lite\|dense`, `--lite` | Start in that view. |
 | `--demo` | Replay a recorded Diagnose incident instead of watching this host. |
 | `--no-sandbox`, `--sandbox-strict` | Turn the Linux sandbox off, or refuse to start unless it is enforced. |
-| `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Experimental. |
-| `--insecure-remote` | Allow an `http://` remote URL. Experimental, with `--remote`. |
-| `--api-key KEY` | Deprecated: the key shows in the process list. Use `NETWATCH_API_KEY`. Keeps working until 2.0, and prints a warning that does not include the key. |
+| `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Accepted through 1.x; what it does is experimental. |
+| `--insecure-remote` | Allow an `http://` remote URL. Accepted through 1.x; experimental, with `--remote`. |
+| `--api-key KEY` | Deprecated: the key shows in the process list. Use `NETWATCH_API_KEY`. Accepted through 1.x, with a warning that does not include the key, and goes in 2.0. What it does is experimental, with `--remote`. |
 | `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
 
 ### Uptime report
@@ -879,8 +879,8 @@ The selection, highlighted rows and filled bars show in reverse video instead.
 | Variable | Effect |
 |----------|--------|
 | `NO_COLOR` | Any non-empty value: draw the TUI without colour ([no-color.org](https://no-color.org)). |
-| `NETWATCH_API_KEY` | API key for `--remote`. Preferred over `--api-key`, which leaves the key in the process list and shell history. |
-| `NETWATCH_REMOTE_URL` | Remote backend URL, when `--remote` is not given. |
+| `NETWATCH_API_KEY` | API key for `--remote`. Preferred over `--api-key`, which leaves the key in the process list and shell history. Accepted through 1.x; what it does is experimental. |
+| `NETWATCH_REMOTE_URL` | Remote backend URL, when `--remote` is not given. Accepted through 1.x; what it does is experimental. |
 | `NETWATCH_METRICS_ADDR` | Address for the daemon's metrics endpoint, when `--metrics-addr` is not given. |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase) | Diagnose records whether a proxy applies to each configured target, and weighs it as evidence: an untrusted certificate behind a proxy points at interception. |
 

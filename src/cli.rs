@@ -57,8 +57,8 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 /// What `--api-key` prints on stderr. Names the replacement and why, and it is a
-/// constant so that it cannot pick up the key. The flag keeps working until 2.0:
-/// units and scripts use it.
+/// constant so that it cannot pick up the key. The flag stays accepted through 1.x,
+/// because units and scripts use it, and goes in 2.0.
 pub const API_KEY_DEPRECATION: &str = "--api-key is deprecated and will go in 2.0, because any user on this host can read the key with ps. Set NETWATCH_API_KEY instead.";
 pub fn help() -> String {
     let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus --unstable [--only ID] [DIR]\n       netwatch diagnose replay --unstable [--json] <FILE|DIR>...\n       netwatch diagnose features --unstable [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch geoip update [--city]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]  (experimental)\n       netwatch resolver recover --unmanaged  (experimental)\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
@@ -68,7 +68,7 @@ pub fn help() -> String {
             if *value { "<value> " } else { "" }
         ));
     }
-    text.push_str("  --unstable           Required by diagnose corpus, replay and features, whose\n                       formats can change in any release\n  --generate-config    Write default config and exit\n  --help, -h           Show help\n  --version, -V        Show version\n\nKeys: 1–9,0 tabs; V view; L Lite; q quit; Shift+R/F/E recorder\n\nExperimental, and outside the 1.0 compatibility promise: --remote and --api-key,\nresolver set and recover, AI Insights, and the JSON in PCAPNG packet comments.\n");
+    text.push_str("  --unstable           Required by diagnose corpus, replay and features, whose\n                       formats can change in any release\n  --generate-config    Write default config and exit\n  --help, -h           Show help\n  --version, -V        Show version\n\nKeys: 1–9,0 tabs; V view; L Lite; q quit; Shift+R/F/E recorder\n\nExperimental, and can change in any release: what --remote, --insecure-remote and\n--api-key do, resolver set and recover, AI Insights, and the JSON in PCAPNG packet\ncomments. Those three flags stay accepted through 1.x; --api-key goes in 2.0.\n");
     text
 }
 pub fn parse(args: &[String]) -> anyhow::Result<Command> {
@@ -274,7 +274,7 @@ mod tests {
         assert!(line.contains("Deprecated"), "{line}");
         assert!(line.contains("NETWATCH_API_KEY"), "{line}");
         assert!(API_KEY_DEPRECATION.contains("NETWATCH_API_KEY"));
-        // Deprecated, not removed: existing units keep working until 2.0.
+        // Deprecated, not removed: existing units keep starting through 1.x.
         assert!(matches!(
             command("--remote https://cloud.example.com --api-key k").unwrap(),
             Command::Run(Run {
@@ -304,8 +304,19 @@ mod tests {
             .find(|l| l.contains("netwatch resolver status"))
             .unwrap()
             .contains("experimental"));
-        for word in ["AI Insights", "PCAPNG packet comments"] {
-            assert!(help.contains(word), "{word}");
+        let footer = help
+            .split("Experimental, and")
+            .nth(1)
+            .unwrap()
+            .replace('\n', " ");
+        for word in [
+            "AI Insights",
+            "PCAPNG packet comments",
+            "what --remote, --insecure-remote and --api-key do",
+            "stay accepted through 1.x",
+            "--api-key goes in 2.0",
+        ] {
+            assert!(footer.contains(word), "{word}: {footer}");
         }
     }
 

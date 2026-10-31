@@ -61,8 +61,8 @@ Remote API key. Deprecated: any user on the host can read it in
 .BR ps (1).
 Set the
 .B NETWATCH_API_KEY
-environment variable instead. It keeps working until 2.0, and prints a warning
-that does not include the key.
+environment variable instead. It stays accepted through 1.x, with a warning that
+does not include the key, and goes in 2.0.
 .TP
 .B \-\-insecure\-remote
 Experimental, with
@@ -216,10 +216,12 @@ administrator-confirmed unmanaged files, and requires
 Experimental. Put a resolver changed by netwatch back.
 .SH EXPERIMENTAL
 These are outside the 1.0 compatibility promise and can change or go away in any
-release:
+release: what
 .BR \-\-remote ,
+.B \-\-insecure\-remote
+and
 .B \-\-api\-key
-and the snapshots they send;
+do, and the snapshots they send;
 .B resolver set
 and
 .BR "resolver recover" ;
@@ -236,7 +238,13 @@ which need
 .BR \-\-unstable ;
 and anything in the
 .B [experimental]
-configuration table.
+configuration table. Those three flags,
+.B NETWATCH_REMOTE_URL
+and
+.B NETWATCH_API_KEY
+stay accepted through 1.x, so a unit file keeps starting, and
+.B \-\-api\-key
+goes in 2.0.
 .SH KEYS
 .B 1
 to

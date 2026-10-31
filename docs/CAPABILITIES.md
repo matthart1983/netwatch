@@ -38,7 +38,9 @@ kernel accepted a program or that every flow was attributed.
 These can change or go away in any release, and are outside the 1.0 compatibility promise:
 
 - AI Insights.
-- `--remote` and `--api-key`, and the snapshots they send.
+- What `--remote`, `--insecure-remote` and `--api-key` do, and the snapshots they send. The flags
+  and `NETWATCH_REMOTE_URL` and `NETWATCH_API_KEY` stay accepted through 1.x, so a unit file keeps
+  starting. `--api-key` goes in 2.0.
 - Resolver changes: `netwatch resolver set` and `recover`.
 - The JSON in PCAPNG packet comments, `netwatch.annotation.v1`. The PCAPNG file itself is the
   standard format.

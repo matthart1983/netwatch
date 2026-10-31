@@ -49,12 +49,14 @@ All notable changes to NetWatch will be documented in this file.
   which are opt-in already.
 - **`--api-key` prints a deprecation warning.** It has been discouraged because any
   user on the host can read the key with `ps`. It now says so on stderr and in the log,
-  and points at `NETWATCH_API_KEY`. It keeps working until 2.0, and the warning does not
-  include the key.
+  and points at `NETWATCH_API_KEY`. It stays accepted through 1.x and goes in 2.0, and the
+  warning does not include the key.
 - **AI Insights, `--remote`, `--api-key`, `resolver set` and `recover`, and the JSON in
-  PCAPNG packet comments are labelled experimental.** They can change or go away in any
-  release, and are outside the 1.0 compatibility promise. Nothing about how they work
-  changes, and none is gated. `--help`, the man page, docs/REFERENCE.md,
+  PCAPNG packet comments are labelled experimental.** They can change in any release, and
+  are outside the 1.0 compatibility promise. `--remote`, `--insecure-remote`, `--api-key`
+  and their environment variables stay accepted through 1.x, so a unit file keeps
+  starting, and what they do is experimental. Nothing about how these work changes, and
+  none is gated. `--help`, the man page, docs/REFERENCE.md,
   docs/CAPABILITIES.md and the README now say so, and Settings says so under the AI
   rows while one is selected. The running UI has no other new label. REFERENCE used to
   call the whole export layout stable. PCAP and PCAPNG are still the standard formats,
@@ -142,8 +144,10 @@ All notable changes to NetWatch will be documented in this file.
   `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
   append a TOML error, so the file then failed to load with `config_invalid`.
 - **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
-  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key
-  in the rule was lost. Comments inside a promoted rule are still lost.
+  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key in the
+  rule was lost, with the comments in it and directly above it, and for the file's first
+  rule, the file's header. They all stay now. A list that gains an entry is rewritten on one
+  line, so a comment inside that list goes, and its line's own comment stays.
 
 ## [0.39.0] - 2026-10-31
 
