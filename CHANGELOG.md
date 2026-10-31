@@ -63,6 +63,26 @@ All notable changes to NetWatch will be documented in this file.
   the next start. When lookups answer with DB-IP's data, Settings and the
   `geoip_db` detail carry its CC BY 4.0 attribution, judged by each file's own
   `database_type` rather than its path.
+- **`third_party_probes = false` stops netwatch's automatic probes to public
+  servers.** Every TUI and daemon run sends STUN to Google and Cloudflare
+  about once a minute, asks 1.1.1.1 for `dns.google` and probes 1.1.1.1 with
+  ICMP and TCP 443 every probe cycle, and each TUI start traces 1.1.1.1.
+  Nothing could turn these off, which ruled netwatch out on an air-gapped or
+  privacy-minded host. The key defaults to `true`, so nothing changes unless
+  you set it. Set to `false`, none of those go out, and that holds across a
+  network change. What they measured reads as not measured, never as failed.
+  The internet RTT reads `—`, and `netwatch uptime` reports the connection as
+  unknown with no uptime percentage, though a gateway or DNS outage still
+  counts. Topology's ISP box stays empty until you press `T`. In Diagnose,
+  `dns.hijack_suspect`, `nat.symmetric` and `gateway.unreachable` show as not
+  measured and cannot open, so a router that answers nothing no longer raises
+  a critical on a probe that was never sent. The cost is that a dead gateway
+  shows up as a failing resolver or a down link instead. The three tests that
+  ask 1.1.1.1 do not run: `t` on an issue picks another, and `t` on the
+  coverage row refuses the load test, which also uploads to
+  speed.cloudflare.com. Your resolver and gateway are still probed, and what
+  else you start yourself still runs: `T`, `W`, `t` on the other coverage rows
+  and periodic traces. docs/REFERENCE.md lists them.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
@@ -684,6 +704,35 @@ All notable changes to NetWatch will be documented in this file.
   `autonomous_system_organization`, so an egress policy's `allow_asn` entries
   written for ip-api or MaxMind names (`CLOUDFLARENET`) need DB-IP's
   (`Cloudflare, Inc.`) if you switch.
+- **Insights now says when it sends in cleartext to another machine.** With
+  `insights_endpoint` set to an `http://` URL on another host, every request
+  carries DNS names, peer addresses and packet summaries across the network
+  unencrypted, and only docs/INSIGHTS.md said so. `--remote` refuses the same
+  setup unless told otherwise. The Diagnose page now carries a `cleartext,
+  off-host` line under the verdict while Insights is on, whatever the page
+  shows and however short the terminal, the AI Endpoint row in Settings leads with the same words, and `netwatch doctor`
+  reports `insights` as degraded with reason `cleartext_off_host`. netwatch
+  still sends: there is no new key, and Insights stays experimental. A
+  loopback address, `localhost` and `https://` carry no mark.
+- **The capture error and the package install messages restrict the binary to
+  a group before granting it capture.** They printed a bare `setcap`, which on
+  a 0755 binary lets every local account capture. The README, REFERENCE.md and
+  the man page already put a `netwatch` group first, but anyone following the
+  error or the post-install message did not get that. The `.deb` and `.rpm`
+  messages now give `groupadd`, `usermod`, `chown root:netwatch`, `chmod 0750`
+  and `setcap`, in that order. On Linux the capture error gives the same steps
+  as one command, which finds the binary once, before `chmod` takes it away
+  from an account not yet in the group, and ends by saying to log in again.
+  `usermod` does not reach a running session, so until then the new restriction
+  keeps that session out too, and `netwatch` gets permission denied. The
+  Dashboard and Packets headers draw that command whole, breaking only between
+  its steps. A terminal too short or too narrow for that gets a pointer to
+  `netwatch doctor --check-capture --json` and REFERENCE.md instead, never part
+  of the command, which at 50 columns pasted as something else. netwatch
+  changes no file itself, so a binary you already granted stays open to every
+  account until you run the steps. The README now leads with this recipe and
+  the systemd unit, and the container docs drop `--cap-add=NET_ADMIN`, which
+  nothing in netwatch uses.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix

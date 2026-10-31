@@ -80,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             capability: Capability::Root,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             // These stills are for documentation, not a live claim: the
             // caption carries the provenance.

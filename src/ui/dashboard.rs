@@ -65,18 +65,36 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // full-width strip.
     let timeline_under_interfaces = show_timeline && iface_beside_conns;
     let timeline_full_width = show_timeline && !iface_beside_conns;
-    // A failed capture gets a header row of its own: the dashboard is the
-    // first screen, and the failure used to show only on the Packets tab.
-    let header_rows = if widgets::capture_failure(app).is_some() {
-        4
+    // A failed capture gets header rows of its own: the dashboard is the
+    // first screen, and the failure used to show only on the Packets tab. They
+    // come off the top before the layout runs, which could shrink a header
+    // and cut the fix short. The whole fix takes only rows the panels below
+    // can do without; anything shorter gets the pointer.
+    let spare = area.height.saturating_sub(
+        3 + KPI_ROWS
+            + MID_ROWS
+            + 6
+            + if timeline_full_width {
+                TIMELINE_ROWS
+            } else {
+                0
+            }
+            + 3,
+    );
+    let failure_rows = widgets::capture_failure(app).map_or(0, |error| {
+        widgets::capture_failure_lines(&app.theme, &error, area.width, spare).len() as u16
+    });
+    let (header, area) = if failure_rows > 0 {
+        let (header, rest) = widgets::take_top(area, 3 + failure_rows);
+        (Some(header), rest)
     } else {
-        3
+        (None, area)
     };
     let mut constraints = vec![
-        Constraint::Length(header_rows), // header
-        Constraint::Length(KPI_ROWS),    // hero row
-        Constraint::Length(MID_ROWS),    // throughput, and interfaces when narrow
-        Constraint::Min(6),              // connections, interfaces and timeline
+        Constraint::Length(if header.is_some() { 0 } else { 3 }), // header
+        Constraint::Length(KPI_ROWS),                             // hero row
+        Constraint::Length(MID_ROWS), // throughput, and interfaces when narrow
+        Constraint::Min(6),           // connections, interfaces and timeline
     ];
     if timeline_full_width {
         constraints.push(Constraint::Length(TIMELINE_ROWS));
@@ -88,7 +106,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .constraints(constraints)
         .split(area);
 
-    widgets::render_header(f, app, chunks[0]);
+    widgets::render_header(f, app, header.unwrap_or(chunks[0]));
     render_kpi_strip(f, app, chunks[1]);
     render_mid_section(f, app, chunks[2], iface_beside_conns);
     render_bottom_section(

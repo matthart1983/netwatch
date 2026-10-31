@@ -142,6 +142,27 @@ fn threat_model_lists_every_outbound_endpoint() {
             "{service}: missing {endpoint}"
         );
     }
+    // The rows `third_party_probes = false` turns off say so, and no other
+    // row claims it.
+    let switched: Vec<&str> = {
+        let mut rows: Vec<&str> = rows
+            .iter()
+            .filter(|(_, words)| words.contains(&"third_party_probes"))
+            .map(|(service, _)| *service)
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(
+        switched,
+        [
+            "Explicit upload test",
+            "Internet reachability",
+            "Reference DNS",
+            "STUN",
+            "Startup trace",
+        ]
+    );
 }
 
 /// The online GeoIP lookup is gone, and so is its provider's name, from the

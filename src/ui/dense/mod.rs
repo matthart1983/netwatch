@@ -1761,7 +1761,17 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
             h.dns_rtt_ms,
             50.0,
         ),
-        ("internet", "1.1.1.1".to_string(), h.internet_rtt_ms, 100.0),
+        (
+            "internet",
+            if app.user_config.third_party_probes {
+                crate::collectors::health::INTERNET_TARGET
+            } else {
+                "off"
+            }
+            .to_string(),
+            h.internet_rtt_ms,
+            100.0,
+        ),
         (
             "peer",
             slowest
