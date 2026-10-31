@@ -5,6 +5,7 @@ The first adapter supports an explicitly administrator-confirmed unmanaged regul
 runtime, packet capture, remote publishing, model workers, or parser confinement.
 It does not widen the TUI/parser's filesystem grants. Automatic TUI/daemon edits
 and startup rollback remain disabled; both modes inspect recovery evidence.
+Resolver changes are experimental, outside the 1.0 compatibility promise.
 
 ## Commands
 
@@ -39,6 +40,20 @@ and a valid original backup. Unknown ownership, changed contents or identity, an
 partial writes remain unresolved for manual review. There is no automatic keep or
 permanent-change command in this first adapter.
 
+`recover` restores from this command's store and nothing else. It exits 0 when no
+unresolved record is left there and 1 when it refuses or a record stays unresolved.
+
+`status` and `recover` also print a notice when 0.30's
+[legacy journal](recovery-store.md#legacy-journal) has an entry open, because
+`Recovered 0 resolver operations` and `No resolver authority journal` only speak for
+this store. The notice names the file and the backup. It restores nothing and never
+changes the exit status: the journal is outside recovery authority, so a file a user
+can write cannot fail a root command. Exit 0 therefore says nothing about that
+journal, so read the output.
+
+A failed write to stdout changes nothing: a closed pipe or a full disk loses the text,
+and each command still finishes, with the same exit status and the same error on stderr.
+
 ## Ownership and supported scope
 
 A plain regular file is only an unmanaged *candidate*. `--unmanaged` is the
@@ -66,6 +81,14 @@ store at `/var/lib/netwatch/resolver-v2`. Its OS lock is held throughout the
 transaction and temporary change. Different invoking users therefore contend on
 the same store under root authority. User cache/state journals are never promoted
 into privileged recovery authority.
+
+The store is private to root, so the kernel refuses every other user once `set` or
+`recover` has run. Such a user cannot tell a resolved store from an unresolved one, so
+netwatch claims neither. Their TUI or daemon session keeps the Diagnose status line
+clear and writes one line to the log, at startup, saying the store exists, this user
+cannot read it, and to run `sudo netwatch resolver status`. `netwatch doctor` reports
+the same as `resolver_store`, `not_checked`. Root sessions report unresolved records on
+the status line. Any other failure to read the store is reported to everyone.
 
 The target must be a single-link regular file owned by root and not writable by
 group/others. Open uses no-follow/nonblocking flags. The adapter validates device,
@@ -99,7 +122,8 @@ renaming it over the target would give the target a new inode, which verificatio
 compares and recovery refuses as a changed identity. An interrupted in-place write
 already leaves recovery-required evidence that blocks further operations until
 `recover` runs. The TUI's older file-edit and make-permanent journal helpers had
-no caller and were deleted rather than converted.
+no caller and were deleted rather than converted, and 0.40 deleted the rollback
+that went with them, which nothing had called since 0.31.1.
 
 ## Validation
 
@@ -108,9 +132,14 @@ identity/permissions preservation, held-lease exclusion, manager/symlink refusal
 external edits, inode replacement, tampered backups, partial target writes,
 completion-record failure, PID reuse/unknown namespaces, and SIGKILL after Prepared,
 target sync, Applied, and restoration. Another process must acquire the released
-lease and restore only the verified original.
+lease and restore only the verified original. A journal and backup that a real 0.31.1
+`resolver set` left when SIGKILLed must restore the original through the current session
+code, so an upgrade cannot strand one.
 
-Privileged disposable-VM/network-namespace acceptance, real system-resolver behavior
+`tests/recovery.rs` runs that record through the real `resolver recover` in a private
+root inside a user namespace. It skips where the runner has no such namespace, which
+is the default CI runner, and the sandbox lab runs it. Privileged disposable-VM
+acceptance of `set`, real system-resolver behavior
 and deployment on actual unmanaged hosts remain outstanding. No real host resolver
 was modified during implementation. Broader manager/platform adapters remain
 unavailable rather than inferred from root privileges.
