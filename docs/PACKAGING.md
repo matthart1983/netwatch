@@ -44,8 +44,10 @@ drives it, with maintainer scripts in `packaging/debian/`.
 No package grants capabilities. Capture needs `CAP_NET_RAW` (and `CAP_BPF` /
 `CAP_PERFMON` for eBPF attribution), and a package that hands those to a binary
 without asking takes a decision that belongs to the administrator. Every
-post-install prints the `setcap` line instead, and CI fails the release if an
-installed package ever comes with capabilities already applied.
+post-install prints the commands instead: restrict the binary to a `netwatch`
+group, then `setcap`. On a binary every account can run, the capabilities would
+let every local account capture. CI fails the release if an installed package
+ever comes with capabilities already applied.
 
 ## Per-release checklist
 
@@ -53,13 +55,17 @@ Most of it is automatic. By hand:
 
 1. Write the release notes under `## [Unreleased]` in `CHANGELOG.md`, and
    commit them.
-2. On `main`, or on a `release/X.Y.Z` branch for a hotfix, run
+2. Get a green `sandbox-lab.yml` run on that commit, the release candidate:
+   `gh workflow run sandbox-lab.yml --ref <branch>`. The release guard does not
+   wait on it, because a flaky namespace should not hold a tag, so this step is
+   the only thing that does.
+3. On `main`, or on a `release/X.Y.Z` branch for a hotfix, run
    `scripts/release.sh X.Y.Z "summary"`. It bumps the version in `Cargo.toml`,
    `Cargo.lock` and `packaging/rpm/netwatch.spec`, and adds the spec's
    `%changelog` entry. It turns `[Unreleased]` into the version's section,
    runs `cargo test`, then commits and tags `vX.Y.Z`. It pushes nothing.
-3. Run the push commands it prints.
-4. For a hotfix, merge `release/X.Y.Z` back into `main`. Until it is, CI on
+4. Run the push commands it prints.
+5. For a hotfix, merge `release/X.Y.Z` back into `main`. Until it is, CI on
    `main` fails its `tags-on-main` job, and the release guard refuses the
    next tag cut from `main`.
 
@@ -86,7 +92,7 @@ musl-static release binary on an Alpine base — about 26 MB.
 
 ```sh
 docker run --rm -it --net=host --pid=host \
-  --cap-add=NET_RAW --cap-add=NET_ADMIN \
+  --cap-add=NET_RAW \
   ghcr.io/matthart1983/netwatch
 ```
 
@@ -97,7 +103,9 @@ Each flag earns its place:
 | `--net=host` | netwatch sees the container's veth, not the host's traffic |
 | `--pid=host` | no process attribution: `/proc/<pid>/fd` is the container's |
 | `--cap-add=NET_RAW` | packet capture fails with `socket: Operation not permitted` |
-| `--cap-add=NET_ADMIN` | interface state and some probes degrade |
+
+`--cap-add=NET_ADMIN` is not needed. Nothing in netwatch uses it, and
+promiscuous capture opens with `NET_RAW` alone.
 
 The image is not `scratch`. netwatch shells out to `ss` and `ip` (iproute2)
 for the connection table and routes, `ping` (iputils) for gateway and internet

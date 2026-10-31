@@ -278,6 +278,19 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
             .map(|e| e.raw_os_error().unwrap_or(-1));
         NET_PROBES.lock().unwrap().insert(name.into(), errno);
     }
+    // After those probes: the TCP probe's socket(2) has to work for it to show
+    // Landlock's deny.
+    let mut report = report;
+    if super::roles::no_sockets(name) {
+        super::deny_socket_create(p.mode, &mut report);
+    }
+    #[cfg(test)]
+    if std::env::var_os("NETWATCH_WORKER_NET_PROBE").is_some() {
+        SOCKET_PROBES
+            .lock()
+            .unwrap()
+            .insert(name.into(), probe_sockets());
+    }
     let allowed = !matches!(p.mode, Mode::Strict) || report.mode.warnings.is_empty();
     let mut components = crate::app::safe_lock(&p.components, "worker::enter");
     let earlier_error = components.get(name).and_then(|s| s.error.clone());
@@ -423,6 +436,26 @@ pub fn wait_ready(timeout: Duration) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+/// Of the workers whose role stacks a layer on the filesystem one and that have
+/// entered, how many have TCP bind and connect denied, and how many there are.
+///
+/// A component with no report ran under no policy of its own, so it is neither:
+/// a capture that failed to open never entered, a worker just started has not
+/// yet, and `ebpf-reader` is a note about the SDK's reader thread, which has no
+/// entry to report. That thread inherits the deny from the `ebpf` worker, which
+/// is counted.
+pub fn parser_tcp_coverage(states: &BTreeMap<String, Component>) -> (usize, usize) {
+    let entered: Vec<_> = states
+        .iter()
+        .filter(|(name, _)| super::roles::role_for(name).layer().is_some())
+        .filter_map(|(_, state)| state.report.as_ref())
+        .collect();
+    let denied = entered
+        .iter()
+        .filter(|report| report.platform.landlock_network_blocked)
+        .count();
+    (denied, entered.len())
+}
 pub fn summary() -> String {
     let states = snapshot();
     if states.is_empty() {
@@ -445,6 +478,44 @@ pub fn summary() -> String {
 static PROBES: Mutex<BTreeMap<String, bool>> = Mutex::new(BTreeMap::new());
 #[cfg(test)]
 static NET_PROBES: Mutex<BTreeMap<String, Option<i32>>> = Mutex::new(BTreeMap::new());
+/// The errno of socket(2) for UDP, MPTCP and netlink, then of io_uring_setup(2),
+/// on each worker as it finished entry, or `None` for one that opened.
+#[cfg(test)]
+static SOCKET_PROBES: Mutex<BTreeMap<String, [Option<i32>; 4]>> = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+fn probe_sockets() -> [Option<i32>; 4] {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::libc;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let opened = |fd: libc::c_long| {
+            if fd < 0 {
+                return std::io::Error::last_os_error().raw_os_error();
+            }
+            // SAFETY: the caller just got this descriptor from the kernel and
+            // nothing else owns it.
+            drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+            None
+        };
+        let [udp, mptcp, netlink] = [
+            (libc::AF_INET, libc::SOCK_DGRAM, 0),
+            (libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_MPTCP),
+            (libc::AF_NETLINK, libc::SOCK_RAW, 0),
+        ]
+        // SAFETY: socket takes three integers and reads no memory of ours.
+        .map(|(domain, kind, protocol)| {
+            opened(unsafe { libc::socket(domain, kind, protocol) } as libc::c_long)
+        });
+        let mut params = [0u64; 15];
+        // SAFETY: io_uring_setup reads and writes the 120-byte io_uring_params
+        // it is given, which `params` is, alive throughout.
+        let ring =
+            opened(unsafe { libc::syscall(libc::SYS_io_uring_setup, 8, params.as_mut_ptr()) });
+        [udp, mptcp, netlink, ring]
+    }
+    #[cfg(not(target_os = "linux"))]
+    [None; 4]
+}
 /// What the thread that last called [`fail`] for each name held then.
 #[cfg(all(test, target_os = "linux"))]
 static FAILED_HOLDING: Mutex<BTreeMap<String, caps::CapsHashSet>> = Mutex::new(BTreeMap::new());
@@ -620,11 +691,6 @@ mod tests {
         }
         let capture = snapshot()["capture"].report.clone().unwrap();
         assert_eq!(capture.platform.landlock_layer, Some("capture"));
-        // Online lookups are opt-in (off by default, see `geoip_online` in
-        // NetwatchConfig); force them on here so the geoip worker actually
-        // spawns and this test still covers its sandbox entry.
-        let geo = crate::collectors::geo::GeoCache::with_mmdb_and_online("", "", true);
-        geo.start();
         let whois = crate::collectors::whois::WhoisCache::new();
         whois.start();
         let mut packet = crate::collectors::packets::PacketCollector::new();
@@ -655,7 +721,7 @@ mod tests {
         let mut ai =
             crate::collectors::insights::InsightsCollector::new("unused", "http://127.0.0.1:1");
         ai.start();
-        for name in ["geoip", "whois", "reverse-dns", "keylog", "insights"] {
+        for name in ["whois", "reverse-dns", "keylog", "insights"] {
             assert_eq!(
                 PROBES.lock().unwrap().get(name),
                 Some(&true),
@@ -688,21 +754,32 @@ mod tests {
         std::io::Read::read_to_string(&mut scrape, &mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let net = NET_PROBES.lock().unwrap().clone();
-        for name in [
-            "keylog",
-            "metrics-listener",
-            "metrics-client",
-            "boundary-check",
-            "capture",
-        ] {
+        for name in ["keylog", "metrics-listener", "boundary-check", "capture"] {
             assert_eq!(
                 net.get(name),
                 Some(&Some(nix::libc::EACCES)),
                 "actual {name} worker could connect: {net:?}"
             );
         }
-        // The online GeoIP worker is on its way out, so it is not held to
-        // connecting here.
+        // The last metrics-client served that scrape. It started on the
+        // listener's thread and inherited the filter, so its probe stops at
+        // socket(2), before Landlock's deny.
+        assert_eq!(
+            net.get("metrics-client"),
+            Some(&Some(nix::libc::EPERM)),
+            "{net:?}"
+        );
+        // The no-socket workers get EPERM for every family and for a ring, and
+        // the parser threads without the filter still open sockets.
+        let sockets = SOCKET_PROBES.lock().unwrap().clone();
+        let eperm = Some(nix::libc::EPERM);
+        for name in ["keylog", "metrics-listener", "metrics-client", "capture"] {
+            assert_eq!(sockets.get(name), Some(&[eperm; 4]), "{name}");
+        }
+        for name in ["connections", "whois"] {
+            let [udp, _, netlink, _] = sockets[name];
+            assert_eq!((udp, netlink), (None, None), "{name}");
+        }
         for name in ["whois", "reverse-dns", "insights"] {
             assert_eq!(
                 net.get(name),
@@ -816,6 +893,89 @@ mod tests {
             "{error}"
         );
         assert!(!snapshot()["policy-preflight"].ready);
+    }
+
+    /// Best-effort runs on without Landlock: parser workers do their work with
+    /// the network open, and the reports say so.
+    #[test]
+    fn best_effort_runs_parser_workers_without_the_tcp_deny() {
+        const CHILD: &str = "NETWATCH_WORKER_BEST_EFFORT_NO_LANDLOCK_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::worker::tests::best_effort_runs_parser_workers_without_the_tcp_deny",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        hide_landlock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        install(Mode::BestEffort, SandboxPaths::default()).unwrap();
+        assert_eq!(preflight(), Ok(()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn("connections", move || {
+            tx.send(std::net::TcpStream::connect(addr).is_ok()).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        let states = snapshot();
+        let report = states["connections"].report.as_ref().unwrap();
+        let platform = &report.platform;
+        assert_eq!(platform.landlock_abi, 0);
+        assert_eq!(platform.landlock_kernel_abi, 0);
+        assert_eq!(platform.landlock_availability, Some("not_built"));
+        assert_eq!(platform.network_policy(), "allowed");
+        assert!(platform.landlock_restrictions.is_empty(), "{report:?}");
+        let warnings = report.mode.warnings.join("; ");
+        assert!(warnings.contains("ENOSYS"), "{warnings}");
+        assert_eq!(parser_tcp_coverage(&states), (0, states.len()));
+        // The degradation shows, which is what best-effort promises instead.
+        assert!(wait_ready(Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn parser_tcp_coverage_counts_only_parsers_that_entered() {
+        let component = |blocked: Option<bool>| Component {
+            ready: true,
+            report: blocked.map(|blocked| {
+                let mut report = Report::default();
+                report.platform.landlock_network_blocked = blocked;
+                report
+            }),
+            error: None,
+        };
+        let healthy = |name: &str| (name.to_string(), component(Some(true)));
+        let mut states: BTreeMap<String, Component> =
+            [healthy("connections"), healthy("capture"), healthy("ebpf")]
+                .into_iter()
+                .collect();
+        // A network worker is not a parser, whatever its policy.
+        states.insert("whois".into(), component(Some(false)));
+        assert_eq!(parser_tcp_coverage(&states), (3, 3));
+        // A healthy session with eBPF attached still reads N/N. The reader is a
+        // note: it inherits the deny from `ebpf`, which is counted.
+        states.insert("ebpf-reader".into(), component(None));
+        assert_eq!(parser_tcp_coverage(&states), (3, 3));
+        // A worker started and not yet entered, and a capture that failed to
+        // open, ran under no policy. Neither is a parser the deny missed.
+        states.insert("traffic".into(), component(None));
+        states.insert("capture".into(), component(None));
+        assert_eq!(parser_tcp_coverage(&states), (2, 2));
+        // One that entered without the deny does count against it.
+        states.insert("keylog".into(), component(Some(false)));
+        assert_eq!(parser_tcp_coverage(&states), (2, 3));
     }
 
     /// Workers that enter before the session starts drop CAP_NET_RAW; the

@@ -140,6 +140,11 @@ required-features = ["ebpf"]
 name = "ebpf_udp_v6_smoke"
 required-features = ["ebpf"]
 
+# Its main thread is a session's main, which a test harness's would not be.
+[[test]]
+name = "capture_authority"
+harness = false
+
 [build-dependencies]
 # Embeds a Windows application manifest (activeCodePage = UTF-8) so libpcap /
 # Npcap device strings and error buffers in non-UTF-8 system locales decode as

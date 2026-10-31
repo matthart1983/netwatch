@@ -70,6 +70,8 @@ newer (it cannot be static). On anything older, build from source with
 
 ## Run
 
+Packet capture needs elevated access. On Linux, grant `cap_net_raw,cap_bpf,cap_perfmon+eip` to a binary [restricted to a netwatch group](docs/REFERENCE.md#running-without-sudo-linux), or run the [systemd unit](packaging/systemd/netwatch.service). `sudo netwatch` works, but as root the sandbox is defence in depth only and containment is limited. See the [threat model](docs/THREAT-MODEL.md).
+
 ```bash
 netwatch              # interfaces, connections, config. No privileges.
 sudo netwatch         # works; root containment is limited
@@ -77,7 +79,7 @@ netwatch --lite       # one 80x24 screen
 netwatch --view dense # four boxes, 130x44 or larger
 ```
 
-`1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key. On Linux, prefer `cap_net_raw,cap_bpf,cap_perfmon+eip` [restricted to a netwatch group](docs/REFERENCE.md#running-without-sudo-linux). Running as root works, but the sandbox is defence in depth and containment is limited. See the [threat model](docs/THREAT-MODEL.md).
+`1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key.
 
 ### Without the TUI
 
@@ -87,6 +89,7 @@ netwatch diagnose run --budget 30s       # one bounded diagnosis; exit 0 clean, 
 netwatch diagnose run --format json      # the same, for scripts
 netwatch daemon --metrics                # headless; Prometheus /metrics on 127.0.0.1:9464
 netwatch uptime --since 7d               # outages this week: when, how long, and which hop failed
+netwatch geoip update                    # download the offline GeoIP databases
 netwatch --demo                          # replay a recorded Diagnose incident, no capture needed
 ```
 

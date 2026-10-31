@@ -2,11 +2,16 @@
 //! inspection never starts collectors, loads Npcap, or contacts an endpoint.
 use crate::{
     app::{App, AttributionStatus},
+    collectors::geo::{DbFile, DbStatus},
     config::NetwatchConfig,
     sandbox::{self, Mode},
 };
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How old a loaded GeoIP database gets before doctor calls it stale. DB-IP
+/// publishes monthly, so this is a refresh or two missed.
+const GEOIP_DB_STALE_AFTER: Duration = Duration::from_secs(60 * 86_400);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,11 +48,35 @@ pub struct Protection {
     pub component: String,
     pub entry_ready: bool,
     pub effective: Option<String>,
+    /// The Landlock ABI of what this thread enforces: the newest feature in
+    /// force, so 3 for the filesystem layer alone on any newer kernel.
     pub landlock_abi: u32,
     pub caps_dropped: Vec<String>,
     pub caps_retained: Vec<String>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+    /// The ABI the kernel reports.
+    #[serde(default)]
+    pub landlock_kernel_abi: u32,
+    /// `denied` when this thread's TCP bind and connect are, `allowed` when it
+    /// entered and they are not, and `not_entered` when it has no report: a
+    /// capture that failed to open, a worker just started, or the note for the
+    /// eBPF SDK's reader, which inherits the `ebpf` worker's policy.
+    #[serde(default)]
+    pub network_policy: String,
+    /// `filesystem`, `filesystem_write`, `tcp_bind`, `tcp_connect`,
+    /// `abstract_unix_socket`, `signal`, `pathname_unix_socket` and, from the
+    /// seccomp filter, `socket_create`.
+    #[serde(default)]
+    pub landlock_restrictions: Vec<String>,
+    /// CAP_NET_RAW on this thread: `dropped`, `retained_for_reopen`, `not_held`
+    /// or `not_applicable`.
+    #[serde(default)]
+    pub capture_authority: String,
+    /// The no-socket filter: `installed`, `unknown_arch`, `failed` or
+    /// `not_applicable`.
+    #[serde(default)]
+    pub socket_filter: String,
 }
 impl Protection {
     fn from_report(
@@ -69,8 +98,65 @@ impl Protection {
                 .unwrap_or_default(),
             warnings: report.map(|r| r.mode.warnings.clone()).unwrap_or_default(),
             error,
+            landlock_kernel_abi: report.map_or(0, |r| r.platform.landlock_kernel_abi),
+            network_policy: report
+                .map_or("not_entered", |r| r.platform.network_policy())
+                .into(),
+            landlock_restrictions: report
+                .map(|r| {
+                    r.platform
+                        .landlock_restrictions
+                        .iter()
+                        .map(|restriction| (*restriction).to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            capture_authority: report
+                .map_or(sandbox::NetRaw::NotApplicable, |r| {
+                    r.platform.capture_authority
+                })
+                .label()
+                .into(),
+            socket_filter: report
+                .map_or(sandbox::SocketFilter::NotApplicable, |r| {
+                    r.platform.socket_filter
+                })
+                .label()
+                .into(),
         }
     }
+}
+/// What Landlock this kernel has and what a parser thread gets from it. Null
+/// off Linux.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Landlock {
+    /// The ABI the kernel reports, 0 without Landlock.
+    pub kernel_abi: u32,
+    /// `available`, `not_enabled`, `not_built` or `unknown`. `not_built` also
+    /// covers a seccomp profile blocking the syscalls with any errno but
+    /// EOPNOTSUPP: the landlock crate reports both the same way.
+    pub availability: String,
+    /// The errata the kernel reports fixed, by the numbers in the kernel's
+    /// documentation.
+    pub errata: Vec<u32>,
+    /// Static doctor runs this on a disposable thread. A live session reads it
+    /// from a parser worker's entry report. Null if neither has one.
+    pub parser_check: Option<ParserCheck>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParserCheck {
+    /// The same meaning as a protection's `landlock_abi`.
+    pub enforced_abi: u32,
+    pub restrictions: Vec<String>,
+    /// `denied`, `allowed` or `error`, for anything else a check got back.
+    pub tcp_bind: String,
+    pub tcp_connect: String,
+}
+/// A thread still holding CAP_NET_RAW when startup audited the process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetRawTask {
+    pub tid: u32,
+    pub comm: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
@@ -80,12 +166,28 @@ pub struct CapabilitySnapshot {
     pub interface: Option<String>,
     pub capabilities: Vec<Capability>,
     pub protections: Vec<Protection>,
+    /// Always false: this is about the whole process, and main and the network
+    /// workers keep the network. Each protection has its own `network_policy`.
     pub network_restricted: bool,
     #[serde(default)]
     pub attribution_coverage: Option<crate::collectors::attribution::Coverage>,
+    #[serde(default)]
+    pub landlock: Option<Landlock>,
+    /// Process-wide, from the audit at startup. Null in doctor, which starts
+    /// no session to audit, and off Linux. A session writes it to its log, which
+    /// is the only place to read it.
+    #[serde(default)]
+    pub tasks_holding_net_raw: Option<Vec<NetRawTask>>,
 }
 impl CapabilitySnapshot {
+    /// With the databases read from disk, for a report. A live session passes
+    /// what it opened to [`Self::configured_with`] instead, as Settings
+    /// redraws this every frame.
     fn configured(config: &NetwatchConfig) -> Self {
+        let (db, asn) = config.geoip_paths();
+        Self::configured_with(config, &DbStatus::open(&db, &asn))
+    }
+    fn configured_with(config: &NetwatchConfig, geoip: &DbStatus) -> Self {
         let mut snapshot = Self {
             schema_version: 1,
             scope: "static".into(),
@@ -96,6 +198,8 @@ impl CapabilitySnapshot {
             protections: vec![],
             network_restricted: false,
             attribution_coverage: None,
+            landlock: None,
+            tasks_holding_net_raw: None,
         };
         snapshot.put(
             "config",
@@ -152,7 +256,11 @@ impl CapabilitySnapshot {
             "probes",
             State::NotChecked,
             "no_active_probes",
-            "Gateway, DNS and Internet probes were not sent",
+            if config.third_party_probes {
+                "Gateway, DNS and Internet probes were not sent"
+            } else {
+                "Gateway and DNS probes were not sent; third_party_probes is off, so a live session sends no Internet probe, STUN or resolver cross-check"
+            },
             Some("Open a live session and inspect Diagnose coverage"),
         );
         let tcp_supported = cfg!(any(target_os = "linux", target_os = "macos"));
@@ -182,36 +290,40 @@ impl CapabilitySnapshot {
                 State::Unavailable
             },
             "policy_not_applied",
-            &format!(
-                "Requested {:?}; no policy applied by static doctor; networking unrestricted",
+            &with_root_note(format!(
+                "Requested {:?}; no policy applied by static doctor; see landlock for what a parser thread gets",
                 mode
-            ),
+            )),
             Some("Inspect live Settings for component enforcement"),
         );
-        for (id, enabled, detail) in [
-            (
-                "online_geo",
-                config.geoip_online,
-                "Online GeoIP configured (ip-api.com, cleartext HTTP); endpoint not contacted",
-            ),
-            (
-                "insights",
-                config.insights_enabled,
-                "Insights configured; endpoint not contacted",
-            ),
-        ] {
-            snapshot.put(
-                id,
-                if enabled {
-                    State::NotChecked
-                } else {
-                    State::Disabled
-                },
-                "configuration_only",
-                detail,
-                Some("Review external-service settings before live use"),
-            );
-        }
+        let (state, reason, detail, next) =
+            landlock_capability(cfg!(target_os = "linux"), mode, None);
+        snapshot.put("landlock", state, reason, &detail, next);
+        let (state, reason, detail, next) = geoip_db_assessment(geoip, SystemTime::now());
+        snapshot.put("geoip_db", state, reason, &detail, next);
+        snapshot.put(
+            "online_geo",
+            State::Disabled,
+            "removed",
+            if config.geoip_online {
+                "Online GeoIP was removed in 0.39; geoip_online in config.toml is ignored"
+            } else {
+                "Online GeoIP was removed in 0.39; lookups stay on this machine"
+            },
+            Some("netwatch geoip update"),
+        );
+        snapshot.put(
+            "insights",
+            if config.insights_enabled {
+                State::NotChecked
+            } else {
+                State::Disabled
+            },
+            "configuration_only",
+            "Insights configured; endpoint not contacted",
+            Some("Review external-service settings before live use"),
+        );
+        snapshot.flag_cleartext_insights(config);
         snapshot.put(
             "whois",
             State::NotChecked,
@@ -243,6 +355,26 @@ impl CapabilitySnapshot {
         snapshot.put("resolver",if cfg!(target_os="linux") {State::NotChecked} else {State::Unavailable},"authority_not_granted","Automatic TUI edits disabled; Linux requires separate confirmed-unmanaged root command",Some("netwatch resolver status"));
         snapshot
     }
+    /// Insights going out unencrypted to another machine is what to report,
+    /// whatever the model is doing: every request carries the snapshot. The
+    /// endpoint stays out of it, as elsewhere in this report.
+    fn flag_cleartext_insights(&mut self, config: &NetwatchConfig) {
+        use crate::collectors::insights::{cleartext_off_host, CLEARTEXT_OFF_HOST};
+        if !config.insights_enabled || !cleartext_off_host(&config.insights_endpoint) {
+            return;
+        }
+        let detail = format!(
+            "{CLEARTEXT_OFF_HOST}: the endpoint is http:// on another host, so DNS names, peer addresses and packet summaries cross the network unencrypted. {}",
+            self.get("insights").detail
+        );
+        self.put(
+            "insights",
+            State::Degraded,
+            "cleartext_off_host",
+            &detail,
+            Some("Use an https:// endpoint, or one on this host"),
+        );
+    }
     pub fn get(&self, id: &str) -> &Capability {
         self.capabilities
             .iter()
@@ -270,6 +402,16 @@ impl CapabilitySnapshot {
             self.get("attribution").state.label(),
             self.get("sandbox").state.label()
         )
+    }
+    /// The sandbox part of a snapshot as one line of JSON, for the session log:
+    /// `landlock`, `protections` and `tasks_holding_net_raw`.
+    pub fn sandbox_json(&self) -> String {
+        serde_json::json!({
+            "landlock": self.landlock,
+            "protections": self.protections,
+            "tasks_holding_net_raw": self.tasks_holding_net_raw,
+        })
+        .to_string()
     }
     /// A line for Settings when the connection table is not read from `ss`,
     /// state first. It is a row of its own: appended to [`Self::compact`],
@@ -301,7 +443,7 @@ impl CapabilitySnapshot {
         lines.join("\n") + "\n"
     }
     pub fn live(app: &App) -> Self {
-        let mut snapshot = Self::configured(&app.user_config);
+        let mut snapshot = Self::configured_with(&app.user_config, app.geo_cache.db_status());
         snapshot.scope = "runtime".into();
         snapshot.interface = Some(app.capture_interface.clone());
         snapshot.put(
@@ -383,18 +525,22 @@ impl CapabilitySnapshot {
         }
         snapshot.attribution_coverage = Some(coverage);
         let health = app.health_prober.status();
+        // A skipped internet probe still stamps its cycle. That is no
+        // completion here: with the switch off, two targets is all of them.
+        let third_party = app.health_prober.third_party_probes();
         let times = [
             health.completed.gateway,
             health.completed.dns,
-            health.completed.internet,
+            health.completed.internet.filter(|_| third_party),
         ];
+        let targets = if third_party { 3 } else { 2 };
         let fresh = times
             .iter()
             .filter(|t| t.is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
             .count();
         snapshot.put(
             "probes",
-            if fresh == 3 {
+            if fresh == targets {
                 State::Ready
             } else if fresh > 0 {
                 State::Degraded
@@ -405,7 +551,12 @@ impl CapabilitySnapshot {
             },
             "probe_completions",
             &format!(
-                "{fresh}/3 probe targets have fresh completions; completion does not imply success"
+                "{fresh}/{targets} probe targets have fresh completions; completion does not imply success{}",
+                if third_party {
+                    ""
+                } else {
+                    "; third_party_probes is off, so the Internet probe, STUN and resolver cross-check are not measured"
+                }
             ),
             Some("Inspect Diagnose for RTT, loss and target coverage"),
         );
@@ -441,17 +592,34 @@ impl CapabilitySnapshot {
         } else {
             State::Degraded
         };
+        let workers = sandbox::worker::snapshot();
         snapshot.put(
             "sandbox",
             state,
             "runtime_enforcement",
-            &format!("{} · {}", report.summary(), sandbox::worker::summary()),
-            Some("netwatch doctor --json; networking is unrestricted"),
+            &sandbox_detail(report, &workers, &sandbox::worker::summary()),
+            Some("netwatch doctor --json"),
         );
+        snapshot.landlock = live_landlock(report, &workers);
+        let (state, reason, detail, next) = landlock_capability(
+            cfg!(target_os = "linux"),
+            sandbox::worker::mode(),
+            snapshot.landlock.as_ref(),
+        );
+        snapshot.put("landlock", state, reason, &detail, next);
+        snapshot.tasks_holding_net_raw = sandbox::audit::tasks_holding_net_raw().map(|holders| {
+            holders
+                .into_iter()
+                .map(|holder| NetRawTask {
+                    tid: holder.tid,
+                    comm: holder.comm,
+                })
+                .collect()
+        });
         snapshot
             .protections
             .push(Protection::from_report("main", true, Some(report), None));
-        for (name, component) in sandbox::worker::snapshot() {
+        for (name, component) in workers {
             snapshot.protections.push(Protection::from_report(
                 &name,
                 component.ready,
@@ -459,17 +627,6 @@ impl CapabilitySnapshot {
                 component.error,
             ));
         }
-        snapshot.put(
-            "online_geo",
-            if app.user_config.geoip_online {
-                State::NotChecked
-            } else {
-                State::Disabled
-            },
-            "live_configuration",
-            "Live online lookup setting (ip-api.com, cleartext HTTP); per-request outcomes not tracked here",
-            None,
-        );
         for id in ["whois", "reverse_dns"] {
             snapshot.put(
                 id,
@@ -503,6 +660,7 @@ impl CapabilitySnapshot {
                 detail,
                 Some("Review Insights settings and data sharing"),
             );
+            snapshot.flag_cleartext_insights(&app.user_config);
         } else {
             snapshot.put(
                 "insights",
@@ -535,11 +693,329 @@ impl CapabilitySnapshot {
         snapshot
     }
 }
+/// Added to the sandbox capability wherever it is shown when netwatch runs as
+/// root. Most files stay readable and writable there whatever the sandbox does,
+/// so an escape is not what it promises (SECURITY.md).
+const ROOT_NOTE: &str = "running as root: containment limited";
+
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    return nix::unistd::geteuid().is_root();
+    #[cfg(not(unix))]
+    false
+}
+
+fn with_root_note(detail: String) -> String {
+    if running_as_root() {
+        format!("{detail} · {ROOT_NOTE}")
+    } else {
+        detail
+    }
+}
+
+/// The live sandbox capability's detail, as clauses Settings puts on a row
+/// each. `verified` is [`sandbox::worker::summary`]'s line.
+fn sandbox_detail(
+    main: &sandbox::Report,
+    workers: &std::collections::BTreeMap<String, sandbox::worker::Component>,
+    verified: &str,
+) -> String {
+    use sandbox::{NetRaw, SocketFilter};
+    let mut clauses = vec![main.summary()];
+    if cfg!(target_os = "linux") && main.mode.effective != Some("disabled") {
+        let (denied, parsers) = sandbox::worker::parser_tcp_coverage(workers);
+        if parsers > 0 {
+            clauses.push(format!("TCP denied on {denied}/{parsers} parser workers"));
+        }
+        let unfiltered = workers
+            .values()
+            .filter_map(|w| w.report.as_ref())
+            .any(|r| r.platform.socket_filter == SocketFilter::UnknownArch);
+        if unfiltered {
+            clauses.push(format!(
+                "no-socket filter skipped: no syscall table for {}",
+                std::env::consts::ARCH
+            ));
+        }
+        match main.platform.capture_authority {
+            NetRaw::RetainedForReopen => {
+                clauses.push("CAP_NET_RAW kept on main to reopen capture (c, i, Shift+R)".into())
+            }
+            NetRaw::Dropped => clauses.push("CAP_NET_RAW dropped once capture opened".into()),
+            NetRaw::NotHeld | NetRaw::NotApplicable => {}
+        }
+    }
+    clauses.push(verified.to_owned());
+    with_root_note(clauses.join(" · "))
+}
+
+/// The `landlock` capability, from what doctor or a live session found.
+/// `linux` says whether there is a backend; the sandbox mode comes next because
+/// the object is reported either way, and only this says whether it applies.
+fn landlock_capability(
+    linux: bool,
+    mode: Mode,
+    landlock: Option<&Landlock>,
+) -> (State, &'static str, String, Option<&'static str>) {
+    if !linux {
+        return (
+            State::Unavailable,
+            "platform_unsupported",
+            "Landlock is Linux only; this platform has no sandbox backend".into(),
+            None,
+        );
+    }
+    if matches!(mode, Mode::Disabled) {
+        return (
+            State::Disabled,
+            "sandbox_disabled",
+            "Sandbox disabled by configuration; no thread takes a Landlock policy".into(),
+            Some("Set sandbox = \"on\" or drop --no-sandbox"),
+        );
+    }
+    let Some(landlock) = landlock else {
+        return (
+            State::NotChecked,
+            "self_test_not_run",
+            "Landlock has not been checked".into(),
+            Some("netwatch doctor"),
+        );
+    };
+    match landlock.availability.as_str() {
+        "not_enabled" => {
+            return (
+                State::Unavailable,
+                "landlock_not_enabled",
+                "This kernel has Landlock built in but it is not enabled (EOPNOTSUPP); parser threads keep the network".into(),
+                Some("Add landlock to the kernel's lsm= boot parameter"),
+            )
+        }
+        "not_built" => {
+            return (
+                State::Unavailable,
+                "landlock_not_built",
+                "This kernel has no Landlock (ENOSYS), or something such as a container's seccomp profile blocks it; parser threads keep the network".into(),
+                Some("Use a kernel built with CONFIG_SECURITY_LANDLOCK, or allow syscalls 444-446 in the seccomp profile"),
+            )
+        }
+        _ => {}
+    }
+    let kernel = landlock.kernel_abi;
+    if landlock.availability == "available" && kernel < 4 {
+        return (
+            State::Degraded,
+            "kernel_abi_below_4",
+            format!(
+                "Kernel Landlock ABI {kernel} cannot deny TCP; parser threads keep the network and --sandbox-strict refuses to start"
+            ),
+            Some("Linux 6.7 or newer has ABI 4"),
+        );
+    }
+    match &landlock.parser_check {
+        Some(check) if check.tcp_bind == "denied" && check.tcp_connect == "denied" => (
+            State::Ready,
+            "parser_network_denied",
+            format!(
+                "Kernel Landlock ABI {kernel}; a parser thread enforces ABI {} and is denied TCP bind and connect",
+                check.enforced_abi
+            ),
+            None,
+        ),
+        Some(check) => (
+            State::Unavailable,
+            "self_test_failed",
+            format!(
+                "Kernel Landlock ABI {kernel}, but a parser thread got TCP bind {} and connect {}",
+                check.tcp_bind, check.tcp_connect
+            ),
+            Some("Report this: the kernel should deny both"),
+        ),
+        None => (
+            State::Unavailable,
+            "self_test_failed",
+            format!("Kernel Landlock ABI {kernel}, but the parser check did not complete"),
+            Some("Report this: the kernel should deny both"),
+        ),
+    }
+}
+
+/// What the reports of a live session say of Landlock. Entry reports only, so
+/// the check says what each worker's layer enforced rather than trying a
+/// connection: Settings asks for this on every frame.
+#[cfg(target_os = "linux")]
+fn live_landlock(
+    main: &sandbox::Report,
+    workers: &std::collections::BTreeMap<String, sandbox::worker::Component>,
+) -> Option<Landlock> {
+    let parser = workers.iter().find_map(|(name, worker)| {
+        let is_parser = sandbox::roles::role_for(name) == sandbox::Role::Parser;
+        worker.report.as_ref().filter(|_| is_parser)
+    });
+    let report = parser.unwrap_or(main);
+    Some(Landlock {
+        kernel_abi: report.platform.landlock_kernel_abi,
+        availability: report
+            .platform
+            .landlock_availability
+            .unwrap_or("unknown")
+            .into(),
+        errata: sandbox::landlock_errata(),
+        parser_check: parser.map(|parser| {
+            let held = |restriction: &'static str| {
+                let denied = parser.platform.landlock_restrictions.contains(&restriction);
+                String::from(if denied { "denied" } else { "allowed" })
+            };
+            ParserCheck {
+                enforced_abi: parser.platform.landlock_abi,
+                restrictions: restrictions_of(parser),
+                tcp_bind: held("tcp_bind"),
+                tcp_connect: held("tcp_connect"),
+            }
+        }),
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn live_landlock(
+    _main: &sandbox::Report,
+    _workers: &std::collections::BTreeMap<String, sandbox::worker::Component>,
+) -> Option<Landlock> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn restrictions_of(report: &sandbox::Report) -> Vec<String> {
+    report
+        .platform
+        .landlock_restrictions
+        .iter()
+        .map(|restriction| (*restriction).to_owned())
+        .collect()
+}
+
+/// A loopback listener doctor binds itself, so that a TCP connect that is not
+/// denied reaches nothing else. Without one, as with loopback down, the connect
+/// goes to port 0, which nothing can listen on.
+#[cfg(target_os = "linux")]
+struct TcpCheck(Option<std::net::TcpListener>);
+#[cfg(target_os = "linux")]
+impl TcpCheck {
+    fn new() -> Self {
+        Self(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok())
+    }
+    /// What TCP bind and connect do on the calling thread. Landlock answers
+    /// EACCES before it looks at the address, so a down loopback does not hide
+    /// a deny.
+    fn run(&self) -> (&'static str, &'static str) {
+        let observed = |result: std::io::Result<()>| match result {
+            Ok(()) => "allowed",
+            Err(error) if error.raw_os_error() == Some(nix::libc::EACCES) => "denied",
+            Err(_) => "error",
+        };
+        let port = self
+            .0
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map_or(0, |addr| addr.port());
+        let localhost = std::net::Ipv4Addr::LOCALHOST;
+        (
+            observed(std::net::TcpListener::bind((localhost, 0)).map(drop)),
+            observed(std::net::TcpStream::connect((localhost, port)).map(drop)),
+        )
+    }
+}
+
+/// Take a parser's policy on a thread that ends with it, and try TCP from
+/// there. It runs with the sandbox disabled too: what this kernel can do does
+/// not depend on what the configuration asks for.
+#[cfg(target_os = "linux")]
+fn landlock_self_test() -> Landlock {
+    let check = TcpCheck::new();
+    let outcome = std::thread::Builder::new()
+        .name("landlock-check".into())
+        .spawn(move || {
+            let report = sandbox::apply_retaining(
+                Mode::BestEffort,
+                &sandbox::SandboxPaths::default(),
+                sandbox::Retain::Nothing,
+                sandbox::Role::Parser,
+            );
+            let (tcp_bind, tcp_connect) = check.run();
+            (report, tcp_bind, tcp_connect)
+        })
+        .ok()
+        .and_then(|thread| thread.join().ok());
+    let errata = sandbox::landlock_errata();
+    let Some((report, tcp_bind, tcp_connect)) = outcome else {
+        return Landlock {
+            kernel_abi: 0,
+            availability: "unknown".into(),
+            errata,
+            parser_check: None,
+        };
+    };
+    Landlock {
+        kernel_abi: report.platform.landlock_kernel_abi,
+        availability: report
+            .platform
+            .landlock_availability
+            .unwrap_or("unknown")
+            .into(),
+        errata,
+        parser_check: Some(ParserCheck {
+            enforced_abi: report.platform.landlock_abi,
+            restrictions: restrictions_of(&report),
+            tcp_bind: tcp_bind.into(),
+            tcp_connect: tcp_connect.into(),
+        }),
+    }
+}
+
+/// The capture thread's policy on the calling thread, so strict fails here
+/// where it would refuse capture. What the check saw of TCP stands in for what
+/// the layer reported, and it runs before the no-socket filter, as a worker's
+/// entry does, because the filter would stop it at socket(2).
+fn enter_capture_policy(mode: Mode) -> sandbox::Report {
+    #[cfg(target_os = "linux")]
+    let check = TcpCheck::new();
+    let mut report = sandbox::apply_retaining(
+        mode,
+        &sandbox::SandboxPaths::default(),
+        sandbox::Retain::Nothing,
+        sandbox::Role::Capture,
+    );
+    #[cfg(target_os = "linux")]
+    if report.platform.landlock_network_blocked {
+        let (bind, connect) = check.run();
+        if (bind, connect) != ("denied", "denied") {
+            report.platform.landlock_network_blocked = false;
+            report.mode.warnings.push(format!(
+                "capture layer reports TCP denied, but bind got {bind} and connect {connect}"
+            ));
+        }
+    }
+    sandbox::deny_socket_create(mode, &mut report);
+    report
+}
+
 fn wrap(lines: &mut Vec<String>, value: &str) {
     let clean: String = value
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
+    // A fix's commands take a row each. This wraps by the column, and a row
+    // broken inside a command pastes as a different one.
+    match crate::platform::fix_commands(&clean) {
+        Some((sentence, commands)) => {
+            wrap_row(lines, sentence);
+            for command in commands {
+                wrap_row(lines, command);
+            }
+        }
+        None => wrap_row(lines, &clean),
+    }
+}
+
+fn wrap_row(lines: &mut Vec<String>, clean: &str) {
     let mut line = String::from("  ");
     for ch in clean.chars() {
         if unicode_width::UnicodeWidthStr::width(line.as_str())
@@ -619,8 +1095,69 @@ fn npcap_capture_library(npcap: Npcap) -> (State, &'static str, String, String) 
 }
 
 /// A capability's state, reason code, detail and next check.
-#[cfg(target_os = "linux")]
 type Assessment = (State, &'static str, String, Option<&'static str>);
+
+/// One database as doctor words it, and how old it is when it is loaded.
+fn describe_db(what: &str, file: &DbFile, now: SystemTime) -> (String, Option<Duration>) {
+    match file {
+        DbFile::NotConfigured => (format!("{what}: none"), None),
+        DbFile::Unreadable { path, error } => {
+            (format!("{what}: {path} did not open: {error}"), None)
+        }
+        DbFile::Loaded {
+            path,
+            database_type,
+            build_epoch,
+        } => {
+            let built = UNIX_EPOCH.checked_add(Duration::from_secs(*build_epoch));
+            let date = crate::collectors::geo::epoch_date(*build_epoch)
+                .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
+            (
+                format!("{what}: {database_type} built {date}, {path}"),
+                built.and_then(|built| now.duration_since(built).ok()),
+            )
+        }
+    }
+}
+
+/// Doctor's view of the GeoIP databases, from a read of their metadata. No
+/// lookup is made and no endpoint contacted.
+fn geoip_db_assessment(status: &DbStatus, now: SystemTime) -> Assessment {
+    const UPDATE: &str = "netwatch geoip update";
+    const FIX: &str = "netwatch geoip update, or fix the path in config.toml";
+    const REFRESH: &str =
+        "netwatch geoip update refreshes the downloaded files; replace any you set yourself";
+    let (city, city_age) = describe_db("Country/City", &status.city, now);
+    let (asn, asn_age) = describe_db("ASN", &status.asn, now);
+    // First, so doctor's text, which wraps by character, keeps the link whole.
+    let detail = match status.attribution() {
+        Some(line) => format!("{line}. {city}; {asn}"),
+        None => format!("{city}; {asn}"),
+    };
+    let stale = [city_age, asn_age]
+        .into_iter()
+        .flatten()
+        .any(|age| age > GEOIP_DB_STALE_AFTER);
+    match (&status.city, &status.asn) {
+        (DbFile::NotConfigured, _) => (
+            State::Disabled,
+            "not_configured",
+            format!("No Country or City database, so no GeoIP lookups; {asn}"),
+            Some(UPDATE),
+        ),
+        (DbFile::Unreadable { .. }, _) => (State::Unavailable, "db_unreadable", detail, Some(FIX)),
+        (DbFile::Loaded { .. }, DbFile::Unreadable { .. }) => {
+            (State::Degraded, "db_unreadable", detail, Some(FIX))
+        }
+        (DbFile::Loaded { .. }, _) if stale => (
+            State::Degraded,
+            "db_stale",
+            format!("Older than 60 days. {detail}"),
+            Some(REFRESH),
+        ),
+        (DbFile::Loaded { .. }, _) => (State::Ready, "db_loaded", detail, None),
+    }
+}
 
 /// Doctor's view of the Linux connection table, before any poll: `ss` on
 /// `PATH`, or the `/proc/net` tables a live session falls back to without it.
@@ -748,6 +1285,16 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
         &detail,
         Some("Review config.toml; doctor never writes it"),
     );
+    #[cfg(target_os = "linux")]
+    {
+        snapshot.landlock = Some(landlock_self_test());
+        let (state, reason, detail, next) = landlock_capability(
+            true,
+            Mode::from_config(&config.sandbox),
+            snapshot.landlock.as_ref(),
+        );
+        snapshot.put("landlock", state, reason, &detail, next);
+    }
     if interface.is_some() {
         snapshot.interface = interface;
     }
@@ -920,14 +1467,7 @@ pub fn capture_child(interface: &str, mode: Mode) -> anyhow::Result<()> {
             protection: None,
         },
         Ok(capture) => {
-            // The capture thread's policy, so strict fails here where it
-            // would refuse capture.
-            let report = sandbox::apply_retaining(
-                mode,
-                &sandbox::SandboxPaths::default(),
-                sandbox::Retain::Nothing,
-                sandbox::Role::Capture,
-            );
+            let report = enter_capture_policy(mode);
             let rejected = matches!(mode, Mode::Strict) && !report.mode.warnings.is_empty();
             let result = CaptureResult {
                 interface: interface.into(),
@@ -994,7 +1534,7 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
                         } else {
                             State::Degraded
                         };
-                        snapshot.put("sandbox",state,"isolated_capture_check","Protection applies only to the isolated check process; live worker enforcement is not tested",None);
+                        snapshot.put("sandbox",state,"isolated_capture_check",&with_root_note("Protection applies only to the isolated check process; live worker enforcement is not tested".to_string()),None);
                         snapshot.protections.push(protection);
                     }
                 }
@@ -1108,15 +1648,349 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(restored.get("capture").reason, "open_not_attempted");
     }
+    fn loaded(age_days: u64, now: SystemTime) -> DbFile {
+        let built = now.duration_since(UNIX_EPOCH).unwrap().as_secs() - age_days * 86_400;
+        DbFile::Loaded {
+            path: "/geo/db.mmdb".into(),
+            database_type: "DBIP-Country-Lite".into(),
+            build_epoch: built,
+        }
+    }
     #[test]
-    fn online_geo_is_labelled_cleartext() {
+    fn geoip_db_absent_suggests_update() {
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let geoip = snapshot.get("geoip_db");
+        assert_eq!(geoip.state, State::Disabled);
+        assert_eq!(geoip.reason, "not_configured");
+        assert_eq!(geoip.next_check.as_deref(), Some("netwatch geoip update"));
+    }
+    #[test]
+    fn geoip_db_unreadable_is_unavailable() {
         let config = NetwatchConfig {
-            geoip_online: true,
+            geoip_db: "/nonexistent/x.mmdb".into(),
             ..Default::default()
         };
         let snapshot = CapabilitySnapshot::configured(&config);
-        assert_eq!(snapshot.get("online_geo").state, State::NotChecked);
-        assert!(snapshot.get("online_geo").detail.contains("cleartext"));
+        let geoip = snapshot.get("geoip_db");
+        assert_eq!(geoip.state, State::Unavailable);
+        assert_eq!(geoip.reason, "db_unreadable");
+        assert!(
+            geoip.detail.contains("/nonexistent/x.mmdb"),
+            "{}",
+            geoip.detail
+        );
+        assert!(geoip
+            .next_check
+            .as_deref()
+            .unwrap()
+            .contains("geoip update"));
+    }
+    /// Country still answers with the ASN file broken, so it is not called
+    /// unavailable, but the reason is the same.
+    #[test]
+    fn geoip_db_with_only_the_asn_file_unreadable_is_degraded() {
+        let now = SystemTime::now();
+        let status = DbStatus {
+            city: loaded(1, now),
+            asn: DbFile::Unreadable {
+                path: "/geo/asn.mmdb".into(),
+                error: "bad".into(),
+            },
+        };
+        let (state, reason, detail, _) = geoip_db_assessment(&status, now);
+        assert_eq!((state, reason), (State::Degraded, "db_unreadable"));
+        assert!(
+            detail.contains("/geo/asn.mmdb did not open: bad"),
+            "{detail}"
+        );
+    }
+    #[test]
+    fn geoip_db_ready_until_sixty_days_old() {
+        let now = SystemTime::now();
+        let assess = |city: u64, asn: u64| {
+            let status = DbStatus {
+                city: loaded(city, now),
+                asn: loaded(asn, now),
+            };
+            geoip_db_assessment(&status, now)
+        };
+        let (state, reason, detail, next) = assess(59, 59);
+        assert_eq!((state, reason, next), (State::Ready, "db_loaded", None));
+        assert!(detail.contains("DBIP-Country-Lite built "), "{detail}");
+        for (city, asn) in [(61, 1), (1, 61)] {
+            let (state, reason, _, next) = assess(city, asn);
+            assert_eq!((state, reason), (State::Degraded, "db_stale"));
+            assert!(next.unwrap().contains("netwatch geoip update"));
+        }
+    }
+    /// What doctor reports for a file written to `name` with this
+    /// `database_type`, as it reads a real one.
+    fn geoip_db_for(name: &str, database_type: &str) -> Capability {
+        use crate::collectors::geo::test_db;
+        let dir = std::env::temp_dir().join(format!("nw-doctor-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        std::fs::write(&path, test_db::city(database_type, now.as_secs())).unwrap();
+        let config = NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&config);
+        let _ = std::fs::remove_dir_all(&dir);
+        snapshot.get("geoip_db").clone()
+    }
+    /// What doctor reports for a file holding `bytes`.
+    fn geoip_db_of(bytes: &[u8]) -> Capability {
+        let dir = std::env::temp_dir().join(format!("nw-doctor-geo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.mmdb");
+        std::fs::write(&path, bytes).unwrap();
+        let config = NetwatchConfig {
+            geoip_db: path.to_str().unwrap().to_owned(),
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&config);
+        let _ = std::fs::remove_dir_all(&dir);
+        snapshot.get("geoip_db").clone()
+    }
+    /// This date fits `SystemTime` but not chrono, and chrono's conversion
+    /// panicked here: doctor and daemon exited 101, and the TUI left the
+    /// alternate screen the same way, on one hand-made file.
+    #[test]
+    fn geoip_db_with_an_out_of_range_build_epoch_is_unreadable() {
+        use crate::collectors::geo::test_db;
+        for epoch in [9_000_000_000_000, u64::MAX] {
+            let geoip = geoip_db_of(&test_db::city("DBIP-Country-Lite", epoch));
+            assert_eq!(geoip.state, State::Unavailable, "{epoch}");
+            assert_eq!(geoip.reason, "db_unreadable", "{epoch}");
+            assert!(geoip.detail.contains("build_epoch"), "{}", geoip.detail);
+        }
+    }
+    /// The wording itself must not panic on a value that reached it some other
+    /// way, and says nothing about a date it cannot state.
+    #[test]
+    fn describing_an_out_of_range_date_does_not_panic() {
+        let now = SystemTime::now();
+        for build_epoch in [9_000_000_000_000, u64::MAX] {
+            let file = DbFile::Loaded {
+                path: "/geo/db.mmdb".into(),
+                database_type: "DBIP-Country-Lite".into(),
+                build_epoch,
+            };
+            let (text, age) = describe_db("Country/City", &file, now);
+            assert!(text.contains("built ?"), "{text}");
+            assert_eq!(age, None);
+        }
+    }
+    /// DB-IP's data carries its attribution wherever the file came from, here
+    /// a name the download would never use.
+    #[test]
+    fn geoip_db_detail_attributes_a_dbip_database() {
+        let geoip = geoip_db_for("own.mmdb", "DBIP-City-Lite");
+        assert_eq!(
+            (geoip.state, geoip.reason.as_str()),
+            (State::Ready, "db_loaded")
+        );
+        assert!(
+            geoip
+                .detail
+                .contains("IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0"),
+            "{}",
+            geoip.detail
+        );
+    }
+    /// A MaxMind file named as the download names its files is still MaxMind's.
+    #[test]
+    fn geoip_db_detail_does_not_attribute_another_database() {
+        let geoip = geoip_db_for("dbip-city-lite.mmdb", "GeoLite2-City");
+        assert_eq!(
+            (geoip.state, geoip.reason.as_str()),
+            (State::Ready, "db_loaded")
+        );
+        assert!(geoip.detail.contains("GeoLite2-City"), "{}", geoip.detail);
+        assert!(!geoip.detail.contains("IP geolocation"), "{}", geoip.detail);
+        assert!(!geoip.detail.contains("db-ip.com"), "{}", geoip.detail);
+    }
+    /// doctor's text wraps at 80 columns by character, so the line has to come
+    /// where a wrap cannot cut its link, stale or not.
+    #[test]
+    fn geoip_db_attribution_survives_text_wrapping() {
+        let now = SystemTime::now();
+        for age in [1, 61] {
+            let status = DbStatus {
+                city: loaded(age, now),
+                asn: DbFile::NotConfigured,
+            };
+            let (state, reason, detail, next) = geoip_db_assessment(&status, now);
+            let mut snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+            snapshot.put("geoip_db", state, reason, &detail, next);
+            let text = snapshot.text();
+            assert!(
+                text.lines()
+                    .any(|line| line
+                        .contains("IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0")),
+                "{text}"
+            );
+        }
+    }
+    /// Without a Country or City database a session makes no lookup, so an
+    /// ASN file alone does not count as loaded.
+    #[test]
+    fn geoip_db_with_only_an_asn_file_is_not_configured() {
+        let now = SystemTime::now();
+        let status = DbStatus {
+            city: DbFile::NotConfigured,
+            asn: loaded(1, now),
+        };
+        let (state, reason, detail, _) = geoip_db_assessment(&status, now);
+        assert_eq!((state, reason), (State::Disabled, "not_configured"));
+        assert!(detail.contains("ASN: "), "{detail}");
+        assert!(!detail.contains("IP geolocation"), "{detail}");
+    }
+    #[test]
+    fn online_geo_reports_removed() {
+        for geoip_online in [false, true] {
+            let config = NetwatchConfig {
+                geoip_online,
+                ..Default::default()
+            };
+            let snapshot = CapabilitySnapshot::configured(&config);
+            let online = snapshot.get("online_geo");
+            assert_eq!(online.state, State::Disabled);
+            assert_eq!(online.reason, "removed");
+            assert_eq!(online.detail.contains("is ignored"), geoip_online);
+            assert_eq!(online.next_check.as_deref(), Some("netwatch geoip update"));
+        }
+    }
+    fn insights_config(endpoint: &str) -> NetwatchConfig {
+        NetwatchConfig {
+            insights_enabled: true,
+            insights_endpoint: endpoint.into(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn insights_cleartext_is_degraded() {
+        let endpoint = "http://10.0.0.5:11434";
+        let config = insights_config(endpoint);
+        let snapshot = CapabilitySnapshot::configured(&config);
+        let cap = snapshot.get("insights");
+        assert_eq!(cap.state, State::Degraded);
+        assert_eq!(cap.reason, "cleartext_off_host");
+        assert!(cap.detail.contains("cleartext, off-host"), "{}", cap.detail);
+        assert!(!cap.detail.contains(endpoint), "{}", cap.detail);
+
+        // Live, whatever the collector says: a model that answers makes the
+        // data no less readable on the way there.
+        let app = App::prepare_with_config(config);
+        let cap = CapabilitySnapshot::live(&app);
+        let cap = cap.get("insights");
+        assert_eq!(cap.state, State::Degraded);
+        assert_eq!(cap.reason, "cleartext_off_host");
+        assert!(
+            cap.detail.contains("endpoint not verified"),
+            "{}",
+            cap.detail
+        );
+
+        // Nothing is sent with the feature off, or to this host, or over TLS.
+        let off = NetwatchConfig {
+            insights_enabled: false,
+            ..insights_config(endpoint)
+        };
+        assert_eq!(
+            CapabilitySnapshot::configured(&off).get("insights").state,
+            State::Disabled
+        );
+        for fine in [
+            "local",
+            "http://127.0.0.1:11434",
+            "https://ollama.example.com",
+        ] {
+            let snapshot = CapabilitySnapshot::configured(&insights_config(fine));
+            let cap = snapshot.get("insights");
+            assert_eq!(cap.state, State::NotChecked, "{fine}");
+            assert_eq!(cap.reason, "configuration_only", "{fine}");
+        }
+    }
+    /// `--check-capture` prints the refused-capture error as text, and the
+    /// header's pointer sends people here. Wrapped by the column, a row ended
+    /// in `sudo groupadd -f net`, which pastes as a group named net.
+    #[test]
+    fn doctor_text_keeps_each_fix_command_on_a_row_of_its_own() {
+        let fix = crate::platform::LINUX_CAPTURE_FIX;
+        let mut snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        snapshot.put(
+            "capture",
+            State::Unavailable,
+            "capture_open_failed",
+            &format!("not permitted — {fix}"),
+            None,
+        );
+        let text = snapshot.text();
+        let rows: Vec<&str> = text.lines().map(str::trim).collect();
+        let at = rows.iter().position(|r| *r == "not permitted").unwrap();
+        for (i, command) in fix.split_inclusive(" && ").enumerate() {
+            assert_eq!(rows[at + 1 + i], command.trim_end(), "{text}");
+        }
+        // And the JSON, which the pointer names, holds the line as one string.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["detail"].as_str().is_some_and(|d| d.contains(fix))));
+    }
+    /// A completion stamp on a probe that was skipped is not a probe target
+    /// answering, so doctor must not count it among the fresh ones.
+    #[test]
+    fn a_skipped_internet_probe_is_not_a_fresh_completion() {
+        let config = NetwatchConfig {
+            third_party_probes: false,
+            ..Default::default()
+        };
+        assert!(CapabilitySnapshot::configured(&config)
+            .get("probes")
+            .detail
+            .contains("third_party_probes is off"));
+        let app = App::prepare_with_config(config);
+        let mut status = (*app.health_prober.status()).clone();
+        let now = Instant::now();
+        status.completed.gateway = Some(now);
+        status.completed.internet = Some(now);
+        app.health_prober.publish_for_test(status.clone());
+        let snapshot = CapabilitySnapshot::live(&app);
+        let probes = snapshot.get("probes");
+        assert_eq!(probes.state, State::Degraded);
+        assert!(
+            probes.detail.starts_with("1/2 probe targets"),
+            "{}",
+            probes.detail
+        );
+        assert!(
+            probes.detail.contains("third_party_probes is off"),
+            "{}",
+            probes.detail
+        );
+
+        status.completed.dns = Some(now);
+        app.health_prober.publish_for_test(status);
+        let snapshot = CapabilitySnapshot::live(&app);
+        assert_eq!(snapshot.get("probes").state, State::Ready);
+
+        // And with the switch on, the same two local stamps are not all of them.
+        let app = App::prepare_with_config(NetwatchConfig::default());
+        let mut status = (*app.health_prober.status()).clone();
+        status.completed.gateway = Some(now);
+        status.completed.dns = Some(now);
+        app.health_prober.publish_for_test(status);
+        let snapshot = CapabilitySnapshot::live(&app);
+        assert_eq!(snapshot.get("probes").state, State::Degraded);
+        assert!(snapshot
+            .get("probes")
+            .detail
+            .starts_with("2/3 probe targets"));
     }
     /// Since 0.32.2 eBPF loads inside the sandbox policy, so the default
     /// configuration must not report it switched off by that policy.
@@ -1248,6 +2122,227 @@ mod tests {
         let restored: CapabilitySnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(restored.get("connections").reason, "table_unchecked");
+    }
+    /// A consumer holding a schema_version 1 document from before these
+    /// fields still reads it, and so does anything that wrote one.
+    #[test]
+    fn landlock_fields_are_additive() {
+        let old = r#"{
+            "schema_version": 1,
+            "scope": "capture_check",
+            "platform": "linux",
+            "interface": "eth0",
+            "capabilities": [],
+            "protections": [{
+                "component": "capture-check",
+                "entry_ready": true,
+                "effective": "best-effort",
+                "landlock_abi": 9,
+                "caps_dropped": [],
+                "caps_retained": [],
+                "warnings": [],
+                "error": null
+            }],
+            "network_restricted": false
+        }"#;
+        let restored: CapabilitySnapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(restored.schema_version, 1);
+        assert_eq!(restored.landlock, None);
+        assert_eq!(restored.tasks_holding_net_raw, None);
+        let protection = &restored.protections[0];
+        assert_eq!(protection.landlock_abi, 9);
+        assert_eq!(protection.landlock_kernel_abi, 0);
+        assert!(protection.landlock_restrictions.is_empty());
+
+        // And what doctor writes now still has every field a v1 consumer read.
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["network_restricted"], false);
+        assert!(json["landlock"].is_null());
+        assert!(json["tasks_holding_net_raw"].is_null());
+        for field in [
+            "scope",
+            "platform",
+            "interface",
+            "capabilities",
+            "protections",
+        ] {
+            assert!(json.get(field).is_some(), "{field}");
+        }
+    }
+    #[test]
+    fn a_protection_says_what_its_report_says() {
+        let mut report = sandbox::Report::default();
+        report.platform.landlock_abi = 9;
+        report.platform.landlock_kernel_abi = 9;
+        report.platform.landlock_network_blocked = true;
+        report.platform.landlock_restrictions = vec!["filesystem", "tcp_bind", "tcp_connect"];
+        report.platform.capture_authority = sandbox::NetRaw::Dropped;
+        report.platform.socket_filter = sandbox::SocketFilter::Installed;
+        let protection = Protection::from_report("capture", true, Some(&report), None);
+        assert_eq!(protection.landlock_kernel_abi, 9);
+        assert_eq!(protection.network_policy, "denied");
+        assert_eq!(
+            protection.landlock_restrictions,
+            ["filesystem", "tcp_bind", "tcp_connect"]
+        );
+        assert_eq!(protection.capture_authority, "dropped");
+        assert_eq!(protection.socket_filter, "installed");
+        // A worker with no report ran under no policy of its own, which is not
+        // the same as one that entered and was allowed the network.
+        let waiting = Protection::from_report("traffic", false, None, None);
+        assert_eq!(waiting.network_policy, "not_entered");
+        assert_eq!(waiting.capture_authority, "not_applicable");
+        assert_eq!(waiting.socket_filter, "not_applicable");
+    }
+    #[test]
+    fn landlock_capability_covers_each_reason() {
+        let found = |kernel_abi, availability: &str, bind: &str, connect: &str| Landlock {
+            kernel_abi,
+            availability: availability.into(),
+            errata: vec![],
+            parser_check: Some(ParserCheck {
+                enforced_abi: kernel_abi,
+                restrictions: vec![],
+                tcp_bind: bind.into(),
+                tcp_connect: connect.into(),
+            }),
+        };
+        let assess = |landlock: &Landlock| {
+            let (state, reason, _, _) = landlock_capability(true, Mode::BestEffort, Some(landlock));
+            (state, reason)
+        };
+        assert_eq!(
+            assess(&found(9, "available", "denied", "denied")),
+            (State::Ready, "parser_network_denied")
+        );
+        assert_eq!(
+            assess(&found(4, "available", "denied", "denied")),
+            (State::Ready, "parser_network_denied")
+        );
+        for kernel in [1, 3] {
+            assert_eq!(
+                assess(&found(kernel, "available", "allowed", "allowed")),
+                (State::Degraded, "kernel_abi_below_4")
+            );
+        }
+        assert_eq!(
+            assess(&found(0, "not_enabled", "allowed", "allowed")),
+            (State::Unavailable, "landlock_not_enabled")
+        );
+        assert_eq!(
+            assess(&found(0, "not_built", "allowed", "allowed")),
+            (State::Unavailable, "landlock_not_built")
+        );
+        // A kernel that can deny TCP and did not, one way or the other.
+        for (bind, connect) in [
+            ("allowed", "denied"),
+            ("denied", "allowed"),
+            ("error", "denied"),
+        ] {
+            assert_eq!(
+                assess(&found(9, "available", bind, connect)),
+                (State::Unavailable, "self_test_failed"),
+                "{bind} {connect}"
+            );
+        }
+        let unfinished = Landlock {
+            parser_check: None,
+            ..found(9, "available", "", "")
+        };
+        assert_eq!(
+            assess(&unfinished),
+            (State::Unavailable, "self_test_failed")
+        );
+        let ready = found(9, "available", "denied", "denied");
+        let (state, reason, _, _) = landlock_capability(true, Mode::Disabled, Some(&ready));
+        assert_eq!((state, reason), (State::Disabled, "sandbox_disabled"));
+        let (state, reason, _, _) = landlock_capability(false, Mode::BestEffort, None);
+        assert_eq!(
+            (state, reason),
+            (State::Unavailable, "platform_unsupported")
+        );
+    }
+    #[test]
+    fn landlock_capability_is_not_checked_until_someone_checks() {
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let expected = if cfg!(target_os = "linux") {
+            State::NotChecked
+        } else {
+            State::Unavailable
+        };
+        assert_eq!(snapshot.get("landlock").state, expected);
+        let off = NetwatchConfig {
+            sandbox: "off".into(),
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&off);
+        if cfg!(target_os = "linux") {
+            assert_eq!(snapshot.get("landlock").reason, "sandbox_disabled");
+        }
+    }
+    #[test]
+    fn sandbox_detail_names_what_each_worker_got() {
+        use sandbox::worker::Component;
+        use sandbox::NetRaw;
+        let entered = |blocked| {
+            let mut report = sandbox::Report::default();
+            report.platform.landlock_network_blocked = blocked;
+            Component {
+                ready: true,
+                report: Some(report),
+                error: None,
+            }
+        };
+        let workers: std::collections::BTreeMap<_, _> = [
+            ("capture".to_string(), entered(true)),
+            ("connections".to_string(), entered(true)),
+            ("keylog".to_string(), entered(false)),
+            ("whois".to_string(), entered(false)),
+        ]
+        .into_iter()
+        .collect();
+        let mut main = sandbox::Report::default();
+        main.mode.effective = Some("best-effort");
+        main.platform.landlock_abi = 3;
+        main.platform.landlock_kernel_abi = 9;
+        main.platform.capture_authority = NetRaw::RetainedForReopen;
+        let detail = sandbox_detail(&main, &workers, "4/4 worker entries verified");
+        assert!(
+            detail.starts_with("best-effort: Landlock fs ABI 3 (kernel 9)"),
+            "{detail}"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                detail.contains("TCP denied on 2/3 parser workers"),
+                "{detail}"
+            );
+            assert!(detail.contains("CAP_NET_RAW kept on main"), "{detail}");
+            main.platform.capture_authority = NetRaw::Dropped;
+            let dropped = sandbox_detail(&main, &workers, "");
+            assert!(dropped.contains("CAP_NET_RAW dropped"), "{dropped}");
+            main.platform.capture_authority = NetRaw::NotHeld;
+            let unheld = sandbox_detail(&main, &workers, "");
+            assert!(!unheld.contains("CAP_NET_RAW"), "{unheld}");
+        }
+        assert!(detail.ends_with("4/4 worker entries verified") || running_as_root());
+        // No worker that skipped the filter, and then one that did.
+        assert!(!detail.contains("no-socket filter"));
+        let mut skipped = entered(true);
+        skipped.report.as_mut().unwrap().platform.socket_filter =
+            sandbox::SocketFilter::UnknownArch;
+        let workers: std::collections::BTreeMap<_, _> =
+            [("keylog".to_string(), skipped)].into_iter().collect();
+        let detail = sandbox_detail(&main, &workers, "");
+        if cfg!(target_os = "linux") {
+            assert!(detail.contains("no-socket filter skipped"), "{detail}");
+        }
+        let mut disabled = sandbox::Report::default();
+        disabled.mode.effective = Some("disabled");
+        let detail = sandbox_detail(&disabled, &workers, "");
+        assert!(detail.starts_with("disabled"), "{detail}");
+        assert!(!detail.contains("TCP denied"), "{detail}");
     }
     #[test]
     fn doctor_text_fits_an_80_column_terminal_and_sanitizes_controls() {

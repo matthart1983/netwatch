@@ -71,7 +71,7 @@ are private owned config/cache/state directories, dedicated exports/scratch and
 writable grants. Exports now go to the platform cache directory's
 `netwatch/exports` subtree (normally `~/.cache/netwatch/exports` on Linux).
 
-Validation includes an isolated-process test at the real GeoIP, WHOIS, reverse-DNS,
+Validation includes an isolated-process test at the real WHOIS, reverse-DNS,
 Insights and keylog worker entries, keylog restart/read access, allowed exports,
 forbidden sentinel reads, post-preparation symlink replacement and injected strict
 entry failure. These are Linux filesystem boundary tests, not a hostile-parser
@@ -97,19 +97,20 @@ strict raw-authority loss prevents unsandboxed capture reopen retries.
 
 `App::prepare()` launches no application background workers. It still performs
 synchronous platform discovery, reads configuration/state/journals, takes the Linux
-process-attribution snapshot and opens configured MaxMind databases. Synchronous
+process-attribution snapshot and opens the GeoIP databases. Synchronous
 platform discovery can invoke system commands; prepare is not a no-I/O API.
 
 `start_workers()` is idempotent at the application level. It starts reverse DNS,
-optional Insights, configured keylog polling, ambient capture, platform attribution,
-GeoIP and WHOIS. It attaches attribution caches to the existing connection collector
+optional Insights, configured keylog polling, ambient capture, platform attribution
+and WHOIS. It attaches attribution caches to the existing connection collector
 so the prepared Linux process snapshot is retained. Its `workers_started` flag
 records that startup was requested, not that resources or confinement are ready.
 Both TUI and daemon still start these workers before applying the sandbox.
 
-`GeoCache::new/with_mmdb`, `WhoisCache::new`, `DnsCache::new` and
-`InsightsCollector::new` now prepare channels and state only. Call `start()` before
-expecting queued requests to be processed. Cache clones share one start gate.
+`WhoisCache::new`, `DnsCache::new` and `InsightsCollector::new` now prepare channels
+and state only. Call `start()` before expecting queued requests to be processed. Cache
+clones share one start gate. `GeoCache` has no worker: it answers from the databases
+opened in prepare, on the calling thread.
 Settings changes construct and explicitly start a replacement Insights collector.
 Terminal worker creation is named `EventHandler::start`; eBPF activation is named
 `ConnTracker::start` because its SDK cannot currently prepare without starting.
@@ -118,31 +119,36 @@ These API changes also apply to library consumers; eBPF smoke examples are updat
 ## Worker inventory
 
 “Authority” below describes resource requirements or inherited authority, not proof
-of its successful removal. Existing-thread confinement remains incomplete.
+of its successful removal. Existing-thread confinement remains incomplete. Network
+policy is the role in [`sandbox/roles.rs`](../src/sandbox/roles.rs), and a session's
+log says what each thread got
+([where each value can be read](doctor.md#where-each-value-can-be-read)). A TCP deny
+needs Linux 6.7 and is not a
+wall: [the threat model](THREAT-MODEL.md#what-containment-does-not-cover) lists what
+gets past it.
 
-| Component / creator | Resources, authority and input | Filesystem needs | Start/restart | Shutdown owner and current gaps |
-| --- | --- | --- | --- | --- |
-| Tokio runtime / `#[tokio::main]` | Runtime threads exist before main body; tasks and I/O | Inherited; no per-task policy | Before CLI dispatch | Runtime teardown; synchronous confined bootstrap pending |
-| Logging / `logging::init` → tracing-appender | Log writer thread; receives application log text | Cache/log directory; opens daily appender | Main startup | Main retains `WorkerGuard` for flush; dependency worker policy unverified |
-| Remote sender / `RemotePublisher::start` | HTTP sender, API key, host snapshots and remote responses | Host metadata/config discovery, resolver/TLS files | Main when remote enabled | Explicit bounded `shutdown`; no new lifecycle split needed here; repeated starts lack a gate |
-| Metrics listener / `MetricsExporter::start` | TCP listener and untrusted HTTP requests | No export files required | Main in metrics-enabled daemon | Detached accept loop; no stop/join owner |
-| Metrics connection handler / listener | One thread per accepted connection; untrusted request line | None beyond runtime dependencies | Per accepted connection | Detached; socket timeout; concurrency bound pending |
-| Reverse DNS / `DnsCache::start` | Channel of observed addresses, `host` subprocess responses | Executable, resolver/NSS paths | Explicit app start; also ensured by capture start; clones share gate | All sender clones dropped → channel disconnect; queued work may drain; no join |
-| Packet capture/decoder / `PacketCollector::start_capture` | Resolves device, opens pcap, installs BPF; parses hostile packet bytes | Device/system configuration, decoder state; Windows device lookup reads adapter GUIDs from IP Helper, PowerShell only if that fails | Ambient start; capture toggle, interface/filter changes, recorder paths use same method | Collector stop flag; join waits up to 750 ms then detaches; old-worker/restart overlap remains a PR05 concern |
-| TLS keylog / `configure_tls_keylog` → `spawn_keylog_watcher` | Poller parses externally written session secrets | Configured keylog and rotation/truncation handling | Explicit configured startup or replacement | Watcher handle stops and joins; no verified worker policy |
-| PKTAP / `platform::pktap::spawn` (macOS) | Capture resource and kernel attribution metadata; requires capture authority | Platform capture facilities | Explicit app startup | `PktapHandle` stop/join; startup errors reported separately; no macOS sandbox backend |
-| eBPF SDK reader / `EventSource::new` (inside `ConnTracker::start`) | Loads/attaches programs, opens ring buffers and starts dependency reader; BPF authority needed | Embedded object/system BPF resources | Explicit app start; dependency constructor is internally active | SDK signals shutdown and detaches reader on drop; no preparation/enforcement hook |
-| eBPF attribution drain / `ConnTracker::start` | Receives SDK events and updates bounded cache | No application files needed after startup | After SDK reader has already started | Tracker stop flag and join; spawn errors currently converted to absent join rather than readiness failure |
-| GeoIP / `GeoCache::start` | Online HTTP fallback requests/responses; offline database opened in prepare | Configured MaxMind files, resolver/runtime paths | Explicit app start, shared gate | Sender disconnect; queued requests may drain; detached, no cancellation/join |
-| WHOIS / `WhoisCache::start` | Lookup requests and external command/remote text | Lookup executable and resolver paths | Explicit app start, shared gate | Sender disconnect; queued requests may drain; detached, no cancellation/join |
-| Insights / `InsightsCollector::start` | Network-summary prompt and model HTTP response | Resolver/TLS runtime paths | Explicit app start and settings replacement | Sender disconnect; in-flight/queued work may finish; request timeout 30s, no join |
-| Terminal events / `EventHandler::start` | Crossterm terminal input and ticks | Terminal descriptors | TUI after sandbox call | Receiver drop eventually makes send fail; detached; no explicit stop/join |
-| Interface traffic / `TrafficCollector::update` | OS counter snapshots | `/proc`, `/sys` or platform tools | Tick-driven, busy flag | Short-lived detached worker; completion clears busy flag |
-| Connections / `ConnectionCollector::update` | Socket/process tables, attribution cache | `/proc` and platform socket/process tools | Initial poll and periodic ticks, busy flag | Short-lived detached worker; no unified cancellation |
-| Health / `HealthProber::probe` | Gateway/internet ICMP, DNS and STUN replies | Resolver/system networking dependencies | Initial probe and periodic ticks | Detached probe cycle with busy flag; individual probe limits, no unified cancellation |
-| Kernel TCP / `TcpInfoCollector::update` | Netlink (Linux), sysctl (macOS); Windows unsupported | Kernel interfaces | Tick-driven, busy flag | Detached short-lived worker; timed snapshot published |
-| Process CPU / `ProcessBandwidthCollector::refresh_cpu` | Process CPU sampling | `ps`/platform process data | Slow tick, busy flag | Detached short-lived worker |
-| Traceroute / `TracerouteRunner::run` | External traceroute/tracert output, hostile network replies | Executable/resolver paths | User-requested target | Detached worker/subprocess; no shared cancellation/join; completion timestamp published |
+| Component / creator | Resources, authority and input | Filesystem needs | Start/restart | Network policy (Linux) | Shutdown owner and current gaps |
+| --- | --- | --- | --- | --- | --- |
+| Tokio runtime / `#[tokio::main]` | Runtime threads exist before main body; tasks and I/O | Inherited; no per-task policy | Before CLI dispatch | Open: the blocking pool takes any blocking job, a name lookup among them | Runtime teardown; synchronous confined bootstrap pending |
+| Logging / `logging::init` → tracing-appender | Log writer thread; receives application log text | Cache/log directory; opens daily appender | Main startup | TCP denied | Main retains `WorkerGuard` for flush; dependency worker policy unverified |
+| Remote sender / `RemotePublisher::start` | HTTP sender, API key, host snapshots and remote responses | Host metadata/config discovery, resolver/TLS files | Main when remote enabled | Open | Explicit bounded `shutdown`; no new lifecycle split needed here; repeated starts lack a gate |
+| Metrics listener / `MetricsExporter::start` | TCP listener and untrusted HTTP requests | No export files required | Main in metrics-enabled daemon | no socket(2), TCP denied | Detached accept loop; no stop/join owner |
+| Metrics connection handler / listener | One thread per accepted connection; untrusted request line | None beyond runtime dependencies | Per accepted connection | no socket(2), TCP denied | Detached; socket timeout; concurrency bound pending |
+| Reverse DNS / `DnsCache::start` | Channel of observed addresses, `host` subprocess responses | Executable, resolver/NSS paths | Explicit app start; also ensured by capture start; clones share gate | Open | All sender clones dropped → channel disconnect; queued work may drain; no join |
+| Packet capture/decoder / `PacketCollector::start_capture` | Resolves device, opens pcap, installs BPF; parses hostile packet bytes | Device/system configuration, decoder state; Windows device lookup reads adapter GUIDs from IP Helper, PowerShell only if that fails | Ambient start; capture toggle, interface/filter changes, recorder paths use same method | no socket(2), TCP denied; no write grant | Collector stop flag; join waits up to 750 ms then detaches; old-worker/restart overlap remains a PR05 concern |
+| TLS keylog / `configure_tls_keylog` → `spawn_keylog_watcher` | Poller parses externally written session secrets | Configured keylog and rotation/truncation handling | Explicit configured startup or replacement | no socket(2), TCP denied | Watcher handle stops and joins; no verified worker policy |
+| PKTAP / `platform::pktap::spawn` (macOS) | Capture resource and kernel attribution metadata; requires capture authority | Platform capture facilities | Explicit app startup | No backend | `PktapHandle` stop/join; startup errors reported separately; no macOS sandbox backend |
+| eBPF SDK reader / `EventSource::new` (inside `ConnTracker::start`) | Loads/attaches programs, opens ring buffers and starts dependency reader; BPF authority needed | Embedded object/system BPF resources | Explicit app start; dependency constructor is internally active | Inherits the eBPF worker's: TCP denied | SDK signals shutdown and detaches reader on drop; no preparation/enforcement hook |
+| eBPF attribution drain / `ConnTracker::start` | Receives SDK events and updates bounded cache | No application files needed after startup | After SDK reader has already started | TCP denied | Tracker stop flag and join; spawn errors currently converted to absent join rather than readiness failure |
+| WHOIS / `WhoisCache::start` | Lookup requests and external command/remote text | Lookup executable and resolver paths | Explicit app start, shared gate | Open | Sender disconnect; queued requests may drain; detached, no cancellation/join |
+| Insights / `InsightsCollector::start` | Network-summary prompt and model HTTP response | Resolver/TLS runtime paths | Explicit app start and settings replacement | Open | Sender disconnect; in-flight/queued work may finish; request timeout 30s, no join |
+| Terminal events / `EventHandler::start` | Crossterm terminal input and ticks | Terminal descriptors | TUI after sandbox call | TCP denied | Receiver drop eventually makes send fail; detached; no explicit stop/join |
+| Interface traffic / `TrafficCollector::update` | OS counter snapshots | `/proc`, `/sys` or platform tools | Tick-driven, busy flag | TCP denied; `ip` and `iw` need netlink | Short-lived detached worker; completion clears busy flag |
+| Connections / `ConnectionCollector::update` | Socket/process tables, attribution cache | `/proc` and platform socket/process tools | Initial poll and periodic ticks, busy flag | TCP denied; `ss` needs netlink | Short-lived detached worker; no unified cancellation |
+| Health / `HealthProber::probe` | Gateway/internet ICMP, DNS and STUN replies | Resolver/system networking dependencies | Initial probe and periodic ticks | Open | Detached probe cycle with busy flag; individual probe limits, no unified cancellation |
+| Kernel TCP / `TcpInfoCollector::update` | Netlink (Linux), sysctl (macOS); Windows unsupported | Kernel interfaces | Tick-driven, busy flag | TCP denied; reads netlink | Detached short-lived worker; timed snapshot published |
+| Process CPU / `ProcessBandwidthCollector::refresh_cpu` | Process CPU sampling | `ps`/platform process data | Slow tick, busy flag | TCP denied | Detached short-lived worker |
+| Traceroute / `TracerouteRunner::run` | External traceroute/tracert output, hostile network replies | Executable/resolver paths | User-requested target | Open | Detached worker/subprocess; no shared cancellation/join; completion timestamp published |
 
 Source inventory: [app](../src/app.rs), [main](../src/main.rs),
 [collectors](../src/collectors/mod.rs), [capture](../src/collectors/packets/mod.rs),
@@ -179,7 +185,7 @@ Regression tests cover preparing an app with capture/keylog/Insights configured
 without activating those workers, retaining queued cache/analysis requests until
 explicit start, and starting each clone-shared lookup worker only once. These tests
 consume their synthetic requests before starting workers so they do not send DNS,
-WHOIS, GeoIP or model requests. Capture failure/restart checks use a nonexistent
+WHOIS or model requests. Capture failure/restart checks use a nonexistent
 Linux interface and never acquire a live capture handle.
 
 PR05 still owns policy application before processing, readiness/failure messages,

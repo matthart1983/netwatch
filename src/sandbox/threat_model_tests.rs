@@ -108,6 +108,10 @@ fn threat_model_lists_every_outbound_endpoint() {
         ("Internet reachability", health::INTERNET_TARGET.to_owned()),
         ("Startup trace", traceroute::STARTUP_TARGET.to_owned()),
         ("WHOIS on W", whois::RDAP_URL.to_owned()),
+        (
+            "GeoIP update",
+            crate::geoip_update::DOWNLOAD_BASE.to_owned(),
+        ),
     ];
     endpoints.extend(
         health::STUN_SERVERS
@@ -138,6 +142,52 @@ fn threat_model_lists_every_outbound_endpoint() {
             "{service}: missing {endpoint}"
         );
     }
+    // The rows `third_party_probes = false` turns off say so, and no other
+    // row claims it.
+    let switched: Vec<&str> = {
+        let mut rows: Vec<&str> = rows
+            .iter()
+            .filter(|(_, words)| words.contains(&"third_party_probes"))
+            .map(|(service, _)| *service)
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(
+        switched,
+        [
+            "Explicit upload test",
+            "Internet reachability",
+            "Reference DNS",
+            "STUN",
+            "Startup trace",
+        ]
+    );
+}
+
+/// The online GeoIP lookup is gone, and so is its provider's name, from the
+/// code and from everything that describes the current behaviour. The
+/// changelog keeps its history.
+#[test]
+fn nothing_names_the_removed_geoip_service() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Assembled, so this file does not match itself.
+    let name = concat!("ip-", "api");
+    let mut pending = vec![
+        root.join("src"),
+        root.join("docs"),
+        root.join("README.md"),
+        root.join("SECURITY.md"),
+    ];
+    let mut found = Vec::new();
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+        } else if std::fs::read_to_string(&path).is_ok_and(|text| text.contains(name)) {
+            found.push(path);
+        }
+    }
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// Whether a sentence names eBPF (or its SDK source) as switched off by the

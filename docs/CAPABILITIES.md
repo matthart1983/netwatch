@@ -6,8 +6,9 @@ the isolated check's results. Live Settings and startup use the same capability
 model with runtime observations; static configuration is never a health verdict.
 
 This matrix describes the implementation as of 18 October 2026 (0.35.4); the
-FreeBSD column dates from 0.35, and the Windows process-attribution cell from
-0.38 (earlier versions polled `netstat -ano` and `tasklist`). It is not a claim
+FreeBSD column dates from 0.35, the Windows process-attribution cell from
+0.38 (earlier versions polled `netstat -ano` and `tasklist`), and the capture
+authority row from 0.39. It is not a claim
 that every backend was exercised on every supported OS. Linux unit tests do not
 establish macOS or Windows runtime parity.
 
@@ -15,11 +16,13 @@ establish macOS or Windows runtime parity.
 | --- | --- | --- | --- | --- |
 | Interface/configuration collection | Linux system counters and network tools | macOS network tools | IP Helper API (adapters, DNS servers, counters, routes), with `ipconfig`/PowerShell/`route print` fallbacks | `getifaddrs` up-state, `netstat`/`ifconfig` |
 | Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required | Base-system libpcap/BPF; `/dev/bpf` access required |
+| Capture authority | File capabilities on a binary restricted to a group, the systemd unit, or root. With the sandbox on, the daemon and Diagnose CLI drop `CAP_NET_RAW` from every thread once capture opens, and so does strict mode; the open descriptor keeps its access | No capability model; `/dev/bpf` access is checked at `open()`, and an open descriptor keeps its access | Npcap's install options decide who can capture; no capability model | No capability model; `/dev/bpf` access is checked at `open()`, and an open descriptor keeps its access |
 | Process attribution | Verified procfs socket ownership; eBPF hints require corroboration; the SDK reader inherits filesystem policy but retains load capabilities | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified polling of the kernel socket tables through IP Helper; names from a process snapshot | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
 | Process in PCAPNG packet comments | When two verified owner checks bracket the packet | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified |
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |
 | Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules | Shared detectors; absent TCP metrics limit socket rules |
 | Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend | No backend (no Capsicum) |
+| Network policy per thread | Parser and capture threads denied TCP bind and connect from Linux 6.7; capture, keylog and metrics threads also lose socket(2) on x86_64, aarch64 and armv5te; main and network workers unrestricted | None | None | None |
 | Strict sandbox startup | Rejects preflight/required entry failures; raw capture reopening may fail | Rejected: no backend | Rejected: no backend | Rejected: no backend |
 | Resolver changes | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable | Unavailable |
 | AI commentary | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
@@ -74,9 +77,11 @@ The [sandbox reference](REFERENCE.md#landlock-sandbox-linux) documents current
 worker entry enforcement and exact file/dedicated-directory grants. eBPF loads
 inside the policy; the SDK reader inherits it but keeps the load capabilities
 until it has an entry hook of its own.
-Network access remains unrestricted. Linux tests cover actual lookup, Insights and
-keylog entries, keylog restart, export access, symlink replacement and strict entry
-rejection. Privileged capture/restart and cross-platform acceptance remain pending.
+On Linux, network policy is per thread: the table above says which, `netwatch doctor
+--json` says what a parser thread gets on this kernel, and a session's log what each
+of its threads got. Linux tests cover actual lookup,
+Insights and keylog entries, keylog restart, export access, symlink replacement and
+strict entry rejection. Privileged capture/restart and cross-platform acceptance remain pending.
 Managed workers have a shared shutdown deadline; an in-flight blocking operation
 may still outlive it and is reported rather than forcibly interrupted.
 

@@ -50,6 +50,11 @@ impl RuleCoverage {
             Availability::Unsupported => {
                 "nothing to run on this host or interface; the reason says what is missing"
             }
+            // Before the rule rows too: `t` will not start STUN with the
+            // switch off, so the nat row must not offer it.
+            _ if self.reason.starts_with(crate::collectors::health::PROBES_OFF) => {
+                "set third_party_probes = true in config.toml to measure this"
+            }
             _ if matches!(self.rule.as_str(), "ipv6.broken" | "captive.portal" | "pmtu.blackhole") => { "configure [diagnose_probes]; t runs three rounds, x cancels; direct selected-endpoint traffic only" }
             _ if self.rule.starts_with("egress.") => {
                 "review the Egress tab; press t on the policy check to reload egress-policy.toml"

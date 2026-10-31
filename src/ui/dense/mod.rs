@@ -1833,7 +1833,17 @@ fn render_health(
             h.dns_rtt_ms,
             50.0,
         ),
-        ("internet", "1.1.1.1".to_string(), h.internet_rtt_ms, 100.0),
+        (
+            "internet",
+            if app.user_config.third_party_probes {
+                crate::collectors::health::INTERNET_TARGET
+            } else {
+                "off"
+            }
+            .to_string(),
+            h.internet_rtt_ms,
+            100.0,
+        ),
         (
             "peer",
             slowest
@@ -3070,8 +3080,8 @@ mod tests {
 
     /// The detail label looked up the row's host, which is the SNI name when
     /// the connection sent one. A name is not an address, so a TLS or QUIC
-    /// row never showed its peer's org and city, and with `geoip_online` on
-    /// the name itself went to ip-api.com.
+    /// row never showed its peer's org and city, and with the online lookup
+    /// that 0.39 removed the name itself left the machine.
     #[test]
     fn detail_geo_label_looks_up_the_address_not_the_sni() {
         let mut app =

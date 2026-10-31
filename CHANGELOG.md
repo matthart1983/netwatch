@@ -19,6 +19,70 @@ All notable changes to NetWatch will be documented in this file.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
+- **`netwatch doctor` says what Landlock does on this kernel.** Until now it
+  could not: static doctor applied no policy, and a capture check reported only one
+  number, the kernel's. Doctor now runs a parser thread's policy on a disposable
+  thread, tries a TCP bind and connect to its own loopback listener, and reports the
+  result in a top-level `landlock` object with the kernel's ABI, whether Landlock is
+  available, and the errata fixed. A new `landlock` capability sums it up:
+  `parser_network_denied`, `kernel_abi_below_4`, `landlock_not_enabled`,
+  `landlock_not_built`, `self_test_failed`, `sandbox_disabled` or
+  `platform_unsupported`. Each protection gains `landlock_kernel_abi`,
+  `network_policy`, `landlock_restrictions`, `capture_authority` and
+  `socket_filter`, and the snapshot gains `tasks_holding_net_raw`. All of this is
+  additive, and the JSON stays `schema_version` 1. `doctor` runs no session, so
+  `protections` is empty there, or the one capture check, and `tasks_holding_net_raw`
+  is null.
+- **A daemon or TUI session writes its sandbox report to its log.** Once, about five
+  ticks in, one `session protections` line gives each worker's protection and the
+  threads the startup audit found holding CAP_NET_RAW. No command prints these, so
+  until now a running session's per-thread results could not be read at all. The log's
+  default filter now keeps `info` on `netwatch::sandbox` for this.
+  `docs/doctor.md` says where each value can be read. Settings puts what it found on
+  rows of its own, such as `TCP denied on 13/13 parser workers`, and wraps them, so a
+  popup at 80 columns or wider shows all of it, given the height for every row.
+- **Doctor and Settings say `running as root: containment limited`** when netwatch
+  runs as root. Root keeps most file access whatever the sandbox does, and
+  `SECURITY.md` scopes sandbox escapes to non-root runs.
+- **`netwatch geoip update [--city]` downloads the databases the GeoIP column
+  needs, and an empty `geoip_db` or `geoip_asn_db` now uses them.** Offline
+  lookups used to need a MaxMind account and two paths in the config. The
+  command fetches DB-IP's free Country and ASN databases, plus City with
+  `--city`, reports each file as updated or already current, and exits 0 when
+  every file is up to date and 1 otherwise. A path in the config still wins.
+  The gzip and the database are read on a worker thread with TCP denied from
+  Linux 6.7 on, and a file that fails its checks leaves the old one in place.
+  Nothing refreshes the files on its own, and the provider and file location
+  are not part of the stable interface.
+- **`netwatch doctor` reports a `geoip_db` capability, and Settings says which
+  database is loaded.** A path that did not open looked the same as no path:
+  the column stayed empty and nothing said why. `geoip_db` is now `ready`
+  (`db_loaded`), `degraded` (`db_stale`, over 60 days old), `unavailable`
+  (`db_unreadable`) or `disabled` (`not_configured`, with the command to run).
+  The Settings rows show the database type and path, or the path that waits for
+  the next start. When lookups answer with DB-IP's data, Settings and the
+  `geoip_db` detail carry its CC BY 4.0 attribution, judged by each file's own
+  `database_type` rather than its path.
+- **`third_party_probes = false` stops netwatch's automatic probes to public
+  servers.** Every TUI and daemon run sends STUN to Google and Cloudflare
+  about once a minute, asks 1.1.1.1 for `dns.google` and probes 1.1.1.1 with
+  ICMP and TCP 443 every probe cycle, and each TUI start traces 1.1.1.1.
+  Nothing could turn these off, which ruled netwatch out on an air-gapped or
+  privacy-minded host. The key defaults to `true`, so nothing changes unless
+  you set it. Set to `false`, none of those go out, and that holds across a
+  network change. What they measured reads as not measured, never as failed.
+  The internet RTT reads `—`, and `netwatch uptime` reports the connection as
+  unknown with no uptime percentage, though a gateway or DNS outage still
+  counts. Topology's ISP box stays empty until you press `T`. In Diagnose,
+  `dns.hijack_suspect`, `nat.symmetric` and `gateway.unreachable` show as not
+  measured and cannot open, so a router that answers nothing no longer raises
+  a critical on a probe that was never sent. The cost is that a dead gateway
+  shows up as a failing resolver or a down link instead. The three tests that
+  ask 1.1.1.1 do not run: `t` on an issue picks another, and `t` on the
+  coverage row refuses the load test, which also uploads to
+  speed.cloudflare.com. Your resolver and gateway are still probed, and what
+  else you start yourself still runs: `T`, `W`, `t` on the other coverage rows
+  and periodic traces. docs/REFERENCE.md lists them.
 - **The Connections table says when rates cover only some of its flows, and
   the Timeline says when it has lost closed connections.** A running capture
   drops the flows it has seen least recently once it passes 1,280 flows or its
@@ -92,6 +156,26 @@ All notable changes to NetWatch will be documented in this file.
   `ConnectionTimeline::tracked_len` and `tracked_cap`, and gain
   `ConnectionTimeline::closed_len`, `closed_trimmed` and `first_seen`, and
   `ConnectionCollector::connections_with_generation`.
+- **`landlock_abi` in doctor's protections now means the ABI a thread enforces,
+  not the kernel's.** It read the kernel's ABI, so on Linux 7.1 every thread reported
+  9, including threads with only the filesystem layer, which needs 3. It is now the
+  newest feature in force: 3 for main and the network workers, and 9 for parser and
+  capture threads on Linux 7.1. Anything reading it for the kernel's version should
+  read the new `landlock_kernel_abi`. A Landlock that cannot enforce now says why,
+  naming ENOSYS or a seccomp profile, EOPNOTSUPP or the ABI, rather than "present but
+  not enforced".
+  `network_restricted` stays false, because it describes the whole process.
+- **`caps_dropped` and `caps_retained` in doctor's protections hold different
+  values.** They name each capability where they used to say `CAP_OTHER`. Under root
+  the dropped list is longer, as the Security entries below say, CAP_NET_ADMIN no
+  longer appears as retained, and CAP_NET_RAW is dropped on parser and capture threads
+  in every mode and on every thread in daemon, Diagnose CLI and strict sessions.
+- **A `geoip_db` or `geoip_asn_db` file over 2 GiB, or anything but a regular
+  file, now reads as unreadable.** netwatch holds the whole file in memory, and
+  doctor now opens these files too, so a FIFO would hang it and `/dev/zero` would
+  read until memory ran out. Doctor and Settings name the cause. A database under
+  2 GiB loads as it did, commercial ones included. Files `netwatch geoip update`
+  saved are held to 256 MiB.
 - **The Connections tab, the Dense view and the UI tick keep up at 10,000
   connections.** Each Connections frame copied and sorted the whole table twice,
   and each scroll key once more, so at 10,000 rows a frame took about 40 to
@@ -640,6 +724,61 @@ All notable changes to NetWatch will be documented in this file.
   whose `net.ipv4.ping_group_range` leaves out the user netwatch runs as,
   the `ping` that health falls back to and the Diagnose PMTU probe now
   fail, and health measures over TCP instead.
+- **The capture, keylog and metrics threads can no longer open a socket with
+  socket(2) or through io_uring.** Landlock's TCP deny stops connect(2) and bind(2)
+  on TCP sockets only. A compromised parser could still open UDP, ICMP and netlink
+  sockets, and on Linux 7.1 an MPTCP socket reached a plain TCP listener past the
+  deny. These four workers now take a seccomp filter on Linux, on x86_64, aarch64 and
+  armv5te, that returns EPERM for socket(2) and io_uring_setup(2). The second is
+  there because `IORING_OP_SOCKET` makes a socket with no socket(2) call for a filter
+  to see, and netwatch opens no ring, so this costs nothing. A build for another
+  architecture skips the filter and says so in the sandbox report, and a kernel that
+  refuses it stops a strict start. The filter does not cover the other parser threads,
+  which start `ss`, `ip` and `iw` and need netlink, or a descriptor opened earlier, a
+  ring's included. `docs/THREAT-MODEL.md` lists those gaps. No new crate: the filter
+  is about a dozen hand-written BPF instructions.
+- **netwatch no longer sends peer addresses to a third party for GeoIP.**
+  With `geoip_online = true` and no working database, every public peer address
+  a connection or packet touched went to ip-api.com over cleartext HTTP, where
+  anyone on the path could read which hosts you talk to and rewrite the answer.
+  Its free tier has no HTTPS, so this could not be made private. The lookup, its
+  worker thread and the parser are gone. A config that sets `geoip_online` still
+  loads; the setting is ignored, the log warns once per start, `netwatch doctor`
+  reports `online_geo` as `disabled` (`removed`), and the next save from Settings
+  drops the key. The GeoIP column stays empty until you run `netwatch geoip
+  update`. Organisation names now come from DB-IP's
+  `autonomous_system_organization`, so an egress policy's `allow_asn` entries
+  written for ip-api or MaxMind names (`CLOUDFLARENET`) need DB-IP's
+  (`Cloudflare, Inc.`) if you switch.
+- **Insights now says when it sends in cleartext to another machine.** With
+  `insights_endpoint` set to an `http://` URL on another host, every request
+  carries DNS names, peer addresses and packet summaries across the network
+  unencrypted, and only docs/INSIGHTS.md said so. `--remote` refuses the same
+  setup unless told otherwise. The Diagnose page now carries a `cleartext,
+  off-host` line under the verdict while Insights is on, whatever the page
+  shows and however short the terminal, the AI Endpoint row in Settings leads with the same words, and `netwatch doctor`
+  reports `insights` as degraded with reason `cleartext_off_host`. netwatch
+  still sends: there is no new key, and Insights stays experimental. A
+  loopback address, `localhost` and `https://` carry no mark.
+- **The capture error and the package install messages restrict the binary to
+  a group before granting it capture.** They printed a bare `setcap`, which on
+  a 0755 binary lets every local account capture. The README, REFERENCE.md and
+  the man page already put a `netwatch` group first, but anyone following the
+  error or the post-install message did not get that. The `.deb` and `.rpm`
+  messages now give `groupadd`, `usermod`, `chown root:netwatch`, `chmod 0750`
+  and `setcap`, in that order. On Linux the capture error gives the same steps
+  as one command, which finds the binary once, before `chmod` takes it away
+  from an account not yet in the group, and ends by saying to log in again.
+  `usermod` does not reach a running session, so until then the new restriction
+  keeps that session out too, and `netwatch` gets permission denied. The
+  Dashboard and Packets headers draw that command whole, breaking only between
+  its steps. A terminal too short or too narrow for that gets a pointer to
+  `netwatch doctor --check-capture --json` and REFERENCE.md instead, never part
+  of the command, which at 50 columns pasted as something else. netwatch
+  changes no file itself, so a binary you already granted stays open to every
+  account until you run the steps. The README now leads with this recipe and
+  the systemd unit, and the container docs drop `--cap-add=NET_ADMIN`, which
+  nothing in netwatch uses.
 
 ### Dependencies
 - **landlock 0.4.7 at minimum.** The parser layer's rule for pathname Unix
@@ -715,7 +854,7 @@ All notable changes to NetWatch will be documented in this file.
   daemon, a daemon that lost its packet socket, a run with no
   segmentation-offload frames, or a view whose p99 frame time passes
   33 ms. It records decode rate, drops and CPU for every phase. A full run
-  takes 75 minutes and `--smoke` five. No workflow runs it yet.
+  takes 75 minutes and `--smoke` five.
 - **The 10,000-socket poll and Diagnose's socket join are held to their
   budgets.** `scale_poll_real_sockets` fails past 150 ms at the median,
   times `NW_PERF_SLACK`, instead of printing it as pending.
@@ -727,6 +866,27 @@ All notable changes to NetWatch will be documented in this file.
 - **A test checks the metrics table in docs/observability-export.md
   against the exporter.** It fails when a metric is added, renamed or given
   another type without the table.
+- **A workflow runs the flood soak.** `.github/workflows/flood-soak.yml` runs
+  it in full once a week, or by hand with `minutes` and `scenarios`, and runs
+  `--smoke` on pull requests that touch the capture path, the detectors,
+  `src/app.rs` or the soak. It puts the gates and figures on the run's summary
+  page and keeps `flood-soak.json` and the JSONL. It is outside `ci.yml`, so
+  the release guard does not wait on it.
+- **The capture authority claims have a lab.** `tests/capture_authority.rs` runs
+  real daemon and TUI sessions as root in a user and network namespace with a veth
+  pair. It checks that capture still receives frames, what every thread holds, that
+  a stopped daemon cannot reopen capture and a TUI can, what capture, keylog and the
+  metrics threads get from socket(2) and io_uring_setup(2), and that a live capture
+  thread gets EACCES from TCP connect. `isolated_worker_boundaries`, a worker unit
+  test, covers TCP connect on keylog and the metrics threads. The lab skips unless
+  `NETWATCH_CAP_LAB=1`. `scripts/capture-authority-audit.sh` audits the real
+  `netwatch daemon` from outside. `sandbox-lab.yml` runs both, with the sandbox tests
+  that make their own user namespace, on pull requests touching the sandbox or
+  capture and once a week. It is separate from `ci.yml`, so it holds no tag, and the
+  release checklist in `docs/PACKAGING.md` asks for a green run on the candidate.
+- **Two GeoIP checks.** `geoip_update_live`, ignored by default, runs
+  `netwatch geoip update` against DB-IP by hand at release, and a unit test fails
+  if the removed service's name comes back in the code or the docs.
 - **The 10,000-row budgets for Connections and Dense frames, the scroll key
   and the tick's connection work are enforced.** They were pending on the
   Connections view cache. The scale tests also time Connections frames with a

@@ -192,6 +192,10 @@ pub const STUN_EVERY: u32 = 12;
 /// probe applies — plenty of networks drop echo but pass TCP.
 pub const INTERNET_TARGET: &str = "1.1.1.1";
 
+/// Why a reading that needs a public server is empty: the config said not to
+/// ask one. It starts every reason the Diagnose coverage table gives for it.
+pub const PROBES_OFF: &str = "third_party_probes is off";
+
 pub struct HealthProber {
     cancel: crate::diagnose::probe_io::Cancel,
     /// Latest probe results, shared via the `Arc<RwLock<Arc<…>>>` snapshot
@@ -205,6 +209,9 @@ pub struct HealthProber {
     /// cycle.
     cycles: Arc<AtomicU32>,
     nat_outcome: Arc<RwLock<Option<Result<(), String>>>>,
+    /// The `third_party_probes` config key: whether a cycle may ask STUN
+    /// servers, the reference resolver and the internet target.
+    third_party_probes: bool,
 }
 
 impl Drop for HealthProber {
@@ -221,6 +228,12 @@ impl Default for HealthProber {
 
 impl HealthProber {
     pub fn new() -> Self {
+        Self::with_third_party_probes(true)
+    }
+
+    /// A prober that honours the `third_party_probes` config key. Anything
+    /// replacing the prober mid-session has to pass the key on again.
+    pub fn with_third_party_probes(third_party_probes: bool) -> Self {
         Self {
             cancel: Default::default(),
             snapshot: Arc::new(RwLock::new(Arc::new(HealthStatus {
@@ -242,7 +255,12 @@ impl HealthProber {
             busy: Arc::new(AtomicBool::new(false)),
             cycles: Arc::new(AtomicU32::new(0)),
             nat_outcome: Arc::new(RwLock::new(None)),
+            third_party_probes,
         }
+    }
+
+    pub fn third_party_probes(&self) -> bool {
+        self.third_party_probes
     }
 
     /// Cheap snapshot of the most recent probe results. Single atomic
@@ -278,129 +296,192 @@ impl HealthProber {
         let snapshot = Arc::clone(&self.snapshot);
         let gw = gateway.map(|s| s.to_string());
         let dns = dns_server.map(|s| s.to_string());
-        let cycle = self.cycles.fetch_add(1, Ordering::SeqCst);
+        let number = self.cycles.fetch_add(1, Ordering::SeqCst);
+        let third_party = self.third_party_probes;
         crate::sandbox::worker::spawn("health", move || {
-            // Each probe block builds a new HealthStatus off the latest
-            // published snapshot, then swaps it in. The deep-clone is cheap:
-            // `HealthStatus` contains at most ~60 history entries per series.
-            if cancel.cancelled() {
-                busy.store(false, Ordering::SeqCst);
-                return;
-            }
-            if let Some(gw) = gw.as_deref() {
-                let (rtt, loss) = run_gateway_probe(gw);
-                let mut next = (**safe_read(&snapshot, "health::probe::read_gw")).clone();
-                if next.completed.gateway_target.as_deref() != Some(gw) {
-                    next.gateway_rtt_history.clear();
-                    next.completed.gateway_history.clear();
-                }
-                next.gateway_rtt_ms = rtt;
-                next.gateway_loss = loss;
-                let completed = std::time::Instant::now();
-                // The history is a series of measurements. A probe that could
-                // not be sent is recorded as such on `gateway_loss`, not as
-                // a lost sample the sparkline and the rules would then read.
-                if loss.is_measured() {
-                    next.completed.gateway_history.push_back(completed);
-                    next.gateway_rtt_history.push_back(rtt);
-                    if next.gateway_rtt_history.len() > RTT_HISTORY_MAX {
-                        next.gateway_rtt_history.pop_front();
-                        next.completed.gateway_history.pop_front();
-                    }
-                    next.gateway_rtt_history.make_contiguous();
-                }
-                next.completed.gateway = Some(completed);
-                next.completed.gateway_target = Some(gw.to_string());
-                *safe_write(&snapshot, "health::probe::publish_gw") = Arc::new(next);
-            }
-            if cancel.cancelled() {
-                busy.store(false, Ordering::SeqCst);
-                return;
-            }
-            if let Some(dns) = dns.as_deref() {
-                // Send a real DNS query rather than ICMP. ICMP-pinging the
-                // DNS server is a misleading health signal — plenty of
-                // resolvers (cloud LBs, internal CoreDNS, hardened routers)
-                // drop ICMP echo while happily answering DNS. It also fails
-                // on Linux hosts where `net.ipv4.ping_group_range = 1 0`
-                // and the sandbox has dropped CAP_NET_RAW, even though UDP
-                // queries to port 53 work fine.
-                let (rtt, loss, flags) = run_dns_query(dns);
-                let completed = std::time::Instant::now();
-                // Same cycle, same resolver: what does it say a public name
-                // resolves to, against a reference that validates?
-                let cross = run_dns_cross_check(dns);
-                let mut next = (**safe_read(&snapshot, "health::probe::read_dns")).clone();
-                if next.completed.dns_target.as_deref() != Some(dns) {
-                    next.dns_rtt_history.clear();
-                    next.completed.dns_history.clear();
-                    next.dns_probe_history.clear();
-                    next.dns_cross_history.clear();
-                }
-                next.dns_rtt_ms = rtt;
-                next.dns_loss = loss;
-                if loss.is_measured() {
-                    next.completed.dns_history.push_back(completed);
-                    next.dns_rtt_history.push_back(rtt);
-                    if next.dns_rtt_history.len() > RTT_HISTORY_MAX {
-                        next.dns_rtt_history.pop_front();
-                        next.completed.dns_history.pop_front();
-                    }
-                    next.dns_rtt_history.make_contiguous();
-                    next.dns_probe_history.push_back(flags);
-                    if next.dns_probe_history.len() > RTT_HISTORY_MAX {
-                        next.dns_probe_history.pop_front();
-                    }
-                }
-                if let Some(c) = &cross {
-                    next.dns_cross_history
-                        .push_back(c.mismatch || c.private_answer);
-                    if next.dns_cross_history.len() > RTT_HISTORY_MAX {
-                        next.dns_cross_history.pop_front();
-                    }
-                }
-                next.dns_cross = cross;
-                next.completed.dns = Some(completed);
-                next.completed.dns_target = Some(dns.to_string());
-                *safe_write(&snapshot, "health::probe::publish_dns") = Arc::new(next);
-            }
-            if cancel.cancelled() {
-                busy.store(false, Ordering::SeqCst);
-                return;
-            }
-            if cycle.is_multiple_of(STUN_EVERY) {
-                let result = run_stun_probe(&cancel);
-                *nat_outcome.write().unwrap() =
-                    Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
-                let nat = result.ok();
-                let mut next = (**safe_read(&snapshot, "health::probe::read_nat")).clone();
-                next.nat = nat;
-                next.completed.nat = Some(std::time::Instant::now());
-                *safe_write(&snapshot, "health::probe::publish_nat") = Arc::new(next);
-            }
-            {
-                // Same ICMP-then-TCP shape as the gateway probe: on hosts
-                // where unprivileged ICMP is unavailable, a 1-RTT TCP connect
-                // to 443 answers the same question without any privileges.
-                let (rtt, loss) = run_internet_probe(INTERNET_TARGET);
-                let mut next = (**safe_read(&snapshot, "health::probe::read_inet")).clone();
-                next.internet_rtt_ms = rtt;
-                next.internet_loss = loss;
-                let completed = std::time::Instant::now();
-                if loss.is_measured() {
-                    next.completed.internet_history.push_back(completed);
-                    next.internet_rtt_history.push_back(rtt);
-                    if next.internet_rtt_history.len() > RTT_HISTORY_MAX {
-                        next.internet_rtt_history.pop_front();
-                        next.completed.internet_history.pop_front();
-                    }
-                    next.internet_rtt_history.make_contiguous();
-                }
-                next.completed.internet = Some(completed);
-                *safe_write(&snapshot, "health::probe::publish_inet") = Arc::new(next);
-            }
+            let cycle = Cycle {
+                gateway: gw.as_deref(),
+                dns: dns.as_deref(),
+                number,
+                third_party,
+            };
+            run_cycle(&Network, cycle, &cancel, &snapshot, &nat_outcome);
             busy.store(false, Ordering::SeqCst);
         });
+    }
+}
+
+/// What a probe cycle sends, apart from what it does with the answers, so a
+/// test can see which of these a cycle asks for without touching a network.
+trait Probes {
+    fn gateway(&self, target: &str) -> (Option<f64>, Loss);
+    fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe);
+    fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck>;
+    fn stun(&self, cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String>;
+    fn internet(&self, target: &str) -> (Option<f64>, Loss);
+}
+
+struct Network;
+
+impl Probes for Network {
+    fn gateway(&self, target: &str) -> (Option<f64>, Loss) {
+        run_gateway_probe(target)
+    }
+    fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe) {
+        run_dns_query(server)
+    }
+    fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck> {
+        run_dns_cross_check(server)
+    }
+    fn stun(&self, cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String> {
+        run_stun_probe(cancel)
+    }
+    fn internet(&self, target: &str) -> (Option<f64>, Loss) {
+        run_internet_probe(target)
+    }
+}
+
+/// One cycle's inputs.
+struct Cycle<'a> {
+    gateway: Option<&'a str>,
+    dns: Option<&'a str>,
+    number: u32,
+    third_party: bool,
+}
+
+fn run_cycle(
+    probes: &impl Probes,
+    cycle: Cycle,
+    cancel: &crate::diagnose::probe_io::Cancel,
+    snapshot: &RwLock<Arc<HealthStatus>>,
+    nat_outcome: &RwLock<Option<Result<(), String>>>,
+) {
+    // Each probe block builds a new HealthStatus off the latest
+    // published snapshot, then swaps it in. The deep-clone is cheap:
+    // `HealthStatus` contains at most ~60 history entries per series.
+    if cancel.cancelled() {
+        return;
+    }
+    if let Some(gw) = cycle.gateway {
+        let (rtt, loss) = probes.gateway(gw);
+        let mut next = (**safe_read(snapshot, "health::probe::read_gw")).clone();
+        if next.completed.gateway_target.as_deref() != Some(gw) {
+            next.gateway_rtt_history.clear();
+            next.completed.gateway_history.clear();
+        }
+        next.gateway_rtt_ms = rtt;
+        next.gateway_loss = loss;
+        let completed = std::time::Instant::now();
+        // The history is a series of measurements. A probe that could
+        // not be sent is recorded as such on `gateway_loss`, not as
+        // a lost sample the sparkline and the rules would then read.
+        if loss.is_measured() {
+            next.completed.gateway_history.push_back(completed);
+            next.gateway_rtt_history.push_back(rtt);
+            if next.gateway_rtt_history.len() > RTT_HISTORY_MAX {
+                next.gateway_rtt_history.pop_front();
+                next.completed.gateway_history.pop_front();
+            }
+            next.gateway_rtt_history.make_contiguous();
+        }
+        next.completed.gateway = Some(completed);
+        next.completed.gateway_target = Some(gw.to_string());
+        *safe_write(snapshot, "health::probe::publish_gw") = Arc::new(next);
+    }
+    if cancel.cancelled() {
+        return;
+    }
+    if let Some(dns) = cycle.dns {
+        // Send a real DNS query rather than ICMP. ICMP-pinging the
+        // DNS server is a misleading health signal — plenty of
+        // resolvers (cloud LBs, internal CoreDNS, hardened routers)
+        // drop ICMP echo while happily answering DNS. It also fails
+        // on Linux hosts where `net.ipv4.ping_group_range = 1 0`
+        // and the sandbox has dropped CAP_NET_RAW, even though UDP
+        // queries to port 53 work fine.
+        let (rtt, loss, flags) = probes.dns(dns);
+        let completed = std::time::Instant::now();
+        // Same cycle, same resolver: what does it say a public name
+        // resolves to, against a reference that validates?
+        let cross = if cycle.third_party {
+            probes.dns_cross_check(dns)
+        } else {
+            None
+        };
+        let mut next = (**safe_read(snapshot, "health::probe::read_dns")).clone();
+        if next.completed.dns_target.as_deref() != Some(dns) {
+            next.dns_rtt_history.clear();
+            next.completed.dns_history.clear();
+            next.dns_probe_history.clear();
+            next.dns_cross_history.clear();
+        }
+        next.dns_rtt_ms = rtt;
+        next.dns_loss = loss;
+        if loss.is_measured() {
+            next.completed.dns_history.push_back(completed);
+            next.dns_rtt_history.push_back(rtt);
+            if next.dns_rtt_history.len() > RTT_HISTORY_MAX {
+                next.dns_rtt_history.pop_front();
+                next.completed.dns_history.pop_front();
+            }
+            next.dns_rtt_history.make_contiguous();
+            next.dns_probe_history.push_back(flags);
+            if next.dns_probe_history.len() > RTT_HISTORY_MAX {
+                next.dns_probe_history.pop_front();
+            }
+        }
+        if let Some(c) = &cross {
+            next.dns_cross_history
+                .push_back(c.mismatch || c.private_answer);
+            if next.dns_cross_history.len() > RTT_HISTORY_MAX {
+                next.dns_cross_history.pop_front();
+            }
+        }
+        next.dns_cross = cross;
+        next.completed.dns = Some(completed);
+        next.completed.dns_target = Some(dns.to_string());
+        *safe_write(snapshot, "health::probe::publish_dns") = Arc::new(next);
+    }
+    if cancel.cancelled() {
+        return;
+    }
+    if cycle.third_party && cycle.number.is_multiple_of(STUN_EVERY) {
+        let result = probes.stun(cancel);
+        *nat_outcome.write().unwrap() = Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
+        let nat = result.ok();
+        let mut next = (**safe_read(snapshot, "health::probe::read_nat")).clone();
+        next.nat = nat;
+        next.completed.nat = Some(std::time::Instant::now());
+        *safe_write(snapshot, "health::probe::publish_nat") = Arc::new(next);
+    }
+    {
+        // Same ICMP-then-TCP shape as the gateway probe: on hosts
+        // where unprivileged ICMP is unavailable, a 1-RTT TCP connect
+        // to 443 answers the same question without any privileges.
+        //
+        // Switched off, the cycle still completes here: the uptime monitor
+        // counts cycles by this stamp, and reads the unmeasured loss as an
+        // unknown hop, not a dead one.
+        let (rtt, loss) = if cycle.third_party {
+            probes.internet(INTERNET_TARGET)
+        } else {
+            (None, Loss::Unmeasured(PROBES_OFF))
+        };
+        let mut next = (**safe_read(snapshot, "health::probe::read_inet")).clone();
+        next.internet_rtt_ms = rtt;
+        next.internet_loss = loss;
+        let completed = std::time::Instant::now();
+        if loss.is_measured() {
+            next.completed.internet_history.push_back(completed);
+            next.internet_rtt_history.push_back(rtt);
+            if next.internet_rtt_history.len() > RTT_HISTORY_MAX {
+                next.internet_rtt_history.pop_front();
+                next.completed.internet_history.pop_front();
+            }
+            next.internet_rtt_history.make_contiguous();
+        }
+        next.completed.internet = Some(completed);
+        *safe_write(snapshot, "health::probe::publish_inet") = Arc::new(next);
     }
 }
 
@@ -1200,6 +1281,117 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers every probe at once, and writes down who was asked.
+    #[derive(Default)]
+    struct FakeProbes {
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeProbes {
+        fn saw(&self, what: String) {
+            self.asked.borrow_mut().push(what);
+        }
+    }
+
+    impl Probes for FakeProbes {
+        fn gateway(&self, target: &str) -> (Option<f64>, Loss) {
+            self.saw(format!("gateway {target}"));
+            (Some(1.0), Loss::Measured(0.0))
+        }
+        fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe) {
+            self.saw(format!("dns {server}"));
+            (Some(2.0), Loss::Measured(0.0), DnsProbe::default())
+        }
+        fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck> {
+            self.saw(format!("cross {server} and {REFERENCE_RESOLVER}"));
+            Some(DnsCrossCheck {
+                name: CROSS_CHECK_NAME.into(),
+                local: vec![],
+                reference_resolver: REFERENCE_RESOLVER.into(),
+                reference: vec![],
+                validated: false,
+                private_answer: false,
+                mismatch: false,
+            })
+        }
+        fn stun(&self, _: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String> {
+            self.saw("stun".into());
+            Ok(NatProbe {
+                mappings: vec![],
+                symmetric: false,
+            })
+        }
+        fn internet(&self, target: &str) -> (Option<f64>, Loss) {
+            self.saw(format!("internet {target}"));
+            (Some(3.0), Loss::Measured(0.0))
+        }
+    }
+
+    /// What one cycle asked for and what it left behind.
+    fn one_cycle(third_party: bool) -> (Vec<String>, HealthProber) {
+        let probes = FakeProbes::default();
+        let prober = HealthProber::with_third_party_probes(third_party);
+        run_cycle(
+            &probes,
+            Cycle {
+                gateway: Some("192.0.2.1"),
+                dns: Some("192.0.2.53"),
+                // A cycle STUN is due on.
+                number: 0,
+                third_party: prober.third_party_probes(),
+            },
+            &prober.cancel,
+            &prober.snapshot,
+            &prober.nat_outcome,
+        );
+        (probes.asked.into_inner(), prober)
+    }
+
+    /// The readings the rest of netwatch reads as "not measured", none of
+    /// them as a failure: no loss figure, no history, no outcome.
+    #[test]
+    fn probes_skip_stun_dns_tcp_when_disabled() {
+        let (asked, prober) = one_cycle(false);
+        assert_eq!(asked, ["gateway 192.0.2.1", "dns 192.0.2.53"]);
+
+        let status = prober.status();
+        assert_eq!(status.internet_rtt_ms, None);
+        assert_eq!(status.internet_loss, Loss::Unmeasured(PROBES_OFF));
+        assert_eq!(status.internet_loss.pct(), None);
+        assert!(!status.internet_loss.degrades(status.internet_rtt_ms));
+        assert!(status.internet_rtt_history.is_empty());
+        assert_eq!(status.dns_cross, None);
+        assert!(status.dns_cross_history.is_empty());
+        assert_eq!(status.nat, None);
+        assert_eq!(status.completed.nat, None);
+        assert_eq!(prober.nat_outcome(), None);
+
+        // The cycle still counts as one, and what stays local still runs.
+        assert!(status.completed.internet.is_some());
+        assert_eq!(status.gateway_rtt_ms, Some(1.0));
+        assert_eq!(status.dns_rtt_ms, Some(2.0));
+    }
+
+    #[test]
+    fn probes_ask_every_target_by_default() {
+        assert!(HealthProber::new().third_party_probes());
+        let (asked, prober) = one_cycle(true);
+        assert_eq!(
+            asked,
+            [
+                "gateway 192.0.2.1",
+                "dns 192.0.2.53",
+                "cross 192.0.2.53 and 1.1.1.1",
+                "stun",
+                "internet 1.1.1.1",
+            ]
+        );
+        let status = prober.status();
+        assert_eq!(status.internet_loss, Loss::Measured(0.0));
+        assert!(status.dns_cross.is_some());
+        assert!(status.nat.is_some());
+    }
 
     // ── loss model ─────────────────────────────────────────────────────
     #[test]

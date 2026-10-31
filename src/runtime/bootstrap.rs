@@ -90,6 +90,17 @@ fn confine_main(
     Ok(report)
 }
 
+/// Write the session's sandbox report to the log, the first time this is called.
+/// `doctor` is another process and cannot see this one, so the log is where each
+/// worker's protection and the startup audit can be read (docs/doctor.md).
+pub fn log_protections(app: &App) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let report = crate::runtime::capabilities::CapabilitySnapshot::live(app).sandbox_json();
+        tracing::info!(target: "netwatch::sandbox", report = %report, "session protections");
+    });
+}
+
 /// Both live loops begin with the same initial observations.
 pub fn prime_collectors(app: &mut App) {
     app.traffic.update();

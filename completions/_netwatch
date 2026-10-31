@@ -46,6 +46,7 @@ _netwatch() {
                 'doctor:Read-only setup report'
                 'diagnose:Diagnose runs, coverage, episodes and exports'
                 'uptime:Outage history from the uptime log'
+                'geoip:Download offline GeoIP databases'
                 'resolver:Inspect or change the DNS resolver'
             )
             _describe 'command' subcommands
@@ -74,6 +75,11 @@ _netwatch() {
                         '--only=[One corpus entry]:id:' \
                         '--include-beta[Count beta rules in the exit status]' \
                         '*:file:_files'
+                    ;;
+                geoip)
+                    _arguments \
+                        '1: :(update)' \
+                        '--city[Also download the City database]'
                     ;;
                 uptime)
                     _arguments \

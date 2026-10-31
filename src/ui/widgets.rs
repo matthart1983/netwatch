@@ -642,19 +642,113 @@ pub fn capture_failure(app: &App) -> Option<String> {
         .filter(|_| !app.diagnose.is_demo())
 }
 
-/// The header's capture-failure row: what failed and, for a refused open,
-/// the fix (see [`crate::platform::capture_fix`]).
-pub fn capture_failure_line(app: &App, error: String) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(" ⚠ capture off: "),
-        Span::styled(error, Style::default().fg(app.theme.status_error).bold()),
-    ])
+/// `rows` off the top of `area`, and what is left. Taken before a [`Layout`]
+/// runs, so that rows the content depends on are rows the solver cannot shrink.
+pub fn take_top(area: Rect, rows: u16) -> (Rect, Rect) {
+    let rows = rows.min(area.height);
+    (
+        Rect {
+            height: rows,
+            ..area
+        },
+        Rect {
+            y: area.y + rows,
+            height: area.height - rows,
+            ..area
+        },
+    )
+}
+
+/// Where the exact fix is, when the header cannot draw it whole.
+pub const CAPTURE_FIX_POINTER: &str =
+    "fix: netwatch doctor --check-capture --json, or REFERENCE.md";
+
+const FAILURE_LEAD: &str = " ⚠ capture off: ";
+const FAILURE_INDENT: &str = " ";
+
+/// `text` broken between words, for a message that is not a command.
+fn failure_word_rows(text: &str, width: usize) -> Vec<(&'static str, String)> {
+    use crate::ui::text::width as cells;
+    let mut rows = vec![(FAILURE_LEAD, String::new())];
+    for word in text.split_inclusive(' ') {
+        let (lead, row) = &rows[rows.len() - 1];
+        if !row.is_empty() && cells(lead) + cells(row) + cells(word.trim_end()) > width {
+            rows.push((FAILURE_INDENT, String::new()));
+        }
+        let last = rows.len() - 1;
+        rows[last].1.push_str(word);
+    }
+    rows
+}
+
+/// The fix's commands as rows of whole commands under a row of their own for
+/// the sentence, or `None` when a command is wider than a row.
+fn failure_command_rows(
+    sentence: &str,
+    commands: &[&str],
+    width: usize,
+) -> Option<Vec<(&'static str, String)>> {
+    use crate::ui::text::width as cells;
+    let room = width.checked_sub(cells(FAILURE_INDENT))?;
+    let mut chain: Vec<String> = Vec::new();
+    for command in commands {
+        if cells(command) > room {
+            return None;
+        }
+        match chain.last_mut() {
+            Some(row) if cells(row) + 1 + cells(command) <= room => {
+                row.push(' ');
+                row.push_str(command);
+            }
+            _ => chain.push((*command).to_string()),
+        }
+    }
+    let mut rows = vec![(FAILURE_LEAD, format!("{sentence}. Run:"))];
+    rows.extend(chain.into_iter().map(|row| (FAILURE_INDENT, row)));
+    Some(rows)
+}
+
+/// The header's capture-failure rows at `width`: what failed and, for a
+/// refused open, the fix (see [`crate::platform::capture_fix`]).
+///
+/// The Linux fix is a chain of commands longer than most terminals are wide,
+/// and it is drawn whole or not at all. A chain cut off before its `setcap`
+/// fixes nothing, and one broken inside a command pastes as something else:
+/// 50-column rows ran `netwatch` inside `$(...)` and pointed `chown` at a file
+/// named after what it printed. Rows break between commands, so they still
+/// paste as one. If the chain does not fit `width`, or needs more than `spare`
+/// rows, the rows name where the exact line is instead. Prose breaks between
+/// words, whatever the rows.
+pub fn capture_failure_lines(
+    theme: &Theme,
+    error: &str,
+    width: u16,
+    spare: u16,
+) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    let rows = match crate::platform::fix_commands(error) {
+        Some((sentence, commands)) => failure_command_rows(sentence, &commands, width)
+            .filter(|rows| rows.len() <= usize::from(spare))
+            .unwrap_or_else(|| failure_word_rows(CAPTURE_FIX_POINTER, width)),
+        None => failure_word_rows(error, width),
+    };
+    let style = Style::default().fg(theme.status_error).bold();
+    rows.into_iter()
+        .map(|(lead, row)| {
+            Line::from(vec![
+                Span::raw(lead),
+                Span::styled(row.trim_end().to_string(), style),
+            ])
+        })
+        .collect()
 }
 
 pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![build_header_line(app, None), build_verdict_line(app)];
     if let Some(error) = capture_failure(app).filter(|_| area.height > 3) {
-        lines.push(capture_failure_line(app, error));
+        // Two rows above and the border below.
+        let spare = area.height.saturating_sub(3);
+        lines.extend(capture_failure_lines(&app.theme, &error, area.width, spare));
     }
     let header = Paragraph::new(lines).block(
         Block::default()
@@ -1060,6 +1154,73 @@ mod tests {
     }
 
     use super::*;
+
+    fn failure_rows(error: &str, width: u16, spare: u16) -> Vec<String> {
+        capture_failure_lines(&crate::theme::by_name("default"), error, width, spare)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_fix_is_drawn_whole_between_its_commands_or_not_at_all() {
+        let error = "not permitted — first command && second command && third command";
+        let whole = [
+            " ⚠ capture off: not permitted. Run:",
+            " first command && second command &&",
+            " third command",
+        ];
+        assert_eq!(failure_rows(error, 40, 3), whole);
+        let pointer = [format!(" ⚠ capture off: {CAPTURE_FIX_POINTER}")];
+        // Two rows at this width, and one row short of them.
+        assert_eq!(
+            failure_rows(error, 200, 2)[1],
+            " first command && second command && third command"
+        );
+        assert_eq!(failure_rows(error, 200, 1), pointer);
+        assert_eq!(failure_rows(error, 200, 0), pointer);
+        // A command wider than a row, with rows to spare.
+        let narrow = failure_rows("no — a very long first command && b", 18, 10).join(" ");
+        assert!(!narrow.contains("very"), "{narrow}");
+        assert!(narrow.contains("--check-capture"), "{narrow}");
+    }
+
+    /// Not a command, so nothing is lost by breaking it, whatever `spare` says.
+    #[test]
+    fn a_failure_in_prose_breaks_between_words() {
+        let plain = "run with sudo, or give your user read access to the device";
+        let wrapped = [
+            " ⚠ capture off: run with sudo, or give",
+            " your user read access to the device",
+        ];
+        assert_eq!(failure_rows(plain, 40, 0), wrapped);
+        assert_eq!(failure_rows(plain, 40, 9), wrapped);
+        assert_eq!(
+            failure_rows(plain, 200, 0),
+            [format!(" ⚠ capture off: {plain}")]
+        );
+    }
+
+    /// The real one: every row fits, at the widths that take it at all.
+    #[test]
+    fn the_linux_fix_fits_an_ordinary_terminal_in_whole_commands() {
+        let error = format!("not permitted — {}", crate::platform::LINUX_CAPTURE_FIX);
+        for width in [80, 100, 120, 200] {
+            let rows = failure_rows(&error, width, 40);
+            assert!(rows[0].ends_with("not permitted. Run:"), "{rows:?}");
+            assert_eq!(
+                rows[1..]
+                    .iter()
+                    .map(|r| r.trim())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                crate::platform::LINUX_CAPTURE_FIX
+            );
+            for row in &rows {
+                assert!(crate::ui::text::width(row) <= usize::from(width), "{row}");
+            }
+        }
+    }
 
     fn find_first_col(target: Tab) -> Option<u16> {
         (0..220).find(|&col| tab_at_column(col) == Some(target))
