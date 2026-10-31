@@ -48,7 +48,9 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.0.join("config"))
             .env("XDG_CACHE_HOME", self.0.join("cache"))
             .env("XDG_STATE_HOME", self.0.join("state"))
-            .env("TERM", "xterm-256color");
+            .env("TERM", "xterm-256color")
+            // Nix's build sets it empty, which filters out every warning.
+            .env_remove("RUST_LOG");
         cmd
     }
 }
