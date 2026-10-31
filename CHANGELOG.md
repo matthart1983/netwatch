@@ -4,6 +4,24 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **A key netwatch does not read now warns, naming the key and the file.** serde
+  ignored them without a word, so `sandbox_mode = "strict"` left the sandbox
+  best-effort with nothing to say the setting had no effect, and
+  `allow_snis = [...]` in `egress-policy.toml` left a rule with no restriction by
+  name, because an empty list means unrestricted. Both files now report such keys
+  at any depth, such as `alerts.typo` or `process.curl.allow_snis`, and never the
+  value, and netwatch still starts. A session prints `warning: <file>: unknown key
+  <key> is ignored` on stderr before it starts, which a service manager keeps and
+  the TUI shows again when it quits, and writes it to the log. The TUI also says so
+  on its bottom row for its first 30 seconds, in every view, and Settings keeps the
+  list. The Egress tab counts the policy's. `diagnose run`, `diagnose coverage` and
+  `geoip update` print the same line on stderr, and `doctor` reports `config` as
+  `degraded`, reason `config_unknown_keys`, which is additive in its JSON.
+  `__capture-check` stays silent. Loading itself says nothing, however often a
+  session does it. This adds the serde_ignored crate, which reports what the
+  deserializer really skipped, where a list of known keys kept by hand would drift.
+
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
   the plain Linux asset has been the static binary, and the `-static` name went
@@ -25,6 +43,19 @@ All notable changes to NetWatch will be documented in this file.
   across TLS records, or whose segments arrive out of order, is still not
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
+- **Saving config.toml no longer deletes what netwatch does not read.** Settings,
+  `--generate-config` and a Diagnose target toggle rewrote the whole file from the
+  struct, so a key from a newer version or a typo went, and so did the warning about
+  it, with every comment in the file. A save now edits a file that loads in place:
+  those keys stay, comments stay, a value that has not changed keeps its spelling,
+  and a changed one keeps its line's comment. `--generate-config` still sets every
+  key netwatch reads to its default, and still empties `diagnose_targets`, whose
+  entries take their own keys with them. A removed key such as `geoip_online` still
+  goes on a save. If the result would not read back as the config being saved, the
+  save fails and the file stays.
+- **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
+  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key
+  in the rule was lost. Comments inside a promoted rule are still lost.
 
 ## [0.39.0] - 2026-10-31
 

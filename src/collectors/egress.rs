@@ -31,7 +31,7 @@ mod policy;
 // reorganisation, not an API change.
 use policy::write_owner_only;
 pub use policy::{
-    default_policy_path, load_policy_file, merge_rules_into_policy_file,
+    default_policy_path, default_policy_warnings, load_policy_file, merge_rules_into_policy_file,
     remove_rules_from_policy_file, rule_diff, save_policy_file, wildcard_suggestions, AlertMode,
     BlockList, EgressPolicy, ProcessRule,
 };
@@ -574,6 +574,15 @@ impl EgressProfiler {
         let loaded = load_policy_file(path);
         let failed = loaded.is_none()
             && !matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        // Promoting reloads the file, so the log says each one once, not every
+        // time.
+        if let Some(policy) = &loaded {
+            for warning in &policy.load_warnings {
+                if !self.policy_warnings().contains(warning) {
+                    warning.log();
+                }
+            }
+        }
         self.set_policy(loaded);
         if failed {
             self.policy_error =
@@ -586,6 +595,10 @@ impl EgressProfiler {
     }
     pub fn policy_error(&self) -> Option<&str> {
         self.policy_error.as_deref()
+    }
+    /// What the policy in force should have its owner told.
+    pub fn policy_warnings(&self) -> &[crate::config::ConfigWarning] {
+        self.policy.as_ref().map_or(&[], |p| &p.load_warnings)
     }
     pub fn last_observation_wall(&self) -> Option<SystemTime> {
         self.last_wall
@@ -1962,6 +1975,89 @@ block = {
         assert!(rule.allow_sni.contains(&"a.example.com".to_string()));
         assert!(!rule.allow_sni.contains(&"b.example.com".to_string()));
         assert!(p.promote_one("nonexistent").is_none());
+    }
+
+    /// `allow_snis` is not `allow_sni`: this rule restricts no name at all, so
+    /// the typo admits every host. Loading names it, with the file, and a reload
+    /// replaces what the last one found rather than adding to it.
+    #[test]
+    fn a_policy_key_it_does_not_read_is_recorded_at_every_depth() {
+        use crate::config::ConfigWarningKind::UnknownKey;
+        let path = scratch("unknown-keys.toml");
+        std::fs::write(
+            &path,
+            "stirct = true\n[block]\nipp = ['192.0.2.1']\n\
+             [process.curl]\nallow_snis = ['a.example']\n\
+             [process.curl.block]\nport = [25]\n\
+             [process.'any name']\nallow_ports = [443]\n",
+        )
+        .unwrap();
+        let policy = load_policy_file(&path).unwrap();
+        assert!(!policy.strict, "the typo is not the setting");
+        assert!(policy.process["curl"].allow_sni.is_empty());
+        let mut keys: Vec<_> = policy
+            .load_warnings
+            .iter()
+            .map(|w| {
+                assert_eq!(w.file, path);
+                let UnknownKey(key) = &w.kind;
+                key.as_str()
+            })
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "block.ipp",
+                "process.curl.allow_snis",
+                "process.curl.block.port",
+                "stirct",
+            ]
+        );
+
+        let mut profiler = EgressProfiler::new();
+        profiler.reload_policy(&path);
+        profiler.reload_policy(&path);
+        assert_eq!(profiler.policy_warnings().len(), 4);
+        std::fs::write(&path, "strict = true\n").unwrap();
+        profiler.reload_policy(&path);
+        assert_eq!(profiler.policy_warnings(), []);
+        profiler.reload_policy(&scratch("no-such-policy.toml"));
+        assert_eq!(profiler.policy_warnings(), []);
+    }
+
+    /// Promotion rewrote the rule from the four lists and `block`, so a key it
+    /// did not know was gone from the file, and the warning about it with it.
+    #[test]
+    fn promotion_keeps_the_keys_of_a_rule_it_does_not_read() {
+        let path = scratch("promote-unknown.toml");
+        std::fs::write(
+            &path,
+            "stirct = true\n\
+             [process.curl]\nallow_snis = ['a.example']\nallow_sni = ['b.example']\n\
+             [process.curl.block]\nport = [25]\nports = [26]\n\
+             [process.inline]\nallow_sni = []\nfuture = { a = 1 }\n",
+        )
+        .unwrap();
+        let before = load_policy_file(&path).unwrap().load_warnings;
+        let rule = ProcessRule {
+            allow_sni: vec!["c.example".into()],
+            ..Default::default()
+        };
+        merge_rules_into_policy_file(
+            &[("curl".into(), rule.clone()), ("inline".into(), rule)],
+            &path,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let policy = load_policy_file(&path).unwrap();
+        assert_eq!(policy.load_warnings.len(), before.len(), "{body}");
+        assert_eq!(body.matches("allow_snis").count(), 1, "{body}");
+        assert_eq!(policy.process["curl"].allow_sni, ["b.example", "c.example"]);
+        assert_eq!(policy.process["curl"].block.ports, [26]);
+        assert!(body.contains("future = { a = 1 }"), "{body}");
+        assert!(body.contains("port = [25]"), "{body}");
+        assert!(body.contains("stirct = true"), "{body}");
     }
 
     #[test]

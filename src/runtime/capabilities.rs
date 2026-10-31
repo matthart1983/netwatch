@@ -1245,7 +1245,7 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
     const REFUSED: &str = "defaults shown. Live sessions refuse to start until it is fixed";
     let path = NetwatchConfig::path();
     let loaded = path.as_deref().map(NetwatchConfig::load_from);
-    let (config, config_state, code, detail) = match loaded {
+    let (config, mut config_state, mut code, mut detail) = match loaded {
         Some(Ok(config)) if path.as_deref().is_some_and(std::path::Path::exists) => (
             config,
             State::Ready,
@@ -1277,6 +1277,22 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
             "No saved configuration; defaults shown".to_string(),
         ),
     };
+    // Key names and files, never a value, as with a file that does not parse.
+    let policy = crate::collectors::egress::default_policy_warnings();
+    for warnings in [&config.load_warnings, &policy] {
+        if let Some(first) = warnings.first() {
+            let messages: Vec<_> = warnings.iter().map(|w| w.kind.message()).collect();
+            detail.push_str(&format!(
+                "; {}: {}",
+                first.file.display(),
+                messages.join(", ")
+            ));
+            if config_state == State::Ready {
+                config_state = State::Degraded;
+                code = "config_unknown_keys";
+            }
+        }
+    }
     let mut snapshot = CapabilitySnapshot::configured(&config);
     snapshot.put(
         "config",

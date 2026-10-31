@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 /// User-facing persistent configuration, stored as `netwatch/config.toml`
 /// under the platform config directory (`dirs::config_dir()`): `~/.config` on
@@ -186,6 +187,11 @@ pub struct NetwatchConfig {
     /// defaults in the file would hold them there when a release retunes one.
     #[serde(default, skip_serializing_if = "is_default_thresholds")]
     pub diagnose_thresholds: crate::diagnose::detectors::Thresholds,
+
+    /// What the file this came from should have its owner told. Never read
+    /// from or written to a file; see [`ConfigWarning`].
+    #[serde(skip)]
+    pub load_warnings: Vec<ConfigWarning>,
 }
 
 fn is_default_thresholds(t: &crate::diagnose::detectors::Thresholds) -> bool {
@@ -274,6 +280,7 @@ impl Default for NetwatchConfig {
             egress_violation_cooldown_secs: default_egress_cooldown(),
             groups_start_collapsed: default_groups_collapsed(),
             confirm_quit: false,
+            load_warnings: Vec::new(),
         }
     }
 }
@@ -344,6 +351,232 @@ impl std::fmt::Display for ConfigError {
 // would otherwise print it twice.
 impl std::error::Error for ConfigError {}
 
+/// Something about a file that loaded that its owner should be told: serde
+/// ignores a key it does not know, so `sandbox_mode = "strict"` would otherwise
+/// do nothing without a word.
+///
+/// Loading only records these. A session loads the file again after `main` has
+/// and on every save, so each entry point reports them once, where its user
+/// looks: stderr, which the TUI hides, then the log, Settings and doctor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    pub file: PathBuf,
+    pub kind: ConfigWarningKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigWarningKind {
+    /// A key netwatch does not read, so setting it changes nothing.
+    UnknownKey(String),
+}
+
+impl ConfigWarningKind {
+    /// Keys come from the file and can hold anything a quoted key can, so they
+    /// are made safe for a terminal here. A value is never part of this.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownKey(key) => {
+                format!(
+                    "unknown key {} is ignored",
+                    crate::ui::sanitize::display(key)
+                )
+            }
+        }
+    }
+}
+
+impl ConfigWarning {
+    /// The file by name alone, for the TUI's narrow rows.
+    pub fn short(&self) -> String {
+        let name = self.file.file_name().map(|name| name.to_string_lossy());
+        format!(
+            "{}: {}",
+            crate::ui::sanitize::display(name.as_deref().unwrap_or("config")),
+            self.kind.message()
+        )
+    }
+
+    /// For the log, once it exists.
+    pub fn log(&self) {
+        tracing::warn!(target: "netwatch::config", "{self}");
+    }
+}
+
+impl std::fmt::Display for ConfigWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.file.display(), self.kind.message())
+    }
+}
+
+/// `warnings` on stderr, for a command with no log, and for the moment before a
+/// session takes the terminal: the lines are there when the TUI quits, and in
+/// the journal under a service manager.
+pub fn print_warnings(warnings: &[ConfigWarning]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// A key `T` did not read, one element per level: `["alerts", "typo"]`, or
+/// `["diagnose_targets", "0", "typo"]` under an array of tables. A table `T`
+/// has no field for at all is reported once, not key by key.
+pub(crate) type KeyPath = Vec<String>;
+
+fn key_path(path: &serde_ignored::Path<'_>, out: &mut KeyPath) {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => {}
+        Path::Seq { parent, index } => {
+            key_path(parent, out);
+            out.push(index.to_string());
+        }
+        Path::Map { parent, key } => {
+            key_path(parent, out);
+            out.push(key.clone());
+        }
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => key_path(parent, out),
+    }
+}
+
+/// [`toml::from_str`], and every key in `text` that `T` did not read.
+pub(crate) fn from_toml_reporting_unread<T: serde::de::DeserializeOwned>(
+    text: &str,
+) -> Result<(T, Vec<KeyPath>), toml::de::Error> {
+    let mut unread = Vec::new();
+    let value = serde_ignored::deserialize(toml::de::Deserializer::parse(text)?, |path| {
+        let mut key = KeyPath::new();
+        key_path(&path, &mut key);
+        unread.push(key);
+    })?;
+    Ok((value, unread))
+}
+
+/// Bring `old`, a table as the file has it, up to `new`, what the config would
+/// write. Comments and layout stay, and so does a value that has not changed,
+/// however it is spelled. What netwatch read but does not write back goes: a
+/// removed key such as `geoip_online`, a table back at its defaults. A key it
+/// did not read stays, because it may belong to another version or be a typo
+/// the user has yet to fix. `keep` lists those, and `at` is where `old` is.
+fn merge_table(old: &mut dyn TableLike, new: &Table, at: &mut KeyPath, keep: &[KeyPath]) {
+    let gone: Vec<String> = old
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .filter(|key| !new.contains_key(key))
+        .collect();
+    for key in gone {
+        at.push(key.clone());
+        // A key not read, or inside a table not read, is left exactly as it is.
+        if !keep.iter().any(|kept| at.starts_with(kept)) {
+            if keep.iter().any(|kept| kept.starts_with(at)) {
+                if let Some(table) = old.get_mut(&key).and_then(Item::as_table_like_mut) {
+                    merge_table(table, &Table::new(), at, keep);
+                }
+            } else {
+                old.remove(&key);
+            }
+        }
+        at.pop();
+    }
+    for (key, item) in new.iter() {
+        at.push(key.to_owned());
+        let merged = old
+            .get_mut(key)
+            .is_some_and(|current| merge_item(current, item, at, keep));
+        if !merged {
+            // New to the file, or now a different kind of thing, such as the
+            // `diagnose_targets = []` of a reset. The key goes too, as a table's
+            // has none of the spacing a value's needs.
+            old.remove(key);
+            old.insert(key, without_positions(item));
+        }
+        at.pop();
+    }
+}
+
+/// Whether `new` could be written into `current` where it is.
+fn merge_item(current: &mut Item, new: &Item, at: &mut KeyPath, keep: &[KeyPath]) -> bool {
+    match new {
+        Item::Table(new) => match current.as_table_like_mut() {
+            Some(table) => merge_table(table, new, at, keep),
+            None => return false,
+        },
+        // An entry at a time while there are as many as the file has. Only a
+        // reset or a hand edit changes the number.
+        Item::ArrayOfTables(new) => {
+            let Some(tables) = tables_in(current).filter(|tables| tables.len() == new.len()) else {
+                return false;
+            };
+            for (index, (table, new)) in tables.into_iter().zip(new.iter()).enumerate() {
+                at.push(index.to_string());
+                merge_table(table, new, at, keep);
+                at.pop();
+            }
+        }
+        Item::Value(new) => {
+            let Item::Value(value) = current else {
+                return false;
+            };
+            if !same_value(value, new) {
+                let decor = value.decor().clone();
+                *value = new.clone();
+                *value.decor_mut() = decor;
+            }
+        }
+        Item::None => return false,
+    }
+    true
+}
+
+/// The tables of an array of tables, or of an array of inline tables.
+fn tables_in(item: &mut Item) -> Option<Vec<&mut dyn TableLike>> {
+    match item {
+        Item::ArrayOfTables(tables) => {
+            Some(tables.iter_mut().map(|t| t as &mut dyn TableLike).collect())
+        }
+        Item::Value(Value::Array(values)) => values
+            .iter_mut()
+            .map(|v| v.as_inline_table_mut().map(|t| t as &mut dyn TableLike))
+            .collect(),
+        _ => None,
+    }
+}
+
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(a), Value::String(b)) => a.value() == b.value(),
+        (Value::Integer(a), Value::Integer(b)) => a.value() == b.value(),
+        (Value::Float(a), Value::Float(b)) => a.value() == b.value(),
+        (Value::Boolean(a), Value::Boolean(b)) => a.value() == b.value(),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| same_value(a, b))
+        }
+        _ => false,
+    }
+}
+
+/// A copy of `item` from another document, whose positions mean nothing in this
+/// one. Without them a table is written after the one before it.
+fn without_positions(item: &Item) -> Item {
+    fn clear(table: &mut Table) {
+        table.set_position(None);
+        for (_, item) in table.iter_mut() {
+            clear_item(&mut *item);
+        }
+    }
+    fn clear_item(item: &mut Item) {
+        match item {
+            Item::Table(table) => clear(table),
+            Item::ArrayOfTables(tables) => tables.iter_mut().for_each(clear),
+            Item::None | Item::Value(_) => {}
+        }
+    }
+    let mut item = item.clone();
+    clear_item(&mut item);
+    item
+}
+
 /// The 1-based line and column of byte `at`, counting characters as toml does.
 fn line_column(text: &str, at: usize) -> (usize, usize) {
     let before = text.get(..at).unwrap_or(text);
@@ -374,6 +607,15 @@ impl NetwatchConfig {
 
     /// [`load`](Self::load) from `path` rather than the platform location.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
+        match Self::read_file(path)? {
+            Some((_, cfg, _)) => Ok(cfg),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// The text at `path`, the config it holds and the keys that did not read,
+    /// or `None` if there is nothing at the path.
+    fn read_file(path: &Path) -> Result<Option<(String, Self, Vec<KeyPath>)>, ConfigError> {
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
             // Nothing at the path at all. A symlink to a missing file is
@@ -382,7 +624,7 @@ impl NetwatchConfig {
                 if e.kind() == std::io::ErrorKind::NotFound
                     && fs::symlink_metadata(path).is_err() =>
             {
-                return Ok(Self::default());
+                return Ok(None);
             }
             Err(source) => {
                 return Err(ConfigError::Read {
@@ -391,13 +633,32 @@ impl NetwatchConfig {
                 })
             }
         };
-        let mut cfg: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-            path: path.into(),
-            position: source.span().map(|span| line_column(&contents, span.start)),
-            source: Box::new(source),
-        })?;
+        let (mut cfg, unread) =
+            Self::parse(&contents, path).map_err(|source| ConfigError::Parse {
+                path: path.into(),
+                position: source.span().map(|span| line_column(&contents, span.start)),
+                source: Box::new(source),
+            })?;
         cfg.validate();
-        Ok(cfg)
+        Ok(Some((contents, cfg, unread)))
+    }
+
+    /// `text`, the contents of `file`, with [`load_warnings`](Self::load_warnings)
+    /// filled in. Not validated: that is for what a session will run on.
+    pub fn from_toml(text: &str, file: &Path) -> Result<Self, toml::de::Error> {
+        Self::parse(text, file).map(|(cfg, _)| cfg)
+    }
+
+    fn parse(text: &str, file: &Path) -> Result<(Self, Vec<KeyPath>), toml::de::Error> {
+        let (mut cfg, unread): (Self, Vec<KeyPath>) = from_toml_reporting_unread(text)?;
+        cfg.load_warnings = unread
+            .iter()
+            .map(|key| ConfigWarning {
+                file: file.into(),
+                kind: ConfigWarningKind::UnknownKey(key.join(".")),
+            })
+            .collect();
+        Ok((cfg, unread))
     }
 
     /// Clamp and normalise fields that may arrive out of range from a hand-edited
@@ -439,19 +700,46 @@ impl NetwatchConfig {
     /// [`save`](Self::save) to `path`. A file already there that does not
     /// load is left alone, by Settings and `--generate-config` alike: it holds
     /// settings nothing has read, such as a hand edit made while netwatch ran.
+    ///
+    /// One that does load is edited in place, not replaced, so a key this
+    /// version does not read, from a newer one or misspelled, is still there
+    /// and still warned about afterwards. So are the file's comments.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Err(e) = Self::load_from(path) {
-            return Err(anyhow::Error::new(e).context(format!(
-                "{} does not load; not overwriting it",
-                path.display()
-            )));
-        }
+        let existing = Self::read_file(path).map_err(|e| {
+            let context = format!("{} does not load; not overwriting it", path.display());
+            anyhow::Error::new(e).context(context)
+        })?;
+        let contents = match existing {
+            Some((text, _, unread)) => self.merged_into(&text, &unread)?,
+            None => toml::to_string_pretty(self)?,
+        };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let contents = toml::to_string_pretty(self)?;
         fs::write(path, contents)?;
         Ok(())
+    }
+
+    /// `text` with this config's values in it and the keys in `unread` left
+    /// alone. Refuses a result that does not read back as this config, because
+    /// the file it would replace does.
+    fn merged_into(&self, text: &str, unread: &[KeyPath]) -> anyhow::Result<String> {
+        let wanted = toml::to_string_pretty(self)?;
+        let new: DocumentMut = wanted.parse()?;
+        let mut doc: DocumentMut = text.parse()?;
+        merge_table(
+            doc.as_table_mut(),
+            new.as_table(),
+            &mut KeyPath::new(),
+            unread,
+        );
+        let merged = doc.to_string();
+        let back: Self = toml::from_str(&merged)?;
+        anyhow::ensure!(
+            toml::to_string_pretty(&back)? == wanted,
+            "cannot update it in place; not overwriting it"
+        );
+        Ok(merged)
     }
 }
 
@@ -462,6 +750,7 @@ impl NetwatchConfig {
     /// anything. For the session's start, once the log exists: `main` loads
     /// the config before it installs the logger, and a session loads it again
     /// after that and on every save, so this cannot live in [`Self::load_from`].
+    /// [`load_warnings`](Self::load_warnings) go to the log the same way.
     pub fn warn_removed_keys(&self) {
         if self.geoip_online {
             tracing::warn!(
@@ -625,6 +914,317 @@ show_geo = false
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn unknown_keys(cfg: &NetwatchConfig) -> Vec<String> {
+        cfg.load_warnings
+            .iter()
+            .map(|warning| match &warning.kind {
+                ConfigWarningKind::UnknownKey(key) => key.clone(),
+            })
+            .collect()
+    }
+
+    /// The typo the warning exists for, at every depth a config has, and the
+    /// value is not what it reads as. Loading any number of times says nothing
+    /// and finds the same keys, because a session does load more than once.
+    #[test]
+    fn unknown_keys_are_recorded_at_every_depth_and_loading_says_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dir = scratch("unknown");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            r#"
+sandbox_mode = "strict"
+[alerts]
+bandwidth_thresold = 5
+[diagnose_thresholds]
+dns_ceiling = 30
+[diagnose_probes]
+trace_targt = "9.9.9.9"
+[[diagnose_probes.portal_endpoints]]
+url = "http://a.example/"
+expect_status = 204
+expected = 1
+[[diagnose_targets]]
+name = "api"
+host = "a.example"
+[[diagnose_targets]]
+name = "web"
+host = "b.example"
+intervl = 5
+[stray]
+anything = "goes"
+"#,
+        )
+        .unwrap();
+
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Count(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                let cfg = NetwatchConfig::load_from(&path).unwrap();
+                let mut keys = unknown_keys(&cfg);
+                keys.sort();
+                assert_eq!(
+                    keys,
+                    [
+                        "alerts.bandwidth_thresold",
+                        "diagnose_probes.portal_endpoints.0.expected",
+                        "diagnose_probes.trace_targt",
+                        "diagnose_targets.1.intervl",
+                        "diagnose_thresholds.dns_ceiling",
+                        "sandbox_mode",
+                        "stray",
+                    ]
+                );
+                assert_eq!(cfg.sandbox, "on", "the typo is not the setting");
+                assert!(cfg.load_warnings.iter().all(|w| w.file == path));
+            }
+            assert_eq!(events.load(Ordering::Relaxed), 0);
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A warning that fires on a key netwatch does read teaches people to
+    /// ignore the warning. Every key at once, with every optional one set.
+    #[test]
+    fn no_key_netwatch_reads_is_called_unknown() {
+        let cfg: NetwatchConfig = toml::from_str(
+            r#"
+[diagnose_probes]
+pmtu_url = "http://a.example/big"
+trace_refresh_secs = 60
+[[diagnose_targets]]
+name = "api"
+host = "a.example"
+tls = true
+expect_status = 200
+"#,
+        )
+        .unwrap();
+        let cfg = NetwatchConfig {
+            diagnose_thresholds: crate::diagnose::detectors::Thresholds {
+                sigma_k: 4.0,
+                ..Default::default()
+            },
+            ..cfg
+        };
+        let text = format!(
+            "geoip_online = true\n{}",
+            toml::to_string_pretty(&cfg).unwrap()
+        );
+        for key in [
+            "pmtu_url",
+            "trace_refresh_secs",
+            "tls",
+            "expect_status",
+            "sigma_k",
+        ] {
+            assert!(text.contains(key), "{key} is not in\n{text}");
+        }
+        let back = NetwatchConfig::from_toml(&text, Path::new("config.toml")).unwrap();
+        assert_eq!(back.load_warnings, []);
+        // Nor is the field that holds them a key a file can set.
+        let set = NetwatchConfig::from_toml("load_warnings = []", Path::new("c")).unwrap();
+        assert_eq!(unknown_keys(&set), ["load_warnings"]);
+    }
+
+    /// A quoted key can hold an escape sequence, and this text goes to a
+    /// terminal. The message names the file, and never carries the value.
+    #[test]
+    fn a_warning_names_the_key_and_file_safely_and_not_the_value() {
+        let cfg = NetwatchConfig::from_toml(
+            "\"a\\u001b[2Jb\" = \"secret-value\"\n",
+            Path::new("/etc/netwatch/config.toml"),
+        )
+        .unwrap();
+        let warning = &cfg.load_warnings[0];
+        assert_eq!(
+            warning.to_string(),
+            "/etc/netwatch/config.toml: unknown key a·[2Jb is ignored"
+        );
+        assert_eq!(
+            warning.short(),
+            "config.toml: unknown key a·[2Jb is ignored"
+        );
+    }
+
+    /// What a save did to these until 0.40: rewrote the file from the struct,
+    /// so a key netwatch does not read was gone with no word, and with it the
+    /// warning about it. A key from a newer version went the same way.
+    #[test]
+    fn a_save_keeps_unknown_keys_and_comments_and_changes_what_changed() {
+        let dir = scratch("save_unknown");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            r#"# my settings
+sandbox_mode = "strict"  # typo, fix me
+theme = 'nord' # the good one
+refresh_rate_ms = 1_000
+
+# watch the uplink
+[alerts]
+bandwidth_threshold = 1_000
+bandwidth_thresold = 5
+
+[[diagnose_targets]]
+# the api
+name = "api"
+host = "a.example"
+from_a_newer_version = { a = 1 }
+
+[stray]
+anything = "goes"
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
+        cfg.theme = "ocean".into();
+        cfg.diagnose_targets[0].enabled = false;
+        cfg.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# my settings\n",
+            "sandbox_mode = \"strict\"  # typo, fix me\n",
+            "refresh_rate_ms = 1_000\n",
+            "# watch the uplink\n",
+            "bandwidth_threshold = 1_000\n",
+            "bandwidth_thresold = 5\n",
+            "# the api\n",
+            "from_a_newer_version = { a = 1 }\n",
+            "[stray]\nanything = \"goes\"\n",
+            // A changed value keeps its line's comment.
+            "theme = \"ocean\" # the good one\n",
+        ] {
+            assert!(saved.contains(kept), "{kept:?} not in\n{saved}");
+        }
+
+        let back = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(back.theme, "ocean");
+        assert!(!back.diagnose_targets[0].enabled);
+        assert_eq!(cfg.load_warnings, back.load_warnings, "\n{saved}");
+
+        // Again, unchanged: nothing is written twice or moves.
+        back.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other ways TOML writes a table. An unknown key in each stays.
+    #[test]
+    fn a_save_keeps_unknown_keys_in_inline_and_dotted_tables() {
+        let dir = scratch("save_forms");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "alerts = { bandwidth_threshold = 5, typo = 1 }\n\
+             diagnose_probes.trace_target = \"9.9.9.9\"\n\
+             diagnose_probes.typo = 2\n\
+             diagnose_targets = [{ name = \"api\", host = \"a.example\", typo = 3 }]\n",
+        )
+        .unwrap();
+        let mut cfg = NetwatchConfig::load_from(&path).unwrap();
+        let unknown = cfg.load_warnings.clone();
+        assert_eq!(unknown.len(), 3);
+        cfg.alerts.bandwidth_threshold = 6;
+        cfg.diagnose_probes.trace_target = "8.8.8.8".into();
+        cfg.diagnose_targets[0].port = 8443;
+        cfg.save_to(&path).unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        let back = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(back.load_warnings, unknown, "\n{saved}");
+        assert_eq!(back.alerts.bandwidth_threshold, 6, "\n{saved}");
+        assert_eq!(back.alerts.port_scan_threshold, 20, "\n{saved}");
+        assert_eq!(back.diagnose_probes.trace_target, "8.8.8.8", "\n{saved}");
+        assert_eq!(back.diagnose_targets[0].port, 8443, "\n{saved}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--generate-config` resets what netwatch reads. It cannot reset what it
+    /// does not, and a list it empties takes the entries' own keys with it.
+    #[test]
+    fn a_reset_sets_known_keys_to_their_defaults_and_keeps_the_rest() {
+        let dir = scratch("save_reset");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            r#"# mine
+sandbox = "strict"
+typo = 1
+[[diagnose_targets]]
+name = "api"
+host = "a.example"
+intervl = 5
+[diagnose_thresholds]
+sigma_k = 9.0
+sigmak = 9.0
+"#,
+        )
+        .unwrap();
+        NetwatchConfig::default().save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# mine\n"), "{saved}");
+        assert!(saved.contains("sandbox = \"on\"\n"), "{saved}");
+        assert!(saved.contains("diagnose_targets = []\n"), "{saved}");
+        // The table holds its defaults again, so only what was not read is left.
+        assert!(
+            saved.contains("[diagnose_thresholds]\nsigmak = 9.0\n"),
+            "{saved}"
+        );
+        let back = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(back.sandbox, "on");
+        assert_eq!(back.diagnose_targets, []);
+        assert_eq!(back.diagnose_thresholds, Default::default());
+        let mut keys = unknown_keys(&back);
+        keys.sort();
+        assert_eq!(keys, ["diagnose_thresholds.sigmak", "typo"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A first save has nothing to keep, and an empty file should end up the
+    /// same as no file. A file with Windows line endings stays loadable.
+    #[test]
+    fn a_save_over_nothing_lays_the_file_out_as_generated() {
+        let dir = scratch("save_layout");
+        let path = dir.join("config.toml");
+        let cfg = NetwatchConfig::default();
+        cfg.save_to(&path).unwrap();
+        let fresh = fs::read_to_string(&path).unwrap();
+        assert_eq!(fresh, toml::to_string_pretty(&cfg).unwrap());
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            fresh,
+            "a save of itself"
+        );
+        fs::write(&path, "").unwrap();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            fresh,
+            "over an empty file"
+        );
+
+        fs::write(&path, "# mine\r\ntypo = 1\r\ntheme = \"nord\"\r\n").unwrap();
+        cfg.save_to(&path).unwrap();
+        let back = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(back.theme, "dark");
+        assert_eq!(unknown_keys(&back), ["typo"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// An empty key means the downloaded file where there is one, a path in
     /// the config always wins, and each key is decided on its own.
     #[test]
@@ -737,6 +1337,7 @@ show_geo = false
             diagnose_probes: Default::default(),
             diagnose_targets: vec![],
             diagnose_thresholds: Default::default(),
+            load_warnings: vec![],
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();

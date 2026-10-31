@@ -151,6 +151,64 @@ mod cli {
         }
     }
 
+    /// `sandbox_mode = "strict"` does nothing, so it has to say so. A session
+    /// says it before anything else, and `--remote` to an http:// URL is a
+    /// session that stops right after, so this needs no terminal or capture.
+    #[test]
+    fn an_unknown_key_warns_on_stderr_and_does_not_stop_anything() {
+        let fixture = Fixture::new();
+        let config = fixture.config();
+        fs::write(
+            &config,
+            "sandbox_mode = 'strict'\n[alerts]\nbandwidth_thresold = 'secret-value'\n",
+        )
+        .unwrap();
+        let policy = config.with_file_name("egress-policy.toml");
+        fs::write(&policy, "[process.curl]\nallow_snis = ['a.example']\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut session = fixture.command();
+        session
+            .args(["--remote", "http://192.0.2.1"])
+            .env("NETWATCH_API_KEY", "k");
+        let (status, stderr) = {
+            let output = session.output().unwrap();
+            (output.status, String::from_utf8(output.stderr).unwrap())
+        };
+        assert_eq!(status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("cleartext"), "{stderr}");
+        for line in [
+            format!(
+                "warning: {}: unknown key sandbox_mode is ignored\n",
+                config.display()
+            ),
+            format!(
+                "warning: {}: unknown key alerts.bandwidth_thresold is ignored\n",
+                config.display()
+            ),
+            format!(
+                "warning: {}: unknown key process.curl.allow_snis is ignored\n",
+                policy.display()
+            ),
+        ] {
+            assert_eq!(stderr.matches(&line).count(), 1, "{line}in\n{stderr}");
+        }
+        assert!(!stderr.contains("secret-value"), "{stderr}");
+
+        // A command with no session reports it too, with its stdout untouched.
+        // No such target, so this is exit 3 without a run.
+        let (status, stdout, stderr) =
+            fixture.run(&["diagnose", "run", "--format", "json", "--target", "none"]);
+        assert_eq!(status.code(), Some(3), "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("unknown key sandbox_mode"), "{stderr}");
+        assert!(stderr.contains("no configured target"), "{stderr}");
+    }
+
     #[test]
     fn generate_config_does_not_overwrite_it() {
         let fixture = Fixture::new();

@@ -495,6 +495,13 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.status_good),
             ));
         }
+        let ignored = app.egress_profiler.policy_warnings().len();
+        if ignored > 0 {
+            extra.push(Span::styled(
+                format!("  ·  {ignored} policy keys ignored"),
+                Style::default().fg(t.status_warn).bold(),
+            ));
+        }
     } else {
         extra.push(Span::styled(
             "  ·  observe only (no policy)",

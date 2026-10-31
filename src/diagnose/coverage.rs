@@ -312,6 +312,8 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         diagnose_record_episodes: false,
         ..NetwatchConfig::load()?
     };
+    crate::config::print_warnings(&config.load_warnings);
+    crate::config::print_warnings(&crate::collectors::egress::default_policy_warnings());
     super::run::print_threshold_warnings(&config.diagnose_thresholds);
     if let Some(rule) = &test {
         // The platform first, as Runner::start checks it: asking for a

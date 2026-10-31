@@ -60,6 +60,11 @@ fn main() -> Result<()> {
     // cause: the defaults would drop every setting in it, the sandbox mode
     // and `record_uptime` included.
     let config = NetwatchConfig::load()?;
+    // The TUI is about to hide stderr, and these are back in view when it
+    // quits. A daemon's go to the journal. Nothing else here reports them twice:
+    // `load` says nothing, however many times a session calls it.
+    netwatch::config::print_warnings(&config.load_warnings);
+    netwatch::config::print_warnings(&netwatch::collectors::egress::default_policy_warnings());
     let remote_url = options
         .remote
         .or_else(|| std::env::var("NETWATCH_REMOTE_URL").ok());
@@ -129,6 +134,10 @@ fn main() -> Result<()> {
     // touch the cache dir.
     let _log_guard = netwatch::logging::init();
     config.warn_removed_keys();
+    config
+        .load_warnings
+        .iter()
+        .for_each(netwatch::config::ConfigWarning::log);
 
     // Headless daemon mode: `netwatch daemon` (or `--daemon`/`--headless`).
     // Runs the same collectors as the TUI with no rendering, streams to the

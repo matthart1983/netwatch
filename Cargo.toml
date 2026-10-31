@@ -74,6 +74,12 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 # longer parses through toml_edit, so this is the only copy of it in the tree.
 toml = "1"
 toml_edit = "0.25"
+# Names the keys in config.toml and the egress policy that serde did not read,
+# so a typo in a security setting warns instead of doing nothing. It reports
+# what the deserializer actually skipped, where a list of known keys kept by
+# hand would drift from the structs. cargo builds on it, so distros have it, and
+# it brings in nothing but serde_core, which is already in the tree.
+serde_ignored = "0.1"
 # Where config, cache and state live. A major that moves one strands users'
 # files, so sandbox::paths has a test that pins every location.
 dirs = "7"

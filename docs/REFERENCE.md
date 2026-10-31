@@ -348,6 +348,12 @@ Sharp edges handled for you:
 - **Policy file trust**: a group- or world-writable `egress-policy.toml` is refused
   with a loud log warning. If anyone but the owner can edit the policy, "warn on
   drift" could be silenced by the very thing drifting. `chmod 644` or stricter.
+- **Unknown keys**: a key the policy does not read is ignored and reported, naming the
+  key and the file: on stderr when a session starts, in the log, in Settings, in the
+  Egress tab's header and in `netwatch doctor`, as for
+  [`config.toml`](#configuration). It matters more here. An empty list means
+  unrestricted, so `allow_snis` for `allow_sni` is a rule that restricts no name.
+  Promoting a rule keeps such a key, as it keeps the rule's `block` table.
 
 **Structured export.** Press `e` on the Egress tab to write the attributed
 records as **NDJSON** (`netwatch.egress.v1`) — one JSON object per line, preceded
@@ -914,7 +920,8 @@ exist until you write one.
 Two ways to write it. From the shell:
 
 ```bash
-netwatch --generate-config    # writes every key at its default value, then exits
+netwatch --generate-config    # writes every key at its default value, then exits. Keeps
+                              # your comments and any key it does not read
 ```
 
 Or live in the TUI: `,` opens Settings, `↑`/`↓` moves, `←`/`→` cycles the enum-valued rows
@@ -929,6 +936,20 @@ release can retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
 A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
 out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
 to start.
+
+A key netwatch does not read is ignored and reported, because otherwise a typo such as
+`sandbox_mode = "strict"` would do nothing without a word. netwatch still starts. `netwatch`
+and `netwatch daemon` print `warning: <file>: unknown key <key> is ignored` on stderr before
+they start, at any depth (`alerts.typo`, `diagnose_targets.0.typo`), and write it to the log.
+The TUI hides stderr until it quits, so it also shows the warning on its bottom row for its
+first 30 seconds, in every view, and Settings keeps the list. `diagnose run`,
+`diagnose coverage` and `geoip update` print the same line on stderr. `netwatch doctor` reports
+`config` as `degraded`, reason `config_unknown_keys`. None of these prints the key's value.
+
+A save keeps those keys. Settings and `--generate-config` edit a file that loads in place, so
+comments stay too, and a value that has not changed keeps its spelling. `--generate-config`
+sets every key netwatch reads to its default, and empties `diagnose_targets`; what it does not
+read, it leaves.
 
 A file netwatch cannot read or parse is different. If the TOML is broken, or a key has a value
 of the wrong type (`refresh_rate_ms = "fast"`), `netwatch` and `netwatch daemon` print the

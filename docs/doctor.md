@@ -29,6 +29,10 @@ On Windows the `capture_library` entry's reason says which of these it found:
 Before 0.38, every Windows host with a `wpcap.dll` reported `not_checked`
 with `npcap_present_unloaded`, including the two `unavailable` cases above.
 
+A key `config.toml` or `egress-policy.toml` sets that netwatch does not read makes
+`config` `degraded`, with reason `config_unknown_keys`. Its detail names each key and
+its file, never a value, and live sessions start as usual.
+
 Missing or malformed configuration is reported explicitly; malformed content and
 configured endpoint credentials are not echoed. A configuration file that cannot
 be read or parsed makes `config` `unavailable`, with reason `config_unreadable` or

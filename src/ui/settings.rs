@@ -507,8 +507,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         inner_width,
         label_width + 4,
     );
-    // Up to three workers that warned, the capability line, and the connection
-    // table when it is not read from `ss`.
+    // Up to three workers that warned, the capability line, the connection table
+    // when it is not read from `ss`, and what the config files got wrong.
     let mut notes: Vec<String> = crate::sandbox::worker::snapshot()
         .iter()
         .filter(|(_, s)| {
@@ -528,6 +528,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     notes.push(capabilities.compact());
     notes.extend(capabilities.connection_table_line());
+    notes.extend(app.config_warnings().map(|warning| warning.short()));
     let note_rows: Vec<(usize, String)> = notes
         .iter()
         .flat_map(|note| {
@@ -906,6 +907,34 @@ mod tests {
             .chunks(width as usize)
             .map(|row| row.iter().map(|c| c.symbol()).collect())
             .collect()
+    }
+
+    /// Where the keys a config got wrong stay listed after the session's first
+    /// moments, however narrow the popup.
+    #[test]
+    fn settings_list_the_keys_the_config_ignored() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let config = NetwatchConfig::from_toml(
+            "sandbox_mode = 'strict'\n[alerts]\na_rather_long_key_of_some_kind = 1\n",
+            std::path::Path::new("/etc/netwatch/config.toml"),
+        )
+        .unwrap();
+        let app = App::prepare_with_config(config);
+        for width in [80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 60)).unwrap();
+            terminal.draw(|f| render(f, &app, f.area())).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            for needle in ["unknown key sandbox_mode", "a_rather_long_key_of_some_kind"] {
+                assert!(text.contains(needle), "{width}: {needle} in {text}");
+            }
+        }
     }
 
     /// Settings redraws the live capability snapshot, which is how a date chrono

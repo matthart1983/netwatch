@@ -366,6 +366,9 @@ impl App {
             if let Some(error) = self.egress_profiler.policy_error() {
                 return Err(error.into());
             }
+            if let Some(warning) = self.egress_profiler.policy_warnings().first() {
+                return Ok(format!("egress policy reloaded; {}", warning.short()));
+            }
             return Ok(if self.egress_profiler.has_policy() {
                 "egress policy reloaded; awaiting a fresh connection sample".into()
             } else {

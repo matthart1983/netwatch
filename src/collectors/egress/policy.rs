@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{from_toml_reporting_unread, ConfigWarning, ConfigWarningKind};
+
 // ── Declared egress policy ─────────────────────────────────────────────
 
 /// A declarative egress allowlist: `process → {allowed SNIs, ASNs, ports}`.
@@ -52,6 +54,11 @@ pub struct EgressPolicy {
     pub block: BlockList,
     #[serde(default)]
     pub process: HashMap<String, ProcessRule>,
+    /// What the file this came from should have its owner told: a rule whose
+    /// `allow_snis` was not read is a rule with no name restriction at all, so
+    /// the typo admits traffic. Never read from or written to a file.
+    #[serde(skip)]
+    pub load_warnings: Vec<ConfigWarning>,
 }
 
 /// Which egress findings raise alerts. See [`EgressPolicy::alert`].
@@ -344,13 +351,32 @@ pub fn load_policy_file(path: &Path) -> Option<EgressPolicy> {
         }
     }
     let contents = std::fs::read_to_string(path).ok()?;
-    match toml::from_str(&contents) {
-        Ok(policy) => Some(policy),
+    match from_toml_reporting_unread::<EgressPolicy>(&contents) {
+        Ok((mut policy, unread)) => {
+            policy.load_warnings = unread
+                .iter()
+                .map(|key| ConfigWarning {
+                    file: path.into(),
+                    kind: ConfigWarningKind::UnknownKey(key.join(".")),
+                })
+                .collect();
+            Some(policy)
+        }
         Err(e) => {
             tracing::warn!(target: "netwatch::egress", path = %path.display(), error = %e, "egress policy parse failed");
             None
         }
     }
+}
+
+/// What the policy file at the default path should have its owner told, for
+/// doctor and for a command with no log. Nothing for a file that is refused or
+/// does not parse: that is a louder message of its own, and no rule is in force.
+pub fn default_policy_warnings() -> Vec<ConfigWarning> {
+    default_policy_path()
+        .and_then(|path| load_policy_file(&path))
+        .map(|policy| policy.load_warnings)
+        .unwrap_or_default()
 }
 
 /// Serialize a policy to disk (creating parent dirs). Used by "promote".
@@ -527,6 +553,9 @@ fn leading_comment_block(src: &str) -> String {
     out
 }
 
+/// The keys of a rule that promotion writes.
+const ALLOW_KEYS: [&str; 4] = ["allow_sni", "allow_asn", "allow_ip", "allow_ports"];
+
 /// Upsert `rules` into the policy file, preserving everything else — hand
 /// edits, comments, and rules for processes not being promoted. Promotion
 /// is additive per process: it unions the observed entries with those already
@@ -567,7 +596,17 @@ pub fn merge_rules_into_policy_file(
         let ip = union_strings(existing, "allow_ip", &rule.allow_ip);
         let ports = union_ports(existing, "allow_ports", &rule.allow_ports);
 
+        // Everything else in the rule stays where it is: a hand-written
+        // `[process.<name>.block]`, which promotion must never drop, and any key
+        // this version does not read. Only the four lists are promotion's.
         let mut t = toml_edit::Table::new();
+        if let Some(rule) = existing.and_then(toml_edit::Item::as_table_like) {
+            for (key, item) in rule.iter() {
+                if !ALLOW_KEYS.contains(&key) {
+                    t[key] = item.clone();
+                }
+            }
+        }
         // Wildcard suggestions land as a comment above the rule — visible
         // exactly where the human reviews, applied only by their hand.
         // Computed on the *unioned* set so the suggestion reflects the file.
@@ -592,11 +631,6 @@ pub fn merge_rules_into_policy_file(
         t["allow_ports"] = toml_edit::value(toml_edit::Array::from_iter(
             ports.iter().map(|p| i64::from(*p)),
         ));
-        // Carry a hand-written `[process.<name>.block]` across: promotion
-        // only ratifies observed allow entries and must never drop a block.
-        if let Some(block) = existing.and_then(|e| e.get("block")).cloned() {
-            t["block"] = block;
-        }
         doc["process"][name.as_str()] = toml_edit::Item::Table(t);
     }
 
