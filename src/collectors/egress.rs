@@ -100,6 +100,10 @@ pub struct EgressDest {
     /// ClientHello — the inner SNI is hidden by design, so a policy miss on
     /// this row may be "name unreadable", not real drift. Sticky once seen.
     pub ech: bool,
+    /// True when a flow named this destination with a cleartext HTTP `Host`
+    /// rather than a ClientHello, so the export's `proto` must not say `tls`.
+    /// Sticky once seen.
+    pub http_host: bool,
     /// Wall-clock times, not `Instant`: the evidence a human reviews at
     /// promote time ("known for 3 weeks" vs "showed up 40 seconds ago")
     /// must survive restarts, and the persisted baseline serializes them.
@@ -229,7 +233,8 @@ pub struct EgressRecord {
     pub ip: String,
     pub port: u16,
     /// Coarse L7 class: `tls` when a ClientHello named the destination,
-    /// else `other`. Kept coarse on purpose — no payload inspection.
+    /// else `other`, which includes a flow named by a cleartext HTTP `Host`.
+    /// Kept coarse on purpose — no payload inspection.
     pub proto: String,
     pub ech: bool,
     /// Unix seconds.
@@ -394,19 +399,21 @@ impl EgressProfiler {
 
             let sni = dest_hostname(&conn.app_protocol);
             let ech = flow_ech(&conn.app_protocol);
+            let http_host = flow_http_host(&conn.app_protocol);
             let asn_org = geo.lookup(ip).map(|g| g.org).filter(|o| !o.is_empty());
             // Rates are present only while packet capture is running, so
             // without it these stay zero and the UI shows "—" rather than a
             // confident 0 B.
             let out = (conn.tx_rate.unwrap_or(0.0) * elapsed).max(0.0) as u64;
             let inb = (conn.rx_rate.unwrap_or(0.0) * elapsed).max(0.0) as u64;
-            self.record_flow(
+            self.record_observed(
                 process,
                 ip,
                 port,
                 sni.clone(),
                 asn_org.clone(),
                 ech,
+                http_host,
                 wall,
                 out,
                 inb,
@@ -741,6 +748,8 @@ impl EgressProfiler {
         self.record_flow(process, ip, port, sni, asn_org, false, now, 0, 0);
     }
 
+    /// Test-facing shorthand for `record_observed` with `http_host: false`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn record_flow(
         &mut self,
@@ -750,6 +759,25 @@ impl EgressProfiler {
         sni: Option<String>,
         asn_org: Option<String>,
         ech: bool,
+        now: SystemTime,
+        bytes_out: u64,
+        bytes_in: u64,
+    ) {
+        self.record_observed(
+            process, ip, port, sni, asn_org, ech, false, now, bytes_out, bytes_in,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_observed(
+        &mut self,
+        process: &str,
+        ip: &str,
+        port: u16,
+        sni: Option<String>,
+        asn_org: Option<String>,
+        ech: bool,
+        http_host: bool,
         now: SystemTime,
         bytes_out: u64,
         bytes_in: u64,
@@ -766,6 +794,7 @@ impl EgressProfiler {
             port,
             ip,
             ech,
+            http_host,
             now,
             bytes_out,
             bytes_in,
@@ -856,6 +885,7 @@ impl EgressProfiler {
                     existing.first_seen = existing.first_seen.min(dest.first_seen);
                     existing.last_seen = existing.last_seen.max(dest.last_seen);
                     existing.ech |= dest.ech;
+                    existing.http_host |= dest.http_host;
                     if existing.sni.is_none() {
                         existing.sni = dest.sni;
                     }
@@ -890,6 +920,7 @@ impl EgressProfiler {
         port: u16,
         ip: &str,
         ech: bool,
+        http_host: bool,
         now: SystemTime,
         bytes_out: u64,
         bytes_in: u64,
@@ -917,6 +948,7 @@ impl EgressProfiler {
             dest.last_seen = now;
             dest.count += 1;
             dest.ech |= ech;
+            dest.http_host |= http_host;
             // Only ever upgrade the endpoint. A flow whose address we couldn't
             // read must not downgrade a destination we already know the IP for
             // — that turned named rows into blank ones on disk.
@@ -959,6 +991,7 @@ impl EgressProfiler {
                 port,
                 last_ip: ip.to_string(),
                 ech,
+                http_host,
                 first_seen: now,
                 last_seen: now,
                 count: 1,
@@ -1064,7 +1097,12 @@ impl EgressProfiler {
                     asn_org: dest.asn_org.clone(),
                     ip: dest.last_ip.clone(),
                     port: dest.port,
-                    proto: if dest.sni.is_some() { "tls" } else { "other" }.to_string(),
+                    proto: if dest.sni.is_some() && !dest.http_host {
+                        "tls"
+                    } else {
+                        "other"
+                    }
+                    .to_string(),
                     ech: dest.ech,
                     first_seen: unix_secs(dest.first_seen),
                     last_seen: unix_secs(dest.last_seen),
@@ -1152,6 +1190,7 @@ impl EgressProfiler {
                             asn_org: d.asn_org.clone(),
                             ip: d.last_ip.clone(),
                             ech: d.ech,
+                            http_host: d.http_host,
                             first_seen: unix_secs(d.first_seen),
                             last_seen: unix_secs(d.last_seen),
                             count: d.count,
@@ -1240,6 +1279,7 @@ impl EgressProfiler {
                         port: dest.port,
                         last_ip,
                         ech: dest.ech,
+                        http_host: dest.http_host,
                         first_seen: from_unix_secs(dest.first_seen),
                         last_seen,
                         count: dest.count,
@@ -1376,6 +1416,10 @@ struct PersistedDest {
     ip: String,
     #[serde(default)]
     ech: bool,
+    /// A baseline saved before this existed reads as a ClientHello until the
+    /// flow is seen again.
+    #[serde(default)]
+    http_host: bool,
     first_seen: u64,
     last_seen: u64,
     count: u64,
@@ -1409,6 +1453,11 @@ fn flow_ech(p: &Option<AppProtocol>) -> bool {
         p,
         Some(AppProtocol::Tls { ech: true, .. }) | Some(AppProtocol::Quic { ech: true, .. })
     )
+}
+
+/// Whether the name [`dest_hostname`] reads came from a cleartext HTTP `Host`.
+fn flow_http_host(p: &Option<AppProtocol>) -> bool {
+    matches!(p, Some(AppProtocol::Http { host: Some(_), .. }))
 }
 
 #[cfg(test)]
@@ -2145,6 +2194,7 @@ block = {
             port: 443,
             last_ip: "1.2.3.4".into(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,
@@ -2184,6 +2234,7 @@ block = {
             port: 443,
             last_ip: "1.2.3.4".into(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,
@@ -2399,6 +2450,66 @@ block = {
         assert_eq!(recs[1].verdict, "unchecked"); // no rule for curl
         assert_eq!(recs[1].asn_org.as_deref(), Some("Quad9"));
         assert_eq!(recs[1].proto, "other");
+    }
+
+    /// `proto` said `tls` for anything with a name, and a cleartext HTTP
+    /// `Host` fills the same field as an SNI, so plaintext exported as TLS.
+    #[test]
+    fn a_cleartext_http_host_exports_as_other_not_tls() {
+        use crate::collectors::connections::Connection;
+        let mk = |app_protocol| Connection {
+            protocol: "TCP".into(),
+            local_addr: "192.168.1.10:5000".into(),
+            remote_addr: "203.0.113.50:80".into(),
+            state: "ESTABLISHED".into(),
+            pid: Some(1),
+            process_name: Some("curl".into()),
+            handshake_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: Some(app_protocol),
+            retransmits: 0,
+            out_of_order: 0,
+        };
+        let http = |host: &str| AppProtocol::Http {
+            method: "GET".into(),
+            host: Some(host.into()),
+            path: None,
+            status: None,
+        };
+        let tls = |name: &str| AppProtocol::Tls {
+            sni: Some(name.into()),
+            alpn: None,
+            ech: false,
+            ja4: None,
+        };
+        let geo = crate::collectors::geo::GeoCache::new();
+        let mut p = EgressProfiler::new();
+        p.observe(
+            &[mk(http("plain.example.com")), mk(tls("tls.example.com"))],
+            &geo,
+        );
+        let protos = |p: &EgressProfiler| -> Vec<(Option<String>, String)> {
+            p.export_records()
+                .into_iter()
+                .map(|r| (r.sni, r.proto))
+                .collect()
+        };
+        let want = vec![
+            (Some("plain.example.com".to_string()), "other".to_string()),
+            (Some("tls.example.com".to_string()), "tls".to_string()),
+        ];
+        assert_eq!(protos(&p), want);
+
+        // Across a restart too, where the name alone would say tls again.
+        let path = scratch("http-host.json");
+        p.save_profiles(&path).unwrap();
+        let mut fresh = EgressProfiler::new();
+        fresh.load_profiles(&path);
+        assert_eq!(protos(&fresh), want);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2729,6 +2840,7 @@ mod blank_and_split_regressions {
             port: 443,
             last_ip: ip.to_string(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,
@@ -3134,6 +3246,7 @@ ip = ["203.0.113.0/24"]
             port: 443,
             last_ip: ip.to_string(),
             ech,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,

@@ -1105,6 +1105,7 @@ mod tests {
             port: 443,
             last_ip: "203.0.113.5".into(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::UNIX_EPOCH,
             last_seen: SystemTime::UNIX_EPOCH,
             count: 1,

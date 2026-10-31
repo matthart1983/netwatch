@@ -40,6 +40,17 @@ All notable changes to NetWatch will be documented in this file.
   a daemon losing packets to a full kernel buffer looked the same as one
   that saw every packet. The counters are 64-bit and keep counting past
   libpcap's 32-bit wrap. While no capture is running, for example when the
+- **The egress export says `"proto": "tls"` only when a ClientHello named the
+  destination.** It said `tls` for anything with a name, and a cleartext HTTP
+  `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
+  to anyone filtering on `proto`. Such a flow now says `other`, which is what the
+  field was documented to do. A destination in a baseline saved before this keeps
+  saying `tls` until a flow to it is seen again.
+
+### Migration
+- **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
+  name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
+  said `"tls"`, and keeps its name in `sni`.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
