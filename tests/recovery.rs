@@ -158,6 +158,59 @@ fn assert_legacy_notice(stdout: &str) {
     assert!(stdout.contains("docs/recovery-store.md"), "{stdout}");
 }
 
+/// Stdout where a write fails: a pipe nobody reads, or a full disk.
+fn broken_stdouts() -> Vec<(&'static str, Stdio)> {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    vec![("closed pipe", writer.into()), ("/dev/full", full.into())]
+}
+
+/// What the commands do must not depend on where their output goes. Each is run
+/// with a good stdout first, with and without a notice due, and has to exit the
+/// same way and say the same thing on stderr with a broken one. A refused
+/// `recover` keeps its error, and a panic is exit 101 and text on stderr.
+#[test]
+fn a_broken_stdout_changes_neither_exit_status_nor_error() {
+    let fixture = Fixture::new();
+    let mut commands = vec![vec!["resolver", "status"]];
+    if !nix::unistd::geteuid().is_root() {
+        commands.push(vec!["resolver", "recover", "--unmanaged"]);
+    }
+    for journal in [true, false] {
+        if journal {
+            fs::write(fixture.journal(), KILLED_AFTER_APPLY).unwrap();
+        } else {
+            fs::remove_file(fixture.journal()).unwrap();
+        }
+        for args in &commands {
+            let good = fixture.command().args(args).output().unwrap();
+            assert_eq!(!good.stdout.is_empty(), journal || args[1] == "status");
+            for (what, stdout) in broken_stdouts() {
+                let broken = fixture
+                    .command()
+                    .args(args)
+                    .stdout(stdout)
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+                    .wait_with_output()
+                    .unwrap();
+                let context = format!("{args:?} journal={journal} stdout={what}");
+                assert_eq!(broken.status.code(), good.status.code(), "{context}");
+                assert_eq!(
+                    String::from_utf8_lossy(&broken.stderr),
+                    String::from_utf8_lossy(&good.stderr),
+                    "{context}"
+                );
+            }
+        }
+    }
+}
+
 /// `set` and `recover` take no paths and need root, so these build what they
 /// expect in a private root: a tmpfs, the host's programs bound in, and scratch
 /// `/etc`, `/var/lib` and cache. It cannot reach the host's resolver. The resolver
@@ -212,6 +265,30 @@ echo "--- /etc/resolv.conf"
 cat "$root/etc/resolv.conf"
 "#;
 
+/// The reports go to the broken stdout this runs with, so what the test reads
+/// goes to stderr. By its first line `set` has changed the resolver, so a panic
+/// there would leave the change in place and the record `applied`.
+const SET_WITH_BROKEN_STDOUT: &str = r#"
+chroot "$root" /netwatch resolver set 192.0.2.53 --unmanaged --seconds 1
+cmp "$fixture/resolv.conf.installed" "$root/etc/resolv.conf" >&2
+grep '"state"' "$root/var/lib/netwatch/resolver-v2/journal.json" >&2
+"#;
+
+/// A notice is due and `recover` has a record to restore, with stdout broken.
+const RECOVER_WITH_BROKEN_STDOUT: &str = r#"
+cp "$fixture/../v0.30.4-killed-after-apply.applied.json" "$root/cache/netwatch/applied.json"
+mkdir -p "$root/var/lib/netwatch/resolver-v2"
+chmod 700 "$root/var/lib/netwatch" "$root/var/lib/netwatch/resolver-v2"
+sed -e "s/\"device\": 53/\"device\": $(stat -c %d "$root/etc/resolv.conf")/" \
+    -e "s/\"inode\": 11037260/\"inode\": $(stat -c %i "$root/etc/resolv.conf")/" \
+    "$fixture/journal.json" > "$root/var/lib/netwatch/resolver-v2/journal.json"
+cp "$fixture/bd204382-3ba1-46a0-a521-79de298b097e.backup" "$root/var/lib/netwatch/resolver-v2/"
+chmod 600 "$root/var/lib/netwatch/resolver-v2/"*
+chroot "$root" /netwatch resolver recover --unmanaged
+cmp "$fixture/bd204382-3ba1-46a0-a521-79de298b097e.backup" "$root/etc/resolv.conf" >&2
+grep '"state"' "$root/var/lib/netwatch/resolver-v2/journal.json" >&2
+"#;
+
 fn records() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/recovery/v0.31.1-killed-resolver-set")
@@ -220,6 +297,14 @@ fn records() -> PathBuf {
 /// Runs `scenario` as root in a private root, or None where the runner has no
 /// user and mount namespace.
 fn in_private_root(fixture: &Fixture, scenario: &str) -> Option<std::process::Output> {
+    in_private_root_with_stdout(fixture, scenario, Stdio::piped())
+}
+
+fn in_private_root_with_stdout(
+    fixture: &Fixture,
+    scenario: &str,
+    stdout: Stdio,
+) -> Option<std::process::Output> {
     let root = fixture.0.join("root");
     fs::create_dir(&root).unwrap();
     let namespace = ["--user", "--map-root-user", "--mount"];
@@ -241,9 +326,32 @@ fn in_private_root(fixture: &Fixture, scenario: &str) -> Option<std::process::Ou
         .arg(env!("CARGO_BIN_EXE_netwatch"))
         .arg(records())
         .env("XDG_CACHE_HOME", "/cache")
-        .output()
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
         .unwrap();
     Some(output)
+}
+
+#[test]
+fn set_and_recover_finish_their_work_with_a_broken_stdout() {
+    for (scenario, state) in [
+        (SET_WITH_BROKEN_STDOUT, "reverted"),
+        (RECOVER_WITH_BROKEN_STDOUT, "reverted"),
+    ] {
+        for (what, stdout) in broken_stdouts() {
+            let fixture = Fixture::new();
+            let Some(output) = in_private_root_with_stdout(&fixture, scenario, stdout) else {
+                return;
+            };
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{what}: {stderr}");
+            assert!(stderr.contains(state), "{what}: {stderr}");
+            assert!(!stderr.contains("panicked"), "{what}: {stderr}");
+        }
+    }
 }
 
 #[test]

@@ -122,6 +122,15 @@ pub fn authority_notice() -> Option<String> {
     }
 }
 
+/// One line of a command's report. `println!` panics when stdout is closed or
+/// full, and these commands must finish whatever happens to their output: by its
+/// first line `set` has changed the resolver, and only it can put it back at the
+/// deadline. What they did is in the exit status and the store, not in this text.
+fn report(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(io::stdout(), "{line}");
+}
+
 /// Called synchronously before the application's runtime, Npcap or workers start.
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     let request = parse(args)?;
@@ -133,7 +142,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     {
         match request {
             Request::Status => {
-                println!("{}", Ownership::Unsupported.description());
+                report(Ownership::Unsupported.description());
                 Ok(())
             }
             _ => anyhow::bail!("resolver changes are unavailable on this platform"),

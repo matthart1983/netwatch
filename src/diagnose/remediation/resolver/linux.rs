@@ -458,7 +458,7 @@ pub(super) fn command(request: Request) -> anyhow::Result<()> {
     if reports_legacy {
         let uid = nix::unistd::geteuid().as_raw();
         if let Some(notice) = legacy_notice(Journal::default_path(), uid) {
-            println!("{notice}");
+            report(&notice);
         }
     }
     result
@@ -467,26 +467,29 @@ pub(super) fn command(request: Request) -> anyhow::Result<()> {
 fn run(request: Request) -> anyhow::Result<()> {
     match request {
         Request::Status => {
-            println!("{}", ownership()?.description());
+            report(ownership()?.description());
             match store::inspect(Path::new(STATE_DIR)) {
-                Ok(Some(snapshot)) => println!(
+                Ok(Some(snapshot)) => report(&format!(
                     "{} unresolved operations in {STATE_DIR}",
                     snapshot
                         .operations
                         .iter()
                         .filter(|o| o.state.unresolved())
                         .count()
-                ),
-                Ok(None) => println!("No resolver authority journal"),
-                Err(error) => {
-                    println!("Authority journal unavailable: {error}; inspect with root authority")
-                }
+                )),
+                Ok(None) => report("No resolver authority journal"),
+                Err(error) => report(&format!(
+                    "Authority journal unavailable: {error}; inspect with root authority"
+                )),
             }
             Ok(())
         }
         Request::Recover => {
             let mut session = Session::live()?;
-            println!("Recovered {} resolver operations", session.recover()?);
+            report(&format!(
+                "Recovered {} resolver operations",
+                session.recover()?
+            ));
             Ok(())
         }
         Request::Set { address, seconds } => {
@@ -501,14 +504,14 @@ fn run(request: Request) -> anyhow::Result<()> {
                 let mut terminate = signal(SignalKind::terminate())?;
                 let mut session = Session::live()?;
                 let id = session.apply(address)?;
-                println!("Temporary resolver file change to {address}; effective resolution unverified; operation {id}; reverting in {seconds}s or on Ctrl-C/SIGTERM");
+                report(&format!("Temporary resolver file change to {address}; effective resolution unverified; operation {id}; reverting in {seconds}s or on Ctrl-C/SIGTERM"));
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(seconds)) => {},
                     _ = interrupt.recv() => {},
                     _ = terminate.recv() => {},
                 }
                 session.finish()?;
-                println!("Resolver restored; operation {id}");
+                report(&format!("Resolver restored; operation {id}"));
                 Ok(())
             })
         }

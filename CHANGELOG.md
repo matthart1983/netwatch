@@ -34,6 +34,13 @@ All notable changes to NetWatch will be documented in this file.
   to clear it. Those sessions now say nothing when the kernel refuses them this store.
   Root sessions still report unresolved records, any other failure to read the store is
   still reported, and `netwatch resolver status` still says the journal is unavailable.
+- **`netwatch resolver set` no longer leaves the resolver changed when its stdout is
+  closed or full.** The line announcing the change was the first write after making it,
+  so `sudo netwatch resolver set ... | head -0` or `> /dev/full` panicked there and exited
+  101 with the change in place and its record `applied`, until someone ran `recover`.
+  Since 0.31.1. Every line `status`, `set` and `recover` print now ignores a failed
+  write: `set` still restores at its deadline, and the exit status and any error on stderr
+  are the same as with a working stdout.
 
 ### Changed
 - **The notice for a resolver change left by 0.30 now names the file and says how

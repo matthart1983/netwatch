@@ -51,6 +51,9 @@ changes the exit status: the journal is outside recovery authority, so a file a 
 can write cannot fail a root command. Exit 0 therefore says nothing about that
 journal. Read the output, or `ls /etc/resolv.conf.netwatch-*.bak`.
 
+A failed write to stdout changes nothing: a closed pipe or a full disk loses the text,
+and each command still finishes, with the same exit status and the same error on stderr.
+
 ## Ownership and supported scope
 
 A plain regular file is only an unmanaged *candidate*. `--unmanaged` is the
