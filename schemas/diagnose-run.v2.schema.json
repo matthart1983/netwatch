@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/diagnose-run.v2.schema.json",
+  "title": "netwatch diagnose run --format json, schema 2",
+  "description": "One bounded diagnosis. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated is outside that promise and can go in a minor. A finding with beta true comes from a rule with no reviewed contract: its shape follows this schema, but the rule can change thresholds or disappear. Exit 3, for bad arguments or a session that could not start, prints no JSON at all. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
+  "type": "object",
+  "required": ["metadata", "schema", "version", "ruleset", "outcome", "exit", "include_beta", "target", "started_at", "window_seconds", "samples", "evidence", "completeness", "coverage", "issues", "observations"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "description": "Names this output's schema. Every stable netwatch output has this block, at the same path.",
+      "required": ["schema", "schema_version", "schema_url", "netwatch_version"],
+      "properties": {
+        "schema": { "const": "netwatch.diagnose-run.v2" },
+        "schema_version": { "const": "2" },
+        "schema_url": { "const": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/diagnose-run.v2.schema.json" },
+        "netwatch_version": { "type": "string", "description": "The netwatch that wrote this document." }
+      }
+    },
+    "schema": { "const": 2, "description": "The integer form of metadata.schema_version." },
+    "version": { "type": "string", "description": "The netwatch version, the same as metadata.netwatch_version. Not a schema version." },
+    "ruleset": { "type": "integer", "minimum": 0, "description": "How many rules this build's catalogue holds. A count that grows between releases, not a version." },
+    "outcome": {
+      "enum": ["no_finding", "finding", "incomplete"],
+      "description": "Closed set: a new value needs netwatch 2.0, because each one is an exit status. no_finding is not a health claim, only that the rules that could be evaluated did not fire. incomplete means retry with a longer budget, and is not health either."
+    },
+    "exit": {
+      "enum": [0, 1, 2],
+      "description": "The process's exit status: 0 for no_finding, 1 for finding, 2 for incomplete. Closed set: a new value needs netwatch 2.0."
+    },
+    "include_beta": { "type": "boolean", "description": "Whether --include-beta was given. Without it a beta rule's issue is listed but does not set the exit status." },
+    "target": { "type": ["string", "null"], "description": "The --target name. Null for a run about the host." },
+    "started_at": { "type": "string", "format": "date-time", "description": "RFC 3339 with this host's UTC offset. Finding timestamps have no offset, so read it from here." },
+    "window_seconds": { "type": "number", "minimum": 0, "description": "How long the run sampled." },
+    "samples": { "type": "integer", "minimum": 0 },
+    "evidence": { "type": "boolean", "description": "Whether the run saw a usable observation of what it was asked about." },
+    "completeness": { "type": "string", "description": "What the outcome can be taken to mean, in words. The wording is not stable." },
+    "coverage": {
+      "type": "object",
+      "description": "Which rules had their inputs on this host.",
+      "required": ["rules"],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "status", "reason"],
+            "properties": {
+              "rule": { "$ref": "#/$defs/rule_id" },
+              "status": { "$ref": "#/$defs/availability" },
+              "reason": { "type": "string", "description": "In words, unlike doctor's reason code. The wording is not stable." }
+            }
+          }
+        }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "description": "Faults. Only an Issue from a contracted rule, or any Issue with --include-beta, sets the exit status.",
+      "items": {
+        "$ref": "#/$defs/finding",
+        "properties": {
+          "kind": { "const": "issue" },
+          "severity": { "enum": ["medium", "high", "critical"], "description": "Closed set: see the finding's severity." }
+        }
+      }
+    },
+    "observations": {
+      "type": "array",
+      "description": "Things worth knowing that are not faults. They never set the exit status.",
+      "items": {
+        "$ref": "#/$defs/finding",
+        "properties": {
+          "kind": { "const": "observation" },
+          "severity": { "const": "info" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "outcome": { "const": "no_finding" } } }, "then": { "properties": { "exit": { "const": 0 } } } },
+    { "if": { "properties": { "outcome": { "const": "finding" } } }, "then": { "properties": { "exit": { "const": 1 } } } },
+    { "if": { "properties": { "outcome": { "const": "incomplete" } } }, "then": { "properties": { "exit": { "const": 2 } } } }
+  ],
+  "$defs": {
+    "local_time": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$",
+      "description": "Local wall-clock time on the host, with no UTC offset. started_at has the offset."
+    },
+    "rule_id": {
+      "type": "string",
+      "description": "A rule in the catalogue. An existing id keeps its meaning. Open set: a minor may add a rule, so ignore an id you do not know.",
+      "examples": [
+        "dns.slow_resolver", "dns.failing", "dns.truncation_retry", "dns.hijack_suspect",
+        "gateway.unreachable", "link.down", "gateway.rtt_spike", "iface.errors", "iface.saturated", "wifi.weak_signal",
+        "path.changed", "path.high_loss", "path.rtt_spike",
+        "tcp.bufferbloat_local", "tcp.bufferbloat_remote", "tcp.retrans_burst", "tcp.zero_window", "tcp.connect_failures", "tcp.timewait_exhaustion",
+        "pmtu.blackhole", "nat.symmetric", "ipv6.broken", "captive.portal",
+        "target.resolve_failed", "target.connect_failed", "target.tls_failed", "target.http_error", "target.slow_stage",
+        "egress.drift", "egress.policy_violation"
+      ]
+    },
+    "availability": {
+      "type": "string",
+      "description": "Why a rule input or a check has something or nothing to say. Open set: a minor may add a word, so treat an unknown value like unknown, which older recordings can also carry.",
+      "examples": ["available", "learning", "not_measured", "unsupported", "stale", "not_configured", "no_subjects", "not_applicable", "awaiting_test", "permission_denied", "collector_failed", "not_implemented", "unknown"]
+    },
+    "finding": {
+      "type": "object",
+      "required": ["kind", "id", "rule", "severity", "title", "subject", "since", "last_seen", "beta", "state", "evidence", "scope", "causes", "remediation", "verify", "consequences", "recurrence"],
+      "properties": {
+        "kind": {
+          "enum": ["issue", "observation"],
+          "description": "Derived from severity: info is an observation, anything else an issue. Closed set: a new value needs netwatch 2.0."
+        },
+        "id": { "type": "string", "description": "Unique within this run's engine, not across runs or hosts." },
+        "rule": { "$ref": "#/$defs/rule_id" },
+        "severity": {
+          "enum": ["info", "medium", "high", "critical"],
+          "description": "Closed set: a new value needs netwatch 2.0, because severity decides kind and with it the exit status."
+        },
+        "title": { "type": "string", "description": "In words. The wording is not stable; use rule for matching." },
+        "subject": { "$ref": "#/$defs/subject" },
+        "since": { "$ref": "#/$defs/local_time" },
+        "last_seen": { "$ref": "#/$defs/local_time" },
+        "stale_since": { "$ref": "#/$defs/local_time", "description": "From when this finding's evidence stopped arriving. Absent, not null, while it is arriving." },
+        "beta": { "type": "boolean", "description": "Opened by a rule with no reviewed contract." },
+        "state": {
+          "type": "object",
+          "description": "An object holding the state, unlike a check's state, which is a string.",
+          "required": ["state"],
+          "properties": {
+            "state": {
+              "type": "string",
+              "description": "A run lists only open findings, so this is open. acked is the other value a session can give one. Open set: treat an unknown value as open, because the finding is listed.",
+              "examples": ["open", "acked"]
+            }
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["metric", "value", "unit", "baseline", "sigma", "window_secs", "samples"],
+            "properties": {
+              "metric": { "type": "string", "description": "A dotted metric name such as dns.rtt_p50." },
+              "value": { "type": "number" },
+              "unit": { "type": "string", "description": "A display suffix such as ms or %, which can be empty." },
+              "baseline": { "type": ["number", "null"], "description": "The learned baseline, when one exists." },
+              "sigma": { "type": ["number", "null"], "description": "The baseline's standard deviation. Present exactly when baseline is." },
+              "window_secs": { "type": "integer", "minimum": 0, "description": "Seconds of data the value summarises." },
+              "samples": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "scope": {
+          "type": "object",
+          "required": ["processes", "destinations", "flows", "note"],
+          "properties": {
+            "configuration": { "type": "string", "description": "An opaque revision of a configured target. Absent for other subjects." },
+            "processes": { "type": "array", "items": { "type": "string" } },
+            "destinations": { "type": "integer", "minimum": 0 },
+            "flows": { "type": "integer", "minimum": 0 },
+            "via_iface": { "type": "string", "description": "The interface this finding's traffic used. Absent when not known." },
+            "via_resolver": { "type": "string", "description": "The resolver this finding's lookups used. Absent when not known." },
+            "processes_measured": { "type": "boolean", "description": "Absent means false. true with empty processes means attribution was tried and named nobody, which is not the same as every process." },
+            "note": { "type": ["string", "null"], "description": "A qualifier in words, such as service, not network. The wording is not stable." }
+          }
+        },
+        "causes": {
+          "type": "array",
+          "description": "Best first.",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "checks"],
+            "properties": {
+              "id": { "type": "string", "description": "Stable within its rule. Match on this, not on label." },
+              "label": { "type": "string", "description": "In words, and built at run time for some causes. The wording is not stable." },
+              "checks": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id", "name", "state", "detail", "weight"],
+                  "properties": {
+                    "id": { "type": "string", "description": "Stable within its cause. Match on this, not on name." },
+                    "name": { "type": "string", "description": "In words. The wording is not stable." },
+                    "state": {
+                      "enum": ["passed", "failed", "not_run"],
+                      "description": "Closed set: a new value needs netwatch 2.0. not_run is not a failure and does not count against the cause."
+                    },
+                    "why_not": { "$ref": "#/$defs/availability", "description": "Why the check did not run. Present exactly when state is not_run." },
+                    "detail": { "type": "string", "description": "In words. The wording is not stable." },
+                    "weight": { "type": "number", "description": "Relative importance within the cause. 2 or more marks the check that tells this cause from its lookalikes." }
+                  },
+                  "if": { "properties": { "state": { "const": "not_run" } } },
+                  "then": { "required": ["why_not"] }
+                }
+              }
+            }
+          }
+        },
+        "remediation": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["text", "detail", "kind"],
+            "properties": {
+              "text": { "type": "string", "description": "In words. The wording is not stable." },
+              "detail": { "type": "string", "description": "In words, or the literal command. The wording is not stable." },
+              "kind": {
+                "type": "string",
+                "description": "instruct is something for the operator to run, escalate is something to send to someone. apply belongs to the TUI. Open set: treat an unknown value as instruct.",
+                "examples": ["instruct", "escalate", "apply"]
+              },
+              "key": {
+                "type": ["string", "null"],
+                "deprecated": true,
+                "description": "The TUI hotkey. A run applies nothing, and keybindings are outside the promise."
+              },
+              "action": {
+                "type": ["object", "null"],
+                "deprecated": true,
+                "description": "What the TUI would do for an apply step. A run applies nothing."
+              },
+              "reversible": {
+                "type": "boolean",
+                "deprecated": true,
+                "description": "Whether the TUI could undo an apply step. A run applies nothing."
+              },
+              "requires": {
+                "type": "string",
+                "deprecated": true,
+                "description": "The privilege an apply step needs in the TUI. A run applies nothing. Open set, like the field itself.",
+                "examples": ["none", "root", "cap_net_admin"]
+              },
+              "applied": {
+                "type": ["object", "null"],
+                "deprecated": true,
+                "description": "What became of an apply step in the TUI. Always null from a run."
+              }
+            }
+          }
+        },
+        "verify": {
+          "type": "object",
+          "description": "The condition that would close this finding in a session.",
+          "required": ["metric", "predicate", "threshold", "unit", "hold_secs"],
+          "properties": {
+            "metric": { "type": "string" },
+            "predicate": {
+              "enum": ["below", "above"],
+              "description": "Closed set: a new value needs netwatch 2.0, because the threshold means nothing without it."
+            },
+            "threshold": { "type": "number" },
+            "unit": { "type": "string" },
+            "hold_secs": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "consequences": {
+          "type": "array",
+          "description": "The ids of findings this one hides as consequences of the same cause. Those findings are not listed in this output.",
+          "items": { "type": "string" }
+        },
+        "recurrence": { "type": "integer", "minimum": 0, "description": "Times this finding reopened inside the recurrence window." },
+        "artifacts": {
+          "type": "array",
+          "deprecated": true,
+          "description": "Files a session's report attached. Always empty from a run.",
+          "items": { "type": "string" }
+        },
+        "suppressed_by": {
+          "type": ["string", "null"],
+          "deprecated": true,
+          "description": "The finding hiding this one. Always null from a run, which lists only findings nothing hides."
+        },
+        "tests": {
+          "type": "array",
+          "deprecated": true,
+          "description": "Discriminating tests run from the TUI. Always empty from a run.",
+          "items": { "type": "object" }
+        },
+        "verification": {
+          "type": ["object", "null"],
+          "deprecated": true,
+          "description": "Whether a step the user carried out in the TUI worked. Always null from a run."
+        }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "description": "What the finding is about. Each kind has its own fields, listed together here and required by kind below.",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Open set: a minor may add a kind, so treat an unknown one as the host and read the finding's rule.",
+          "examples": ["host", "egress", "resolver", "path", "socket", "iface", "process", "target"]
+        },
+        "process": { "type": "string", "description": "egress: the process name." },
+        "destination": { "type": "string", "description": "egress: the name or address." },
+        "port": { "type": "integer", "minimum": 0, "maximum": 65535, "description": "egress." },
+        "addr": { "type": "string", "description": "resolver." },
+        "target": { "type": "string", "description": "path: the traced destination." },
+        "local": { "type": "string", "description": "socket." },
+        "remote": { "type": "string", "description": "socket." },
+        "name": { "type": "string", "description": "iface, process or target." },
+        "pid": { "type": ["integer", "null"], "minimum": 0, "description": "process. Null when not known." }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "egress" } } }, "then": { "required": ["process", "destination", "port"] } },
+        { "if": { "properties": { "kind": { "const": "resolver" } } }, "then": { "required": ["addr"] } },
+        { "if": { "properties": { "kind": { "const": "path" } } }, "then": { "required": ["target"] } },
+        { "if": { "properties": { "kind": { "const": "socket" } } }, "then": { "required": ["local", "remote"] } },
+        { "if": { "properties": { "kind": { "const": "iface" } } }, "then": { "required": ["name"] } },
+        { "if": { "properties": { "kind": { "const": "process" } } }, "then": { "required": ["name", "pid"] } },
+        { "if": { "properties": { "kind": { "const": "target" } } }, "then": { "required": ["name"] } }
+      ]
+    }
+  }
+}

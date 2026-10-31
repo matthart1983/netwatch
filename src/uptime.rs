@@ -859,6 +859,7 @@ fn text(r: &Report, dir: &Path) -> String {
 fn json(r: &Report) -> serde_json::Value {
     let ts = |t: u64| local(t).to_rfc3339();
     serde_json::json!({
+        "metadata": crate::schemas::UPTIME.metadata(),
         "schema": SCHEMA,
         "since": ts(r.since),
         "until": ts(r.until),

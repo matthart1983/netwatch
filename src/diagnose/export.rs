@@ -443,6 +443,7 @@ fn class(ip: &IpAddr) -> &'static str {
 
 #[derive(Debug, Serialize)]
 pub struct Bundle {
+    pub metadata: crate::schemas::Metadata,
     pub format: &'static str,
     pub version: u32,
     pub created: String,
@@ -519,6 +520,7 @@ pub fn build(
     };
     Preview {
         bundle: Bundle {
+            metadata: crate::schemas::DIAGNOSE_EXPORT.metadata(),
             format: FORMAT,
             version: VERSION,
             created: super::engine::format_ts(now),
@@ -684,6 +686,7 @@ mod tests {
         });
         let preview = Preview {
             bundle: Bundle {
+                metadata: crate::schemas::DIAGNOSE_EXPORT.metadata(),
                 format: FORMAT,
                 version: VERSION,
                 created: String::new(),

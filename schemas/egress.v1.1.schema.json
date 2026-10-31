@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/egress.v1.1.schema.json",
+  "title": "netwatch egress NDJSON export, netwatch.egress.v1.1",
+  "description": "One line of the Egress tab's export. This validates a line, not a file. The first line is the header and every later line is a record. Later minors may add fields, so ignore any you do not know. A new record field bumps the minor in the schema name and adds a new schema file; a break needs netwatch 2.0. This file describes what netwatch 0.40 and later write; 0.39's header has no metadata block.",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "#/$defs/record" }
+  ],
+  "$defs": {
+    "header": {
+      "type": "object",
+      "description": "The first line of the file.",
+      "required": ["_meta", "metadata"],
+      "properties": {
+        "_meta": {
+          "type": "object",
+          "required": ["schema", "records"],
+          "properties": {
+            "schema": { "const": "netwatch.egress.v1.1", "description": "The same name as metadata.schema." },
+            "records": { "type": "integer", "minimum": 0, "description": "How many record lines follow." }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Names this output's schema. Every stable netwatch output has this block, at the same path.",
+          "required": ["schema", "schema_version", "schema_url", "netwatch_version"],
+          "properties": {
+            "schema": { "const": "netwatch.egress.v1.1" },
+            "schema_version": { "const": "1.1" },
+            "schema_url": { "const": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/egress.v1.1.schema.json" },
+            "netwatch_version": { "type": "string", "description": "The netwatch that wrote this file." }
+          }
+        }
+      }
+    },
+    "record": {
+      "type": "object",
+      "description": "One attributed destination of one process, with its policy verdict at export time. Metadata only, never payload.",
+      "required": ["process", "ip", "port", "proto", "ech", "first_seen", "last_seen", "count", "verdict", "matched_by", "bytes_out", "bytes_in"],
+      "properties": {
+        "process": { "type": "string" },
+        "sni": { "type": "string", "description": "The destination's name: a TLS or QUIC SNI, or a cleartext HTTP Host. Absent, not null, when the flow carried no readable name." },
+        "asn_org": { "type": "string", "description": "Organisation of the remote address, from the ASN database. Absent, not null, when no database resolved it." },
+        "ip": { "type": "string", "description": "The most recent remote address. Can be empty in a baseline restored from a file that never held one." },
+        "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "proto": {
+          "type": "string",
+          "description": "tls when a ClientHello named the destination, otherwise other, which includes a flow named by a cleartext HTTP Host. Before 0.40 such a flow said tls. Open set: a minor may split other into narrower values, so treat an unknown value as other.",
+          "examples": ["tls", "other"]
+        },
+        "ech": { "type": "boolean", "description": "A flow to this destination used Encrypted ClientHello. Stays true once seen." },
+        "first_seen": { "type": "integer", "minimum": 0, "description": "Unix seconds." },
+        "last_seen": { "type": "integer", "minimum": 0, "description": "Unix seconds." },
+        "count": { "type": "integer", "minimum": 0, "description": "Connection-table ticks, about one a second, in which this destination appeared. A time spent connected, not a number of connections." },
+        "verdict": {
+          "type": "string",
+          "description": "ok means a rule admitted it. drift means outside the process's allowlist. blocked means it matched a block entry. undeclared means no rule under a policy that declares itself complete. unchecked means nothing was compared, because the process has no rule or no policy is loaded. unreadable means Encrypted ClientHello hid the name. Open set: a minor may add a verdict, so treat an unknown value as not ok.",
+          "examples": ["ok", "drift", "blocked", "undeclared", "unchecked", "unreadable"]
+        },
+        "matched_by": {
+          "type": ["string", "null"],
+          "description": "What admitted an ok verdict: sni for a declared hostname, which also covers a rule that declares no name restriction at all, ip for a declared address, and asn for a whole autonomous system. Null for every other verdict. Open set: a minor may add a way of matching, so treat an unknown value as broad.",
+          "examples": ["sni", "ip", "asn"]
+        },
+        "bytes_out": { "type": "integer", "minimum": 0, "description": "Approximate, from per-tick rates. Zero when no capture ran, which does not mean no traffic." },
+        "bytes_in": { "type": "integer", "minimum": 0, "description": "Approximate, from per-tick rates. Zero when no capture ran, which does not mean no traffic." }
+      }
+    }
+  }
+}

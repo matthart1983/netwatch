@@ -171,6 +171,11 @@ only, `observations` holds the rest, and each finding carries a `kind` of
 or `not_run`, and a `why_not` when it did not run. Schema 1 listed
 observations under `issues` and wrote `passed` (`true`, `false` or `null`) on
 each check; recordings that carry `passed` still load.
+[`schemas/diagnose-run.v2.schema.json`](../schemas/diagnose-run.v2.schema.json)
+describes the output, and [JSON schemas](REFERENCE.md#json-schemas) has the
+rules it follows. `diagnose export` has
+[its own](../schemas/diagnose-export.v1.schema.json), which covers the bundle
+and not the recordings in it.
 
 ## Thresholds
 

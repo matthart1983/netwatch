@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/diagnose-export.v1.schema.json",
+  "title": "netwatch diagnose export, version 1",
+  "description": "The JSON document inside the gzip file netwatch diagnose export writes. This schema covers the envelope, which is stable: later minors may add fields, so ignore any you do not know, and a break needs netwatch 2.0 and a new schema file. Each entry in episodes is a recording in the episode format, which is experimental and can change in any release. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
+  "type": "object",
+  "required": ["metadata", "format", "version", "created", "install", "redaction", "episodes"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "description": "Names this output's schema. Every stable netwatch output has this block, at the same path.",
+      "required": ["schema", "schema_version", "schema_url", "netwatch_version"],
+      "properties": {
+        "schema": { "const": "netwatch.diagnose-export.v1" },
+        "schema_version": { "const": "1" },
+        "schema_url": { "const": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/diagnose-export.v1.schema.json" },
+        "netwatch_version": { "type": "string", "description": "The netwatch that wrote this bundle." }
+      }
+    },
+    "format": { "const": "netwatch-episode-export" },
+    "version": { "const": 1, "description": "The version of this envelope, the integer form of metadata.schema_version. Not the netwatch version." },
+    "created": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$",
+      "description": "Local wall-clock time on the host that wrote the bundle, with no UTC offset."
+    },
+    "install": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{12}$",
+      "description": "A keyed hash that stays the same for one install across bundles and links to nothing else about the machine."
+    },
+    "redaction": { "type": "string", "description": "What the bundle's redaction did, in words. The wording is not stable." },
+    "episodes": {
+      "type": "array",
+      "description": "Redacted recordings. Experimental inside, apart from schema_version.",
+      "items": {
+        "type": "object",
+        "description": "One recording. Everything but schema_version is experimental and is left undescribed here on purpose.",
+        "required": ["schema_version"],
+        "properties": {
+          "schema_version": { "type": "integer", "minimum": 1, "description": "This recording's episode format version. netwatch refuses to replay a recording newer than it knows." }
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

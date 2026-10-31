@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/doctor.v1.schema.json",
+  "title": "netwatch doctor --json, schema_version 1",
+  "description": "A capability snapshot, which describes what this host lets netwatch see. It says nothing about network health. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated is outside that promise and can go in a minor. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
+  "type": "object",
+  "required": ["metadata", "schema_version", "scope", "platform", "interface", "capabilities", "protections", "attribution_coverage", "landlock", "tasks_holding_net_raw"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "description": "Names this output's schema. Every stable netwatch output has this block, at the same path.",
+      "required": ["schema", "schema_version", "schema_url", "netwatch_version"],
+      "properties": {
+        "schema": { "const": "netwatch.doctor.v1" },
+        "schema_version": { "const": "1" },
+        "schema_url": { "const": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/doctor.v1.schema.json" },
+        "netwatch_version": { "type": "string", "description": "The netwatch that wrote this document." }
+      }
+    },
+    "schema_version": { "const": 1, "description": "The integer form of metadata.schema_version." },
+    "scope": {
+      "type": "string",
+      "description": "What the snapshot had the chance to check. static is a plain doctor run, capture_check is one with --check-capture, and runtime is a live session's own view, which no command prints today. Open set: a minor may add a scope, so treat an unknown value like static and read each capability's state.",
+      "examples": ["static", "capture_check", "runtime"]
+    },
+    "platform": {
+      "type": "string",
+      "description": "Rust's name for the operating system. Open set: a build for a new platform adds a value.",
+      "examples": ["linux", "macos", "windows", "freebsd"]
+    },
+    "interface": { "type": ["string", "null"], "description": "The capture interface asked for or selected. Null when none is configured or chosen." },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/capability" }
+    },
+    "protections": {
+      "type": "array",
+      "description": "One entry per component that took a sandbox policy. Empty from a plain doctor run, and holds at most the isolated check from --check-capture.",
+      "items": { "$ref": "#/$defs/protection" }
+    },
+    "network_restricted": {
+      "type": "boolean",
+      "deprecated": true,
+      "description": "Always false, because it describes the whole process and main and the network workers keep the network. It carries no information. Read each protection's network_policy instead."
+    },
+    "attribution_coverage": {
+      "description": "Null from netwatch doctor. Only a live session has coverage to report.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/attribution_coverage" }
+      ]
+    },
+    "landlock": {
+      "description": "What this kernel has and what a parser thread gets. Null off Linux.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/landlock" }
+      ]
+    },
+    "tasks_holding_net_raw": {
+      "type": ["array", "null"],
+      "description": "Threads holding CAP_NET_RAW when a session audited itself at startup. Null from netwatch doctor, which starts no session, and off Linux.",
+      "items": {
+        "type": "object",
+        "required": ["tid", "comm"],
+        "properties": {
+          "tid": { "type": "integer", "minimum": 0 },
+          "comm": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "capability": {
+      "type": "object",
+      "required": ["id", "state", "reason", "detail", "next_check"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Which capability this is. Not every id appears on every platform or scope. Open set: a minor may add an id, so ignore one you do not know.",
+          "examples": ["config", "interface", "capture_library", "capture", "attribution", "attribution_coverage", "connections", "probes", "tcp_metrics", "sandbox", "landlock", "geoip_db", "online_geo", "insights", "whois", "reverse_dns", "remote", "metrics", "resolver"]
+        },
+        "state": {
+          "enum": ["ready", "not_checked", "unavailable", "disabled", "degraded", "stale"],
+          "description": "Closed set: a new value needs netwatch 2.0. This is the field to enforce a requirement on, so a script can list every value. ready describes a checked capability, not network health."
+        },
+        "reason": {
+          "type": "string",
+          "description": "A machine-readable code for why the capability is in this state. An existing code keeps its meaning. Open set: a minor may add a code, so read state for the verdict and treat an unknown code as more detail.",
+          "examples": [
+            "not_loaded", "config_valid", "config_invalid", "config_unreadable", "defaults", "runtime_config",
+            "selection_pending", "interface_present", "interface_missing", "configured_interface", "capture_selection", "selection_failed", "selected",
+            "driver_unchecked", "linked_library", "runtime_loaded", "npcap_missing", "npcap_present_unloaded", "npcap_driver_stopped", "npcap_driver_missing",
+            "open_not_attempted", "open_close_checked", "capture_open_failed", "capture_check_failed", "config_not_loaded", "capture_running", "capture_failed", "capture_starting", "capture_stopped",
+            "backend_unchecked", "kernel_backend", "polling_fallback", "polling_only",
+            "observed_payload_interval",
+            "table_unchecked", "ss_found", "proc_net_fallback", "no_connection_table", "first_poll_pending", "ss", "collection_failed",
+            "no_active_probes", "probe_completions",
+            "collector_unchecked", "platform_unsupported", "observed_flows",
+            "policy_not_applied", "runtime_enforcement", "isolated_capture_check",
+            "sandbox_disabled", "self_test_not_run", "landlock_not_enabled", "landlock_not_built", "kernel_abi_below_4", "parser_network_denied", "self_test_failed",
+            "not_configured", "db_unreadable", "db_stale", "db_loaded",
+            "removed",
+            "configuration_only", "cleartext_off_host", "collector_status", "not_started",
+            "demand_driven", "live_lookup_worker",
+            "startup_configuration", "environment_only", "worker_entry_only",
+            "authority_not_granted", "resolver_ownership"
+          ]
+        },
+        "detail": { "type": "string", "description": "Explanation in words. The wording is not stable." },
+        "next_check": { "type": ["string", "null"], "description": "What to do or run next, in words. The wording is not stable." }
+      }
+    },
+    "protection": {
+      "type": "object",
+      "required": ["component", "entry_ready", "effective", "landlock_abi", "caps_dropped", "caps_retained", "warnings", "error", "landlock_kernel_abi", "network_policy", "landlock_restrictions", "capture_authority", "socket_filter"],
+      "properties": {
+        "component": { "type": "string", "description": "The thread or worker this is about, such as capture-check." },
+        "entry_ready": { "type": "boolean" },
+        "effective": {
+          "type": ["string", "null"],
+          "description": "The sandbox mode in force. Null when the component has no report. Open set: a minor may add a mode, so treat an unknown value as not strict.",
+          "examples": ["disabled", "best-effort", "strict"]
+        },
+        "landlock_abi": { "type": "integer", "minimum": 0, "description": "The Landlock ABI of what this thread enforces: the newest feature in force, so 3 for the filesystem layer alone on any newer kernel." },
+        "caps_dropped": { "type": "array", "items": { "type": "string" } },
+        "caps_retained": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" }, "description": "In words. The wording is not stable." },
+        "error": { "type": ["string", "null"], "description": "In words. The wording is not stable." },
+        "landlock_kernel_abi": { "type": "integer", "minimum": 0, "description": "The ABI the kernel reports." },
+        "network_policy": {
+          "type": "string",
+          "description": "denied when this thread's TCP bind and connect are denied, allowed when it entered a policy and they are not, not_entered when it has no report. Open set: a minor may add a value, so treat anything but denied as not shown to be denied.",
+          "examples": ["denied", "allowed", "not_entered"]
+        },
+        "landlock_restrictions": {
+          "type": "array",
+          "description": "What this thread's policy restricts. socket_create comes from the seccomp filter, the rest from Landlock.",
+          "items": {
+            "type": "string",
+            "description": "Open set: a new kernel feature adds a value.",
+            "examples": ["filesystem", "filesystem_write", "tcp_bind", "tcp_connect", "abstract_unix_socket", "signal", "pathname_unix_socket", "socket_create"]
+          }
+        },
+        "capture_authority": {
+          "type": "string",
+          "description": "CAP_NET_RAW on this thread. Open set: a minor may add a value, so treat anything but dropped or not_held as still holding it.",
+          "examples": ["dropped", "retained_for_reopen", "not_held", "not_applicable"]
+        },
+        "socket_filter": {
+          "type": "string",
+          "description": "The no-socket seccomp filter. Open set: a minor may add a value, so treat anything but installed as not filtered.",
+          "examples": ["installed", "unknown_arch", "failed", "not_applicable"]
+        }
+      }
+    },
+    "landlock": {
+      "type": "object",
+      "required": ["kernel_abi", "availability", "errata", "parser_check"],
+      "properties": {
+        "kernel_abi": { "type": "integer", "minimum": 0, "description": "The ABI the kernel reports, 0 without Landlock." },
+        "availability": {
+          "type": "string",
+          "description": "not_built also covers a seccomp profile blocking the syscalls. Open set: a minor may add a value, so treat anything but available as unavailable.",
+          "examples": ["available", "not_enabled", "not_built", "unknown"]
+        },
+        "errata": { "type": "array", "description": "The errata the kernel reports fixed, by the numbers in the kernel's documentation.", "items": { "type": "integer", "minimum": 0 } },
+        "parser_check": {
+          "description": "What a parser thread got when it tried TCP under its policy. Null if the check did not complete.",
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/parser_check" }
+          ]
+        }
+      }
+    },
+    "parser_check": {
+      "type": "object",
+      "required": ["enforced_abi", "restrictions", "tcp_bind", "tcp_connect"],
+      "properties": {
+        "enforced_abi": { "type": "integer", "minimum": 0, "description": "The same meaning as a protection's landlock_abi." },
+        "restrictions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "Open set: a new kernel feature adds a value.",
+            "examples": ["filesystem", "filesystem_write", "tcp_bind", "tcp_connect", "abstract_unix_socket", "signal", "pathname_unix_socket", "socket_create"]
+          }
+        },
+        "tcp_bind": {
+          "type": "string",
+          "description": "error is anything else a check got back. Open set: a minor may add a value, so treat anything but denied as not denied.",
+          "examples": ["denied", "allowed", "error"]
+        },
+        "tcp_connect": {
+          "type": "string",
+          "description": "error is anything else a check got back. Open set: a minor may add a value, so treat anything but denied as not denied.",
+          "examples": ["denied", "allowed", "error"]
+        }
+      }
+    },
+    "attribution_coverage": {
+      "type": "object",
+      "required": ["collection_succeeded", "table_source", "table_note", "eligible_flows", "attributed_flows", "eligible_payload_bytes", "attributed_payload_bytes", "completed_at_utc_ms", "capture_drops"],
+      "properties": {
+        "collection_succeeded": { "type": "boolean" },
+        "table_source": {
+          "type": ["string", "null"],
+          "description": "Linux: the table the latest poll read. Null before the first poll, when no table could be read, and on other platforms. Open set: a minor may add a source.",
+          "examples": ["ss", "proc_net"]
+        },
+        "table_note": { "type": ["string", "null"], "description": "Why the latest poll did not read ss, in words. The wording is not stable." },
+        "eligible_flows": { "type": "integer", "minimum": 0 },
+        "attributed_flows": { "type": "integer", "minimum": 0 },
+        "eligible_payload_bytes": { "type": "integer", "minimum": 0 },
+        "attributed_payload_bytes": { "type": "integer", "minimum": 0 },
+        "completed_at_utc_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "capture_drops": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    }
+  }
+}

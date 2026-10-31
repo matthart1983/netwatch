@@ -77,8 +77,8 @@ const PERSIST_INTERVAL_SECS: u64 = 60;
 /// the feature's whole point for tidiness.
 const UNDECLARED_SETTLE_TICKS: u64 = 3;
 /// Schema tag stamped on the NDJSON export's `_meta` line. Bump the minor
-/// when adding fields (additive/back-compatible), the major on a breaking
-/// change — the managed ingest keys off this.
+/// when adding a record field (additive/back-compatible), the major on a
+/// breaking change — the managed ingest keys off this.
 pub const EGRESS_EXPORT_SCHEMA: &str = "netwatch.egress.v1.1";
 
 /// One observed destination for a process.
@@ -221,7 +221,7 @@ pub struct EgressProfile {
 }
 
 /// One attributed egress flow-summary plus its policy verdict — the unit of
-/// the structured export (`netwatch.egress.v1`). Metadata only; no payload.
+/// the structured export ([`EGRESS_EXPORT_SCHEMA`]). Metadata only; no payload.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EgressRecord {
     pub process: String,
@@ -241,9 +241,10 @@ pub struct EgressRecord {
     pub first_seen: u64,
     pub last_seen: u64,
     pub count: u64,
-    /// Policy verdict at export time: `ok` | `drift` | `unreadable` (ECH,
-    /// name hidden) | `unchecked` (no rule for this process, observe mode) |
-    /// `undeclared` (no rule, under a policy declaring itself complete).
+    /// Policy verdict at export time: `ok` | `drift` | `blocked` (matched an
+    /// explicit block entry) | `unreadable` (ECH, name hidden) | `unchecked`
+    /// (no rule for this process, observe mode) | `undeclared` (no rule, under
+    /// a policy declaring itself complete).
     pub verdict: String,
     /// Which dimension admitted an `ok` verdict — `sni` | `ip` | `asn`.
     /// `None` for anything not admitted.
@@ -1135,7 +1136,8 @@ impl EgressProfiler {
         let file = std::fs::File::create(path)?;
         let mut w = std::io::BufWriter::new(file);
         let meta = serde_json::json!({
-            "_meta": { "schema": EGRESS_EXPORT_SCHEMA, "records": records.len() }
+            "_meta": { "schema": EGRESS_EXPORT_SCHEMA, "records": records.len() },
+            "metadata": crate::schemas::EGRESS.metadata(),
         });
         writeln!(w, "{meta}")?;
         for rec in &records {
@@ -2565,6 +2567,160 @@ block = {
         assert_eq!(rec.process, "chrome");
         // No payload field ever leaks into the export.
         assert!(!lines[1].contains("payload") && !lines[1].contains("raw"));
+    }
+
+    /// The real writer, with a record for every verdict and `matched_by` the
+    /// export can give, against schemas/egress.v1.1.schema.json. It lives here
+    /// because the only way in from outside is a keypress on the Egress tab,
+    /// and an `asn` match needs a database a test does not have.
+    #[test]
+    fn the_export_matches_its_schema() {
+        use crate::schemas::{test_support as schema, EGRESS};
+        let export = |p: &EgressProfiler, name: &str| -> Vec<serde_json::Value> {
+            let path = scratch(name);
+            let written = p.export_ndjson(&path).unwrap();
+            let body = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let lines: Vec<serde_json::Value> = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            for line in &lines {
+                schema::check(EGRESS.file, line);
+            }
+            assert_eq!(lines[0]["_meta"]["records"], written);
+            assert_eq!(lines[0]["metadata"]["schema"], EGRESS.schema);
+            assert_eq!(lines[0]["metadata"]["schema"], lines[0]["_meta"]["schema"]);
+            assert_eq!(lines.len(), written + 1, "the header, then the records");
+            lines
+        };
+
+        let now = SystemTime::now();
+        let mut p = EgressProfiler::new();
+        let mut policy = EgressPolicy::default();
+        policy.process.insert(
+            "by-name".into(),
+            ProcessRule {
+                allow_sni: vec!["a.example.com".into()],
+                ..Default::default()
+            },
+        );
+        policy.process.insert(
+            "by-ip".into(),
+            ProcessRule {
+                allow_ip: vec!["203.0.113.2".into()],
+                ..Default::default()
+            },
+        );
+        policy.process.insert(
+            "by-asn".into(),
+            ProcessRule {
+                allow_asn: vec!["Example Org".into()],
+                ..Default::default()
+            },
+        );
+        policy.process.insert(
+            "blocked".into(),
+            ProcessRule {
+                allow_sni: vec!["a.example.com".into()],
+                block: BlockList {
+                    sni: vec!["b.example.com".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        p.record(
+            "by-name",
+            "203.0.113.1",
+            443,
+            sni("a.example.com"),
+            None,
+            now,
+        );
+        p.record(
+            "by-name",
+            "203.0.113.1",
+            443,
+            sni("c.example.com"),
+            None,
+            now,
+        );
+        p.record("by-ip", "203.0.113.2", 8443, None, None, now);
+        p.record(
+            "by-asn",
+            "203.0.113.3",
+            443,
+            None,
+            Some("Example Org".into()),
+            now,
+        );
+        p.record(
+            "blocked",
+            "203.0.113.4",
+            443,
+            sni("b.example.com"),
+            None,
+            now,
+        );
+        p.record_flow("by-name", "203.0.113.5", 443, None, None, true, now, 7, 9);
+        p.record("no-rule", "203.0.113.6", 53, None, None, now);
+        p.set_policy(Some(policy));
+        let lines = export(&p, "schema-all.ndjson");
+        let seen = |key: &str| -> std::collections::BTreeSet<String> {
+            lines[1..]
+                .iter()
+                .map(|l| l[key].as_str().unwrap_or("null").to_string())
+                .collect()
+        };
+        assert_eq!(
+            seen("verdict").into_iter().collect::<Vec<_>>(),
+            ["blocked", "drift", "ok", "unchecked", "unreadable"]
+        );
+        assert_eq!(
+            seen("matched_by").into_iter().collect::<Vec<_>>(),
+            ["asn", "ip", "null", "sni"]
+        );
+
+        // A policy that claims to be complete, then no policy at all.
+        let mut strict = EgressPolicy {
+            strict: true,
+            ..Default::default()
+        };
+        strict
+            .process
+            .insert("other".into(), ProcessRule::default());
+        p.set_policy(Some(strict));
+        let lines = export(&p, "schema-strict.ndjson");
+        assert!(lines[1..].iter().all(|l| l["verdict"] == "undeclared"));
+        p.set_policy(None);
+        let lines = export(&p, "schema-none.ndjson");
+        assert!(lines[1..].iter().all(|l| l["verdict"] == "unchecked"));
+
+        // An empty profiler still writes its header.
+        assert_eq!(
+            export(&EgressProfiler::new(), "schema-empty.ndjson").len(),
+            1
+        );
+
+        // And the file refuses what the writer must not write.
+        let record = &lines[1];
+        for (what, change) in [
+            ("a record with no verdict", "verdict"),
+            ("a record with matched_by left out, not null", "matched_by"),
+        ] {
+            let mut bad = record.clone();
+            bad.as_object_mut().unwrap().remove(change);
+            schema::assert_rejected(EGRESS.file, &bad, what);
+        }
+        let mut bad = record.clone();
+        bad["sni"] = serde_json::Value::Null;
+        schema::assert_rejected(EGRESS.file, &bad, "a null sni, which is left out instead");
+        schema::assert_rejected(
+            EGRESS.file,
+            &serde_json::json!({ "note": "neither a header nor a record" }),
+            "a line that is neither",
+        );
     }
 
     // ── Field-report fixes ──

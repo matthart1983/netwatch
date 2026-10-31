@@ -160,6 +160,9 @@ pub struct NetRawTask {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
+    /// Read back as empty from a document older than the block.
+    #[serde(default)]
+    pub metadata: crate::schemas::Metadata,
     pub schema_version: u32,
     pub scope: String,
     pub platform: String,
@@ -189,6 +192,7 @@ impl CapabilitySnapshot {
     }
     fn configured_with(config: &NetwatchConfig, geoip: &DbStatus) -> Self {
         let mut snapshot = Self {
+            metadata: crate::schemas::DOCTOR.metadata(),
             schema_version: 1,
             scope: "static".into(),
             platform: std::env::consts::OS.into(),

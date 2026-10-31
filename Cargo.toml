@@ -172,6 +172,13 @@ nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll",
 # crossterm already depends on it, so nothing new is compiled.
 signal-hook = "0.4"
 
+# tests/schemas.rs validates each stable JSON output against its file under
+# schemas/. Pinned because 0.21 and later depend on borrow-or-share, whose
+# MIT-0 is not on deny.toml's list; boon, the smaller alternative, has the same
+# dependency from 0.6.1 and an idna advisory before it.
+[dev-dependencies]
+jsonschema = { version = "=0.20.0", default-features = false }
+
 # The terminal-restore tests run netwatch on a pty (`term`) and signal it
 # (`signal`). Same crate as above, so nothing new is compiled.
 [target.'cfg(unix)'.dev-dependencies]

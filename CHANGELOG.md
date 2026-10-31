@@ -4,6 +4,21 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Each stable JSON output has a published JSON Schema, and names it in a
+  `metadata` block.** `schemas/` holds one file for `diagnose run --format json`,
+  `doctor --json`, the egress NDJSON export, `diagnose export` and `uptime --json`,
+  and the tests validate what the real code writes against them, including a
+  degraded doctor run and a `diagnose run` with a finding. The five outputs had
+  four ways of saying what they were. Each now also has
+  `metadata.schema`, `schema_version`, `schema_url` and `netwatch_version`, at the
+  top level or on the first line of the NDJSON, and the old markers stay. The
+  schemas leave every object open, because a minor can add fields. They say which
+  value sets are closed and which can grow, and mark the fields a script should not
+  rely on as `deprecated`, such as doctor's `network_restricted`, which is always
+  false. docs/REFERENCE.md has the rules. The egress export stays
+  `netwatch.egress.v1.1`, since no record gained a field.
+
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
   the plain Linux asset has been the static binary, and the `-static` name went
@@ -25,6 +40,17 @@ All notable changes to NetWatch will be documented in this file.
   across TLS records, or whose segments arrive out of order, is still not
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
+- **The egress export says `"proto": "tls"` only when a ClientHello named the
+  destination.** It said `tls` for anything with a name, and a cleartext HTTP
+  `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
+  to anyone filtering on `proto`. Such a flow now says `other`, which is what the
+  field was documented to do. A destination in a baseline saved before this keeps
+  saying `tls` until a flow to it is seen again.
+
+### Migration
+- **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
+  name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
+  said `"tls"`, and keeps its name in `sni`.
 
 ## [0.39.0] - 2026-10-31
 
@@ -40,17 +66,6 @@ All notable changes to NetWatch will be documented in this file.
   a daemon losing packets to a full kernel buffer looked the same as one
   that saw every packet. The counters are 64-bit and keep counting past
   libpcap's 32-bit wrap. While no capture is running, for example when the
-- **The egress export says `"proto": "tls"` only when a ClientHello named the
-  destination.** It said `tls` for anything with a name, and a cleartext HTTP
-  `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
-  to anyone filtering on `proto`. Such a flow now says `other`, which is what the
-  field was documented to do. A destination in a baseline saved before this keeps
-  saying `tls` until a flow to it is seen again.
-
-### Migration
-- **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
-  name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
-  said `"tls"`, and keeps its name in `sni`.
   daemon lacks permission to capture, they have no sample rather than a
   zero. docs/observability-export.md lists them, and puts its table of
   metric names, types and labels under the 1.0 compatibility promise.
