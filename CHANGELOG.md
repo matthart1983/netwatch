@@ -892,6 +892,10 @@ All notable changes to NetWatch will be documented in this file.
   Connections view cache. The scale tests also time Connections frames with a
   full stream tracker and Dashboard frames with socket verdicts against the
   frame budget, and print a tick with a capture running, with no budget.
+- A full flood soak now loads the Country and ASN databases, which is the
+  configuration the 512 MiB ceiling is stated for. `geoip-live.yml` runs
+  `netwatch geoip update` against the real provider on Linux, macOS and Windows
+  by hand, and the release checklist asks for a green run of it and of the soak.
 
 ## [0.38.0] - 2026-10-25
 

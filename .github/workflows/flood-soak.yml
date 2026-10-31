@@ -83,6 +83,17 @@ jobs:
             'mount -t sysfs sysfs /sys && ls /sys/class/net &&
              ip link add d0 type veth peer name d1'
 
+      # The 512 MiB ceiling is stated with Country and ASN databases loaded, so
+      # a full run loads them. A smoke doesn't, so a pull request never depends
+      # on the provider. If the download fails, the run carries on without
+      # them, and the summary's GeoIP line says so.
+      - name: Download the GeoIP databases
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/geoip-cache
+        run: target/release/netwatch geoip update
+
       # A pull request runs --smoke. A schedule has no inputs, so it runs the
       # harness's defaults, which are the full run. An empty --scenarios would
       # leave the harness nothing to divide the minutes by, so it is left out.
@@ -100,6 +111,10 @@ jobs:
           else
             [ -z "${MINUTES}" ] || args+=(--minutes "${MINUTES}")
             [ -z "${SCENARIOS}" ] || args+=(--scenarios "${SCENARIOS}")
+            geoip="${RUNNER_TEMP}/geoip-cache/netwatch/geoip"
+            if [ -f "${geoip}/dbip-country-lite.mmdb" ] && [ -f "${geoip}/dbip-asn-lite.mmdb" ]; then
+              args+=(--geoip-db "${geoip}/dbip-country-lite.mmdb" --geoip-asn-db "${geoip}/dbip-asn-lite.mmdb")
+            fi
           fi
           python3 -I tests/soak/flood_soak.py "${args[@]}" --artifacts flood-soak
 
