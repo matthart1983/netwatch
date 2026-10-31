@@ -141,6 +141,32 @@ fn resolver_status_and_recover_print_the_notice_for_a_journal_from_v0_30() {
     assert!(!stdout.contains("Not restored"), "{stdout}");
 }
 
+/// A rollback that gave up can still leave netwatch's change in the file, with
+/// `recover` saying `Recovered 0`.
+#[test]
+fn resolver_status_prints_the_notice_for_an_abandoned_entry() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.journal(),
+        include_str!("fixtures/recovery/v0.30.4-abandoned-backup-missing.applied.json"),
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["resolver", "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Not restored by resolver recover"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("gave up restoring /etc/resolv.conf"),
+        "{stdout}"
+    );
+}
+
 fn assert_legacy_notice(stdout: &str) {
     assert!(
         stdout.contains("Not restored by resolver recover"),

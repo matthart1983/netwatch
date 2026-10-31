@@ -33,7 +33,8 @@ enum EntryState {
     Applied,
     /// Change was undone; kept in the file as history.
     Reverted,
-    /// Could not be undone safely. The backup path was preserved for a human.
+    /// A rollback gave up: the backup was missing, which left the file as netwatch
+    /// set it, or the file had been edited since. The journal does not say which.
     Abandoned,
 }
 
@@ -79,10 +80,13 @@ impl Journal {
             .join("applied.json")
     }
 
-    fn open_entries(&self) -> impl Iterator<Item = &JournalEntry> {
-        self.entries
-            .iter()
-            .filter(|e| matches!(e.state, EntryState::Pending | EntryState::Applied))
+    fn unresolved_entries(&self) -> impl Iterator<Item = &JournalEntry> {
+        self.entries.iter().filter(|e| {
+            matches!(
+                e.state,
+                EntryState::Pending | EntryState::Applied | EntryState::Abandoned
+            )
+        })
     }
 
     fn load(path: PathBuf) -> Self {
@@ -188,29 +192,39 @@ impl Journal {
             return vec![reason.clone()];
         }
         let unresolved: Vec<String> = self
-            .open_entries()
+            .unresolved_entries()
             .filter(|entry| !entry.permanent)
             .map(|entry| {
+                let issue = &entry.issue_id;
+                let target = entry
+                    .target
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "an unnamed file".into());
+                let backup = entry
+                    .backup
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "missing".into());
+                let journal = self.path.display();
                 // Target and backup first: the status line cuts off at the width
                 // of the terminal, and these are what the reader has to act on.
-                format!(
-                    "recovery required for {}: an older netwatch may have left a change in {}; \
-                     backup: {} (unverified); legacy ownership and resolver authority are \
-                     unverified, so automatic rollback is disabled; restore by hand \
-                     (docs/recovery-store.md), then remove {}",
-                    entry.issue_id,
-                    entry
-                        .target
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "an unnamed file".into()),
-                    entry
-                        .backup
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "missing".into()),
-                    self.path.display(),
-                )
+                if entry.state == EntryState::Abandoned {
+                    format!(
+                        "recovery required for {issue}: an older netwatch gave up restoring \
+                         {target}, so it may still hold netwatch's change; its backup was \
+                         missing or the file had been edited since, and the journal does not \
+                         say which; do not assume {backup} exists; check by hand \
+                         (docs/recovery-store.md), then remove {journal}"
+                    )
+                } else {
+                    format!(
+                        "recovery required for {issue}: an older netwatch may have left a change \
+                         in {target}; backup: {backup} (unverified); legacy ownership and \
+                         resolver authority are unverified, so automatic rollback is disabled; \
+                         restore by hand (docs/recovery-store.md), then remove {journal}"
+                    )
+                }
             })
             .collect();
         if !unresolved.is_empty() {
@@ -256,6 +270,15 @@ mod tests {
     /// pending, and /etc was never changed.
     const SANDBOX_REFUSED: &str =
         include_str!("../../tests/fixtures/recovery/v0.30.4-sandbox-refused-write.applied.json");
+
+    /// A later start's rollback, in that same code, finding the backup gone: the
+    /// file stays as netwatch set it, and the entry says abandoned.
+    const ABANDONED_BACKUP_MISSING: &str =
+        include_str!("../../tests/fixtures/recovery/v0.30.4-abandoned-backup-missing.applied.json");
+    /// The same rollback finding the file edited since. The backup is there, the
+    /// file is not netwatch's, and the journal looks just the same.
+    const ABANDONED_EDITED_LATER: &str =
+        include_str!("../../tests/fixtures/recovery/v0.30.4-abandoned-edited-later.applied.json");
 
     const RESOLV: &str = "# generated\nsearch lan\nnameserver 169.254.1.1\noptions edns0\n";
 
@@ -318,6 +341,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_abandoned_entry_says_what_is_known_and_no_more() {
+        for (fixture, issue, backup) in [
+            (
+                ABANDONED_BACKUP_MISSING,
+                "2026-0909-02",
+                "/etc/resolv.conf.netwatch-52110.bak",
+            ),
+            (
+                ABANDONED_EDITED_LATER,
+                "2026-0909-03",
+                "/etc/resolv.conf.netwatch-52555.bak",
+            ),
+        ] {
+            let temp = Temp::new();
+            let path = temp.journal(fixture);
+            let mut journal = Journal::load(path.clone());
+            let unresolved = journal.inspect_recovery(RecoveryAuthority::InspectOnly);
+            assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+            let notice = journal.recovery_notice().unwrap();
+            assert!(notice.contains(issue), "{notice}");
+            assert!(
+                notice.contains("gave up restoring /etc/resolv.conf"),
+                "{notice}"
+            );
+            assert!(
+                notice.contains("may still hold netwatch's change"),
+                "{notice}"
+            );
+            assert!(notice.contains("does not say which"), "{notice}");
+            // Named, but not offered as the way back.
+            assert!(
+                notice.contains(&format!("do not assume {backup} exists")),
+                "{notice}"
+            );
+            assert!(!notice.contains("backup: "), "{notice}");
+            assert!(notice.contains(&path.display().to_string()), "{notice}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), fixture);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn live_load_discovers_both_formats_without_changing_either() {
@@ -352,7 +416,7 @@ mod tests {
         let warning = live.recovery_notice().unwrap();
         assert!(warning.contains(&id.to_string()));
         assert!(warning.contains("legacy ownership"));
-        assert_eq!(live.open_entries().count(), 1);
+        assert_eq!(live.unresolved_entries().count(), 1);
         assert_eq!(fs::read_to_string(&legacy).unwrap(), KILLED_AFTER_APPLY);
         assert_eq!(
             fs::read(directory.join("journal.json")).unwrap(),
@@ -383,7 +447,7 @@ mod tests {
             assert!(restarted.recovery_notice().unwrap().contains("unverified"));
             // Shutdown inspects again, and must find the same thing still open.
             assert_eq!(restarted.inspect_recovery(authority), startup);
-            assert_eq!(restarted.open_entries().count(), 1);
+            assert_eq!(restarted.unresolved_entries().count(), 1);
         }
     }
 

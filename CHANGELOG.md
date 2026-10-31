@@ -79,6 +79,13 @@ All notable changes to NetWatch will be documented in this file.
   as it was and does not depend on the journal: 0 when no unresolved record is left in
   its own store, 1 otherwise. A file a user can write must not be able to fail a root
   command, so read the output, not just the exit status.
+- **A 0.30 journal entry marked `abandoned` now gets the notice too.** 0.30 and 0.31.0
+  wrote that state when a rollback gave up, either because the backup was missing, which
+  left the file as netwatch set it, or because the file had been edited since. Those
+  entries said nothing, so the resolver could still hold netwatch's change with `recover`
+  saying `Recovered 0`. The journal does not record which it was, so this notice says that
+  and does not offer the backup as the way back. If you have one, the notice stays until
+  you remove `applied.json`.
 
 ### Removed
 - **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,

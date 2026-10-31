@@ -69,10 +69,13 @@ in the cache directory of whichever home the session used. For a change that rea
 0.31.0 was the last release to roll an entry back. Netwatch now only reads this
 file: it has no writer and no rollback.
 
-An entry still marked pending or applied puts `recovery required` on the Diagnose
-status line and in the report's timeline, and in the log at startup and shutdown.
+An entry still marked pending, applied or abandoned puts `recovery required` on the
+Diagnose status line and in the report's timeline, and in the log at startup and shutdown.
+Abandoned means 0.30 or 0.31.0 tried to restore the file and gave up. Either its backup
+was missing, which left the file as netwatch set it, or the file had been edited since.
+The journal does not say which, so the notice does not offer the backup as the way back.
 `netwatch resolver status` and `recover` print the same notice on Linux, naming the
-file and the backup. Nothing restores the entry. The journal cannot authorize a
+file. Nothing restores the entry. The journal cannot authorize a
 write: nothing proves who wrote it, and every confined thread but capture can write
 the cache. So `recover` can print `Recovered 0 resolver operations` and exit 0 with
 `/etc/resolv.conf` still holding netwatch's change. The notice is what says so.
