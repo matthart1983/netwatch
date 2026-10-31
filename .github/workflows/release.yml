@@ -134,7 +134,7 @@ jobs:
       # check an installed netwatch without the SBOM beside it.
       - name: Install cargo-auditable
         if: matrix.target != 'armv5te-unknown-linux-gnueabi'
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-auditable@0.7.7
 
@@ -291,7 +291,7 @@ jobs:
       # runner is x86_64 and would corrupt the aarch64 binary.
       - name: Install packaging tools
         if: contains(matrix.target, 'linux-musl')
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-deb,cargo-generate-rpm
 
@@ -436,7 +436,7 @@ jobs:
       # embeds. A build step that lost the wrapper still links fine, so
       # check the artifacts rather than trust the build.
       - name: Install rust-audit-info
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: rust-audit-info@0.5.4
       - name: Check every binary is auditable
@@ -483,7 +483,7 @@ jobs:
       #   gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch \
       #     --predicate-type https://cyclonedx.org/bom
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-cyclonedx
       - name: Generate the SBOM
@@ -554,7 +554,7 @@ jobs:
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
