@@ -5,6 +5,13 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
+  the plain Linux asset has been the static binary, and the `-static` name went
+  away, but aqua's registry, which mise reads, still asked for it. Every release
+  from 0.31.1 failed with `no asset found: netwatch-linux-x86_64-static.tar.gz`.
+  Releases now also carry `netwatch-linux-x86_64-static.tar.gz` and
+  `netwatch-linux-aarch64-static.tar.gz`, the same binaries under the old names,
+  and 0.39.0 has them too. Use the plain names for anything new.
 - **A TLS connection keeps its hostname when its ClientHello spans two TCP
   segments.** netwatch read only a flow's first segment, and its TLS parser needs
   the whole record. A ClientHello with a post-quantum key share, the default in

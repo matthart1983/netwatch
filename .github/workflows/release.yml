@@ -423,6 +423,15 @@ jobs:
         with:
           merge-multiple: true
 
+      # Before SHA256SUMS and the attestations, so they cover these too. A
+      # re-release of a tag older than the script skips it; static-attach.yml
+      # adds them to a release that has none.
+      - name: Add the -static names for the Linux tarballs
+        run: |
+          if [ -e scripts/static-asset-names.sh ]; then
+            scripts/static-asset-names.sh
+          fi
+
       # Every shipped binary must carry the dependency list `cargo auditable`
       # embeds. A build step that lost the wrapper still links fine, so
       # check the artifacts rather than trust the build.

@@ -1,0 +1,54 @@
+name: Attach static-named Linux assets to a release
+
+# Releases before release.yml made netwatch-linux-<arch>-static.tar.gz don't have
+# it. This adds it to one existing tag's release, with SHA256SUMS and provenance,
+# from the tarballs already there, so nothing is rebuilt.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Released tag missing its -static Linux tarballs (e.g. v0.39.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The script may be newer than the tag, so this is the branch's copy.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Make the tarballs from the release's own
+        run: |
+          set -euo pipefail
+          mkdir assets
+          gh release download "$TAG" --dir assets \
+            --pattern netwatch-linux-x86_64.tar.gz \
+            --pattern netwatch-linux-aarch64.tar.gz
+          (cd assets && ../scripts/static-asset-names.sh)
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: assets/*-static.tar.gz
+
+      # SHA256SUMS keeps release.yml's format: `sha256sum` lines sorted by file
+      # name. Any old -static line is replaced, not duplicated.
+      - name: Upload the tarballs and update SHA256SUMS
+        working-directory: assets
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --pattern SHA256SUMS --dir old
+          { grep -v -- '-static\.tar\.gz$' old/SHA256SUMS || true
+            sha256sum ./*-static.tar.gz | sed 's# \./# #'
+          } | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" ./*-static.tar.gz SHA256SUMS --clobber
