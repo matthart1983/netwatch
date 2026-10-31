@@ -21,6 +21,9 @@ RestartSec=5s
 
 # Run unprivileged with only the capabilities the collectors need. eBPF
 # attribution needs CAP_BPF + CAP_PERFMON; raw packet capture needs CAP_NET_RAW.
+# With the sandbox on, the daemon drops CAP_NET_RAW from its threads once capture
+# has opened. The open capture descriptor can still capture and inject on any
+# interface in this network namespace.
 User=netwatch
 Group=netwatch
 AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_PERFMON

@@ -39,6 +39,9 @@ pub struct View<'a> {
     pub ai: Option<Ai>,
     /// Where the model is configured to live, for the failure message.
     pub endpoint: String,
+    /// The `third_party_probes` config key: whether a test that asks a public
+    /// server may be offered.
+    pub third_party_probes: bool,
     /// Transient status line (export path, applied confirmation, reconciliation).
     pub status: Option<&'a str>,
     /// Set when the engine is replaying a recorded scenario rather than
@@ -105,6 +108,22 @@ impl Ai {
     }
 }
 
+/// The line every Diagnose page carries while Insights is on and sending in
+/// the clear to another machine. Requests go out every 15 seconds whether or
+/// not an issue is open, so it sits under the verdict rather than in a pane
+/// that can run out of rows. It fits 80 columns, with its label first if not.
+fn cleartext_insights_line(view: &View) -> Option<Line<'static>> {
+    use crate::collectors::insights::{cleartext_off_host, CLEARTEXT_OFF_HOST};
+    (view.ai.is_some() && cleartext_off_host(&view.endpoint)).then(|| {
+        Line::from(Span::styled(
+            format!(
+                "{CLEARTEXT_OFF_HOST}: Insights sends DNS names and peer addresses unencrypted"
+            ),
+            Style::default().fg(view.theme.status_warn),
+        ))
+    })
+}
+
 impl<'a> View<'a> {
     /// The issue the cursor is on.
     pub fn current(&self) -> Option<&'a Issue> {
@@ -167,6 +186,7 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
         capability: app.diagnose.capability,
         ai,
         endpoint: app.user_config.insights_endpoint.clone(),
+        third_party_probes: app.user_config.third_party_probes,
         status: app
             .diagnose
             .journal
@@ -183,7 +203,13 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
     // sentence, stacked, reads as a rendering bug.
     crate::ui::widgets::render_header_without_verdict(f, app, chunk_header(area));
     if app.diagnose.show_coverage {
-        render_coverage(f, app, chunk_body(area));
+        let mut body = chunk_body(area);
+        if let Some(line) = cleartext_insights_line(&view) {
+            let (row, rest) = crate::ui::widgets::take_top(body, 1);
+            f.render_widget(Paragraph::new(line), inset(row));
+            body = rest;
+        }
+        render_coverage(f, app, body);
     } else {
         render_body(f, &view, chunk_body(area));
     }
@@ -558,8 +584,13 @@ pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
     }
     if let Some(issue) = view.current() {
         if view.running_tests.is_empty()
-            && crate::diagnose::next_test::suggest(issue, view.capability, &issue.last_seen)
-                .is_some()
+            && crate::diagnose::next_test::suggest(
+                issue,
+                view.capability,
+                view.third_party_probes,
+                &issue.last_seen,
+            )
+            .is_some()
         {
             hints.push(hint("t", "run test"));
         }
@@ -619,32 +650,34 @@ pub fn render_body(f: &mut Frame, view: &View, area: Rect) {
     // line, not a second copy of it in a box.
     let strip_rows = if view.demo_banner.is_some() { 3 } else { 0 };
 
+    // The verdict comes off the top first: `Min(6)` below would otherwise take
+    // its rows on a short terminal, and the second of them can hold a warning.
+    let (verdict, area) = crate::ui::widgets::take_top(area, 2);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),           // verdict line
             Constraint::Length(strip_rows),  // demo banner
             Constraint::Min(6),              // issues + detail, or the report
             Constraint::Length(status_rows), // transient status
         ])
         .split(area);
 
-    render_verdict(f, view, chunks[0]);
+    render_verdict(f, view, verdict);
     if strip_rows > 0 {
-        render_engine_strip(f, view, chunks[1]);
+        render_engine_strip(f, view, chunks[0]);
     }
     // `o` swaps the working view for the whole report. With nothing open the
     // page says so once and gets out of the way — no catalogue, no preview,
     // no empty issue and detail boxes.
     if view.show_report {
-        render_report_preview(f, view, chunks[2]);
+        render_report_preview(f, view, chunks[1]);
     } else if view.engine.primary().is_empty() {
-        render_nothing_open(f, view, chunks[2]);
+        render_nothing_open(f, view, chunks[1]);
     } else {
-        render_main(f, view, chunks[2]);
+        render_main(f, view, chunks[1]);
     }
     if let Some(s) = view.status {
-        render_status(f, view, s, chunks[3]);
+        render_status(f, view, s, chunks[2]);
     }
 }
 
@@ -660,7 +693,9 @@ fn severity_color(sev: Severity, t: &Theme) -> Color {
 
 fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
     let spans = verdict_spans(view.engine, view.baselines, view.theme);
-    f.render_widget(Paragraph::new(Line::from(spans)), inset(area));
+    let mut lines = vec![Line::from(spans)];
+    lines.extend(cleartext_insights_line(view));
+    f.render_widget(Paragraph::new(lines), inset(area));
 }
 
 /// The verdict row: a glyph, then the words, then how many issues it leaves
@@ -1455,7 +1490,12 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
 
     // ── next test ────────────────────────────────────────────
     let runs = crate::diagnose::next_test::latest_runs(issue, &issue.last_seen);
-    let suggestion = crate::diagnose::next_test::suggest(issue, view.capability, &issue.last_seen);
+    let suggestion = crate::diagnose::next_test::suggest(
+        issue,
+        view.capability,
+        view.third_party_probes,
+        &issue.last_seen,
+    );
     if !view.running_tests.is_empty() || suggestion.is_some() || !runs.is_empty() {
         lines.push(section(t, "tests"));
         for run in &runs {
@@ -1829,6 +1869,7 @@ mod tests {
             capability: Capability::Root,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2028,6 +2069,7 @@ mod tests {
             capability: Capability::Root,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2106,6 +2148,7 @@ mod tests {
             capability: Capability::Root,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2148,6 +2191,7 @@ mod tests {
                 capability: Capability::Root,
                 ai: None,
                 endpoint: "local".to_string(),
+                third_party_probes: true,
                 status: None,
                 demo_banner: None,
                 running_tests: vec![],
@@ -2213,6 +2257,7 @@ mod tests {
                     capability: Capability::Root,
                     ai: None,
                     endpoint: "local".to_string(),
+                    third_party_probes: true,
                     status: None,
                     demo_banner: None,
                     running_tests: vec![],
@@ -2278,6 +2323,7 @@ mod tests {
             capability: Capability::None,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],
@@ -2373,6 +2419,156 @@ mod tests {
                 "{status:?} should mention {expect:?}:\n{s}"
             );
         }
+    }
+
+    /// Not only on a detail pane: requests keep going out with nothing open,
+    /// so the empty page has to say so too.
+    #[test]
+    fn a_cleartext_endpoint_shows_on_both_pages_whatever_the_model_is_doing() {
+        use crate::collectors::insights::InsightsStatus;
+        const WORDS: &str = "cleartext, off-host";
+        let (engine, baselines) = fixture::run();
+        let quiet = crate::diagnose::Engine::new(Box::new(crate::diagnose::engine::SystemClock));
+        for status in [
+            InsightsStatus::Idle,
+            InsightsStatus::Available,
+            InsightsStatus::OllamaUnavailable,
+        ] {
+            let on = |v: &mut View| {
+                v.ai = Some(Ai {
+                    status: status.clone(),
+                    narrative: None,
+                });
+                v.endpoint = "http://10.0.0.5:11434".into();
+            };
+            let open = draw_engine(&engine, &baselines, 150, 44, on);
+            assert!(
+                open.contains(WORDS),
+                "{status:?} with an issue open:\n{open}"
+            );
+            let empty = draw_engine(&quiet, &baselines, 150, 44, on);
+            assert!(
+                empty.contains(WORDS),
+                "{status:?} with nothing open:\n{empty}"
+            );
+        }
+        // Loopback, TLS, or the feature off: nothing to warn about, on either.
+        for mutate in [
+            (|v: &mut View| {
+                v.ai = Some(Ai {
+                    status: InsightsStatus::Idle,
+                    narrative: None,
+                });
+                v.endpoint = "http://127.0.0.1:11434".into();
+            }) as fn(&mut View),
+            |v: &mut View| {
+                v.ai = Some(Ai {
+                    status: InsightsStatus::Idle,
+                    narrative: None,
+                });
+                v.endpoint = "https://ollama.example.com".into();
+            },
+            |v: &mut View| v.endpoint = "http://10.0.0.5:11434".into(),
+        ] {
+            for s in [
+                draw_engine(&engine, &baselines, 150, 44, mutate),
+                draw_engine(&quiet, &baselines, 150, 44, mutate),
+            ] {
+                assert!(!s.contains(WORDS), "{s}");
+            }
+        }
+    }
+
+    /// Through the real page, which gives the body six fewer rows than the
+    /// terminal has. The line used to be the last thing in a detail pane with
+    /// no scroll, gone at every size up to 130x40 with an issue open, and in a
+    /// panel on the empty page sized before its text wrapped, gone at 100
+    /// columns and under.
+    #[test]
+    fn the_cleartext_line_reaches_the_screen_on_every_page_at_every_size() {
+        use crate::app::{draw_frame, App, Tab};
+        use crate::config::NetwatchConfig;
+        use crate::diagnose::baseline::{BaselineStore, NetworkFingerprint};
+        use crate::diagnose::detectors::{DnsObs, Observations, Thresholds};
+        const WORDS: &str = "cleartext, off-host: Insights sends";
+
+        let shown = |app: &mut App, width: u16, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw_frame(f, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            buffer
+                .content
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let app = || {
+            let mut app = App::prepare_with_config(NetwatchConfig {
+                insights_enabled: true,
+                insights_endpoint: "http://10.0.0.5:11434".into(),
+                diagnose_record_episodes: false,
+                diagnose_thresholds: Thresholds {
+                    dns_ceiling_ms: 30.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            app.ui.current_tab = Tab::Diagnose;
+            app
+        };
+        let slow_resolver = Observations {
+            dns: Some(DnsObs {
+                resolver: "192.0.2.53".into(),
+                rtt_p50_ms: Some(40.0),
+                rtt_p95_ms: Some(48.0),
+                failure_rate_pct: 0.0,
+                truncation_rate_pct: 0.0,
+                queries: 38,
+                failed: 0,
+                truncated: 0,
+                alt_resolver: None,
+                alt_rtt_ms: None,
+                icmp_rtt_ms: None,
+                cached_rtt_ms: None,
+                window_secs: 180,
+                cross: None,
+            }),
+            ..Default::default()
+        };
+        let base = BaselineStore::new(NetworkFingerprint::new("eth0", None, vec![], None));
+
+        let mut empty = app();
+        let mut open = app();
+        for _ in 0..3 {
+            open.diagnose.engine.observe(&slow_resolver, &base);
+        }
+        assert!(!open.diagnose.engine.primary().is_empty(), "no open issue");
+        for (width, height) in [
+            (78, 16),
+            (80, 24),
+            (100, 30),
+            (120, 40),
+            (130, 40),
+            (150, 44),
+            (200, 60),
+        ] {
+            let page = shown(&mut empty, width, height);
+            assert!(page.contains(WORDS), "empty, {width}x{height}:\n{page}");
+            let page = shown(&mut open, width, height);
+            assert!(page.contains(WORDS), "issue, {width}x{height}:\n{page}");
+            open.diagnose.show_report = true;
+            let page = shown(&mut open, width, height);
+            open.diagnose.show_report = false;
+            assert!(page.contains(WORDS), "report, {width}x{height}:\n{page}");
+            open.diagnose.show_coverage = true;
+            let page = shown(&mut open, width, height);
+            open.diagnose.show_coverage = false;
+            assert!(page.contains(WORDS), "coverage, {width}x{height}:\n{page}");
+        }
+        // Too narrow for the sentence, the words that matter still show.
+        let page = shown(&mut open, 40, 24);
+        assert!(page.contains("cleartext, off-host"), "{page}");
     }
 
     #[test]
@@ -2618,6 +2814,7 @@ mod tests {
                 capability: Capability::Root,
                 ai: None,
                 endpoint: "local".to_string(),
+                third_party_probes: true,
                 status: None,
                 demo_banner: None,
                 running_tests: vec![],
@@ -2672,6 +2869,7 @@ mod tests {
             capability: Capability::None,
             ai: None,
             endpoint: "local".to_string(),
+            third_party_probes: true,
             status: None,
             demo_banner: None,
             running_tests: vec![],

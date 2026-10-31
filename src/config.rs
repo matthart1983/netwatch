@@ -144,6 +144,16 @@ pub struct NetwatchConfig {
     #[serde(default = "default_record_uptime")]
     pub record_uptime: bool,
 
+    /// Send the automatic probes that go to public servers: STUN to Google
+    /// and Cloudflare, the `dns.google` cross-check against 1.1.1.1, the
+    /// internet probe to 1.1.1.1 and the trace a TUI start runs to 1.1.1.1.
+    /// With false none of them is sent, and what they would have measured
+    /// reads as not measured, never as failed. Your resolver and gateway are
+    /// still probed, and what you start yourself still runs. Read at start.
+    /// Default true.
+    #[serde(default = "default_third_party_probes")]
+    pub third_party_probes: bool,
+
     /// Hosts Diagnose probes stage by stage (DNS, TCP, TLS, HTTP), e.g.
     ///
     /// ```toml
@@ -187,6 +197,10 @@ fn default_record_episodes() -> bool {
 }
 
 fn default_record_uptime() -> bool {
+    true
+}
+
+fn default_third_party_probes() -> bool {
     true
 }
 
@@ -251,6 +265,7 @@ impl Default for NetwatchConfig {
             graph_fade: default_graph_fade(),
             diagnose_record_episodes: default_record_episodes(),
             record_uptime: default_record_uptime(),
+            third_party_probes: default_third_party_probes(),
             diagnose_probes: Default::default(),
             diagnose_targets: Vec::new(),
             diagnose_thresholds: Default::default(),
@@ -716,6 +731,7 @@ show_geo = false
             egress_violation_cooldown_secs: 120,
             groups_start_collapsed: false,
             confirm_quit: true,
+            third_party_probes: false,
             diagnose_record_episodes: false,
             record_uptime: false,
             diagnose_probes: Default::default(),
@@ -732,6 +748,7 @@ show_geo = false
         assert!(!deserialized.packet_follow);
         assert!(deserialized.confirm_quit);
         assert!(!deserialized.record_uptime);
+        assert!(!deserialized.third_party_probes);
         assert_eq!(deserialized.bpf_filter, "tcp port 443");
         assert_eq!(deserialized.alerts.bandwidth_threshold, 50_000_000);
         assert_eq!(deserialized.alerts.port_scan_threshold, 10);
@@ -813,6 +830,24 @@ show_geo = false
         assert_eq!(cfg.bpf_filter, "tcp");
         assert_eq!(cfg.alerts.bandwidth_threshold, 5);
         assert_eq!(cfg.alerts.port_scan_threshold, 6);
+    }
+
+    #[test]
+    fn third_party_probes_defaults_true() {
+        assert!(NetwatchConfig::default().third_party_probes);
+        // An older file, which never heard of the key, changes nothing.
+        let cfg: NetwatchConfig = toml::from_str("default_tab = \"packets\"\n").unwrap();
+        assert!(cfg.third_party_probes);
+    }
+
+    #[test]
+    fn third_party_probes_false_parses() {
+        let cfg: NetwatchConfig = toml::from_str("third_party_probes = false\n").unwrap();
+        assert!(!cfg.third_party_probes);
+        // And a Settings save writes it back rather than turning them on again.
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        let again: NetwatchConfig = toml::from_str(&saved).unwrap();
+        assert!(!again.third_party_probes);
     }
 
     #[test]
