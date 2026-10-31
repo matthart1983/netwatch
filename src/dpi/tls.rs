@@ -35,6 +35,22 @@ use crate::ui::sanitize::display;
 /// with this type code.
 const ECH_EXTENSION_TYPE: u16 = 0xfe0d;
 
+/// The most plaintext one TLS record may carry (RFC 8446 section 5.1).
+const MAX_RECORD_PAYLOAD: usize = 1 << 14;
+
+/// The length, header included, of the record at the start of `payload` when
+/// that record holds one ClientHello, whether or not `payload` holds all of it.
+/// A record length is the sender's to claim, so one past what TLS allows, or one
+/// its own handshake header disagrees with, is `None`.
+pub fn client_hello_record_len(payload: &[u8]) -> Option<usize> {
+    if payload.len() < 9 || payload[0] != 0x16 || payload[1] != 0x03 || payload[5] != 0x01 {
+        return None;
+    }
+    let record = u16::from_be_bytes([payload[3], payload[4]]) as usize;
+    let handshake = u32::from_be_bytes([0, payload[6], payload[7], payload[8]]) as usize;
+    (record <= MAX_RECORD_PAYLOAD && handshake + 4 == record).then_some(5 + record)
+}
+
 /// Pull the 32-byte `client_random` out of a TLS ClientHello record.
 /// Used by the TLS-decryption path to key per-flow secrets in the
 /// SSLKEYLOGFILE; the keylog uses `client_random` as its lookup key.

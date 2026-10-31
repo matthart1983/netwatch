@@ -53,10 +53,9 @@
 #   - No port forwards, not even DNS. pasta holds a socket in the namespace per
 #     forwarded port and per forwarded DNS query, and they fill the connection
 #     table with unattributed 127.0.0.1 UDP rows.
-#   - Keep pasta's default MTU. At `-m 1500` this tap does no segmentation
-#     offload, so a ClientHello with a post-quantum key share spans two TCP
-#     segments, and netwatch, which classifies a flow's first segment once,
-#     shows raw IPs. The side effects are `mss 43520` and a 10 Gb link.
+#   - pasta's default MTU shows `mss 43520` and a 10 Gb link. `-m 1500` gives a
+#     normal MSS. The 0.39.0 take kept the default because 0.39.0 read only a
+#     flow's first segment, so at 1500 its ClientHellos lost their hostnames.
 
 # THEN RE-ENCODE IT, for the same reason the hero tape documents: vhs v0.11.0
 # ignores `Set Framerate` for the GIF and writes 25 fps whatever the tape says,
