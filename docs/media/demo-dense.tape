@@ -38,9 +38,25 @@
 # Record on Linux with: vhs docs/media/demo-dense.tape
 # Needs: ./target/release/netwatch with capture permission, vhs, setsid,
 #        scripts/demo-dense-{env,traffic}.sh.
-# The 0.38.0 take uses a separate network/PID namespace for the terminal
+# The 0.39.0 take uses a separate network/PID namespace for the terminal
 # session, with /proc and /sys mounted there. Keep the recorder outside it
-# so its browser sockets do not appear in the connection table.
+# so its browser sockets do not appear in the connection table. That needs no
+# setcap: a `bash` first on vhs's PATH execs this, with resolv.conf holding
+# `nameserver 10.0.2.3` and the wrapper's directory taken off PATH again:
+#
+#   pasta --config-net -q -t none -u none -T none -U none -I demo0 \
+#     -a 10.0.2.15 -n 24 -g 10.0.2.2 --dns-forward 10.0.2.3 -- \
+#     unshare --pid --fork --mount-proc --mount /usr/bin/bash -c \
+#     'mount -t sysfs sysfs /sys; mount --bind RESOLV /etc/resolv.conf;
+#      exec /usr/bin/bash "$@"' bash "$@"
+#
+#   - No port forwards, not even DNS. pasta holds a socket in the namespace per
+#     forwarded port and per forwarded DNS query, and they fill the connection
+#     table with unattributed 127.0.0.1 UDP rows.
+#   - Keep pasta's default MTU. At `-m 1500` this tap does no segmentation
+#     offload, so a ClientHello with a post-quantum key share spans two TCP
+#     segments, and netwatch, which classifies a flow's first segment once,
+#     shows raw IPs. The side effects are `mss 43520` and a 10 Gb link.
 
 # THEN RE-ENCODE IT, for the same reason the hero tape documents: vhs v0.11.0
 # ignores `Set Framerate` for the GIF and writes 25 fps whatever the tape says,
@@ -65,7 +81,7 @@ Set Shell "bash"
 Set FontSize 14
 Set Width 1250
 Set Height 930
-Set Theme "Catppuccin Mocha"
+Set Theme { "name": "Catppuccin Mocha, Crust background", "black": "#45475a", "red": "#f38ba8", "green": "#a6e3a1", "yellow": "#f9e2af", "blue": "#89b4fa", "magenta": "#f5c2e7", "cyan": "#94e2d5", "white": "#bac2de", "brightBlack": "#585b70", "brightRed": "#f38ba8", "brightGreen": "#a6e3a1", "brightYellow": "#f9e2af", "brightBlue": "#89b4fa", "brightMagenta": "#f5c2e7", "brightCyan": "#94e2d5", "brightWhite": "#a6adc8", "background": "#11111b", "foreground": "#cdd6f4", "selection": "#585b70", "cursor": "#f5e0dc" }
 Set TypingSpeed 30ms
 Set Framerate 10
 Set Padding 10
