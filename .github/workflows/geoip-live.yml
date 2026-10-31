@@ -1,0 +1,47 @@
+name: GeoIP live
+
+# `netwatch geoip update` against the real provider on each OS, by hand at
+# release. It stays out of ci.yml because the release guard waits on every
+# ci.yml run and a provider outage should not hold a tag. The release checklist
+# in docs/PACKAGING.md asks for a green run on the release candidate instead.
+on:
+  workflow_dispatch:
+
+# Read-only token for every job: nothing here writes to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  geoip-live:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install libpcap (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Install npcap SDK (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          ./scripts/npcap-sdk.ps1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-nextest
+
+      - name: Run the live update test
+        run: cargo nextest run --run-ignored only -E "test(geoip_update_live)" --no-capture

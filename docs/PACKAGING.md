@@ -55,10 +55,12 @@ Most of it is automatic. By hand:
 
 1. Write the release notes under `## [Unreleased]` in `CHANGELOG.md`, and
    commit them.
-2. Get a green `sandbox-lab.yml` run on that commit, the release candidate:
-   `gh workflow run sandbox-lab.yml --ref <branch>`. The release guard does not
-   wait on it, because a flaky namespace should not hold a tag, so this step is
-   the only thing that does.
+2. Get a green run of each of these on that commit, the release candidate, with
+   `gh workflow run <workflow> --ref <branch>`: `sandbox-lab.yml`,
+   `flood-soak.yml` (a full hour, with the default inputs) and `geoip-live.yml`.
+   The release guard does not wait on them, because a flaky namespace or a
+   provider outage should not hold a tag, so this step is the only thing that
+   does. Refresh `docs/PERFORMANCE.md` from the soak's summary.
 3. On `main`, or on a `release/X.Y.Z` branch for a hotfix, run
    `scripts/release.sh X.Y.Z "summary"`. It bumps the version in `Cargo.toml`,
    `Cargo.lock` and `packaging/rpm/netwatch.spec`, and adds the spec's
