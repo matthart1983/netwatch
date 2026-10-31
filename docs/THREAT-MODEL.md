@@ -289,7 +289,10 @@ write: /dev/null
     `netwatch resolver set` and `recover` are others: as root they write
     `/etc/resolv.conf` and `/var/lib/netwatch` unconfined, and they accept no target
     or journal path from their arguments or a user's home
-    ([resolver adapter](resolver-adapter.md)).
+    ([resolver adapter](resolver-adapter.md)). `status` and `recover` do read 0.30's
+    `applied.json` from the home they run with, even as root, but only to print a
+    notice: a regular, single-link file this user owns, up to 64 KiB, with control
+    characters replaced.
 11. `netwatch geoip update` installs the policy, downloads on main, which stays
     unconfined and keeps any capability the process started with, and undoes the
     gzip, reads and writes each database on a `geoip-update` parser thread. TLS

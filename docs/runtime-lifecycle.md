@@ -12,8 +12,9 @@ only a current-thread signal/timer runtime, registers SIGINT/SIGTERM before muta
 and holds the fixed root-owned authority store lock until restoration or exit.
 No packet, attribution, remote or model workers start in this command.
 
-The shared live bootstrap also reports unresolved/inaccessible authority records
-without performing rollback. See [resolver adapter scope and validation](resolver-adapter.md).
+The shared live bootstrap also reports unresolved authority records without performing
+rollback. A session that is not root cannot read them, and reports nothing about a store
+the kernel refuses it. See [resolver adapter scope and validation](resolver-adapter.md).
 
 ## PR06 implementation update
 

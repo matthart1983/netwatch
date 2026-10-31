@@ -83,6 +83,13 @@ impl Journal {
     }
 
     fn load(path: PathBuf) -> Self {
+        let read = std::fs::read_to_string(&path);
+        Self::parse(path, read)
+    }
+
+    /// A journal from the outcome of reading `path`, for a caller that has to be
+    /// more careful about the read than [`Self::load`].
+    fn parse(path: PathBuf, read: std::io::Result<String>) -> Self {
         let mut journal = Self {
             path,
             entries: Vec::new(),
@@ -90,7 +97,7 @@ impl Journal {
         };
         // `render_status` in ui/diagnose.rs warns on the word "recovery"; without
         // it these lines would be drawn with a success mark.
-        match std::fs::read_to_string(&journal.path) {
+        match read {
             Ok(text) => match serde_json::from_str::<Vec<JournalEntry>>(&text) {
                 Ok(entries) => journal.entries = entries,
                 Err(e) => journal.notice = Some(format!(
@@ -185,8 +192,8 @@ impl Journal {
                 format!(
                     "recovery required for {}: an older netwatch may have left a change in {}; \
                      backup: {} (unverified); legacy ownership and resolver authority are \
-                     unverified, so automatic rollback is disabled; restore by hand, then \
-                     remove {}",
+                     unverified, so automatic rollback is disabled; restore by hand \
+                     (docs/recovery-store.md), then remove {}",
                     entry.issue_id,
                     entry
                         .target

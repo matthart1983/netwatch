@@ -40,9 +40,16 @@ and a valid original backup. Unknown ownership, changed contents or identity, an
 partial writes remain unresolved for manual review. There is no automatic keep or
 permanent-change command in this first adapter.
 
-`recover` reads this command's store and nothing else. It does not restore a change
-recorded by 0.30's [legacy journal](recovery-store.md#legacy-journal), and reports
-`Recovered 0 resolver operations` on a host that has only that.
+`recover` restores from this command's store and nothing else. It exits 0 when no
+unresolved record is left there and 1 when it refuses or a record stays unresolved.
+
+`status` and `recover` also print a notice when 0.30's
+[legacy journal](recovery-store.md#legacy-journal) has an entry open, because
+`Recovered 0 resolver operations` and `No resolver authority journal` only speak for
+this store. The notice names the file and the backup. It restores nothing and never
+changes the exit status: the journal is outside recovery authority, so a file a user
+can write cannot fail a root command. Exit 0 therefore says nothing about that
+journal. Read the output, or `ls /etc/resolv.conf.netwatch-*.bak`.
 
 ## Ownership and supported scope
 
@@ -71,6 +78,12 @@ store at `/var/lib/netwatch/resolver-v2`. Its OS lock is held throughout the
 transaction and temporary change. Different invoking users therefore contend on
 the same store under root authority. User cache/state journals are never promoted
 into privileged recovery authority.
+
+The store is private to root, so the kernel refuses every other user once `set` or
+`recover` has run. TUI and daemon sessions that are not root treat that refusal as
+nothing to report, whatever the store holds. Root sessions report unresolved records,
+and `netwatch resolver status` tells anyone else that the journal is unavailable and
+to ask root. Any other failure to read the store is still reported to everyone.
 
 The target must be a single-link regular file owned by root and not writable by
 group/others. Open uses no-follow/nonblocking flags. The adapter validates device,

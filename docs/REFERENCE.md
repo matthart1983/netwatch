@@ -467,7 +467,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
-| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. Experimental. `recover` undoes an interrupted `set`; a change from 0.30 is [restored by hand](recovery-store.md#legacy-journal). |
+| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. Experimental. `recover` undoes an interrupted `set`, and exits 0 when none is left unresolved, 1 otherwise. A change from 0.30 is [restored by hand](recovery-store.md#legacy-journal): `status` and `recover` print a notice naming it, and it does not affect the exit status. |
 | `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
 

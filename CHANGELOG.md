@@ -25,6 +25,15 @@ All notable changes to NetWatch will be documented in this file.
   across TLS records, or whose segments arrive out of order, is still not
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
+- **An ordinary user's Diagnose no longer reports an error for a resolver store only
+  root can read.** One `sudo netwatch resolver set` or `recover` leaves
+  `/var/lib/netwatch` private to root. Every later TUI or daemon session that was not
+  root then showed `resolver authority journal cannot be inspected: Permission denied`
+  on the Diagnose status line and in the log, in place of the status it would have shown.
+  It did this even when every record there was resolved, and that user could do nothing
+  to clear it. Those sessions now say nothing when the kernel refuses them this store.
+  Root sessions still report unresolved records, any other failure to read the store is
+  still reported, and `netwatch resolver status` still says the journal is unavailable.
 
 ### Changed
 - **The notice for a resolver change left by 0.30 now names the file and says how
@@ -35,9 +44,17 @@ All notable changes to NetWatch will be documented in this file.
   is what clears the notice. It now says all three. The steps are in [the recovery document](docs/recovery-store.md#legacy-journal):
   compare `/etc/resolv.conf` with the backup, copy the backup back as root, then remove
   `applied.json`, which is what clears the notice. This only reaches someone whose 0.30
-  session was killed with a change in place. `netwatch resolver recover` still does not
-  read this journal. It restores what an interrupted `netwatch resolver set` left, and
-  tests now hold that to a journal and backup a real 0.31.1 wrote.
+  session was killed with a change in place. `netwatch resolver recover` restores what an
+  interrupted `netwatch resolver set` left, and tests now hold that to a journal and backup
+  a real 0.31.1 wrote.
+- **`netwatch resolver status` and `recover` no longer read as all clear when a 0.30
+  journal has an entry open.** On that host `recover` said `Recovered 0 resolver
+  operations` and `status` said `No resolver authority journal`, with `/etc/resolv.conf`
+  possibly still changed. Both now print the same notice, naming the file and the
+  backup, on Linux. They restore nothing from the journal. `recover`'s exit status stays
+  as it was and does not depend on the journal: 0 when no unresolved record is left in
+  its own store, 1 otherwise. A file a user can write must not be able to fail a root
+  command, so read the output, not just the exit status.
 
 ### Removed
 - **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,

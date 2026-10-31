@@ -71,10 +71,11 @@ file: it has no writer and no rollback.
 
 An entry still marked pending or applied puts `recovery required` on the Diagnose
 status line and in the report's timeline, and in the log at startup and shutdown.
-Nothing restores it. `netwatch resolver recover` does not read this journal, and on
-a host with nothing else to do it prints `Recovered 0 resolver operations` and leaves
-`/etc/resolv.conf` as it found it. The journal cannot authorize a write: nothing
-proves who wrote it, and every confined thread but capture can write the cache.
+`netwatch resolver status` and `recover` print the same notice on Linux, naming the
+file and the backup. Nothing restores the entry. The journal cannot authorize a
+write: nothing proves who wrote it, and every confined thread but capture can write
+the cache. So `recover` can print `Recovered 0 resolver operations` and exit 0 with
+`/etc/resolv.conf` still holding netwatch's change. The notice is what says so.
 
 To deal with an entry by hand:
 
@@ -85,7 +86,14 @@ To deal with an entry by hand:
 3. Remove the backup and `applied.json`. The notice goes with the next start.
 
 A session in another home does not see the journal, so a leftover backup is the
-other way to find one: `ls /etc/resolv.conf.netwatch-*.bak`.
+other way to find one: `ls /etc/resolv.conf.netwatch-*.bak`. Check for one too when
+the notice says the journal is invalid or cannot be read, since then it cannot name
+a backup.
+
+`status` and `recover` often run as root, and under a `sudo` that keeps HOME the
+journal is in someone else's home. They read it only as a regular, single-link file
+the current user owns, up to 64 KiB, and they only print from it, with control
+characters replaced. Anything else gets `cannot read journal` in place of the entry.
 
 ## Lock and trust scope
 

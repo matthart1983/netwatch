@@ -106,18 +106,68 @@ fn resolver_recover_reaches_the_authority_check() {
     assert!(!stderr.contains("usage:"), "{stderr}");
 }
 
-/// What a real 0.31.1 `resolver set` left when SIGKILLed, against this binary's
-/// `resolver recover`. `set` and `recover` take no paths and need root, so this
-/// builds what they expect in a private root: a tmpfs, the host's programs bound
-/// in, and scratch `/etc` and `/var/lib`. It cannot reach the host's resolver.
-/// Only the target's device and inode change, because they name this tmpfs.
-const PRIVATE_ROOT_RECOVER: &str = r#"
+/// `status` and `recover` say so when a 0.30 journal is open, even on a host
+/// where the command itself is refused. An unprivileged run of `recover` stops at
+/// the refusal, which is what its exit status reports.
+#[test]
+fn resolver_status_and_recover_print_the_notice_for_a_journal_from_v0_30() {
+    let fixture = Fixture::new();
+    fs::write(fixture.journal(), KILLED_AFTER_APPLY).unwrap();
+    let mut commands = vec![vec!["resolver", "status"]];
+    if !nix::unistd::geteuid().is_root() {
+        commands.push(vec!["resolver", "recover", "--unmanaged"]);
+    }
+    for args in commands {
+        let output = fixture.command().args(&args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_legacy_notice(&stdout);
+        if args[1] == "recover" {
+            assert_eq!(output.status.code(), Some(1), "{stdout}");
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.journal()).unwrap(),
+        KILLED_AFTER_APPLY
+    );
+
+    // With nothing open there is nothing to say.
+    fs::remove_file(fixture.journal()).unwrap();
+    let output = fixture
+        .command()
+        .args(["resolver", "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Not restored"), "{stdout}");
+}
+
+fn assert_legacy_notice(stdout: &str) {
+    assert!(
+        stdout.contains("Not restored by resolver recover"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("recovery required for 2026-0908-02"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("in /etc/resolv.conf;"), "{stdout}");
+    assert!(
+        stdout.contains("/etc/resolv.conf.netwatch-48977.bak"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("docs/recovery-store.md"), "{stdout}");
+}
+
+/// `set` and `recover` take no paths and need root, so these build what they
+/// expect in a private root: a tmpfs, the host's programs bound in, and scratch
+/// `/etc`, `/var/lib` and cache. It cannot reach the host's resolver. The resolver
+/// file holds what a 0.31.1 `resolver set` installed.
+const PRIVATE_ROOT: &str = r#"
 set -e
 umask 022
 root=$0 bin=$1 fixture=$2
 mount -t tmpfs -o mode=755 tmpfs "$root"
-mkdir -p "$root/etc" "$root/proc" "$root/var/lib/netwatch/resolver-v2"
-chmod 700 "$root/var/lib/netwatch" "$root/var/lib/netwatch/resolver-v2"
+mkdir -p "$root/etc" "$root/proc" "$root/var/lib" "$root/cache/netwatch"
 for dir in usr bin sbin lib lib64; do
     if [ -L "/$dir" ]; then
         ln -s "$(readlink "/$dir")" "$root/$dir"
@@ -131,6 +181,13 @@ touch "$root/netwatch"
 mount --bind "$bin" "$root/netwatch"
 cp "$fixture/resolv.conf.installed" "$root/etc/resolv.conf"
 chmod 644 "$root/etc/resolv.conf"
+"#;
+
+/// The records a 0.31.1 `resolver set` left when SIGKILLed. Only the target's
+/// device and inode change, because they name this tmpfs.
+const RESTORE_V0_31_1: &str = r#"
+mkdir -p "$root/var/lib/netwatch/resolver-v2"
+chmod 700 "$root/var/lib/netwatch" "$root/var/lib/netwatch/resolver-v2"
 sed -e "s/\"device\": 53/\"device\": $(stat -c %d "$root/etc/resolv.conf")/" \
     -e "s/\"inode\": 11037260/\"inode\": $(stat -c %i "$root/etc/resolv.conf")/" \
     "$fixture/journal.json" > "$root/var/lib/netwatch/resolver-v2/journal.json"
@@ -144,9 +201,25 @@ echo "--- again"
 chroot "$root" /netwatch resolver recover --unmanaged
 "#;
 
-#[test]
-fn resolver_recover_restores_a_change_v0_31_1_left_behind() {
-    let fixture = Fixture::new();
+/// A 0.30 journal and nothing in the authority store. `set -e` above means a
+/// `recover` that exits nonzero fails this.
+const LEGACY_V0_30: &str = r#"
+cp "$fixture/../v0.30.4-killed-after-apply.applied.json" "$root/cache/netwatch/applied.json"
+chroot "$root" /netwatch resolver status
+echo "--- recover"
+chroot "$root" /netwatch resolver recover --unmanaged
+echo "--- /etc/resolv.conf"
+cat "$root/etc/resolv.conf"
+"#;
+
+fn records() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/recovery/v0.31.1-killed-resolver-set")
+}
+
+/// Runs `scenario` as root in a private root, or None where the runner has no
+/// user and mount namespace.
+fn in_private_root(fixture: &Fixture, scenario: &str) -> Option<std::process::Output> {
     let root = fixture.0.join("root");
     fs::create_dir(&root).unwrap();
     let namespace = ["--user", "--map-root-user", "--mount"];
@@ -159,26 +232,62 @@ fn resolver_recover_restores_a_change_v0_31_1_left_behind() {
         .is_ok_and(|status| status.success());
     if !usable {
         eprintln!("skipped: no user and mount namespace");
-        return;
+        return None;
     }
-    let records = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/recovery/v0.31.1-killed-resolver-set");
     let output = Command::new("unshare")
         .args(namespace)
-        .args(["sh", "-c", PRIVATE_ROOT_RECOVER])
+        .args(["sh", "-c", &format!("{PRIVATE_ROOT}{scenario}")])
         .arg(&root)
         .arg(env!("CARGO_BIN_EXE_netwatch"))
-        .arg(&records)
+        .arg(records())
+        .env("XDG_CACHE_HOME", "/cache")
         .output()
         .unwrap();
+    Some(output)
+}
+
+#[test]
+fn resolver_recover_restores_a_change_v0_31_1_left_behind() {
+    let fixture = Fixture::new();
+    let Some(output) = in_private_root(&fixture, RESTORE_V0_31_1) else {
+        return;
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("1 unresolved operations"), "{stdout}");
     let original =
-        fs::read_to_string(records.join("bd204382-3ba1-46a0-a521-79de298b097e.backup")).unwrap();
+        fs::read_to_string(records().join("bd204382-3ba1-46a0-a521-79de298b097e.backup")).unwrap();
     let expected = format!(
         "Recovered 1 resolver operations\n--- /etc/resolv.conf\n{original}--- again\nRecovered 0 resolver operations\n"
     );
     assert!(stdout.ends_with(&expected), "{stdout}\n{stderr}");
+}
+
+/// As root, with the authority store empty, the two lines that used to read as
+/// all clear now come with the notice, and `recover` still exits 0 and restores
+/// nothing: the journal is outside recovery authority.
+#[test]
+fn resolver_recover_exits_0_and_changes_nothing_for_a_journal_from_v0_30() {
+    let fixture = Fixture::new();
+    let Some(output) = in_private_root(&fixture, LEGACY_V0_30) else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let (status, rest) = stdout.split_once("--- recover\n").unwrap();
+    let (recover, resolver) = rest.split_once("--- /etc/resolv.conf\n").unwrap();
+    assert!(
+        status.contains("No resolver authority journal\n"),
+        "{status}"
+    );
+    assert_legacy_notice(status);
+    assert!(
+        recover.starts_with("Recovered 0 resolver operations\n"),
+        "{recover}"
+    );
+    assert_legacy_notice(recover);
+    let installed = fs::read_to_string(records().join("resolv.conf.installed")).unwrap();
+    assert_eq!(resolver, installed);
 }
