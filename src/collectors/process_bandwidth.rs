@@ -10,6 +10,11 @@ use std::time::{Duration, Instant};
 use super::attribution::ProcessIdentity;
 use super::connections::Connection;
 type ProcessKey = (String, Option<u32>, Option<ProcessIdentity>);
+/// A connection's process name, before [`process_label`] fills in a missing
+/// one, with the rest of its [`ProcessKey`].
+///
+/// [`process_label`]: crate::collectors::connections::process_label
+type BorrowedKey<'a> = (Option<&'a str>, Option<u32>, Option<&'a ProcessIdentity>);
 #[derive(Clone)]
 struct CpuObservation {
     value: f64,
@@ -102,6 +107,18 @@ impl ProcessBandwidthCollector {
         let mut process_rtt: HashMap<ProcessKey, f64> = HashMap::new();
         let mut total_active: u32 = 0;
 
+        // Folded under a borrowed key first. An owned one holds the name and
+        // the identity's strings, and copying it for each row and each map
+        // took most of this pass on a 10,000-row table.
+        #[derive(Default)]
+        struct Seen {
+            conns: u32,
+            rx_rate: Option<f64>,
+            tx_rate: Option<f64>,
+            rtt_ms: Option<f64>,
+        }
+        let mut seen: HashMap<BorrowedKey, Seen> = HashMap::new();
+
         for conn in connections {
             // Skip server-side sockets (LISTEN) and fully closed sockets —
             // they have no current peer traffic by definition. Everything
@@ -113,21 +130,38 @@ impl ProcessBandwidthCollector {
             if conn.state == "LISTEN" || conn.state == "CLOSED" {
                 continue;
             }
-            let name = crate::collectors::connections::process_label(
-                conn.process_name.as_deref(),
-                conn.pid,
-            );
-            let key = (name, conn.pid, conn.evidence.process.clone());
-            *process_conns.entry(key.clone()).or_insert(0) += 1;
+            let s = seen
+                .entry((
+                    conn.process_name.as_deref(),
+                    conn.pid,
+                    conn.evidence.process.as_ref(),
+                ))
+                .or_default();
+            s.conns += 1;
             total_active += 1;
             if let Some(rx) = conn.rx_rate {
-                *process_rx_rate.entry(key.clone()).or_insert(0.0) += rx;
+                *s.rx_rate.get_or_insert(0.0) += rx;
             }
             if let Some(tx) = conn.tx_rate {
-                *process_tx_rate.entry(key.clone()).or_insert(0.0) += tx;
+                *s.tx_rate.get_or_insert(0.0) += tx;
             }
             if let Some(rtt_us) = conn.handshake_rtt_us {
                 let rtt_ms = rtt_us / 1000.0;
+                s.rtt_ms = Some(s.rtt_ms.map_or(rtt_ms, |v| v.min(rtt_ms)));
+            }
+        }
+
+        for ((name, pid, identity), s) in seen {
+            let name = crate::collectors::connections::process_label(name, pid);
+            let key = (name, pid, identity.cloned());
+            *process_conns.entry(key.clone()).or_insert(0) += s.conns;
+            if let Some(rx) = s.rx_rate {
+                *process_rx_rate.entry(key.clone()).or_insert(0.0) += rx;
+            }
+            if let Some(tx) = s.tx_rate {
+                *process_tx_rate.entry(key.clone()).or_insert(0.0) += tx;
+            }
+            if let Some(rtt_ms) = s.rtt_ms {
                 process_rtt
                     .entry(key)
                     .and_modify(|v| {
