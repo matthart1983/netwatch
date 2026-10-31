@@ -394,7 +394,7 @@ default `trace_target` is 1.1.1.1. See
 Linux alone has the filesystem backend. Windows uses Npcap and OS APIs; macOS and
 FreeBSD use libpcap/BPF and platform collectors. See
 [capability matrix](CAPABILITIES.md). Memory safety in Rust does not eliminate
-unsafe FFI, native dependencies or resource-exhaustion failures.
+unsafe FFI, native dependencies or resource-exhaustion failures. [PERFORMANCE.md](PERFORMANCE.md) gives the measured memory ceiling and behaviour under a flood, which limit resource exhaustion but don't rule it out.
 
 Unsafe Rust is allowed only in modules and items marked `allow(unsafe_code)`, and
 every unsafe block and impl has a `SAFETY:` comment.

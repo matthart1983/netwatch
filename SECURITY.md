@@ -77,7 +77,8 @@ metrics endpoint to the internet deliberately).
 See the [threat model](docs/THREAT-MODEL.md) for per-thread privileges, outbound
 traffic, unsupported boundaries and planned hardening, and [what netwatch sends
 off this machine](docs/REFERENCE.md#what-netwatch-sends-off-this-machine) for
-what leaves the host and when.
+what leaves the host and when, and [performance](docs/PERFORMANCE.md) for the
+memory ceiling and how netwatch behaves under a flood.
 
 ## Unsafe code
 
