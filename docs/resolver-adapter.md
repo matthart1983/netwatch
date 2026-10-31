@@ -5,6 +5,7 @@ The first adapter supports an explicitly administrator-confirmed unmanaged regul
 runtime, packet capture, remote publishing, model workers, or parser confinement.
 It does not widen the TUI/parser's filesystem grants. Automatic TUI/daemon edits
 and startup rollback remain disabled; both modes inspect recovery evidence.
+Resolver changes are experimental, outside the 1.0 compatibility promise.
 
 ## Commands
 
@@ -38,6 +39,10 @@ Recovery proceeds only for an owner proven gone, with the expected target identi
 and a valid original backup. Unknown ownership, changed contents or identity, and
 partial writes remain unresolved for manual review. There is no automatic keep or
 permanent-change command in this first adapter.
+
+`recover` reads this command's store and nothing else. It does not restore a change
+recorded by 0.30's [legacy journal](recovery-store.md#legacy-journal), and reports
+`Recovered 0 resolver operations` on a host that has only that.
 
 ## Ownership and supported scope
 
@@ -99,7 +104,8 @@ renaming it over the target would give the target a new inode, which verificatio
 compares and recovery refuses as a changed identity. An interrupted in-place write
 already leaves recovery-required evidence that blocks further operations until
 `recover` runs. The TUI's older file-edit and make-permanent journal helpers had
-no caller and were deleted rather than converted.
+no caller and were deleted rather than converted, and 0.40 deleted the rollback
+that went with them, which nothing had called since 0.31.1.
 
 ## Validation
 
@@ -108,9 +114,14 @@ identity/permissions preservation, held-lease exclusion, manager/symlink refusal
 external edits, inode replacement, tampered backups, partial target writes,
 completion-record failure, PID reuse/unknown namespaces, and SIGKILL after Prepared,
 target sync, Applied, and restoration. Another process must acquire the released
-lease and restore only the verified original.
+lease and restore only the verified original. A journal and backup that a real 0.31.1
+`resolver set` left when SIGKILLed must restore the original through the current session
+code, so an upgrade cannot strand one.
 
-Privileged disposable-VM/network-namespace acceptance, real system-resolver behavior
+`tests/recovery.rs` runs that record through the real `resolver recover` in a private
+root inside a user namespace. It skips where the runner has no such namespace, which
+is the default CI runner, and the sandbox lab runs it. Privileged disposable-VM
+acceptance of `set`, real system-resolver behavior
 and deployment on actual unmanaged hosts remain outstanding. No real host resolver
 was modified during implementation. Broader manager/platform adapters remain
 unavailable rather than inferred from root privileges.

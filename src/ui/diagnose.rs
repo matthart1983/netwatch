@@ -190,7 +190,7 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
         status: app
             .diagnose
             .journal
-            .blocked_reason()
+            .recovery_notice()
             .or(app.diagnose.status.as_deref()),
         demo_banner: app.diagnose.demo.as_ref().map(|d| d.banner()),
         running_tests: selected_issue(app)
@@ -2763,11 +2763,11 @@ mod tests {
     #[test]
     fn recovery_status_does_not_display_a_success_checkmark() {
         let screen = draw(150, 44, |view| {
-            view.status = Some("recovery required; host changes blocked")
+            view.status = Some("recovery required; restore by hand")
         });
         let line = screen
             .lines()
-            .find(|l| l.contains("host changes blocked"))
+            .find(|l| l.contains("restore by hand"))
             .unwrap();
         assert!(!line.contains('✓'), "{line}");
         assert!(line.contains('!'), "{line}");

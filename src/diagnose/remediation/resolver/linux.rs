@@ -639,6 +639,86 @@ mod tests {
         owner.pid_namespace = None;
         assert_eq!(owner_status(&owner, uid), OwnerStatus::Unknown);
     }
+    /// What `netwatch resolver set` from 0.31.1, the first release with this
+    /// store, left behind when SIGKILLed: its journal and backup, captured from
+    /// that binary in a private root. Only the boot ID is edited, so the test
+    /// never runs in the boot that wrote it. The target's identity and owner are
+    /// set per run below, because they name a file and a user on that host.
+    const V0_31_1_JOURNAL: &str = include_str!(
+        "../../../../tests/fixtures/recovery/v0.31.1-killed-resolver-set/journal.json"
+    );
+    const V0_31_1_ID: &str = "bd204382-3ba1-46a0-a521-79de298b097e";
+    const V0_31_1_ORIGINAL: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/recovery/v0.31.1-killed-resolver-set/bd204382-3ba1-46a0-a521-79de298b097e.backup"
+    );
+    const V0_31_1_INSTALLED: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/recovery/v0.31.1-killed-resolver-set/resolv.conf.installed"
+    );
+
+    /// A fixture root holding the 0.31.1 records in `state`, as an upgrade finds
+    /// them, with the target holding `current` and the operation in `state_name`.
+    fn upgraded_from_v0_31_1(state_name: &str, current: &[u8]) -> Fixture {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("resolv.conf");
+        std::fs::write(&target, current).unwrap();
+        let metadata = std::fs::metadata(&target).unwrap();
+        let mut journal: serde_json::Value = serde_json::from_str(V0_31_1_JOURNAL).unwrap();
+        let operation = &mut journal["operations"][0];
+        operation["state"] = state_name.into();
+        operation["owner"]["uid"] = nix::unistd::geteuid().as_raw().into();
+        operation["resource"]["target"] = target.to_str().unwrap().into();
+        operation["resource"]["device"] = metadata.dev().into();
+        operation["resource"]["inode"] = metadata.ino().into();
+        let state = fixture.0.join("state");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
+        for (name, bytes) in [
+            ("journal.json".to_owned(), journal.to_string().into_bytes()),
+            (format!("{V0_31_1_ID}.backup"), V0_31_1_ORIGINAL.to_vec()),
+        ] {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(state.join(name))
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        fixture
+    }
+
+    #[test]
+    fn records_from_v0_31_1_restore_the_resolver_after_an_upgrade() {
+        for (state, current) in [
+            ("applied", V0_31_1_INSTALLED),
+            // Killed after the target write, before Applied was recorded.
+            ("prepared", V0_31_1_INSTALLED),
+            // Killed before the target write: nothing to put back.
+            ("prepared", V0_31_1_ORIGINAL),
+            ("recovery_required", V0_31_1_INSTALLED),
+        ] {
+            let fixture = upgraded_from_v0_31_1(state, current);
+            let mut session = fixture.session().unwrap();
+            assert_eq!(session.recover().unwrap(), 1, "{state}");
+            assert_eq!(fixture.bytes(), V0_31_1_ORIGINAL, "{state}");
+            let operation = &session.store.snapshot().operations[0];
+            assert_eq!(operation.state, State::Reverted, "{state}");
+            // Once recorded, a later `recover` has nothing left to do.
+            assert_eq!(session.recover().unwrap(), 0, "{state}");
+        }
+    }
+
+    #[test]
+    fn a_v0_31_1_record_is_not_restored_over_a_later_edit() {
+        let fixture = upgraded_from_v0_31_1("applied", b"nameserver 192.0.2.99\n");
+        let mut session = fixture.session().unwrap();
+        assert!(session.recover().is_err());
+        assert_eq!(fixture.bytes(), b"nameserver 192.0.2.99\n");
+        assert!(session.store.snapshot().operations[0].state.unresolved());
+    }
+
     #[test]
     fn resolver_crash_child() {
         let Some(root) = std::env::var_os("NETWATCH_RESOLVER_TEST_ROOT") else {

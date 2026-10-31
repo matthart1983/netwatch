@@ -62,7 +62,7 @@ pub fn start(app: &mut App, kind: SessionKind, mode: sandbox::Mode) -> anyhow::R
     if kind != SessionKind::Demo && app.user_config.record_uptime {
         app.uptime = crate::uptime::Monitor::new(crate::uptime::default_dir());
     }
-    if app.diagnose.journal.blocked_reason().is_none() && kind != SessionKind::Demo {
+    if app.diagnose.journal.recovery_notice().is_none() && kind != SessionKind::Demo {
         app.diagnose
             .set_status(crate::runtime::capabilities::CapabilitySnapshot::live(app).compact());
     }

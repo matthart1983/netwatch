@@ -279,10 +279,17 @@ write: /dev/null
    compromised parser can persist a setting such as `sandbox = "off"` for the
    next start. The capture thread has no write grant
    ([write grants](../src/sandbox/linux.rs#L427),
-   [capture layer](../src/sandbox/linux.rs#L487)).
+   [capture layer](../src/sandbox/linux.rs#L487)). They can write the cache too,
+   which holds 0.30's `applied.json`, so that journal is evidence and nothing more:
+   netwatch reports the paths it names, opens neither and writes neither, even as
+   root ([recovery store](recovery-store.md#legacy-journal)).
 10. Subcommands returning before worker installation are outside this policy,
     including file-oriented operations ([dispatch](../src/main.rs#L20)). Static
     doctor is one, and opens the GeoIP databases it reports on unconfined.
+    `netwatch resolver set` and `recover` are others: as root they write
+    `/etc/resolv.conf` and `/var/lib/netwatch` unconfined, and they accept no target
+    or journal path from their arguments or a user's home
+    ([resolver adapter](resolver-adapter.md)).
 11. `netwatch geoip update` installs the policy, downloads on main, which stays
     unconfined and keeps any capability the process started with, and undoes the
     gzip, reads and writes each database on a `geoip-update` parser thread. TLS

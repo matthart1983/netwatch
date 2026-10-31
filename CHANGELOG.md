@@ -26,6 +26,26 @@ All notable changes to NetWatch will be documented in this file.
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
 
+### Changed
+- **The notice for a resolver change left by 0.30 now names the file and says how
+  to put it back.** Netwatch 0.30 recorded live resolver changes in `applied.json`.
+  Since 0.31.1 nothing has restored an entry left open there, because nothing proves
+  who wrote the file. Diagnose said `automatic rollback disabled` and gave the backup,
+  but not the changed file or the next step, and nothing said that removing the journal
+  is what clears the notice. It now says all three. The steps are in [the recovery document](docs/recovery-store.md#legacy-journal):
+  compare `/etc/resolv.conf` with the backup, copy the backup back as root, then remove
+  `applied.json`, which is what clears the notice. This only reaches someone whose 0.30
+  session was killed with a change in place. `netwatch resolver recover` still does not
+  read this journal. It restores what an interrupted `netwatch resolver set` left, and
+  tests now hold that to a journal and backup a real 0.31.1 wrote.
+
+### Removed
+- **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,
+  and the code that wrote the journal went in 0.33. That leaves netwatch reading
+  `applied.json` and never writing it or opening a path it names. The notices about
+  an unreadable journal no longer say `host changes blocked`, since no host change
+  was waiting on them. No behaviour changes beyond that wording.
+
 ## [0.39.0] - 2026-10-31
 
 ### Added
