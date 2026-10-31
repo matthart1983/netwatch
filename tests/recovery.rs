@@ -368,7 +368,12 @@ fn a_broken_stdout_changes_neither_exit_status_nor_error() {
         }
         for args in &commands {
             let good = fixture.command().args(args).output().unwrap();
-            assert_eq!(!good.stdout.is_empty(), journal || args[1] == "status");
+            // A build sandbox has no /etc/resolv.conf, so `status` can fail there.
+            assert_eq!(
+                !good.stdout.is_empty(),
+                journal || (args[1] == "status" && good.status.success()),
+                "{args:?} journal={journal}"
+            );
             for (what, stdout) in broken_stdouts() {
                 let broken = fixture
                     .command()
