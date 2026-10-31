@@ -1374,7 +1374,7 @@ mod tests {
         }
         Err(format!(
             "{id}: its scenario no longer records the pinned episode; if that is intended, \
-             run `cargo run -- diagnose corpus --only {id}` and review the diff"
+             run `cargo run -- diagnose corpus --unstable --only {id}` and review the diff"
         ))
     }
 

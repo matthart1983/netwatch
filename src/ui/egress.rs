@@ -490,7 +490,12 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.status_warn).bold(),
             ));
         }
-        if drift == 0 && undeclared == 0 && no_rule == 0 && asn_wide == 0 {
+        if let Some(unknown) = unknown_policy_keys(app) {
+            extra.push(Span::styled(
+                format!("  ·  policy: {unknown}"),
+                Style::default().fg(t.status_warn).bold(),
+            ));
+        } else if drift == 0 && undeclared == 0 && no_rule == 0 && asn_wide == 0 {
             extra.push(Span::styled(
                 "  ·  policy: all precise",
                 Style::default().fg(t.status_good),
@@ -503,6 +508,22 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     widgets::render_attribution_header(f, app, area, extra);
+}
+
+/// How many keys the policy file sets that it does not read, when there are any.
+/// This outranks "all precise": `allow_snis` for `allow_sni` is a rule that
+/// restricts no name, so a policy with a typo in it has not earned that claim.
+fn unknown_policy_keys(app: &App) -> Option<String> {
+    let count = app
+        .egress_profiler
+        .policy_warnings()
+        .iter()
+        .filter(|w| matches!(w.kind, crate::config::ConfigWarningKind::UnknownKey(_)))
+        .count();
+    (count > 0).then(|| {
+        let keys = if count == 1 { "key" } else { "keys" };
+        format!("{count} unknown {keys}")
+    })
 }
 
 /// The attention counts, shared by the header line and the panel title so
@@ -633,7 +654,12 @@ fn summary_line(app: &App, rows: &[EgressRow<'_>]) -> Line<'static> {
                 Style::default().fg(t.status_warn).bold(),
             ));
         }
-        if drift == 0 && undeclared == 0 && no_rule == 0 && asn_wide == 0 {
+        if let Some(unknown) = unknown_policy_keys(app) {
+            spans.push(Span::styled(
+                format!(" · {unknown}"),
+                Style::default().fg(t.status_warn).bold(),
+            ));
+        } else if drift == 0 && undeclared == 0 && no_rule == 0 && asn_wide == 0 {
             spans.push(Span::styled(
                 " · all precise",
                 Style::default().fg(t.status_good),
@@ -1247,6 +1273,61 @@ mod tests {
         }
     }
     use super::*;
+
+    /// The tab counts what the policy ignored, in the panel title as well because
+    /// the header row is cut off in most terminals, and neither calls the policy
+    /// precise: a rule with a typo in it can admit traffic.
+    #[test]
+    fn a_policy_with_unknown_keys_is_counted_and_not_called_precise() {
+        use crate::collectors::egress::EgressPolicy;
+        use crate::config::{ConfigWarning, ConfigWarningKind, NetwatchConfig};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let shown = |app: &App| {
+            let title: String = summary_line(app, &[])
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let mut terminal = Terminal::new(TestBackend::new(320, 8)).unwrap();
+            terminal.draw(|f| render_header(f, app, f.area())).unwrap();
+            let header: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            (title, header)
+        };
+
+        app.egress_profiler.set_policy(Some(Default::default()));
+        let (title, header) = shown(&app);
+        assert!(title.contains("all precise"), "{title}");
+        assert!(header.contains("policy: all precise"), "{header}");
+
+        let warning = ConfigWarning {
+            file: "egress-policy.toml".into(),
+            kind: ConfigWarningKind::UnknownKey("stirct".into()),
+        };
+        app.egress_profiler.set_policy(Some(EgressPolicy {
+            load_warnings: vec![warning.clone()],
+            ..Default::default()
+        }));
+        let (title, header) = shown(&app);
+        assert!(title.contains("1 unknown key"), "{title}");
+        assert!(header.contains("policy: 1 unknown key"), "{header}");
+        assert!(
+            !title.contains("precise") && !header.contains("precise"),
+            "{title} {header}"
+        );
+
+        app.egress_profiler.set_policy(Some(EgressPolicy {
+            load_warnings: vec![warning.clone(), warning],
+            ..Default::default()
+        }));
+        assert!(shown(&app).0.contains("2 unknown keys"));
+    }
 
     /// `count` is ticks-since-first-seen, i.e. seconds. Rendering it raw was
     /// the bug: `31427` reads as a request count but means 8.7 hours.

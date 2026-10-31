@@ -169,7 +169,7 @@ pub fn parse_budget(raw: &str) -> anyhow::Result<Duration> {
 /// line goes nowhere and stderr is where their caller looks.
 pub(crate) fn print_threshold_warnings(thresholds: &crate::diagnose::detectors::Thresholds) {
     for warning in thresholds.validated().1 {
-        eprintln!("warning: {warning}");
+        crate::logging::stderr_line(&format!("warning: {warning}"));
     }
 }
 
@@ -179,7 +179,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     let outcome = match parse(args).and_then(run) {
         Ok(outcome) => outcome,
         Err(e) => {
-            eprintln!("error: {e}");
+            crate::logging::stderr_line(&format!("error: {e}"));
             Outcome::Error
         }
     };
@@ -203,6 +203,8 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
     use crate::{app::App, config::NetwatchConfig, diagnose::live::LiveSampler};
 
     let config = run_config(NetwatchConfig::load()?);
+    crate::config::print_warnings(&config.load_warnings);
+    crate::config::print_warnings(&crate::collectors::egress::default_policy_warnings());
     print_threshold_warnings(&config.diagnose_thresholds);
     let mut asked = opts
         .target
@@ -293,12 +295,15 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
             &findings,
             opts.include_beta,
         );
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let json = serde_json::to_string_pretty(&report)?;
+        crate::logging::stdout_text(&format!("{json}\n"));
     } else {
-        print!(
-            "{}",
-            text_report(outcome, &sampling, &findings, opts.include_beta)
-        );
+        crate::logging::stdout_text(&text_report(
+            outcome,
+            &sampling,
+            &findings,
+            opts.include_beta,
+        ));
     }
     Ok(outcome)
 }
@@ -566,6 +571,29 @@ fn missing_line(missing: &CheckResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status is the interface, and the print macros panic on a closed pipe or
+    /// a full disk, which is exit 101. Assembled, so this test does not match itself.
+    #[test]
+    fn nothing_on_a_runs_path_prints_with_a_macro_that_panics() {
+        for (file, source) in [
+            ("run.rs", include_str!("run.rs")),
+            ("coverage.rs", include_str!("coverage.rs")),
+            ("config.rs", include_str!("../config.rs")),
+        ] {
+            let (code, _tests) = source
+                .split_once(concat!("#[cfg(", "test)]\nmod tests"))
+                .unwrap();
+            for printing in [
+                concat!("print", "ln!"),
+                concat!("print", "!("),
+                concat!("eprint", "ln!"),
+                concat!("eprint", "!("),
+            ] {
+                assert!(!code.contains(printing), "{printing} in {file}");
+            }
+        }
+    }
     use crate::diagnose::issue::Severity;
     use crate::diagnose::targets::TargetObs;
 

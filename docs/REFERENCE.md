@@ -126,8 +126,10 @@ share evidence with someone else, `netwatch diagnose export` writes a pseudonymi
 
 #### Export file format, version 1
 
-This layout is stable. Later versions may add options and comment keys; a change that removes
-or renames one, or changes its meaning, gets a new schema name.
+Classic PCAP and the PCAPNG blocks below are the standard formats, so any reader of them can open
+these files. The JSON in packet comments, `netwatch.annotation.v1`, is experimental and outside
+the 1.0 compatibility promise. Its keys can change in any release. A change that removes or
+renames one, or changes its meaning, gets a new schema name, so a parser can tell.
 
 **Classic PCAP**: little-endian, magic `0xa1b2c3d4` (microsecond timestamps), version 2.4,
 snaplen 65535, and one link type for the whole file. A selection that mixes link types can
@@ -144,7 +146,7 @@ one little-endian section, with only these blocks:
 
 A block with options ends them with `opt_endofopt`; a block without has no options list.
 
-**Packet comments.** Each comment is one JSON object in UTF-8, schema
+**Packet comments.** Experimental. Each comment is one JSON object in UTF-8, schema
 `netwatch.annotation.v1`. Wireshark shows it under *Packet comments*, and
 `tshark -r FILE -T fields -e frame.comment` prints one per line.
 
@@ -349,6 +351,12 @@ Sharp edges handled for you:
 - **Policy file trust**: a group- or world-writable `egress-policy.toml` is refused
   with a loud log warning. If anyone but the owner can edit the policy, "warn on
   drift" could be silenced by the very thing drifting. `chmod 644` or stricter.
+- **Unknown keys**: a key the policy does not read is ignored and reported, naming the
+  key and the file, on stderr when a session starts, in the log, in Settings, in the
+  Egress tab and in `netwatch doctor`, as for [`config.toml`](#configuration). It
+  matters more here. An empty list means unrestricted, so `allow_snis` for `allow_sni`
+  is a rule that restricts no name. The tab stops calling such a policy `all precise`.
+  Promoting a rule keeps such a key, as it keeps the rule's `block` table.
 
 **Structured export.** Press `e` on the Egress tab to write the attributed
 records as **NDJSON** (`netwatch.egress.v1.1`) — one JSON object per line, preceded
@@ -464,14 +472,19 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue counted. 1: at least one open issue counted. 2: no usable observation in the budget. 3: bad arguments or no session. |
 | `netwatch diagnose coverage [--json] [--seconds N] [--test ID]` | Which checks have their inputs on this host, and why the others do not. |
 | `netwatch diagnose episodes [DIR]` | List recorded incident episodes. |
-| `netwatch diagnose replay [--json] FILE\|DIR...` | Replay episodes through the engine and report any divergence. |
-| `netwatch diagnose features [--out FILE] [--schema FILE] FILE\|DIR...` | Write the feature table of recorded episodes. |
+| `netwatch diagnose replay --unstable [--json] FILE\|DIR...` | Experimental. Replay episodes through the engine and report any divergence. |
+| `netwatch diagnose features --unstable [--out FILE] [--schema FILE] FILE\|DIR...` | Experimental. Write the feature table of recorded episodes. |
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
+| `netwatch diagnose corpus --unstable [--only ID] [DIR]` | Experimental, for netwatch's developers. Regenerate the pinned test corpus. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
-| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. Experimental. `recover` undoes an interrupted `set`, and exits 0 when none is left unresolved, 1 otherwise. A change from 0.30 is [restored by hand](recovery-store.md#legacy-journal): `status` and `recover` print a notice naming it, and it does not affect the exit status. |
-| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
+| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. `set` and `recover` are experimental. `recover` undoes an interrupted `set`, and exits 0 when none is left unresolved, 1 otherwise. A change from 0.30 is [restored by hand](recovery-store.md#legacy-journal): `status` and `recover` print a notice naming it, and it does not affect the exit status. |
+| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. To a file that exists it adds only the keys the file lacks, and keeps what is there; delete the file first for a clean one. Refuses to touch a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
+
+`diagnose replay`, `features` and `corpus` read and write episode, feature and corpus formats
+that can change in any release, so each needs `--unstable`. Without it, the command prints an
+error naming the flag and exits 3, the status `diagnose run` documents for bad arguments.
 
 TUI flags:
 
@@ -480,9 +493,9 @@ TUI flags:
 | `--view full\|lite\|dense`, `--lite` | Start in that view. |
 | `--demo` | Replay a recorded Diagnose incident instead of watching this host. |
 | `--no-sandbox`, `--sandbox-strict` | Turn the Linux sandbox off, or refuse to start unless it is enforced. |
-| `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Experimental. |
-| `--insecure-remote` | Allow an `http://` remote URL. |
-| `--api-key KEY` | Discouraged: the key shows in the process list. Use `NETWATCH_API_KEY`. |
+| `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Accepted through 1.x; what it does is experimental. |
+| `--insecure-remote` | Allow an `http://` remote URL. Accepted through 1.x; experimental, with `--remote`. |
+| `--api-key KEY` | Deprecated: the key shows in the process list. Use `NETWATCH_API_KEY`. Accepted through 1.x, with a warning that does not include the key, and goes in 2.0. What it does is experimental, with `--remote`. |
 | `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
 
 ### Uptime report
@@ -977,8 +990,8 @@ The selection, highlighted rows and filled bars show in reverse video instead.
 | Variable | Effect |
 |----------|--------|
 | `NO_COLOR` | Any non-empty value: draw the TUI without colour ([no-color.org](https://no-color.org)). |
-| `NETWATCH_API_KEY` | API key for `--remote`. Preferred over `--api-key`, which leaves the key in the process list and shell history. |
-| `NETWATCH_REMOTE_URL` | Remote backend URL, when `--remote` is not given. |
+| `NETWATCH_API_KEY` | API key for `--remote`. Preferred over `--api-key`, which leaves the key in the process list and shell history. Accepted through 1.x; what it does is experimental. |
+| `NETWATCH_REMOTE_URL` | Remote backend URL, when `--remote` is not given. Accepted through 1.x; what it does is experimental. |
 | `NETWATCH_METRICS_ADDR` | Address for the daemon's metrics endpoint, when `--metrics-addr` is not given. |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase) | Diagnose records whether a proxy applies to each configured target, and weighs it as evidence: an untrusted certificate behind a proxy points at interception. |
 
@@ -1025,7 +1038,8 @@ exist until you write one.
 Two ways to write it. From the shell:
 
 ```bash
-netwatch --generate-config    # writes every key at its default value, then exits
+netwatch --generate-config    # writes every key at its default value, then exits. To a
+                              # file that exists, adds only the keys it lacks
 ```
 
 Or live in the TUI: `,` opens Settings, `↑`/`↓` moves, `←`/`→` cycles the enum-valued rows
@@ -1034,12 +1048,50 @@ the free-text ones, `S` saves. Most changes apply the moment you make them — `
 exception, because Landlock and dropped capabilities can't be undone inside a running
 process, so it takes effect on the next launch.
 
-Both leave out the `[diagnose_thresholds]` table while it holds its defaults, so a later
-release can retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
+Neither writes the `[diagnose_thresholds]` table unless you changed it, so a later release can
+retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
 
 A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
 out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
 to start.
+
+A key netwatch does not read is ignored and reported, because otherwise a typo such as
+`sandbox_mode = "strict"` would do nothing without a word. netwatch still starts. `netwatch`
+and `netwatch daemon` print `warning: <file>: unknown key <key> is ignored` on stderr before
+they start, at any depth (`alerts.typo`, `diagnose_targets.0.typo`), and write it to the log.
+The TUI hides stderr until it quits, so it also shows the warning on its bottom row for its
+first 30 seconds, in every view, and Settings keeps the list. `diagnose run`,
+`diagnose coverage` and `geoip update` print the same line on stderr. `netwatch doctor` reports
+`config` as `degraded`, reason `config_unknown_keys`. None of these prints the key's value.
+
+A key that gets renamed keeps working until 2.0. netwatch reads the old name as the new one and
+warns `<old> was renamed <new> in <release>` in the same places. `netwatch doctor` leaves `config`
+`ready`, with reason `config_renamed_keys`. If the file sets both names, the new one wins. A save
+writes the new name. No key has been renamed so far. `geoip_online` below was removed.
+
+The `[experimental]` table is for settings that can still change, and is outside the 1.0
+compatibility promise. A key in it can change meaning or go away in any release. Nothing is in
+it yet. A key in it this version does not read is expected rather than a mistake, so it does not
+warn as unknown. stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
+`ready`, Settings lists it, and the TUI's bottom row says nothing. A save keeps the table.
+
+A save writes only what the session changed, compared with what it loaded. Settings' `S` and the
+Diagnose tab's `d` change those keys in the file, and a target is found by its `name`, wherever
+it now sits. Everything else stays as the file has it: a key you edited by hand while netwatch
+ran, a value the session clamped or fell back from, a key netwatch does not read, a table at its
+defaults, comments, and any default you never set, which a later release can still change. If you
+and the session changed the same key, the session's value wins for that key alone. `d` on a target
+the file no longer has fails and leaves the file; press `r` to reload. `--view` is for one run, and
+a save does not write it. With nothing to write, the file is not touched.
+
+A save that does write keeps the old file until the new one is complete and synced, so a full
+disk leaves the settings you had, and keeps the file's mode and any symlink to it. It drops a
+byte-order mark and ends every line in LF. Removing `geoip_online` also removes a comment directly
+above it.
+
+`--generate-config` is the one thing that writes defaults. A new file gets every key. A file that
+exists gains the keys it lacks, and keeps every value and comment it has. It leaves out
+`diagnose_targets` while there are none, so you can append `[[diagnose_targets]]` to the file.
 
 A file netwatch cannot read or parse is different. If the TOML is broken, or a key has a value
 of the wrong type (`refresh_rate_ms = "fast"`), `netwatch` and `netwatch daemon` print the
@@ -1150,6 +1202,8 @@ port_scan_window_secs = 30          # detection window
 
 ### AI Insights
 
+Experimental, like the feature. These three can change in any release.
+
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `insights_enabled` | `false` | `true` `false` | Adds an AI narrative block to the Diagnose tab. Opt-in — see [AI Insights](#ai-insights). |
@@ -1159,6 +1213,9 @@ port_scan_window_secs = 30          # detection window
 ---
 
 ## AI Insights
+
+Experimental. This can change or go away in any release, and is outside the 1.0 compatibility
+promise.
 
 Insights is opt-in commentary inside **Diagnose (`9`)**, below the findings.
 It sends a network snapshot to the configured Ollama-compatible `/api/chat`

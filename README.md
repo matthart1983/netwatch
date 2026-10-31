@@ -97,7 +97,7 @@ netwatch geoip update                    # download the offline GeoIP databases
 netwatch --demo                          # replay a recorded Diagnose incident, no capture needed
 ```
 
-`daemon` runs the same collectors with no screen; a [systemd unit](packaging/systemd/netwatch.service) and a [launchd agent](packaging/launchd/com.netwatch.agent.plist) ship with it, and [Prometheus export](docs/observability-export.md) lists the metrics. `--remote URL` with `NETWATCH_API_KEY` streams snapshots to a backend you run; it is experimental and its wire format may change. [Every command and flag](docs/REFERENCE.md#command-line).
+`daemon` runs the same collectors with no screen; a [systemd unit](packaging/systemd/netwatch.service) and a [launchd agent](packaging/launchd/com.netwatch.agent.plist) ship with it, and [Prometheus export](docs/observability-export.md) lists the metrics. `--remote URL` with `NETWATCH_API_KEY` streams snapshots to a backend you run. Both stay accepted through 1.x, and what they do is experimental: the wire format may change. So are AI Insights, `netwatch resolver set` and `recover`, and the JSON in PCAPNG packet comments: [what that covers](docs/CAPABILITIES.md#experimental). [Every command and flag](docs/REFERENCE.md#command-line).
 
 ## The tabs
 
@@ -142,7 +142,7 @@ netwatch --demo                          # replay a recorded Diagnose incident, 
 | [Doctor command](docs/doctor.md) | Read-only setup report, JSON capabilities and optional capture check |
 | [Design 0.30](docs/DESIGN-0.30.md) | Why the screens look the way they do |
 | [Architecture](docs/WIKI.md) | Runtime, source map, permissions model, how to build and verify |
-| [AI Insights](docs/INSIGHTS.md) | Optional LLM commentary inside Diagnose, off by default |
+| [AI Insights](docs/INSIGHTS.md) | Optional LLM commentary inside Diagnose, off by default. Experimental |
 | [Prometheus export](docs/observability-export.md) | Exposed metrics and scrape config |
 | [Packaging](docs/PACKAGING.md) | Every channel, and what updates it |
 | [Changelog](CHANGELOG.md) | Every release |

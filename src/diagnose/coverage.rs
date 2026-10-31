@@ -278,7 +278,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
                     .cloned()
                     .unwrap_or_else(|| "docs/diagnostic-coverage.md".to_string());
                 std::fs::write(&path, super::rules::coverage_markdown())?;
-                println!("wrote {path}");
+                crate::logging::stdout_text(&format!("wrote {path}\n"));
                 return Ok(());
             }
             "--json" => json = true,
@@ -312,6 +312,8 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         diagnose_record_episodes: false,
         ..NetwatchConfig::load()?
     };
+    crate::config::print_warnings(&config.load_warnings);
+    crate::config::print_warnings(&crate::collectors::egress::default_policy_warnings());
     super::run::print_threshold_warnings(&config.diagnose_thresholds);
     if let Some(rule) = &test {
         // The platform first, as Runner::start checks it: asking for a
@@ -337,7 +339,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     let mut sampler = LiveSampler::new();
     let mut samples = 0usize;
     if let Some(rule) = &test {
-        eprintln!("Running {rule}: three direct endpoint rounds. IPv6: up to 24 TCP connects; portal: up to 12 GETs; PMTU: six DF pings and up to six 64 KiB downloads. No redirects or host configuration changes.");
+        crate::logging::stderr_line(&format!("Running {rule}: three direct endpoint rounds. IPv6: up to 24 TCP connects; portal: up to 12 GETs; PMTU: six DF pings and up to six 64 KiB downloads. No redirects or host configuration changes."));
         app.diagnose
             .active_prober
             .start(rule, &app.user_config.diagnose_probes)
@@ -405,25 +407,27 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         "actions": coverage.rules.iter().map(|r| (&r.rule, r.next_action())).collect::<std::collections::BTreeMap<_, _>>()
     });
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let json = serde_json::to_string_pretty(&report)?;
+        crate::logging::stdout_text(&format!("{json}\n"));
     } else {
-        println!(
-            "Netwatch {} · live · {} · {:.1}s sample window",
+        let mut text = format!(
+            "Netwatch {} · live · {} · {:.1}s sample window\n{}\n",
             env!("CARGO_PKG_VERSION"),
             app.capture_interface,
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            coverage.label()
         );
-        println!("{}", coverage.label());
         for row in &coverage.rules {
-            println!(
-                "{} [{}]\n  {}\n  Next: {}",
+            text.push_str(&format!(
+                "{} [{}]\n  {}\n  Next: {}\n",
                 row.rule,
                 row.status.label(),
                 row.reason,
                 row.next_action()
-            );
+            ));
         }
-        println!("Bounded snapshot; existing baselines were read without learning or writing. Missing probes may still be running.");
+        text.push_str("Bounded snapshot; existing baselines were read without learning or writing. Missing probes may still be running.\n");
+        crate::logging::stdout_text(&text);
     }
     Ok(())
 }

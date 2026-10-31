@@ -18,20 +18,39 @@ establish macOS or Windows runtime parity.
 | Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required | Base-system libpcap/BPF; `/dev/bpf` access required |
 | Capture authority | File capabilities on a binary restricted to a group, the systemd unit, or root. With the sandbox on, the daemon and Diagnose CLI drop `CAP_NET_RAW` from every thread once capture opens, and so does strict mode; the open descriptor keeps its access | No capability model; `/dev/bpf` access is checked at `open()`, and an open descriptor keeps its access | Npcap's install options decide who can capture; no capability model | No capability model; `/dev/bpf` access is checked at `open()`, and an open descriptor keeps its access |
 | Process attribution | Verified procfs socket ownership; eBPF hints require corroboration; the SDK reader inherits filesystem policy but retains load capabilities | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified polling of the kernel socket tables through IP Helper; names from a process snapshot | Unverified `sockstat` observations; executable via `KERN_PROC_PATHNAME` |
-| Process in PCAPNG packet comments | When two verified owner checks bracket the packet | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified |
+| Process in PCAPNG packet comments (experimental format) | When two verified owner checks bracket the packet | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified | Always `unknown_owner`: identity unverified |
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows | Not implemented; collector returns no flows |
 | Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules | Shared detectors; absent TCP metrics limit socket rules |
 | Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend | No backend (no Capsicum) |
 | Network policy per thread | Parser and capture threads denied TCP bind and connect from Linux 6.7; capture, keylog and metrics threads also lose socket(2) on x86_64, aarch64 and armv5te; main and network workers unrestricted | None | None | None |
 | Strict sandbox startup | Rejects preflight/required entry failures; raw capture reopening may fail | Rejected: no backend | Rejected: no backend | Rejected: no backend |
-| Resolver changes | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable | Unavailable |
-| AI commentary | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
+| Resolver changes (experimental) | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable | Unavailable |
+| AI commentary (experimental) | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
 
 See [attribution evidence and controlled results](attribution.md) for exact
 coverage denominators and pending platform acceptance. Attribution may be unknown or stale. Polling can miss short-lived connections;
 backend identity and visibility are constrained by permissions and the observed
 network scope. An `ebpf` build or granted capability alone does not prove that the
 kernel accepted a program or that every flow was attributed.
+
+## Experimental
+
+These can change or go away in any release, and are outside the 1.0 compatibility promise:
+
+- AI Insights.
+- What `--remote`, `--insecure-remote` and `--api-key` do, and the snapshots they send. The flags
+  and `NETWATCH_REMOTE_URL` and `NETWATCH_API_KEY` stay accepted through 1.x, so a unit file keeps
+  starting. `--api-key` goes in 2.0.
+- Resolver changes: `netwatch resolver set` and `recover`.
+- The JSON in PCAPNG packet comments, `netwatch.annotation.v1`. The PCAPNG file itself is the
+  standard format.
+- The episode, feature and corpus formats behind `diagnose replay`, `features` and `corpus`,
+  which need `--unstable`.
+- Anything in the `[experimental]` table of `config.toml`.
+
+Only `diagnose replay`, `features` and `corpus` are gated. The rest are opt-in already, and a gate
+would break setups that work today. Rules marked beta are separate, and show their marker wherever
+a rule does.
 
 ## Platform tiers (draft for 1.0)
 
@@ -54,7 +73,7 @@ interface saturation lacks link capacity in the live adapter. Empty findings do
 not establish host health. Baseline readiness is sample-based, not a guaranteed
 30-minute elapsed window.
 
-The [Linux resolver authority command](resolver-adapter.md) supports temporary
+The experimental [Linux resolver authority command](resolver-adapter.md) supports temporary
 changes to an explicitly confirmed unmanaged regular file. Managed resolvers and
 other platforms remain unsupported; automatic TUI/daemon edits stay disabled.
 Manual guidance and simulated demo remediation remain. TUI and daemon
@@ -97,7 +116,7 @@ Packets (`4`), Stats (`5`), Topology (`6`), Timeline (`7`), Processes (`8`), Dia
 (`9`) and Egress (`0`). Insights is commentary within Diagnose, not another tab.
 The config value `default_tab = "insights"` is a legacy alias for Diagnose.
 
-AI is off by default. Enabling it sends packet-derived summaries and network
+AI is experimental and off by default. Enabling it sends packet-derived summaries and network
 metadata to the configured endpoint. Commentary is not validated against findings;
 a localhost endpoint does not guarantee local-only inference. See
 [AI Insights](INSIGHTS.md) for the data sent, timing and shutdown limitations.

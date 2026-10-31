@@ -3,12 +3,12 @@
 # every_corpus_entry_replays_to_its_pinned_decisions checks each one.
 #
 #   kind = "synthetic"  built by a scenario in src/diagnose/fixture.rs;
-#                       `netwatch diagnose corpus` rebuilds its frames
+#                       `netwatch diagnose corpus --unstable` rebuilds its frames
 #   kind = "lab"        recorded by tests/diagnose/health_lab.py; its frames
 #                       are kept and only its decisions are re-derived
 #
 # Regenerate after an intended change in what the engine concludes:
-#   cargo run -- diagnose corpus [--only ID]
+#   cargo run -- diagnose corpus --unstable [--only ID]
 
 [[episode]]
 id = "fixture-scenario"

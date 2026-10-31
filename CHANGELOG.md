@@ -21,6 +21,83 @@ All notable changes to NetWatch will be documented in this file.
   field does not change its tag, and only a break does.
   `uptime --csv` needs no version marker: its header row is the contract, so
   columns are not renamed or removed, and new ones are added at the end.
+- **A key netwatch does not read now warns, naming the key and the file.** serde
+  ignored them without a word. `sandbox_mode = "strict"` left the sandbox best-effort
+  with nothing to say the setting had no effect, and `allow_snis = [...]` in
+  `egress-policy.toml` left a rule with no restriction by name, because an empty list
+  means unrestricted. Both files now report such keys at any depth, such as
+  `alerts.typo` or `process.curl.allow_snis`, and never the value. netwatch still
+  starts. A session prints `warning: <file>: unknown key <key> is ignored` on stderr
+  before it starts and writes it to the log. A service manager keeps that line, and
+  the terminal shows it again when the TUI quits. The TUI also says so on its bottom
+  row for its first 30 seconds, in every view, and Settings keeps the list. The Egress
+  tab counts the policy's, and stops calling the policy `all precise`. `diagnose run`,
+  `diagnose coverage` and `geoip update` print the same line on stderr. `doctor`
+  reports `config` as `degraded`, reason `config_unknown_keys`, which is additive in
+  its JSON. This adds the serde_ignored crate, which reports what the deserializer
+  skipped. A list of known keys kept by hand would drift from the structs.
+- **A key in `config.toml` or `egress-policy.toml` that gets renamed keeps working,
+  with a warning.** Nothing has been renamed so far, so this changes nothing today.
+  The one key to go, `geoip_online`, was removed, and `auto_close_secs` was a field of
+  recorded episodes and never a config key. After 1.0 a rename is one line in a table.
+  netwatch reads the old name as the new one, warns `<old> was renamed <new> in
+  <release>` wherever an unknown key warns, and a save writes the new name. If a file
+  sets both, the new name wins and the warning says the old one is ignored. `doctor`
+  keeps `config` `ready` for a renamed key, with reason `config_renamed_keys`, because
+  the setting is still in force.
+- **An `[experimental]` table in `config.toml`, for settings that can still change.**
+  A key in it is outside the 1.0 compatibility promise and can change or go away in any
+  release. Nothing is in it yet, so it has no settings and this is only the place for
+  them. A key in it this version does not read does not warn as unknown. It gets a
+  `note:` line on stderr, `doctor` lists it and leaves `config` `ready`, Settings lists
+  it, and the TUI's bottom row says nothing. A save keeps the table, and
+  `--generate-config` does not write an empty one.
+
+### Changed
+- **`diagnose replay`, `diagnose features` and `diagnose corpus` now need
+  `--unstable`.** They read and write the episode, feature and corpus formats, which
+  are experimental and can change in any release, and nothing said so to someone
+  scripting against them. Without the flag each prints an error naming it and exits 3,
+  the status `diagnose run` documents for bad arguments, before reading or writing
+  anything. With it they behave as before, including exit 1 for their other errors.
+  `--unstable` gates only these three. `diagnose run`, `coverage`, `episodes` and
+  `export` are unchanged, as are AI Insights, `--remote` and the resolver commands,
+  which are opt-in already.
+- **`--api-key` prints a deprecation warning.** It has been discouraged because any
+  user on the host can read the key with `ps`. It now says so on stderr and in the log,
+  and points at `NETWATCH_API_KEY`. It stays accepted through 1.x and goes in 2.0, and the
+  warning does not include the key.
+- **AI Insights, `--remote`, `--api-key`, `resolver set` and `recover`, and the JSON in
+  PCAPNG packet comments are labelled experimental.** They can change in any release, and
+  are outside the 1.0 compatibility promise. `--remote`, `--insecure-remote`, `--api-key`
+  and their environment variables stay accepted through 1.x, so a unit file keeps
+  starting, and what they do is experimental. Nothing about how these work changes, and
+  none is gated. `--help`, the man page, docs/REFERENCE.md,
+  docs/CAPABILITIES.md and the README now say so, and Settings says so under the AI
+  rows while one is selected. The running UI has no other new label. REFERENCE used to
+  call the whole export layout stable. PCAP and PCAPNG are still the standard formats,
+  and `netwatch.annotation.v1` still gets a new schema name if a key is removed, renamed
+  or changes meaning, but the comments' keys no longer carry a compatibility promise.
+
+### Migration
+- **Add `--unstable` to `diagnose replay`, `diagnose features` and `diagnose corpus`.**
+  `netwatch diagnose replay FILE` becomes `netwatch diagnose replay --unstable FILE`,
+  and likewise `features` and `corpus`. A script that does not gets exit 3. The flag
+  goes after the subcommand, in any position among its arguments.
+- **Move `--api-key KEY` to `NETWATCH_API_KEY=KEY`.** Nothing stops working, but the
+  flag now warns on stderr, so a wrapper that treats stderr output as failure sees it.
+  The units in `packaging/` already use the variable.
+- **Delete `config.toml` before `--generate-config` if you want to start again.** It used
+  to overwrite the file with the defaults. It now adds the keys the file lacks and keeps
+  what it has, so it no longer resets anything.
+- **Delete `diagnose_targets = []` from a generated file before adding a target.** Older
+  releases wrote that line, and TOML does not allow it and `[[diagnose_targets]]` together.
+- **Fix or remove any key netwatch now warns about.** The setting never did anything. A
+  wrapper that treats stderr output as failure will see the warning.
+- **If you parse the JSON in PCAPNG packet comments, check `schema`.** REFERENCE used to
+  promise this layout as stable, and `netwatch.annotation.v1` is now experimental. Its
+  keys can change in any release, and a key removed, renamed or changing meaning still
+  gets a new schema name.
 
 ### Fixed
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
@@ -141,6 +218,50 @@ All notable changes to NetWatch will be documented in this file.
   said `"tls"`, and keeps its name in `sni`.
 - **`doctor --json` consumers: test `interface` for null, not for an empty string.**
   A capture check that selected no interface wrote `""` and now writes `null`.
+- **A save writes only what the session changed.** Settings and the Diagnose target
+  toggle rewrote the whole file from the session's copy. A key netwatch does not read
+  went, with the warning about it and every comment in the file. So did a hand edit made
+  while netwatch ran, which is how `sandbox = "strict"` could go back to `on` when a
+  session saved a theme. `refresh_rate_ms = 50` became 100 and `view = "future_view"`
+  became `full` on an unrelated save. Every save also wrote every default, growing a
+  one-line file to 49 lines and holding today's defaults there when a release changed
+  one. Now a save compares the session's values with what it loaded and changes those
+  keys in the file, keeping the line's comment. Everything else stays as the file has it.
+  If you and the session changed the same key, the session's value wins for that key
+  alone. A target is found by `name`, so entries reordered by hand keep their own
+  comments and keys, a target added by hand survives, and `d` changes only that target's
+  `enabled`. `d` on a target the file no longer has fails and leaves the file. `--view`
+  is for one run, and a save no longer makes it the default. With nothing to write, the
+  file is not touched. A save that does write drops a byte-order mark and ends every line
+  in LF. Removing `geoip_online` also removes a comment directly above it. If the result
+  would not read back as the file plus those changes, the save fails and the file stays.
+- **A save that cannot finish keeps the old file.** `config.toml` and `egress-policy.toml`
+  were truncated and then written, so a full disk could leave half a file. A config cut
+  off at `view = "ful` then stopped netwatch starting, and a lost policy silences every
+  rule. The new contents now go to a temporary file beside the old one, are synced and are
+  renamed over it. The file keeps its mode, a symlink stays and its target is what changes,
+  and a file you made read-only stays refused. Where a rename cannot work, in a directory
+  you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
+  place, as before. The learned egress baseline is written the same way.
+- **A warning that cannot be printed no longer changes how `diagnose run` ends.** With
+  stderr on a full disk or a closed pipe, printing panicked, so `diagnose run --format json`
+  exited 101 with no report, which is not one of its statuses. A failed write to stderr or
+  to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
+  the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
+- **A failed save in Settings stays on screen.** Its status was the last row of the
+  popup's list, so a short terminal cut it off, and with eight unknown keys at 120 columns
+  it needed 44 rows. It now has a row of its own above the footer, at any height the popup
+  opens at, and `✗ Save failed` is in the error colour, not the success one.
+- **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
+  thing that writes defaults. A new file gets every key. A file that exists gains the
+  keys it lacks and keeps what it has, values included. It no longer writes
+  `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
+  append a TOML error, so the file then failed to load with `config_invalid`.
+- **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
+  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key in the
+  rule was lost, with the comments in it and directly above it, and for the file's first
+  rule, the file's header. They all stay now. A list that gains an entry is rewritten on one
+  line, so a comment inside that list goes, and its line's own comment stays.
 
 ## [0.39.0] - 2026-10-31
 

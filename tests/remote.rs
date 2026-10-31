@@ -9,6 +9,49 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+/// `--api-key` warns and keeps working, and the warning does not hold the key.
+/// An http:// URL stops the session right after, so this needs no backend.
+#[test]
+fn api_key_flag_warns_without_printing_the_key() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["--remote", "http://192.0.2.1", "--api-key", "key-sentinel"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.contains("--api-key is deprecated"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("NETWATCH_API_KEY"), "{stderr}");
+    assert!(
+        stderr.contains("cleartext"),
+        "it reached the URL check: {stderr}"
+    );
+    assert!(!stderr.contains("key-sentinel"), "{stderr}");
+    assert!(!String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("key-sentinel"));
+
+    // The environment variable is what it points at, so that says nothing.
+    let output = fixture
+        .command()
+        .args(["--remote", "http://192.0.2.1"])
+        .env("NETWATCH_API_KEY", "key-sentinel")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(!stderr.contains("deprecated"), "{stderr}");
+    assert!(!stderr.contains("key-sentinel"), "{stderr}");
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
