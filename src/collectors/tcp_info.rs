@@ -94,13 +94,34 @@ pub fn endpoint(ip: std::net::IpAddr, port: u16) -> String {
     format!("{}:{}", ip.to_canonical(), port)
 }
 
+/// Where an endpoint names the device its socket is bound to, `%` included.
+/// `ss` prints it after the address (`[fe80::1]%eth0:443`, `192.0.2.1%eth0:443`)
+/// and others inside the brackets (`[fe80::1%eth0]:443`). A device name cannot
+/// hold a colon, so the next colon or bracket ends it.
+fn scope_range(s: &str) -> Option<std::ops::Range<usize>> {
+    let start = s.find('%')?;
+    let name = &s[start + 1..];
+    let len = name.find([':', ']']).unwrap_or(name.len());
+    Some(start..start + 1 + len)
+}
+
+/// The device named in an endpoint, if one is.
+pub(crate) fn endpoint_scope(s: &str) -> Option<&str> {
+    scope_range(s).map(|range| &s[range.start + 1..range.end])
+}
+
 /// Canonicalise an endpoint the UI already rendered as a string.
 ///
+/// A kernel flow names no device, so the spelling has none. See
+/// `diagnose::live::scope_collisions` for the rows that would then merge.
 /// Unparseable input is passed through trimmed rather than dropped: a key that
 /// can't be canonicalised still matches itself.
 pub fn normalize_endpoint(s: &str) -> String {
     fn trim(h: &str) -> &str {
         h.trim_start_matches('[').trim_end_matches(']')
+    }
+    if let Some(scope) = scope_range(s) {
+        return normalize_endpoint(&format!("{}{}", &s[..scope.start], &s[scope.end..]));
     }
     let (host, port) = if let Some(i) = s.rfind("]:") {
         (trim(&s[..i]), &s[i + 2..])
@@ -951,6 +972,30 @@ mod tests {
             normalize_endpoint("[::ffff:1.2.3.4]:443"),
             normalize_endpoint("1.2.3.4:443")
         );
+        // A socket bound to a device, however it is written: the flow has no
+        // device to match.
+        assert_eq!(
+            normalize_endpoint("[fe80::10]%eth0:50001"),
+            "fe80::10:50001"
+        );
+        assert_eq!(
+            normalize_endpoint("[fe80::20%eth0]:50002"),
+            "fe80::20:50002"
+        );
+        assert_eq!(normalize_endpoint("fe80::30%en0]:50003"), "fe80::30:50003");
+        assert_eq!(
+            normalize_endpoint("192.0.2.10%eth0:50000"),
+            "192.0.2.10:50000"
+        );
+        assert_eq!(normalize_endpoint("[fe80::40%12]:50004"), "fe80::40:50004");
+        assert_eq!(normalize_endpoint("127.0.0.53%lo:53"), "127.0.0.53:53");
+        assert_eq!(
+            endpoint_scope("[fe80::10]%wlp192s0:50001"),
+            Some("wlp192s0")
+        );
+        assert_eq!(endpoint_scope("[fe80::20%eth0]:50002"), Some("eth0"));
+        assert_eq!(endpoint_scope("192.0.2.10%eth0:50000"), Some("eth0"));
+        assert_eq!(endpoint_scope("[fe80::10]:50001"), None);
         // Unparseable input still matches itself rather than vanishing.
         assert_eq!(normalize_endpoint("weird"), "weird");
     }

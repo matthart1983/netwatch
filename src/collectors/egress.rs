@@ -13,6 +13,7 @@
 //! ClientHello, so meaningful profiles form on the vast majority of traffic
 //! with no decryption and no keylog.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -377,14 +378,14 @@ impl EgressProfiler {
             if process.is_empty() {
                 continue;
             }
-            let (Some(ip), Some(port_str)) = crate::app::parse_addr_parts(&conn.remote_addr) else {
+            let (Some(ip), Some(port_str)) = crate::app::addr_parts(&conn.remote_addr) else {
                 continue;
             };
-            // Belt and braces with `parse_addr_parts`, which no longer yields
-            // an empty host — but `is_private_ip("")` is false, so an empty IP
+            // Belt and braces with `addr_parts`, which no longer yields an
+            // empty host — but `is_private_ip("")` is false, so an empty IP
             // would otherwise clear every guard here and be recorded as a real
             // destination with no name and no address.
-            if ip.is_empty() || is_private_ip(&ip) {
+            if ip.is_empty() || is_private_ip(ip) {
                 continue;
             }
             let Ok(port) = port_str.parse::<u16>() else {
@@ -393,7 +394,7 @@ impl EgressProfiler {
 
             let sni = dest_hostname(&conn.app_protocol);
             let ech = flow_ech(&conn.app_protocol);
-            let asn_org = geo.lookup(&ip).map(|g| g.org).filter(|o| !o.is_empty());
+            let asn_org = geo.lookup(ip).map(|g| g.org).filter(|o| !o.is_empty());
             // Rates are present only while packet capture is running, so
             // without it these stay zero and the UI shows "—" rather than a
             // confident 0 B.
@@ -401,7 +402,7 @@ impl EgressProfiler {
             let inb = (conn.rx_rate.unwrap_or(0.0) * elapsed).max(0.0) as u64;
             self.record_flow(
                 process,
-                &ip,
+                ip,
                 port,
                 sni.clone(),
                 asn_org.clone(),
@@ -410,7 +411,7 @@ impl EgressProfiler {
                 out,
                 inb,
             );
-            self.check_policy(process, &ip, port, &sni, &asn_org, ech, now);
+            self.check_policy(process, ip, port, &sni, &asn_org, ech, now);
         }
         self.evict_processes_if_needed();
         // Drop expired cooldown entries so the map stays bounded.
@@ -437,6 +438,9 @@ impl EgressProfiler {
         ech: bool,
         now: Instant,
     ) {
+        if self.policy.is_none() {
+            return;
+        }
         // A policy may be authored against either spelling of a truncated
         // name — the user promoted whichever one the baseline held. Try the
         // observed name first, then its canonical form, so a flow attributed
@@ -452,7 +456,7 @@ impl EgressProfiler {
         let rule = policy
             .process
             .get(process)
-            .or_else(|| policy.process.get(canonical.as_str()));
+            .or_else(|| policy.process.get(canonical.as_ref()));
         let blocked = policy.blocked(rule, sni.as_deref(), asn_org.as_deref(), ip, port);
         let is_blocked = blocked.is_some();
         let mut reason = match (blocked, rule) {
@@ -631,7 +635,7 @@ impl EgressProfiler {
         let rule = policy
             .process
             .get(process)
-            .or_else(|| policy.process.get(canonical.as_str()));
+            .or_else(|| policy.process.get(canonical.as_ref()));
         if let Some(reason) = policy.blocked(
             rule,
             dest.sni.as_deref(),
@@ -781,9 +785,9 @@ impl EgressProfiler {
     /// ambiguous (`Google Chrome Helper` vs `Google Chrome Helper (GPU)` both
     /// truncate to `Google Chrome He`). Pick the shortest match so the choice
     /// is deterministic across runs rather than HashMap-order dependent.
-    fn canonical_process(&self, process: &str) -> String {
+    fn canonical_process<'a>(&self, process: &'a str) -> Cow<'a, str> {
         if process.len() != COMM_TRUNCATE_LEN {
-            return process.to_string();
+            return Cow::Borrowed(process);
         }
         self.profiles
             .keys()
@@ -793,8 +797,7 @@ impl EgressProfiler {
                     .cmp(&b.len())
                     .then_with(|| a.as_str().cmp(b.as_str()))
             })
-            .cloned()
-            .unwrap_or_else(|| process.to_string())
+            .map_or(Cow::Borrowed(process), |full| Cow::Owned(full.clone()))
     }
 
     /// Fold an existing truncated profile into `full` when the untruncated
@@ -807,11 +810,15 @@ impl EgressProfiler {
             return;
         }
         let truncated = match full.get(..COMM_TRUNCATE_LEN) {
-            Some(t) => t.to_string(),
+            Some(t) => t,
             // Not a char boundary — a multi-byte name the kernel would have
             // cut mid-character. Leave it alone rather than guess.
             None => return,
         };
+        // Nothing to fold, which is nearly every call: this runs per row.
+        if !self.profiles.contains_key(truncated) {
+            return;
+        }
         // Only fold when `full` is the name the truncation most plausibly
         // belongs to. Ambiguity is resolved the same way as
         // `canonical_process`: shortest candidate wins, ties broken
@@ -822,13 +829,13 @@ impl EgressProfiler {
             .profiles
             .keys()
             .map(String::as_str)
-            .filter(|k| k.len() > COMM_TRUNCATE_LEN && k.starts_with(&truncated))
+            .filter(|k| k.len() > COMM_TRUNCATE_LEN && k.starts_with(truncated))
             .chain(std::iter::once(full))
             .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         if shortest_claimant != Some(full) {
             return;
         }
-        let Some(old) = self.profiles.remove(&truncated) else {
+        let Some(old) = self.profiles.remove(truncated) else {
             return;
         };
         let target = self
@@ -868,7 +875,7 @@ impl EgressProfiler {
         }
         // Violation tallies follow the profile, or the counter resets to zero
         // the moment the two spellings merge.
-        if let Some(n) = self.violation_totals.remove(&truncated) {
+        if let Some(n) = self.violation_totals.remove(truncated) {
             *self.violation_totals.entry(full.to_string()).or_insert(0) += n;
         }
     }
@@ -891,16 +898,19 @@ impl EgressProfiler {
         // onto one key, in whichever order they arrive.
         self.absorb_truncated(process);
         let process = self.canonical_process(process);
-        let process = process.as_str();
+        let process = process.as_ref();
 
-        let profile = self
-            .profiles
-            .entry(process.to_string())
-            .or_insert_with(|| EgressProfile {
-                process: process.to_string(),
-                dests: HashMap::new(),
-                last_seen: now,
-            });
+        let profile = match self.profiles.get_mut(process) {
+            Some(profile) => profile,
+            None => self
+                .profiles
+                .entry(process.to_string())
+                .or_insert_with(|| EgressProfile {
+                    process: process.to_string(),
+                    dests: HashMap::new(),
+                    last_seen: now,
+                }),
+        };
         profile.last_seen = now;
 
         if let Some(dest) = profile.dests.get_mut(&key) {
@@ -911,7 +921,8 @@ impl EgressProfiler {
             // read must not downgrade a destination we already know the IP for
             // — that turned named rows into blank ones on disk.
             if !ip.is_empty() {
-                dest.last_ip = ip.to_string();
+                dest.last_ip.clear();
+                dest.last_ip.push_str(ip);
             }
             dest.bytes_out = dest.bytes_out.saturating_add(bytes_out);
             dest.bytes_in = dest.bytes_in.saturating_add(bytes_in);

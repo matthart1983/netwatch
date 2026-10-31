@@ -274,7 +274,13 @@ impl AnnotationHistory {
             self.previous.clear();
             self.session = session;
         }
-        let mut current: HashMap<StreamKey, Option<Observation>> = HashMap::new();
+        // No capture, no packet to annotate. A capture that starts later
+        // clears the history above, so nothing built here would be read.
+        if self.session.is_none() {
+            return;
+        }
+        let mut current: HashMap<StreamKey, Option<Observation>> =
+            HashMap::with_capacity(connections.len());
         for c in connections {
             let Some((key, side)) = connection_stream_key(c) else {
                 continue;

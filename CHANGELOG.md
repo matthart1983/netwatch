@@ -83,6 +83,16 @@ All notable changes to NetWatch will be documented in this file.
   speed.cloudflare.com. Your resolver and gateway are still probed, and what
   else you start yourself still runs: `T`, `W`, `t` on the other coverage rows
   and periodic traces. docs/REFERENCE.md lists them.
+- **The Connections table says when rates cover only some of its flows, and
+  the Timeline says when it has lost closed connections.** A running capture
+  drops the flows it has seen least recently once it passes 1,280 flows or its
+  byte budget, and a dropped flow's row has no rate, which looked the same as a
+  connection with no traffic. Once the running capture has dropped a flow, and
+  while some rows have no rate, the table's title reads `rates: M of N flows`:
+  M rows with a rate, of the N that could have one. The note is the first thing
+  to go when that row is too short. Once the Timeline has evicted closed
+  connections, its events title reads `closed: last N`, with the number it still
+  holds.
 
 ### Changed
 - **Less `unsafe` code, and the raw-pointer reads this change touches check
@@ -166,6 +176,25 @@ All notable changes to NetWatch will be documented in this file.
   read until memory ran out. Doctor and Settings name the cause. A database under
   2 GiB loads as it did, commercial ones included. Files `netwatch geoip update`
   saved are held to 256 MiB.
+- **The Connections tab, the Dense view and the UI tick keep up at 10,000
+  connections.** Each Connections frame copied and sorted the whole table twice,
+  and each scroll key once more, so at 10,000 rows a frame took about 40 to
+  100 ms at the median, and a key about 18 to 28 ms. The tab now builds one
+  view per table, from the table's generation, the filters, the group mode and
+  the sort, and the table, detail strip, chips, header, scroll keys, mouse and
+  folding all read that view. The order of the rows is unchanged. The table and
+  the detail strip come from one view per frame, so a poll that lands
+  mid-draw can no longer make them describe different rows. Dense ranks rows
+  without copying them and builds full rows only for those on screen. On the
+  reference machine at 10,000 rows, Connections frames take about 6 to 10 ms
+  at the median, a scroll key under 0.1 ms, a Dense frame about 5 ms, down from
+  about 23, and a tick's connection work about 9 to 14 ms, down from 26 to 32.
+  That tick figure is with no capture running. With one, each poll is also
+  kept for PCAPNG annotations, and it is about 18 ms. Library callers lose
+  `ui::connections::build_view` and `sort` and `LiveSampler::verdict_for`, and
+  gain `ui::connections::current_view`, `LiveSampler::socket_verdicts` and
+  `StreamTracker::session_dropped_flows`. `ConnView` and `ConnGroup` now hold
+  row indices.
 
 ### Fixed
 - **One bad value in config.toml no longer throws the whole file away.** A
@@ -476,6 +505,23 @@ All notable changes to NetWatch will be documented in this file.
   header length of 16 it read the ports out of the destination address. The
   DNS timing and the QUIC breakdown in the detail pane read the same bounded
   payload.
+- **The Dashboard shows verdicts on IPv6 and device-bound sockets.** Its verdict
+  column looked a socket up by the connection table's spelling of its addresses,
+  and verdicts are kept under the kernel flow's, which has no brackets, writes
+  an IPv4-mapped address as plain IPv4 and names no device. Every IPv6 or
+  IPv4-mapped row, and every row `ss` marks with its device
+  (`[fe80::1]%eth0:443`, `192.0.2.1%eth0:443`), read `–` whatever its socket was
+  doing, and a broken one sorted as healthy on a panel ordered by concern. Those
+  rows now show their verdicts. Device-bound rows had the same miss in Diagnose,
+  which could not name their process or rates, and in Dense's TCP state, and
+  both now find them. Sockets that differ only by device share one entry in the
+  kernel dump, which could be either's, so when the table lists such a pair
+  neither row takes anything from it, and they show as unknown.
+- **Device-bound IPv6 sockets find their captured streams.** `ss` prints such a
+  socket as `[fe80::1]%eth0:443`, and the parser that matches a row to its stream
+  expected the port right after the bracket. These rows never matched one, so
+  they showed no rate or application protocol even with a capture running. They
+  match now, and count among the flows in the rates note.
 
 ### Security
 - **Selecting a packet or a connection no longer sends its addresses to
@@ -841,6 +887,11 @@ All notable changes to NetWatch will be documented in this file.
 - **Two GeoIP checks.** `geoip_update_live`, ignored by default, runs
   `netwatch geoip update` against DB-IP by hand at release, and a unit test fails
   if the removed service's name comes back in the code or the docs.
+- **The 10,000-row budgets for Connections and Dense frames, the scroll key
+  and the tick's connection work are enforced.** They were pending on the
+  Connections view cache. The scale tests also time Connections frames with a
+  full stream tracker and Dashboard frames with socket verdicts against the
+  frame budget, and print a tick with a capture running, with no budget.
 
 ## [0.38.0] - 2026-10-25
 
