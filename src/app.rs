@@ -664,11 +664,10 @@ impl App {
             bpf_filter_active,
             incident_recorder: IncidentRecorder::new(),
             capture_export: None,
-            geo_cache: GeoCache::with_mmdb_and_online(
-                &user_config.geoip_db,
-                &user_config.geoip_asn_db,
-                user_config.geoip_online,
-            ),
+            geo_cache: {
+                let (db, asn) = user_config.geoip_paths();
+                GeoCache::with_mmdb(&db, &asn)
+            },
             whois_cache: WhoisCache::new(),
             traceroute_runner: TracerouteRunner::new(),
             connection_timeline: ConnectionTimeline::new(),
@@ -746,7 +745,6 @@ impl App {
                 self.ebpf_init_error = Some(error.to_string());
             }
         }
-        self.geo_cache.start();
         self.whois_cache.start();
     }
 

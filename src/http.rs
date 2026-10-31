@@ -1,11 +1,11 @@
-//! The HTTP client shared by the remote publisher, the geo and whois
-//! lookups and the Ollama insights call.
+//! The HTTP client shared by the remote publisher, the whois lookups,
+//! `netwatch geoip update` and the Ollama insights call.
 //!
 //! ureq's default agent has no read or write timeout, so a server that
 //! accepts the connection and then goes quiet holds the calling thread
-//! forever. For the one geo or whois worker that means every later lookup
-//! stalls behind it; for the remote sender it means the daemon's shutdown
-//! drain never returns. Requests built from [`agent`] give up instead.
+//! forever. For the one whois worker that means every later lookup stalls
+//! behind it; for the remote sender it means the daemon's shutdown drain
+//! never returns. Requests built from [`agent`] give up instead.
 //!
 //! Where ureq 3's defaults differ from what ureq 2 did here, [`build`] sets
 //! the old behaviour by hand: no proxy from the environment, the same
@@ -87,8 +87,8 @@ fn build(connect: Duration, io: Duration, body: Duration) -> ureq::Agent {
         .proxy(None)
         .max_redirects(MAX_REDIRECTS)
         // Callers rely on this: the remote publisher classifies the status
-        // carried by `Error::StatusCode`, and geo and whois treat any error
-        // as no answer.
+        // carried by `Error::StatusCode`, and whois treats any error as no
+        // answer.
         .http_status_as_error(true)
         .build()
         .new_agent()

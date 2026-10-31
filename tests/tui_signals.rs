@@ -48,7 +48,9 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.0.join("config"))
             .env("XDG_CACHE_HOME", self.0.join("cache"))
             .env("XDG_STATE_HOME", self.0.join("state"))
-            .env("TERM", "xterm-256color");
+            .env("TERM", "xterm-256color")
+            // Nix's build sets it empty, which filters out every warning.
+            .env_remove("RUST_LOG");
         cmd
     }
 }
@@ -208,6 +210,45 @@ fn stops_cleanly(stop: impl FnOnce(&mut Pty)) {
 
 fn signal(sig: Signal) -> impl FnOnce(&mut Pty) {
     move |pty| kill(Pid::from_raw(pty.child.id() as i32), sig).unwrap()
+}
+
+/// `main` reads the config before it installs the logger, and a warning made
+/// at that first read would go nowhere. A config still setting `geoip_online`
+/// has to reach the log file, once, through a session that reads it twice.
+#[test]
+fn a_removed_config_key_is_logged_once() {
+    let fixture = Fixture::new();
+    // macOS keeps its config under HOME, whatever XDG_CONFIG_HOME says.
+    for dir in ["config/netwatch", "Library/Application Support/netwatch"] {
+        fs::create_dir_all(fixture.0.join(dir)).unwrap();
+        fs::write(
+            fixture.0.join(dir).join("config.toml"),
+            "geoip_online = true\n",
+        )
+        .unwrap();
+    }
+    let mut cmd = fixture.command();
+    cmd.arg("--demo");
+    let mut pty = Pty::spawn(cmd);
+    let started = pty.read_until(Duration::from_secs(10), first_frame);
+    assert!(started, "no first frame: {:?}", pty.output);
+    signal(Signal::SIGTERM)(&mut pty);
+    let status = pty.wait(Duration::from_secs(10));
+    assert!(status.success(), "{status}: {:?}", pty.tail());
+    // macOS keeps its cache under HOME, whatever XDG_CACHE_HOME says.
+    let log: String = ["cache/netwatch", "Library/Caches/netwatch"]
+        .iter()
+        .filter_map(|dir| fs::read_dir(fixture.0.join(dir)).ok())
+        .flatten()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().contains("netwatch.log"))
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    assert_eq!(
+        log.matches("geoip_online was removed in 0.39").count(),
+        1,
+        "{log}"
+    );
 }
 
 #[test]
