@@ -43,11 +43,35 @@ pub struct Protection {
     pub component: String,
     pub entry_ready: bool,
     pub effective: Option<String>,
+    /// The Landlock ABI of what this thread enforces: the newest feature in
+    /// force, so 3 for the filesystem layer alone on any newer kernel.
     pub landlock_abi: u32,
     pub caps_dropped: Vec<String>,
     pub caps_retained: Vec<String>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+    /// The ABI the kernel reports.
+    #[serde(default)]
+    pub landlock_kernel_abi: u32,
+    /// `denied` when this thread's TCP bind and connect are, `allowed` when it
+    /// entered and they are not, and `not_entered` when it has no report: a
+    /// capture that failed to open, a worker just started, or the note for the
+    /// eBPF SDK's reader, which inherits the `ebpf` worker's policy.
+    #[serde(default)]
+    pub network_policy: String,
+    /// `filesystem`, `filesystem_write`, `tcp_bind`, `tcp_connect`,
+    /// `abstract_unix_socket`, `signal`, `pathname_unix_socket` and, from the
+    /// seccomp filter, `socket_create`.
+    #[serde(default)]
+    pub landlock_restrictions: Vec<String>,
+    /// CAP_NET_RAW on this thread: `dropped`, `retained_for_reopen`, `not_held`
+    /// or `not_applicable`.
+    #[serde(default)]
+    pub capture_authority: String,
+    /// The no-socket filter: `installed`, `unknown_arch`, `failed` or
+    /// `not_applicable`.
+    #[serde(default)]
+    pub socket_filter: String,
 }
 impl Protection {
     fn from_report(
@@ -69,8 +93,65 @@ impl Protection {
                 .unwrap_or_default(),
             warnings: report.map(|r| r.mode.warnings.clone()).unwrap_or_default(),
             error,
+            landlock_kernel_abi: report.map_or(0, |r| r.platform.landlock_kernel_abi),
+            network_policy: report
+                .map_or("not_entered", |r| r.platform.network_policy())
+                .into(),
+            landlock_restrictions: report
+                .map(|r| {
+                    r.platform
+                        .landlock_restrictions
+                        .iter()
+                        .map(|restriction| (*restriction).to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            capture_authority: report
+                .map_or(sandbox::NetRaw::NotApplicable, |r| {
+                    r.platform.capture_authority
+                })
+                .label()
+                .into(),
+            socket_filter: report
+                .map_or(sandbox::SocketFilter::NotApplicable, |r| {
+                    r.platform.socket_filter
+                })
+                .label()
+                .into(),
         }
     }
+}
+/// What Landlock this kernel has and what a parser thread gets from it. Null
+/// off Linux.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Landlock {
+    /// The ABI the kernel reports, 0 without Landlock.
+    pub kernel_abi: u32,
+    /// `available`, `not_enabled`, `not_built` or `unknown`. `not_built` also
+    /// covers a seccomp profile blocking the syscalls with any errno but
+    /// EOPNOTSUPP: the landlock crate reports both the same way.
+    pub availability: String,
+    /// The errata the kernel reports fixed, by the numbers in the kernel's
+    /// documentation.
+    pub errata: Vec<u32>,
+    /// Static doctor runs this on a disposable thread. A live session reads it
+    /// from a parser worker's entry report. Null if neither has one.
+    pub parser_check: Option<ParserCheck>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParserCheck {
+    /// The same meaning as a protection's `landlock_abi`.
+    pub enforced_abi: u32,
+    pub restrictions: Vec<String>,
+    /// `denied`, `allowed` or `error`, for anything else a check got back.
+    pub tcp_bind: String,
+    pub tcp_connect: String,
+}
+/// A thread still holding CAP_NET_RAW when startup audited the process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetRawTask {
+    pub tid: u32,
+    pub comm: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
@@ -80,9 +161,18 @@ pub struct CapabilitySnapshot {
     pub interface: Option<String>,
     pub capabilities: Vec<Capability>,
     pub protections: Vec<Protection>,
+    /// Always false: this is about the whole process, and main and the network
+    /// workers keep the network. Each protection has its own `network_policy`.
     pub network_restricted: bool,
     #[serde(default)]
     pub attribution_coverage: Option<crate::collectors::attribution::Coverage>,
+    #[serde(default)]
+    pub landlock: Option<Landlock>,
+    /// Process-wide, from the audit at startup. Null in doctor, which starts
+    /// no session to audit, and off Linux. A session writes it to its log, which
+    /// is the only place to read it.
+    #[serde(default)]
+    pub tasks_holding_net_raw: Option<Vec<NetRawTask>>,
 }
 impl CapabilitySnapshot {
     fn configured(config: &NetwatchConfig) -> Self {
@@ -96,6 +186,8 @@ impl CapabilitySnapshot {
             protections: vec![],
             network_restricted: false,
             attribution_coverage: None,
+            landlock: None,
+            tasks_holding_net_raw: None,
         };
         snapshot.put(
             "config",
@@ -182,12 +274,15 @@ impl CapabilitySnapshot {
                 State::Unavailable
             },
             "policy_not_applied",
-            &format!(
-                "Requested {:?}; no policy applied by static doctor; networking unrestricted",
+            &with_root_note(format!(
+                "Requested {:?}; no policy applied by static doctor; see landlock for what a parser thread gets",
                 mode
-            ),
+            )),
             Some("Inspect live Settings for component enforcement"),
         );
+        let (state, reason, detail, next) =
+            landlock_capability(cfg!(target_os = "linux"), mode, None);
+        snapshot.put("landlock", state, reason, &detail, next);
         for (id, enabled, detail) in [
             (
                 "online_geo",
@@ -270,6 +365,16 @@ impl CapabilitySnapshot {
             self.get("attribution").state.label(),
             self.get("sandbox").state.label()
         )
+    }
+    /// The sandbox part of a snapshot as one line of JSON, for the session log:
+    /// `landlock`, `protections` and `tasks_holding_net_raw`.
+    pub fn sandbox_json(&self) -> String {
+        serde_json::json!({
+            "landlock": self.landlock,
+            "protections": self.protections,
+            "tasks_holding_net_raw": self.tasks_holding_net_raw,
+        })
+        .to_string()
     }
     /// A line for Settings when the connection table is not read from `ss`,
     /// state first. It is a row of its own: appended to [`Self::compact`],
@@ -441,17 +546,34 @@ impl CapabilitySnapshot {
         } else {
             State::Degraded
         };
+        let workers = sandbox::worker::snapshot();
         snapshot.put(
             "sandbox",
             state,
             "runtime_enforcement",
-            &format!("{} · {}", report.summary(), sandbox::worker::summary()),
-            Some("netwatch doctor --json; networking is unrestricted"),
+            &sandbox_detail(report, &workers, &sandbox::worker::summary()),
+            Some("netwatch doctor --json"),
         );
+        snapshot.landlock = live_landlock(report, &workers);
+        let (state, reason, detail, next) = landlock_capability(
+            cfg!(target_os = "linux"),
+            sandbox::worker::mode(),
+            snapshot.landlock.as_ref(),
+        );
+        snapshot.put("landlock", state, reason, &detail, next);
+        snapshot.tasks_holding_net_raw = sandbox::audit::tasks_holding_net_raw().map(|holders| {
+            holders
+                .into_iter()
+                .map(|holder| NetRawTask {
+                    tid: holder.tid,
+                    comm: holder.comm,
+                })
+                .collect()
+        });
         snapshot
             .protections
             .push(Protection::from_report("main", true, Some(report), None));
-        for (name, component) in sandbox::worker::snapshot() {
+        for (name, component) in workers {
             snapshot.protections.push(Protection::from_report(
                 &name,
                 component.ready,
@@ -535,6 +657,310 @@ impl CapabilitySnapshot {
         snapshot
     }
 }
+/// Added to the sandbox capability wherever it is shown when netwatch runs as
+/// root. Most files stay readable and writable there whatever the sandbox does,
+/// so an escape is not what it promises (SECURITY.md).
+const ROOT_NOTE: &str = "running as root: containment limited";
+
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    return nix::unistd::geteuid().is_root();
+    #[cfg(not(unix))]
+    false
+}
+
+fn with_root_note(detail: String) -> String {
+    if running_as_root() {
+        format!("{detail} · {ROOT_NOTE}")
+    } else {
+        detail
+    }
+}
+
+/// The live sandbox capability's detail, as clauses Settings puts on a row
+/// each. `verified` is [`sandbox::worker::summary`]'s line.
+fn sandbox_detail(
+    main: &sandbox::Report,
+    workers: &std::collections::BTreeMap<String, sandbox::worker::Component>,
+    verified: &str,
+) -> String {
+    use sandbox::{NetRaw, SocketFilter};
+    let mut clauses = vec![main.summary()];
+    if cfg!(target_os = "linux") && main.mode.effective != Some("disabled") {
+        let (denied, parsers) = sandbox::worker::parser_tcp_coverage(workers);
+        if parsers > 0 {
+            clauses.push(format!("TCP denied on {denied}/{parsers} parser workers"));
+        }
+        let unfiltered = workers
+            .values()
+            .filter_map(|w| w.report.as_ref())
+            .any(|r| r.platform.socket_filter == SocketFilter::UnknownArch);
+        if unfiltered {
+            clauses.push(format!(
+                "no-socket filter skipped: no syscall table for {}",
+                std::env::consts::ARCH
+            ));
+        }
+        match main.platform.capture_authority {
+            NetRaw::RetainedForReopen => {
+                clauses.push("CAP_NET_RAW kept on main to reopen capture (c, i, Shift+R)".into())
+            }
+            NetRaw::Dropped => clauses.push("CAP_NET_RAW dropped once capture opened".into()),
+            NetRaw::NotHeld | NetRaw::NotApplicable => {}
+        }
+    }
+    clauses.push(verified.to_owned());
+    with_root_note(clauses.join(" · "))
+}
+
+/// The `landlock` capability, from what doctor or a live session found.
+/// `linux` says whether there is a backend; the sandbox mode comes next because
+/// the object is reported either way, and only this says whether it applies.
+fn landlock_capability(
+    linux: bool,
+    mode: Mode,
+    landlock: Option<&Landlock>,
+) -> (State, &'static str, String, Option<&'static str>) {
+    if !linux {
+        return (
+            State::Unavailable,
+            "platform_unsupported",
+            "Landlock is Linux only; this platform has no sandbox backend".into(),
+            None,
+        );
+    }
+    if matches!(mode, Mode::Disabled) {
+        return (
+            State::Disabled,
+            "sandbox_disabled",
+            "Sandbox disabled by configuration; no thread takes a Landlock policy".into(),
+            Some("Set sandbox = \"on\" or drop --no-sandbox"),
+        );
+    }
+    let Some(landlock) = landlock else {
+        return (
+            State::NotChecked,
+            "self_test_not_run",
+            "Landlock has not been checked".into(),
+            Some("netwatch doctor"),
+        );
+    };
+    match landlock.availability.as_str() {
+        "not_enabled" => {
+            return (
+                State::Unavailable,
+                "landlock_not_enabled",
+                "This kernel has Landlock built in but it is not enabled (EOPNOTSUPP); parser threads keep the network".into(),
+                Some("Add landlock to the kernel's lsm= boot parameter"),
+            )
+        }
+        "not_built" => {
+            return (
+                State::Unavailable,
+                "landlock_not_built",
+                "This kernel has no Landlock (ENOSYS), or something such as a container's seccomp profile blocks it; parser threads keep the network".into(),
+                Some("Use a kernel built with CONFIG_SECURITY_LANDLOCK, or allow syscalls 444-446 in the seccomp profile"),
+            )
+        }
+        _ => {}
+    }
+    let kernel = landlock.kernel_abi;
+    if landlock.availability == "available" && kernel < 4 {
+        return (
+            State::Degraded,
+            "kernel_abi_below_4",
+            format!(
+                "Kernel Landlock ABI {kernel} cannot deny TCP; parser threads keep the network and --sandbox-strict refuses to start"
+            ),
+            Some("Linux 6.7 or newer has ABI 4"),
+        );
+    }
+    match &landlock.parser_check {
+        Some(check) if check.tcp_bind == "denied" && check.tcp_connect == "denied" => (
+            State::Ready,
+            "parser_network_denied",
+            format!(
+                "Kernel Landlock ABI {kernel}; a parser thread enforces ABI {} and is denied TCP bind and connect",
+                check.enforced_abi
+            ),
+            None,
+        ),
+        Some(check) => (
+            State::Unavailable,
+            "self_test_failed",
+            format!(
+                "Kernel Landlock ABI {kernel}, but a parser thread got TCP bind {} and connect {}",
+                check.tcp_bind, check.tcp_connect
+            ),
+            Some("Report this: the kernel should deny both"),
+        ),
+        None => (
+            State::Unavailable,
+            "self_test_failed",
+            format!("Kernel Landlock ABI {kernel}, but the parser check did not complete"),
+            Some("Report this: the kernel should deny both"),
+        ),
+    }
+}
+
+/// What the reports of a live session say of Landlock. Entry reports only, so
+/// the check says what each worker's layer enforced rather than trying a
+/// connection: Settings asks for this on every frame.
+#[cfg(target_os = "linux")]
+fn live_landlock(
+    main: &sandbox::Report,
+    workers: &std::collections::BTreeMap<String, sandbox::worker::Component>,
+) -> Option<Landlock> {
+    let parser = workers.iter().find_map(|(name, worker)| {
+        let is_parser = sandbox::roles::role_for(name) == sandbox::Role::Parser;
+        worker.report.as_ref().filter(|_| is_parser)
+    });
+    let report = parser.unwrap_or(main);
+    Some(Landlock {
+        kernel_abi: report.platform.landlock_kernel_abi,
+        availability: report
+            .platform
+            .landlock_availability
+            .unwrap_or("unknown")
+            .into(),
+        errata: sandbox::landlock_errata(),
+        parser_check: parser.map(|parser| {
+            let held = |restriction: &'static str| {
+                let denied = parser.platform.landlock_restrictions.contains(&restriction);
+                String::from(if denied { "denied" } else { "allowed" })
+            };
+            ParserCheck {
+                enforced_abi: parser.platform.landlock_abi,
+                restrictions: restrictions_of(parser),
+                tcp_bind: held("tcp_bind"),
+                tcp_connect: held("tcp_connect"),
+            }
+        }),
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn live_landlock(
+    _main: &sandbox::Report,
+    _workers: &std::collections::BTreeMap<String, sandbox::worker::Component>,
+) -> Option<Landlock> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn restrictions_of(report: &sandbox::Report) -> Vec<String> {
+    report
+        .platform
+        .landlock_restrictions
+        .iter()
+        .map(|restriction| (*restriction).to_owned())
+        .collect()
+}
+
+/// A loopback listener doctor binds itself, so that a TCP connect that is not
+/// denied reaches nothing else. Without one, as with loopback down, the connect
+/// goes to port 0, which nothing can listen on.
+#[cfg(target_os = "linux")]
+struct TcpCheck(Option<std::net::TcpListener>);
+#[cfg(target_os = "linux")]
+impl TcpCheck {
+    fn new() -> Self {
+        Self(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok())
+    }
+    /// What TCP bind and connect do on the calling thread. Landlock answers
+    /// EACCES before it looks at the address, so a down loopback does not hide
+    /// a deny.
+    fn run(&self) -> (&'static str, &'static str) {
+        let observed = |result: std::io::Result<()>| match result {
+            Ok(()) => "allowed",
+            Err(error) if error.raw_os_error() == Some(nix::libc::EACCES) => "denied",
+            Err(_) => "error",
+        };
+        let port = self
+            .0
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map_or(0, |addr| addr.port());
+        let localhost = std::net::Ipv4Addr::LOCALHOST;
+        (
+            observed(std::net::TcpListener::bind((localhost, 0)).map(drop)),
+            observed(std::net::TcpStream::connect((localhost, port)).map(drop)),
+        )
+    }
+}
+
+/// Take a parser's policy on a thread that ends with it, and try TCP from
+/// there. It runs with the sandbox disabled too: what this kernel can do does
+/// not depend on what the configuration asks for.
+#[cfg(target_os = "linux")]
+fn landlock_self_test() -> Landlock {
+    let check = TcpCheck::new();
+    let outcome = std::thread::Builder::new()
+        .name("landlock-check".into())
+        .spawn(move || {
+            let report = sandbox::apply_retaining(
+                Mode::BestEffort,
+                &sandbox::SandboxPaths::default(),
+                sandbox::Retain::Nothing,
+                sandbox::Role::Parser,
+            );
+            let (tcp_bind, tcp_connect) = check.run();
+            (report, tcp_bind, tcp_connect)
+        })
+        .ok()
+        .and_then(|thread| thread.join().ok());
+    let errata = sandbox::landlock_errata();
+    let Some((report, tcp_bind, tcp_connect)) = outcome else {
+        return Landlock {
+            kernel_abi: 0,
+            availability: "unknown".into(),
+            errata,
+            parser_check: None,
+        };
+    };
+    Landlock {
+        kernel_abi: report.platform.landlock_kernel_abi,
+        availability: report
+            .platform
+            .landlock_availability
+            .unwrap_or("unknown")
+            .into(),
+        errata,
+        parser_check: Some(ParserCheck {
+            enforced_abi: report.platform.landlock_abi,
+            restrictions: restrictions_of(&report),
+            tcp_bind: tcp_bind.into(),
+            tcp_connect: tcp_connect.into(),
+        }),
+    }
+}
+
+/// The capture thread's policy on the calling thread, so strict fails here
+/// where it would refuse capture. What the check saw of TCP stands in for what
+/// the layer reported, and it runs before the no-socket filter, as a worker's
+/// entry does, because the filter would stop it at socket(2).
+fn enter_capture_policy(mode: Mode) -> sandbox::Report {
+    #[cfg(target_os = "linux")]
+    let check = TcpCheck::new();
+    let mut report = sandbox::apply_retaining(
+        mode,
+        &sandbox::SandboxPaths::default(),
+        sandbox::Retain::Nothing,
+        sandbox::Role::Capture,
+    );
+    #[cfg(target_os = "linux")]
+    if report.platform.landlock_network_blocked {
+        let (bind, connect) = check.run();
+        if (bind, connect) != ("denied", "denied") {
+            report.platform.landlock_network_blocked = false;
+            report.mode.warnings.push(format!(
+                "capture layer reports TCP denied, but bind got {bind} and connect {connect}"
+            ));
+        }
+    }
+    sandbox::deny_socket_create(mode, &mut report);
+    report
+}
+
 fn wrap(lines: &mut Vec<String>, value: &str) {
     let clean: String = value
         .chars()
@@ -748,6 +1174,16 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
         &detail,
         Some("Review config.toml; doctor never writes it"),
     );
+    #[cfg(target_os = "linux")]
+    {
+        snapshot.landlock = Some(landlock_self_test());
+        let (state, reason, detail, next) = landlock_capability(
+            true,
+            Mode::from_config(&config.sandbox),
+            snapshot.landlock.as_ref(),
+        );
+        snapshot.put("landlock", state, reason, &detail, next);
+    }
     if interface.is_some() {
         snapshot.interface = interface;
     }
@@ -920,14 +1356,7 @@ pub fn capture_child(interface: &str, mode: Mode) -> anyhow::Result<()> {
             protection: None,
         },
         Ok(capture) => {
-            // The capture thread's policy, so strict fails here where it
-            // would refuse capture.
-            let report = sandbox::apply_retaining(
-                mode,
-                &sandbox::SandboxPaths::default(),
-                sandbox::Retain::Nothing,
-                sandbox::Role::Capture,
-            );
+            let report = enter_capture_policy(mode);
             let rejected = matches!(mode, Mode::Strict) && !report.mode.warnings.is_empty();
             let result = CaptureResult {
                 interface: interface.into(),
@@ -994,7 +1423,7 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
                         } else {
                             State::Degraded
                         };
-                        snapshot.put("sandbox",state,"isolated_capture_check","Protection applies only to the isolated check process; live worker enforcement is not tested",None);
+                        snapshot.put("sandbox",state,"isolated_capture_check",&with_root_note("Protection applies only to the isolated check process; live worker enforcement is not tested".to_string()),None);
                         snapshot.protections.push(protection);
                     }
                 }
@@ -1248,6 +1677,227 @@ mod tests {
         let restored: CapabilitySnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(restored.get("connections").reason, "table_unchecked");
+    }
+    /// A consumer holding a schema_version 1 document from before these
+    /// fields still reads it, and so does anything that wrote one.
+    #[test]
+    fn landlock_fields_are_additive() {
+        let old = r#"{
+            "schema_version": 1,
+            "scope": "capture_check",
+            "platform": "linux",
+            "interface": "eth0",
+            "capabilities": [],
+            "protections": [{
+                "component": "capture-check",
+                "entry_ready": true,
+                "effective": "best-effort",
+                "landlock_abi": 9,
+                "caps_dropped": [],
+                "caps_retained": [],
+                "warnings": [],
+                "error": null
+            }],
+            "network_restricted": false
+        }"#;
+        let restored: CapabilitySnapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(restored.schema_version, 1);
+        assert_eq!(restored.landlock, None);
+        assert_eq!(restored.tasks_holding_net_raw, None);
+        let protection = &restored.protections[0];
+        assert_eq!(protection.landlock_abi, 9);
+        assert_eq!(protection.landlock_kernel_abi, 0);
+        assert!(protection.landlock_restrictions.is_empty());
+
+        // And what doctor writes now still has every field a v1 consumer read.
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["network_restricted"], false);
+        assert!(json["landlock"].is_null());
+        assert!(json["tasks_holding_net_raw"].is_null());
+        for field in [
+            "scope",
+            "platform",
+            "interface",
+            "capabilities",
+            "protections",
+        ] {
+            assert!(json.get(field).is_some(), "{field}");
+        }
+    }
+    #[test]
+    fn a_protection_says_what_its_report_says() {
+        let mut report = sandbox::Report::default();
+        report.platform.landlock_abi = 9;
+        report.platform.landlock_kernel_abi = 9;
+        report.platform.landlock_network_blocked = true;
+        report.platform.landlock_restrictions = vec!["filesystem", "tcp_bind", "tcp_connect"];
+        report.platform.capture_authority = sandbox::NetRaw::Dropped;
+        report.platform.socket_filter = sandbox::SocketFilter::Installed;
+        let protection = Protection::from_report("capture", true, Some(&report), None);
+        assert_eq!(protection.landlock_kernel_abi, 9);
+        assert_eq!(protection.network_policy, "denied");
+        assert_eq!(
+            protection.landlock_restrictions,
+            ["filesystem", "tcp_bind", "tcp_connect"]
+        );
+        assert_eq!(protection.capture_authority, "dropped");
+        assert_eq!(protection.socket_filter, "installed");
+        // A worker with no report ran under no policy of its own, which is not
+        // the same as one that entered and was allowed the network.
+        let waiting = Protection::from_report("traffic", false, None, None);
+        assert_eq!(waiting.network_policy, "not_entered");
+        assert_eq!(waiting.capture_authority, "not_applicable");
+        assert_eq!(waiting.socket_filter, "not_applicable");
+    }
+    #[test]
+    fn landlock_capability_covers_each_reason() {
+        let found = |kernel_abi, availability: &str, bind: &str, connect: &str| Landlock {
+            kernel_abi,
+            availability: availability.into(),
+            errata: vec![],
+            parser_check: Some(ParserCheck {
+                enforced_abi: kernel_abi,
+                restrictions: vec![],
+                tcp_bind: bind.into(),
+                tcp_connect: connect.into(),
+            }),
+        };
+        let assess = |landlock: &Landlock| {
+            let (state, reason, _, _) = landlock_capability(true, Mode::BestEffort, Some(landlock));
+            (state, reason)
+        };
+        assert_eq!(
+            assess(&found(9, "available", "denied", "denied")),
+            (State::Ready, "parser_network_denied")
+        );
+        assert_eq!(
+            assess(&found(4, "available", "denied", "denied")),
+            (State::Ready, "parser_network_denied")
+        );
+        for kernel in [1, 3] {
+            assert_eq!(
+                assess(&found(kernel, "available", "allowed", "allowed")),
+                (State::Degraded, "kernel_abi_below_4")
+            );
+        }
+        assert_eq!(
+            assess(&found(0, "not_enabled", "allowed", "allowed")),
+            (State::Unavailable, "landlock_not_enabled")
+        );
+        assert_eq!(
+            assess(&found(0, "not_built", "allowed", "allowed")),
+            (State::Unavailable, "landlock_not_built")
+        );
+        // A kernel that can deny TCP and did not, one way or the other.
+        for (bind, connect) in [
+            ("allowed", "denied"),
+            ("denied", "allowed"),
+            ("error", "denied"),
+        ] {
+            assert_eq!(
+                assess(&found(9, "available", bind, connect)),
+                (State::Unavailable, "self_test_failed"),
+                "{bind} {connect}"
+            );
+        }
+        let unfinished = Landlock {
+            parser_check: None,
+            ..found(9, "available", "", "")
+        };
+        assert_eq!(
+            assess(&unfinished),
+            (State::Unavailable, "self_test_failed")
+        );
+        let ready = found(9, "available", "denied", "denied");
+        let (state, reason, _, _) = landlock_capability(true, Mode::Disabled, Some(&ready));
+        assert_eq!((state, reason), (State::Disabled, "sandbox_disabled"));
+        let (state, reason, _, _) = landlock_capability(false, Mode::BestEffort, None);
+        assert_eq!(
+            (state, reason),
+            (State::Unavailable, "platform_unsupported")
+        );
+    }
+    #[test]
+    fn landlock_capability_is_not_checked_until_someone_checks() {
+        let snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
+        let expected = if cfg!(target_os = "linux") {
+            State::NotChecked
+        } else {
+            State::Unavailable
+        };
+        assert_eq!(snapshot.get("landlock").state, expected);
+        let off = NetwatchConfig {
+            sandbox: "off".into(),
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&off);
+        if cfg!(target_os = "linux") {
+            assert_eq!(snapshot.get("landlock").reason, "sandbox_disabled");
+        }
+    }
+    #[test]
+    fn sandbox_detail_names_what_each_worker_got() {
+        use sandbox::worker::Component;
+        use sandbox::NetRaw;
+        let entered = |blocked| {
+            let mut report = sandbox::Report::default();
+            report.platform.landlock_network_blocked = blocked;
+            Component {
+                ready: true,
+                report: Some(report),
+                error: None,
+            }
+        };
+        let workers: std::collections::BTreeMap<_, _> = [
+            ("capture".to_string(), entered(true)),
+            ("connections".to_string(), entered(true)),
+            ("keylog".to_string(), entered(false)),
+            ("whois".to_string(), entered(false)),
+        ]
+        .into_iter()
+        .collect();
+        let mut main = sandbox::Report::default();
+        main.mode.effective = Some("best-effort");
+        main.platform.landlock_abi = 3;
+        main.platform.landlock_kernel_abi = 9;
+        main.platform.capture_authority = NetRaw::RetainedForReopen;
+        let detail = sandbox_detail(&main, &workers, "4/4 worker entries verified");
+        assert!(
+            detail.starts_with("best-effort: Landlock fs ABI 3 (kernel 9)"),
+            "{detail}"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                detail.contains("TCP denied on 2/3 parser workers"),
+                "{detail}"
+            );
+            assert!(detail.contains("CAP_NET_RAW kept on main"), "{detail}");
+            main.platform.capture_authority = NetRaw::Dropped;
+            let dropped = sandbox_detail(&main, &workers, "");
+            assert!(dropped.contains("CAP_NET_RAW dropped"), "{dropped}");
+            main.platform.capture_authority = NetRaw::NotHeld;
+            let unheld = sandbox_detail(&main, &workers, "");
+            assert!(!unheld.contains("CAP_NET_RAW"), "{unheld}");
+        }
+        assert!(detail.ends_with("4/4 worker entries verified") || running_as_root());
+        // No worker that skipped the filter, and then one that did.
+        assert!(!detail.contains("no-socket filter"));
+        let mut skipped = entered(true);
+        skipped.report.as_mut().unwrap().platform.socket_filter =
+            sandbox::SocketFilter::UnknownArch;
+        let workers: std::collections::BTreeMap<_, _> =
+            [("keylog".to_string(), skipped)].into_iter().collect();
+        let detail = sandbox_detail(&main, &workers, "");
+        if cfg!(target_os = "linux") {
+            assert!(detail.contains("no-socket filter skipped"), "{detail}");
+        }
+        let mut disabled = sandbox::Report::default();
+        disabled.mode.effective = Some("disabled");
+        let detail = sandbox_detail(&disabled, &workers, "");
+        assert!(detail.starts_with("disabled"), "{detail}");
+        assert!(!detail.contains("TCP denied"), "{detail}");
     }
     #[test]
     fn doctor_text_fits_an_80_column_terminal_and_sanitizes_controls() {

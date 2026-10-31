@@ -53,13 +53,17 @@ Most of it is automatic. By hand:
 
 1. Write the release notes under `## [Unreleased]` in `CHANGELOG.md`, and
    commit them.
-2. On `main`, or on a `release/X.Y.Z` branch for a hotfix, run
+2. Get a green `sandbox-lab.yml` run on that commit, the release candidate:
+   `gh workflow run sandbox-lab.yml --ref <branch>`. The release guard does not
+   wait on it, because a flaky namespace should not hold a tag, so this step is
+   the only thing that does.
+3. On `main`, or on a `release/X.Y.Z` branch for a hotfix, run
    `scripts/release.sh X.Y.Z "summary"`. It bumps the version in `Cargo.toml`,
    `Cargo.lock` and `packaging/rpm/netwatch.spec`, and adds the spec's
    `%changelog` entry. It turns `[Unreleased]` into the version's section,
    runs `cargo test`, then commits and tags `vX.Y.Z`. It pushes nothing.
-3. Run the push commands it prints.
-4. For a hotfix, merge `release/X.Y.Z` back into `main`. Until it is, CI on
+4. Run the push commands it prints.
+5. For a hotfix, merge `release/X.Y.Z` back into `main`. Until it is, CI on
    `main` fails its `tags-on-main` job, and the release guard refuses the
    next tag cut from `main`.
 
