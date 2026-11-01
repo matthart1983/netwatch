@@ -133,6 +133,7 @@ netwatch --demo                          # replay a recorded Diagnose incident, 
 | | |
 |---|---|
 | [Reference](docs/REFERENCE.md) | Keys, filters, decoders, configuration, permissions |
+| [Stability](STABILITY.md) | What 1.0 promises, and what stays experimental |
 | [Diagnose](docs/REFERENCE.md#how-it-works) | Baselines, the 30 rules, ranked causes, verified closes |
 | [TLS decryption](docs/REFERENCE.md#tls-13--12-decryption) | Point `SSLKEYLOGFILE` at netwatch and read your own traffic |
 | [Egress linting](docs/egress-linter-plan.md) | Observe destinations, promote a policy, alert on what you block |
