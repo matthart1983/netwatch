@@ -46,6 +46,14 @@ impl WorkerHandle {
         let handle = self.0.lock().unwrap().take();
         handle.map_or(Ok(()), |h| h.join())
     }
+    /// Leave this worker out of the session's shutdown wait, for one with
+    /// nothing to finish.
+    pub fn not_waited_for(self) {
+        HANDLES
+            .lock()
+            .unwrap()
+            .retain(|slot| !Arc::ptr_eq(slot, &self.0));
+    }
 }
 pub fn stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
