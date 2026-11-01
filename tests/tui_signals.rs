@@ -298,6 +298,15 @@ fn ctrl_c_typed_restores_the_terminal_and_exits_0() {
     stops_cleanly(|pty| pty.master.write_all(b"\x03").unwrap());
 }
 
+/// A worker that outlives the shutdown deadline is named in the log, which is
+/// closed last so that the warning reaches it.
+#[test]
+fn a_worker_past_the_shutdown_deadline_is_logged() {
+    let source = include_str!("../src/main.rs");
+    let guard = source.find("let _worker_session").unwrap();
+    assert!(source.find("let _log_guard;").unwrap() < guard);
+}
+
 /// What the session logged, so a failure can show which worker held the exit.
 /// macOS keeps its cache under HOME, whatever XDG_CACHE_HOME says.
 fn logged(fixture: &Fixture) -> String {
