@@ -84,12 +84,29 @@ pub fn shutdown(timeout: Duration) -> usize {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+/// The workers [`shutdown`] is still waiting for, by thread name.
+fn unfinished() -> Vec<String> {
+    HANDLES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|slot| {
+            let handle = slot.lock().unwrap();
+            let name = handle.as_ref()?.thread().name()?.to_string();
+            Some(name)
+        })
+        .collect()
+}
 pub struct SessionGuard;
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         let remaining = shutdown(Duration::from_secs(2));
         if remaining != 0 {
-            tracing::warn!(remaining, "workers still unwinding after shutdown deadline");
+            tracing::warn!(
+                remaining,
+                workers = ?unfinished(),
+                "workers still unwinding after shutdown deadline"
+            );
         }
     }
 }

@@ -298,6 +298,22 @@ fn ctrl_c_typed_restores_the_terminal_and_exits_0() {
     stops_cleanly(|pty| pty.master.write_all(b"\x03").unwrap());
 }
 
+/// What the session logged, so a failure can show which worker held the exit.
+fn logged(fixture: &Fixture) -> String {
+    fs::read_dir(fixture.0.join("cache/netwatch"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("netwatch.log")
+        })
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .collect()
+}
+
 /// `q` gives the shell back without waiting out a refresh tick. The terminal
 /// thread polled for a whole tick before checking whether to stop, so the exit
 /// took that tick, up to the 2 seconds the session allows its workers.
@@ -322,7 +338,8 @@ fn q_does_not_wait_out_a_refresh_tick() {
     let status = pty.wait(Duration::from_secs(10));
     assert_eq!(status.code(), Some(0), "{status}");
     let took = pressed.elapsed();
-    assert!(took < Duration::from_millis(1900), "took {took:?}");
+    let log = logged(&fixture);
+    assert!(took < Duration::from_millis(1900), "took {took:?}: {log}");
 }
 
 /// `netwatch --demo` with the pty as its controlling terminal, the way a
