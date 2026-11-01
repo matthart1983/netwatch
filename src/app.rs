@@ -581,7 +581,20 @@ pub enum AttributionStatus {
     Failed(&'static str, String),
 }
 
+/// How long the TUI shows the row saying its config has keys it ignored. Long
+/// enough to read once the first screen has settled, and Settings keeps the list.
+const CONFIG_NOTICE_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl App {
+    /// What config.toml and egress-policy.toml should have their owner told, as
+    /// of the last time each was read.
+    pub fn config_warnings(&self) -> impl Iterator<Item = &crate::config::ConfigWarning> {
+        self.user_config
+            .load_warnings
+            .iter()
+            .chain(self.egress_profiler.policy_warnings())
+    }
+
     /// Reads the config again after main has. One that stopped loading in
     /// between is an error here too, before any worker starts.
     fn prepare() -> Result<Self> {
@@ -1639,6 +1652,7 @@ pub fn draw_frame(f: &mut Frame, app: &mut App) {
             Tab::Egress => ui::egress::render(f, app, area),
         },
     }
+    ui::widgets::render_config_notice(f, app, area);
     if app.ui.show_help {
         ui::help::render(f, app, area);
     }
@@ -1702,6 +1716,7 @@ where
     #[cfg(unix)]
     shutdown_deadline();
     let mut app = App::prepare()?;
+    app.ui.config_notice_until = Some(std::time::Instant::now() + CONFIG_NOTICE_FOR);
     crate::runtime::bootstrap::start(
         &mut app,
         if demo {
@@ -1725,8 +1740,8 @@ where
         app.ui.view_mode = v;
         // Keep the settings modal honest: it renders the in-memory config, and
         // showing "full" while the screen is plainly Dense makes the row look
-        // broken. Nothing is written to disk unless the user presses `S`.
-        app.user_config.view = v.name().to_string();
+        // broken. A save does not write it, unless the View row is changed too.
+        app.user_config.set_view_for_this_run(v.name());
     }
 
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
@@ -3360,9 +3375,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             let reload = || -> Result<crate::config::NetwatchConfig, String> {
                 let path = crate::config::NetwatchConfig::path()
                     .ok_or("configuration path unavailable")?;
-                let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-                let config: crate::config::NetwatchConfig =
-                    toml::from_str(&text).map_err(|e| e.to_string())?;
+                let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                let config = crate::config::NetwatchConfig::from_toml(&text, &path)
+                    .map_err(|e| e.to_string())?;
                 let errors = crate::diagnose::targets::validation_errors(&config.diagnose_targets);
                 if !errors.is_empty() {
                     return Err(errors.join("; "));
@@ -3373,8 +3388,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 Ok(config) => {
                     app.diagnose.target_prober.cancel();
                     app.diagnose.active_prober.cancel();
-                    app.user_config.diagnose_targets = config.diagnose_targets;
-                    app.user_config.diagnose_probes = config.diagnose_probes;
+                    app.user_config.reload_diagnose_settings(config);
                     app.diagnose.target_selected = 0;
                     app.diagnose.set_status(
                         "Diagnose configuration reloaded; changed targets learn separate baselines",
@@ -5564,6 +5578,80 @@ mod render_safety_tests {
         let first = rows.iter().position(|r| r.contains("capture off")).unwrap();
         let shown = failure_rows_from(&rows, first).join(" ");
         assert!(shown.contains(crate::platform::capture_fix()), "{shown}");
+    }
+
+    /// stderr is behind the TUI, so the first moments of a session say it, in
+    /// every view, on one row that goes again and moves nothing.
+    #[test]
+    fn a_config_with_ignored_keys_says_so_on_the_bottom_row_for_a_while() {
+        use std::time::{Duration, Instant};
+        let config = NetwatchConfig::from_toml(
+            "sandbox_mode = 'strict'\n[alerts]\ntypo = 1\n",
+            std::path::Path::new("/etc/netwatch/config.toml"),
+        )
+        .unwrap();
+        let mut app = App::prepare_with_config(config);
+        let bottom = |app: &mut App, width| rows(&draw_at(app, width, 50)).pop().unwrap();
+
+        let before = bottom(&mut app, 200);
+        assert!(!before.contains("ignored"), "not until a session sets it");
+
+        app.ui.config_notice_until = Some(Instant::now() + Duration::from_secs(60));
+        // What the row says to press has to work in that view: Lite does not bind
+        // `,`, and `L` takes it to the full view, which does.
+        for (view, way) in [
+            (ViewMode::Full, "  , settings"),
+            (ViewMode::Lite, "  L then , settings"),
+            (ViewMode::Dense, "  , settings"),
+        ] {
+            app.ui.view_mode = view;
+            let row = bottom(&mut app, 200);
+            for needle in ["config.toml: unknown key", "is ignored", "(+1 more)", way] {
+                assert!(row.contains(needle), "{view:?}: {needle} in {row}");
+            }
+            let key =
+                |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+            let keys: &[KeyCode] = if view == ViewMode::Lite {
+                &[KeyCode::Char('L'), KeyCode::Char(',')]
+            } else {
+                &[KeyCode::Char(',')]
+            };
+            for code in keys {
+                handle_key(&mut app, key(*code));
+            }
+            assert!(
+                app.ui.show_settings,
+                "{view:?}: {way} did not open Settings"
+            );
+            app.ui.show_settings = false;
+        }
+        // Narrow, the count and the way to the list survive the cut.
+        app.ui.view_mode = ViewMode::Full;
+        let row = bottom(&mut app, 60);
+        assert!(
+            row.contains("(+1 more)") && row.contains("settings"),
+            "{row}"
+        );
+
+        app.ui.config_notice_until = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(bottom(&mut app, 200), before);
+    }
+
+    /// With nothing to say there is no row, whatever the clock says, and a key
+    /// under `[experimental]` is not worth one.
+    #[test]
+    fn a_clean_config_shows_no_notice() {
+        use std::time::{Duration, Instant};
+        let config = NetwatchConfig::from_toml(
+            "[experimental]\nsomething = 1\n",
+            std::path::Path::new("/etc/netwatch/config.toml"),
+        )
+        .unwrap();
+        assert_eq!(config.load_warnings.len(), 1);
+        let mut app = App::prepare_with_config(config);
+        let before = rows(&draw_at(&mut app, 200, 50)).pop().unwrap();
+        app.ui.config_notice_until = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(rows(&draw_at(&mut app, 200, 50)).pop().unwrap(), before);
     }
 
     fn draw_at(app: &mut App, width: u16, height: u16) -> Buffer {

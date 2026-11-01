@@ -46,7 +46,7 @@ below).
 .SH OPTIONS
 .TP
 .BI \-\-remote " URL"
-Remote URL for the fleet backend. Requires an API key, from the
+Experimental. Remote URL for the fleet backend. Requires an API key, from the
 .B NETWATCH_API_KEY
 environment variable or
 .BR \-\-api\-key .
@@ -57,13 +57,16 @@ unless
 is given.
 .TP
 .BI \-\-api\-key " KEY"
-Remote API key. Discouraged: any user on the host can read it in
+Remote API key. Deprecated: any user on the host can read it in
 .BR ps (1).
 Set the
 .B NETWATCH_API_KEY
-environment variable instead.
+environment variable instead. It stays accepted through 1.x, with a warning that
+does not include the key, and goes in 2.0.
 .TP
 .B \-\-insecure\-remote
+Experimental, with
+.BR \-\-remote .
 Allow an
 .B http://
 remote URL. The API key and every snapshot then cross the network in
@@ -103,7 +106,8 @@ Headless mode, no terminal UI. Alias:
 .BR \-\-headless .
 .TP
 .B \-\-generate\-config
-Write the default configuration file and exit.
+Write the default configuration file and exit. An existing file gains only the keys
+it lacks, and keeps everything it has.
 .TP
 .BR \-h ", " \-\-help
 Show help and exit.
@@ -144,13 +148,18 @@ Which diagnostic checks have their inputs, and why the others do not.
 List recorded incident episodes.
 .TP
 .B diagnose replay
-Replay a recorded episode through the engine.
+Replay a recorded episode through the engine. Experimental: needs
+.BR \-\-unstable ,
+because the episode format can change in any release.
 .TP
 .B diagnose features
 Write the feature table of recorded episodes, with
 .B \-\-out
 and
 .BR \-\-schema .
+Experimental: needs
+.BR \-\-unstable ,
+because the table's columns can change in any release.
 .TP
 .B diagnose export
 Write a pseudonymised bundle of recent incidents. Nothing is uploaded.
@@ -160,6 +169,8 @@ For netwatch's developers: regenerate the pinned test corpus under
 .IR tests/diagnose/corpus ,
 or one entry with
 .BR \-\-only .
+Experimental: needs
+.BR \-\-unstable .
 .TP
 .B uptime
 Outage history from the uptime log the TUI and
@@ -197,15 +208,46 @@ the file location may change between releases. IP geolocation by DB\-IP
 Report the current DNS resolver and whether netwatch could change it.
 .TP
 .B resolver set
-Temporarily point the resolver at an address. Only for administrator-confirmed
-unmanaged files, and requires
+Experimental. Temporarily point the resolver at an address. Only for
+administrator-confirmed unmanaged files, and requires
 .BR \-\-unmanaged .
 .TP
 .B resolver recover
-Put back a resolver that an interrupted
+Experimental. Put back a resolver that an interrupted
 .B resolver set
 changed. A change recorded by netwatch 0.30 is not restored; this prints a notice
 naming it, and it does not affect the exit status.
+.SH EXPERIMENTAL
+These are outside the 1.0 compatibility promise and can change or go away in any
+release: what
+.BR \-\-remote ,
+.B \-\-insecure\-remote
+and
+.B \-\-api\-key
+do, and the snapshots they send;
+.B resolver set
+and
+.BR "resolver recover" ;
+AI Insights
+.RB ( insights_enabled
+and the keys beside it); the JSON in PCAPNG packet comments
+.RB ( netwatch.annotation.v1 );
+the formats behind
+.BR "diagnose replay" ,
+.B diagnose features
+and
+.BR "diagnose corpus" ,
+which need
+.BR \-\-unstable ;
+and anything in the
+.B [experimental]
+configuration table. Those three flags,
+.B NETWATCH_REMOTE_URL
+and
+.B NETWATCH_API_KEY
+stay accepted through 1.x, so a unit file keeps starting, and
+.B \-\-api\-key
+goes in 2.0.
 .SH KEYS
 .B 1
 to
@@ -267,6 +309,10 @@ Windows, install Npcap first.
 .I ~/.config/netwatch/config.toml
 Configuration. Create it with
 .BR "netwatch \-\-generate\-config" .
+A key netwatch does not read is reported and kept. The
+.B [experimental]
+table is outside the compatibility promise: a key in it can change or go away in
+any release.
 .TP
 .I ~/.config/netwatch/egress\-policy.toml
 Declared egress policy. Alerts fire for destinations blocked here; set
@@ -291,6 +337,16 @@ reads, one file per day, kept 90 days. Turn it off with
 on success,
 .B 1
 on a usage error or a failed command.
+.B diagnose run
+has its own statuses, listed above, and
+.BR "diagnose replay" ,
+.B diagnose features
+and
+.B diagnose corpus
+exit
+.B 3
+without
+.BR \-\-unstable .
 .SH SEE ALSO
 .BR tcpdump (1),
 .BR ss (8),

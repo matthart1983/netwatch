@@ -16,6 +16,7 @@
 //! when reproducing a stuck resolver, a pcap startup failure, or a
 //! remote-stream issue.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tracing_appender::non_blocking::WorkerGuard;
@@ -77,6 +78,18 @@ fn init_inner() -> Option<WorkerGuard> {
         .try_init();
 
     Some(guard)
+}
+
+/// A line on stderr that cannot change how the process ends. `eprintln!` panics
+/// when the write fails, on a closed pipe or a full disk, and the panic's exit 101
+/// is not a status any command documents: `diagnose run` promises 0, 1, 2 or 3.
+pub fn stderr_line(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// [`stderr_line`] for stdout, whose print macros panic the same way.
+pub fn stdout_text(text: &str) {
+    let _ = write!(std::io::stdout(), "{text}");
 }
 
 pub fn log_dir() -> Option<PathBuf> {
