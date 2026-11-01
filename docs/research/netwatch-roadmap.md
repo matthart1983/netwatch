@@ -1,5 +1,8 @@
 # Netwatch gap assessment and roadmap
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](../index.md).
+
 Netwatch’s strongest opportunity is to become the terminal tool that turns a network symptom into an attributable, explainable incident, then produces evidence another engineer can use. The current product already contains much of that workflow. Its next investment should concentrate on measurement credibility, safe recovery, and incident handoff before adding more screens or protocol breadth.
 
 The immediate priorities are worker sandbox coverage, remediation correctness, and honest diagnostic availability. The next product milestone should combine guided diagnosis, a shared incident timeline, and reproducible reports. Egress change review is the strongest adjacent experiment; fleet incident collaboration is a conditional commercial extension.

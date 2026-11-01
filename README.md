@@ -130,18 +130,20 @@ netwatch --demo                          # replay a recorded Diagnose incident, 
 
 ## Docs
 
+Start with the [documentation index](docs/index.md) for setup, troubleshooting and release-specific wiki guidance.
+
 | | |
 |---|---|
 | [Reference](docs/REFERENCE.md) | Keys, filters, decoders, configuration, permissions |
 | [Diagnose](docs/REFERENCE.md#how-it-works) | Baselines, the 30 rules, ranked causes, verified closes |
 | [TLS decryption](docs/REFERENCE.md#tls-13--12-decryption) | Point `SSLKEYLOGFILE` at netwatch and read your own traffic |
-| [Egress linting](docs/egress-linter-plan.md) | Observe destinations, promote a policy, alert on what you block |
+| [Egress linting](docs/REFERENCE.md#egress-policy-linter) | Observe destinations, promote a policy, alert on what you block |
 | [Security and forensics](docs/REFERENCE.md#security--forensics) | Beaconing, scans, DNS tunnelling, JA4, the flight recorder |
 | [Capability matrix](docs/CAPABILITIES.md) | Platform differences, diagnostic limits and verification scope |
 | [Attribution evidence](docs/attribution.md) | Identity, freshness, coverage denominators and controlled results |
 | [Doctor command](docs/doctor.md) | Read-only setup report, JSON capabilities and optional capture check |
 | [Design 0.30](docs/DESIGN-0.30.md) | Why the screens look the way they do |
-| [Architecture](docs/WIKI.md) | Runtime, source map, permissions model, how to build and verify |
+| [Architecture](docs/ARCHITECTURE.md) | Runtime, source map, permissions model, how to build and verify |
 | [AI Insights](docs/INSIGHTS.md) | Optional LLM commentary inside Diagnose, off by default |
 | [Prometheus export](docs/observability-export.md) | Exposed metrics and scrape config |
 | [Packaging](docs/PACKAGING.md) | Every channel, and what updates it |

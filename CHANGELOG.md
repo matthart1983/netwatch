@@ -5,6 +5,9 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Reconcile documentation and the public wiki: correct privilege, sandbox, privacy,
+  attribution and platform guidance; maintain wiki sources in the repository with
+  deterministic rendering and link checks.
 - **Graphs are readable on the default theme.** `dark` drew upload from
   `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
   every throughput graph all but vanished. A graph's colours now hold at least 4:1

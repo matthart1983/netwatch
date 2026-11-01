@@ -227,6 +227,7 @@
 </style>
 </head>
 <body>
+<aside style="position:fixed;bottom:0;left:0;right:0;z-index:1000;background:#181825;color:#fff;padding:8px;font:14px sans-serif">Historical teaching illustration; examples are not current contracts. Read the <a style="color:#89b4fa" href="ARCHITECTURE.md">architecture</a>, <a style="color:#89b4fa" href="attribution.md">attribution limits</a> and <a style="color:#89b4fa" href="THREAT-MODEL.md">threat model</a>.</aside>
 <div id="progress"></div>
 <div id="brand"><b>eBPF</b> <span class="muted">end&nbsp;to&nbsp;end</span> <span class="dot">●</span></div>
 <div id="act"></div>
@@ -906,38 +907,13 @@ thread::spawn(move || loop {
     </div>
   </section>
 
-  <!-- 20 ─ Why it's safe to ship ────────────────────────────────────────── -->
-  <section class="slide" data-title="Why it's safe to ship" data-act="V · Safety &amp; frontiers">
-    <div class="wrap">
-      <p class="kick">Privilege you earn, then give back</p>
-      <h2>Three guarantees stack up to "safe in an end-user tool"</h2>
-      <div class="cols">
-        <div>
-          <p class="lede">Running code in the kernel sounds reckless for a TUI people install. It isn't, because the risky
-            parts are <b class="hl">proven done before the program runs</b> and the capability is <b class="hl">dropped
-            right after load</b>.</p>
-          <ul class="clean">
-            <li><b>The verifier</b> already proved termination, memory safety, and no leaks — a panic or hang isn't on
-              the table.</li>
-            <li><b>The GPL gate</b> keeps you to audited helpers; you can't call arbitrary kernel code.</li>
-            <li><b>The sandbox</b> drops <code class="inl">CAP_BPF</code> / <code class="inl">CAP_PERFMON</code> /
-              <code class="inl">CAP_NET_RAW</code> the instant load+attach finish — the program keeps running, but
-              nothing can load <i>another</i> one.</li>
-          </ul>
-        </div>
-        <div>
-          <div class="flowv">
-            <div class="node k">startup — hold CAP_BPF (need it to load)</div><div class="down">↓</div>
-            <div class="node b">bpf(PROG_LOAD) — verifier proves the program</div><div class="down">↓</div>
-            <div class="node">attach kprobe · take ring-buffer fd</div><div class="down">↓</div>
-            <div class="node p">sandbox::apply() — DROP CAP_BPF + Landlock</div><div class="down">↓</div>
-            <div class="node g">run loop — probe still firing, privilege gone</div>
-          </div>
-          <p class="cap">This is the same "earn privilege, then drop it" arc as packet capture in NetWatch's sandbox —
-            eBPF just joins the list of things opened <i>before</i> the drop.</p>
-        </div>
-      </div>
-    </div>
+  <section class="slide" data-title="Security limits" data-act="V · Safety &amp; frontiers">
+    <div class="wrap"><p class="kick">Current limits override this historical illustration</p>
+    <h2>Verifier checks do not prove whole-process safety</h2>
+    <p class="lede">The kernel verifier restricts accepted BPF programs; it does not prove the kernel, helpers, loader or userspace parser free of vulnerabilities. A GPL license declaration is not a security audit.</p>
+    <ul class="clean"><li>Linux policy is per thread. The SDK reader inherits filesystem policy but retains load capabilities.</li>
+    <li>Main, workers and parsers share memory and open descriptors. The capture descriptor retains capture/injection authority after capability drops.</li>
+    <li>Root containment is limited. Read the current <a href="THREAT-MODEL.md">threat model</a> and <a href="attribution.md">ownership evidence model</a> before relying on these controls.</li></ul></div>
   </section>
 
   <!-- 21 ─ Limits & gotchas ─────────────────────────────────────────────── -->

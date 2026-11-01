@@ -206,3 +206,12 @@ One browser step, then a script.
 
 The spec has not been built yet — the first COPR build is also its first real
 test. Expect to iterate on `BuildRequires` once.
+
+## Documentation release check
+
+Before calling a release documentation-complete, update the wiki manifest's release
+and peeled commit, review any unreleased notes, run `python3 scripts/wiki.py --check`,
+and publish the reviewed wiki tree using [the maintenance procedure](wiki-maintenance.md).
+Record the documentation source commit and wiki publication commit. Verify the
+shipped man page and platform prerequisites; do not infer live capture acceptance
+from a successful build.

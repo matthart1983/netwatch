@@ -1,5 +1,8 @@
 # Netwatch remediation implementation plan
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](../index.md).
+
 Implement the trust fixes first: confine the actual workers, report host changes accurately, recover interrupted remediations, and distinguish missing diagnostic evidence from healthy measurements. Then complete the diagnostic session and incident handoff workflow. Egress change review follows those foundations.
 
 This plan expands items **NW-R01–NW-R12** in the [gap assessment and roadmap](netwatch-roadmap.md). It is based on Netwatch **0.30.4**, commit `9b4597e`, rechecked on 10 September 2026. Proposed types, modules, commands, and release groupings below are implementation decisions to build, not existing functionality. No application changes are made by this document.

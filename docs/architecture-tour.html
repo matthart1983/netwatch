@@ -134,6 +134,7 @@
 </style>
 </head>
 <body>
+<aside style="position:fixed;bottom:0;left:0;right:0;z-index:1000;background:#181825;color:#fff;padding:8px;font:14px sans-serif">Historical teaching illustration; examples are not current contracts. Read the <a style="color:#89b4fa" href="ARCHITECTURE.md">architecture</a>, <a style="color:#89b4fa" href="attribution.md">attribution limits</a> and <a style="color:#89b4fa" href="THREAT-MODEL.md">threat model</a>.</aside>
 
 <div id="progress"></div>
 <div id="brand"><b>NetWatch</b> <span class="muted">architecture tour</span> <span class="dot">●</span></div>
@@ -488,17 +489,17 @@ pub enum EbpfStatus {
       <h2>Current sandbox boundary</h2>
       <div class="cols">
         <div>
-          <p class="lede">Worker entry points apply a prepared Linux filesystem policy before processing. Capture configures its device first. Grants use exact input files and dedicated output directories. The SDK eBPF reader inherits filesystem policy but retains load capabilities; privileged capture/restart validation remains pending. Network access remains unrestricted.</p>
+          <p class="lede">Worker entry points apply a prepared Linux filesystem policy before processing. Capture configures its device first. Grants use exact input files and dedicated output directories. The SDK eBPF reader inherits filesystem policy but retains load capabilities; privileged capture/restart validation remains pending. Network policy depends on thread role and kernel; shared memory and descriptors prevent a process-isolation guarantee.</p>
           <div class="flowv" style="margin-top:8px">
             <div class="node k">App::prepare() + start_workers() — open pcap · PKTAP · eBPF (needs caps)</div><div class="down">↓</div>
             <div class="node p">worker entry — verified selected cap drops · pinned Landlock FS</div><div class="down">↓</div>
-            <div class="node g">run loop — entry results in Settings; network unrestricted</div>
+            <div class="node g">run loop — entry results in Settings; role-specific network policy</div>
           </div>
           <p class="small muted" style="margin-top:10px"><b>Three modes:</b> <code class="inl">Disabled</code> · <code class="inl">BestEffort</code> (report degradation) · <code class="inl">Strict</code> (reject failed required policy entries).</p>
         </div>
         <div class="code"><div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>src/sandbox/mod.rs</span></div><div data-rust><script type="text/plain">//! Linux: policy at worker entry using a prepared ruleset.
-//! No network restrictions; capture acceptance tests remain pending.
-//! CAP_NET_RAW retained in best-effort; strict attempts to drop it.
+//! Per-thread network policy; shared descriptors retain authority.
+//! Capture drops CAP_NET_RAW; best-effort TUI main can retain it.
 
 pub enum Mode {
     Disabled,    // --no-sandbox escape hatch

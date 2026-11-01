@@ -55,5 +55,7 @@ sudo cp packaging/launchd/com.netwatch.agent.plist /Library/LaunchDaemons/
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.netwatch.agent.plist
 ```
 
-Full eBPF/PKTAP attribution on macOS requires root; without it the daemon falls
-back to lsof/ss-based attribution.
+macOS uses BPF capture and `lsof` observations; Linux eBPF does not run on macOS.
+PKTAP metadata does not establish verified socket ownership. macOS process
+identity remains unverified even with elevated capture access; see
+[attribution evidence](../docs/attribution.md).

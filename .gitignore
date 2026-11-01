@@ -24,3 +24,6 @@ perf.data.old
 flamegraph.svg
 packaging/docker/bin/
 packaging/winget/generated/
+
+# Python documentation tooling
+__pycache__/
