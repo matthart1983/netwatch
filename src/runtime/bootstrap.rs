@@ -34,6 +34,10 @@ impl SessionKind {
 pub fn start(app: &mut App, kind: SessionKind, mode: sandbox::Mode) -> anyhow::Result<()> {
     if let Some(authority) = kind.recovery_authority() {
         app.inspect_remediations(authority);
+        // Once, here rather than in the inspection, which shutdown repeats.
+        if let Some(refusal) = crate::diagnose::remediation::resolver::authority_refusal() {
+            tracing::warn!("{refusal}");
+        }
     } else {
         app.diagnose.enter_demo_mode();
     }
@@ -62,7 +66,7 @@ pub fn start(app: &mut App, kind: SessionKind, mode: sandbox::Mode) -> anyhow::R
     if kind != SessionKind::Demo && app.user_config.record_uptime {
         app.uptime = crate::uptime::Monitor::new(crate::uptime::default_dir());
     }
-    if app.diagnose.journal.blocked_reason().is_none() && kind != SessionKind::Demo {
+    if app.diagnose.journal.recovery_notice().is_none() && kind != SessionKind::Demo {
         app.diagnose
             .set_status(crate::runtime::capabilities::CapabilitySnapshot::live(app).compact());
     }

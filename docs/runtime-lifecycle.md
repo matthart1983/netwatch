@@ -12,8 +12,9 @@ only a current-thread signal/timer runtime, registers SIGINT/SIGTERM before muta
 and holds the fixed root-owned authority store lock until restoration or exit.
 No packet, attribution, remote or model workers start in this command.
 
-The shared live bootstrap also reports unresolved/inaccessible authority records
-without performing rollback. See [resolver adapter scope and validation](resolver-adapter.md).
+The shared live bootstrap also reports unresolved authority records without performing
+rollback. A session that is not root cannot read them. When the kernel refuses it the
+store, it logs one line saying so instead. See [resolver adapter scope and validation](resolver-adapter.md).
 
 ## PR06 implementation update
 
@@ -24,15 +25,15 @@ runtime bootstrap; config generation intentionally writes only its config file.
 
 Live recovery authority is explicitly `InspectOnly`. Legacy PID/path metadata
 cannot authorize a rollback: inspection does not open journal-supplied target or
-backup paths, and unresolved temporary entries block subsequent journal writes.
+backup paths, and nothing writes that journal any more.
 TUI displays the persistent reason and exports it in Diagnose reports; daemon logs
 the same reason. Shutdown cancels pending applies and preserves legacy entries,
 including those whose PID happens to match the current process. Demo sessions skip
 recovery and skip saving their simulated baselines at shutdown.
 
-There are no eligible automatic rollback operations in the legacy format. PR07/08
-must establish durable ownership and a supported resolver authority before enabling
-rollback. No privileged helper or wider parser filesystem grant is introduced.
+There are no eligible automatic rollback operations in the legacy format, and 0.40
+removed the rollback code, which nothing had called since 0.31.1. No privileged
+helper or wider parser filesystem grant is introduced.
 Optional remote/logging/metrics services still start in shared CLI setup under the
 worker policy; recovery inspection precedes application collector startup.
 
