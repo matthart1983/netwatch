@@ -192,7 +192,7 @@ def main():
                       "Development-only behavior is labeled unreleased.\n")
             text = title + '\n\n' + header + body
             text = text.replace('@repo@', f'{BASE}/blob/{ref}')
-            (args.output / f'{page}.md').write_text(text)
+            (args.output / f'{page}.md').write_text(text.rstrip() + '\n')
         print(f'Rendered {len(manifest["pages"])} pages into {args.output}')
     print(f'Validated {len(files)} maintained documents and {len(manifest["pages"])} wiki pages')
 
