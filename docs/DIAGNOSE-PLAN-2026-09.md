@@ -67,7 +67,7 @@ Decisions for Q1 2027 and later (release numbers, second WAN target, host rules 
 
 Working rules that follow from these:
 - A PR that changes any recorded decision re-records the corpus in the same PR, and its description lists each changed span with the item that explains it. An unexplained change blocks the merge.
-- A PR that adds or renames a check or cause regenerates `ml/schema.json` with `cargo run -- diagnose features --schema ml/schema.json`. `the_committed_schema_is_current` (`diagnose/features.rs:892`) fails otherwise, because the feature columns come from `causes::CAUSES` (`diagnose/features.rs:294-303`).
+- A PR that adds or renames a check or cause regenerates `ml/schema.json` with `cargo run -- diagnose features --unstable --schema ml/schema.json`. `the_committed_schema_is_current` (`diagnose/features.rs:892`) fails otherwise, because the feature columns come from `causes::CAUSES` (`diagnose/features.rs:294-303`).
 - Each PR should take under an hour to review. Three reach the hour (P04, P29, P30) and say why.
 - At most 2 unreviewed PRs per lane. The two lanes are the two sessions plan §6.1 allows per repo.
 - Feature freeze is the Friday before a release. Every PR an exit clause or gate depends on is merged by then. The Monday before a Tuesday tag takes only the release PR and at most one low-risk PR that can slip without touching a gate.
@@ -234,7 +234,7 @@ P04 is one of three PRs that reach an hour; it is the lab driver and topology, w
 #### D33-C01 · The fixture episode stamps health-probe times
 - **Why.** Report §"Tests that make the 0.33 exit reachable". `fixture::episode()` never stamps health times (`diagnose/fixture.rs:343-348`), and `observe_live_at` drops DNS and gateway observations without them (`diagnose/engine.rs:351-356`). The corpus therefore cannot see a DNS or gateway regression. Today it pins two spans, `path.changed` and `tcp.bufferbloat_remote`, both with `closed: null`.
 - **Files.** `diagnose/fixture.rs:328-368` (`episode()`); `tests/diagnose/corpus/fixture-scenario.json.gz` and `.decisions.json`.
-- **Change.** Set `times.health.{dns, gateway, internet}` on the prober's 5 s grid, `start + (t − t % 5)`. Set `times.health.dns_target` from `obs.dns.resolver` and `gateway_target` from `obs.gateway.addr`. Regenerate with `netwatch diagnose corpus`.
+- **Change.** Set `times.health.{dns, gateway, internet}` on the prober's 5 s grid, `start + (t − t % 5)`. Set `times.health.dns_target` from `obs.dns.resolver` and `gateway_target` from `obs.gateway.addr`. Regenerate with `netwatch diagnose corpus --unstable`.
 - **Tests.** New `fixture_episode_carries_health_ages`: every frame has DNS and gateway ages and a DNS target. Existing: `the_pinned_corpus_replays_to_its_recorded_decisions`.
 - **Acceptance.** The decisions file gains `dns.slow_resolver|169.254.1.1`, opened `2026-09-03 06:48:20` with top cause `upstream_slow`, and replay still matches. Slice C measured both values in a scratch build.
 - **Depends on.** Nothing.
@@ -525,7 +525,7 @@ Freeze is Fri 20 Nov. P21 and P22 carry exit clause 2 and are reviewed before it
 ##### D33-C02 · The corpus holds many episodes and pins why each span ended
 - **Why.** Report §"Tests that make the 0.33 exit reachable"; REVIEW §2.2 wants open→close episodes per touched rule. The replay test loads one hard-coded file (`diagnose/episode.rs:1431`), `write_corpus` writes only the fixture (`diagnose/episode.rs:1118-1142`), and `IssueSpan` records when an issue left the primary list but not why (`diagnose/episode.rs:936-941`, set at 1007-1015), so an expiry, a suppression and a verified fix look the same.
 - **Files.** `diagnose/episode.rs:936-941`, `963-1019` (`replay`), `1118-1142`, the `corpus` arm at 1150-1159, the test at 1431; new `tests/diagnose/corpus/manifest.toml`.
-- **Change.** `IssueSpan.close_reason: Option<String>` (serde default, skipped when `None`): `"suppressed"` when the issue is still open with `suppressed_by` set, otherwise the state label. Manifest rows are `{id, kind = "synthetic" | "lab", rules, note}`. `write_corpus` rebuilds synthetic episodes; lab episodes keep their frames and re-derive decisions. The test iterates the manifest: synthetic entries must replay to their recording and match decisions; lab entries must match decisions. Add `netwatch diagnose corpus --only ID`.
+- **Change.** `IssueSpan.close_reason: Option<String>` (serde default, skipped when `None`): `"suppressed"` when the issue is still open with `suppressed_by` set, otherwise the state label. Manifest rows are `{id, kind = "synthetic" | "lab", rules, note}`. `write_corpus` rebuilds synthetic episodes; lab episodes keep their frames and re-derive decisions. The test iterates the manifest: synthetic entries must replay to their recording and match decisions; lab entries must match decisions. Add `netwatch diagnose corpus --unstable --only ID`.
 - **Tests.** `every_corpus_entry_replays_to_its_pinned_decisions` (names the failing entry), `a_manifest_entry_without_files_fails`, `close_reason_distinguishes_suppression_from_close`.
 - **Acceptance.** `cargo test` asserts once per manifest entry; decision files without `close_reason` still parse.
 - **Depends on.** C01.

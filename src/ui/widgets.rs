@@ -743,6 +743,47 @@ pub fn capture_failure_lines(
         .collect()
 }
 
+/// The bottom row, for the first moments of a session whose config has keys it
+/// ignored: `sandbox_mode = "strict"` is a sandbox that is not strict, and stderr
+/// is behind the TUI until it quits. Over the view rather than in its layout, so
+/// that it reaches Lite and Dense too and moves nothing when it goes.
+pub fn render_config_notice(f: &mut Frame, app: &App, area: Rect) {
+    let showing = app
+        .ui
+        .config_notice_until
+        .is_some_and(|until| std::time::Instant::now() < until);
+    if !showing || area.height == 0 {
+        return;
+    }
+    let mut warnings = app.config_warnings().filter(|warning| !warning.is_quiet());
+    let Some(first) = warnings.next() else {
+        return;
+    };
+    let more = match warnings.count() {
+        0 => String::new(),
+        n => format!(" (+{n} more)"),
+    };
+    let row = Rect {
+        y: area.y + area.height - 1,
+        height: 1,
+        ..area
+    };
+    // Lite has no Settings of its own: `,` does nothing there, and `L` leaves it.
+    let way = if app.ui.view_mode == crate::app::ViewMode::Lite {
+        "L then , settings"
+    } else {
+        ", settings"
+    };
+    let tail = format!("{more}  {way}");
+    let room = usize::from(row.width).saturating_sub(3 + crate::ui::text::width(&tail));
+    let text = format!(" ⚠ {}{tail}", ellipsise(&first.short(), room));
+    let style = Style::default()
+        .fg(app.theme.text_inverse)
+        .bg(app.theme.status_warn);
+    f.render_widget(ratatui::widgets::Clear, row);
+    f.render_widget(Paragraph::new(text).style(style), row);
+}
+
 pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![build_header_line(app, None), build_verdict_line(app)];
     if let Some(error) = capture_failure(app).filter(|_| area.height > 3) {

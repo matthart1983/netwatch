@@ -15,6 +15,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{
+    apply_renames, from_toml_reporting_unread, same_value, ConfigWarning, ConfigWarningKind,
+    RenamedKey,
+};
+
+/// Every `egress-policy.toml` key that has been renamed, none so far. A rename
+/// after 1.0 is the field's new name and one line here, as in
+/// `config::RENAMED_KEYS`. `*` is every process: `process.*.allow_sni`.
+const RENAMED_KEYS: &[RenamedKey] = &[];
+
 // ── Declared egress policy ─────────────────────────────────────────────
 
 /// A declarative egress allowlist: `process → {allowed SNIs, ASNs, ports}`.
@@ -52,6 +62,11 @@ pub struct EgressPolicy {
     pub block: BlockList,
     #[serde(default)]
     pub process: HashMap<String, ProcessRule>,
+    /// What the file this came from should have its owner told: a rule whose
+    /// `allow_snis` was not read is a rule with no name restriction at all, so
+    /// the typo admits traffic. Never read from or written to a file.
+    #[serde(skip)]
+    pub load_warnings: Vec<ConfigWarning>,
 }
 
 /// Which egress findings raise alerts. See [`EgressPolicy::alert`].
@@ -344,13 +359,38 @@ pub fn load_policy_file(path: &Path) -> Option<EgressPolicy> {
         }
     }
     let contents = std::fs::read_to_string(path).ok()?;
-    match toml::from_str(&contents) {
-        Ok(policy) => Some(policy),
+    let (contents, moved) = apply_renames(&contents, RENAMED_KEYS);
+    match from_toml_reporting_unread::<EgressPolicy>(&contents) {
+        Ok((mut policy, unread)) => {
+            policy.load_warnings = moved
+                .into_iter()
+                .chain(
+                    unread
+                        .iter()
+                        .map(|key| ConfigWarningKind::UnknownKey(key.join("."))),
+                )
+                .map(|kind| ConfigWarning {
+                    file: path.into(),
+                    kind,
+                })
+                .collect();
+            Some(policy)
+        }
         Err(e) => {
             tracing::warn!(target: "netwatch::egress", path = %path.display(), error = %e, "egress policy parse failed");
             None
         }
     }
+}
+
+/// What the policy file at the default path should have its owner told, for
+/// doctor and for a command with no log. Nothing for a file that is refused or
+/// does not parse: that is a louder message of its own, and no rule is in force.
+pub fn default_policy_warnings() -> Vec<ConfigWarning> {
+    default_policy_path()
+        .and_then(|path| load_policy_file(&path))
+        .map(|policy| policy.load_warnings)
+        .unwrap_or_default()
 }
 
 /// Serialize a policy to disk (creating parent dirs). Used by "promote".
@@ -367,28 +407,10 @@ pub fn save_policy_file(policy: &EgressPolicy, path: &Path) -> std::io::Result<(
 /// a trust anchor: `load_policy_file` refuses a group/world-writable one, so
 /// our OWN writes must be tight or promote-then-reload would refuse the file
 /// we just wrote (which looked like "promote didn't take"). No-op perms on
-/// non-unix; the byte write still happens.
+/// non-unix. A write that fails leaves the old file, which a policy needs more
+/// than most: losing it silences every rule.
 pub(super) fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)?;
-        // Re-assert mode in case the file pre-existed with looser perms
-        // (create+mode only applies to newly-created files).
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    crate::atomic_file::replace(path, bytes, crate::atomic_file::Access::OwnerOnly)
 }
 
 const POLICY_HEADER: &str = "# netwatch egress policy (observe → promote → warn).\n\
@@ -471,6 +493,7 @@ pub fn remove_rules_from_policy_file(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    let existing = apply_renames(&existing, RENAMED_KEYS).0;
     let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -527,12 +550,36 @@ fn leading_comment_block(src: &str) -> String {
     out
 }
 
-/// Upsert `rules` into the policy file, preserving everything else — hand
-/// edits, comments, and rules for processes not being promoted. Promotion
-/// is additive per process: it unions the observed entries with those already
-/// declared (it never shrinks or deletes an allowlist). Removal is
-/// `remove_rules_from_policy_file`. Refuses (rather than clobbers) a file that
-/// no longer parses, so a broken hand edit is never silently thrown away.
+/// The keys of a rule that promotion writes.
+const ALLOW_KEYS: [&str; 4] = ["allow_sni", "allow_asn", "allow_ip", "allow_ports"];
+
+/// How a comment promotion wrote starts, so that the next one can replace it.
+const SUGGESTION: &str = "# suggestion:";
+
+/// One of a rule's lists. Left as written if it holds what it should, in that
+/// order; otherwise rewritten on one line, keeping that line's comment.
+fn set_list(rule: &mut toml_edit::Table, key: &str, list: toml_edit::Array) {
+    let list = toml_edit::Value::Array(list);
+    match rule.get_mut(key) {
+        Some(toml_edit::Item::Value(current)) => {
+            if !same_value(current, &list) {
+                let decor = current.decor().clone();
+                *current = list;
+                *current.decor_mut() = decor;
+            }
+        }
+        _ => rule[key] = toml_edit::Item::Value(list),
+    }
+}
+
+/// Upsert `rules` into the policy file, preserving everything else: hand edits,
+/// comments in a rule and above it, and rules for processes not being promoted. A
+/// list that gains an entry is rewritten on one line, so a comment inside that
+/// list goes. Promotion is additive per process: it unions the observed entries
+/// with those already declared (it never shrinks or deletes an allowlist).
+/// Removal is `remove_rules_from_policy_file`. Refuses (rather than clobbers) a
+/// file that no longer parses, so a broken hand edit is never silently thrown
+/// away.
 pub fn merge_rules_into_policy_file(
     rules: &[(String, ProcessRule)],
     path: &Path,
@@ -542,6 +589,7 @@ pub fn merge_rules_into_policy_file(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => POLICY_HEADER.to_string(),
         Err(e) => return Err(e),
     };
+    let existing = apply_renames(&existing, RENAMED_KEYS).0;
     let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -567,7 +615,23 @@ pub fn merge_rules_into_policy_file(
         let ip = union_strings(existing, "allow_ip", &rule.allow_ip);
         let ports = union_ports(existing, "allow_ports", &rule.allow_ports);
 
-        let mut t = toml_edit::Table::new();
+        // Everything else in the rule stays where it is: a hand-written
+        // `[process.<name>.block]`, which promotion must never drop, any key this
+        // version does not read, and comments. Only the four lists are promotion's.
+        let mut t = match existing.and_then(toml_edit::Item::as_table) {
+            Some(rule) => rule.clone(),
+            None => {
+                let mut rule = toml_edit::Table::new();
+                if let Some(other_form) = existing.and_then(toml_edit::Item::as_table_like) {
+                    for (key, item) in other_form.iter() {
+                        if !ALLOW_KEYS.contains(&key) {
+                            rule[key] = item.clone();
+                        }
+                    }
+                }
+                rule
+            }
+        };
         // Wildcard suggestions land as a comment above the rule — visible
         // exactly where the human reviews, applied only by their hand.
         // Computed on the *unioned* set so the suggestion reflects the file.
@@ -578,25 +642,44 @@ pub fn merge_rules_into_policy_file(
             allow_ports: ports.clone(),
             ..Default::default()
         };
+        // Below whatever comment is already above the rule, in place of the last
+        // promotion's suggestion. The file's header is above the first rule.
+        let above = t.decor().prefix().and_then(|prefix| prefix.as_str());
+        let mut comment: Option<String> = above.map(|above| {
+            above
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with(SUGGESTION))
+                .collect()
+        });
         let suggestions = wildcard_suggestions(&unioned);
         if !suggestions.is_empty() {
-            t.decor_mut()
-                .set_prefix(format!("# suggestion: {}\n", suggestions.join("; ")));
+            comment
+                .get_or_insert_default()
+                .push_str(&format!("{SUGGESTION} {}\n", suggestions.join("; ")));
         }
-        t["allow_sni"] =
-            toml_edit::value(toml_edit::Array::from_iter(sni.iter().map(String::as_str)));
-        t["allow_asn"] =
-            toml_edit::value(toml_edit::Array::from_iter(asn.iter().map(String::as_str)));
-        t["allow_ip"] =
-            toml_edit::value(toml_edit::Array::from_iter(ip.iter().map(String::as_str)));
-        t["allow_ports"] = toml_edit::value(toml_edit::Array::from_iter(
-            ports.iter().map(|p| i64::from(*p)),
-        ));
-        // Carry a hand-written `[process.<name>.block]` across: promotion
-        // only ratifies observed allow entries and must never drop a block.
-        if let Some(block) = existing.and_then(|e| e.get("block")).cloned() {
-            t["block"] = block;
+        if let Some(comment) = comment {
+            t.decor_mut().set_prefix(comment);
         }
+        set_list(
+            &mut t,
+            "allow_sni",
+            toml_edit::Array::from_iter(sni.iter().map(String::as_str)),
+        );
+        set_list(
+            &mut t,
+            "allow_asn",
+            toml_edit::Array::from_iter(asn.iter().map(String::as_str)),
+        );
+        set_list(
+            &mut t,
+            "allow_ip",
+            toml_edit::Array::from_iter(ip.iter().map(String::as_str)),
+        );
+        set_list(
+            &mut t,
+            "allow_ports",
+            toml_edit::Array::from_iter(ports.iter().map(|p| i64::from(*p))),
+        );
         doc["process"][name.as_str()] = toml_edit::Item::Table(t);
     }
 

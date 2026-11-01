@@ -17,8 +17,8 @@ never appears in `ps`. The equivalent manual invocation is:
 NETWATCH_API_KEY=<key> netwatch daemon --remote https://cloud.example.com
 ```
 
-`--api-key <key>` still works, but it puts the key where any user on the host
-can read it with `ps`.
+`--api-key <key>` is deprecated. It stays accepted through 1.x, with a warning, and
+goes in 2.0, and it puts the key where any user on the host can read it with `ps`.
 
 The URL must be `https://`. netwatch refuses an `http://` URL, which would
 send the API key in cleartext, unless `--insecure-remote` is also given; for
