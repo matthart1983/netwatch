@@ -5512,6 +5512,33 @@ mod render_safety_tests {
             .collect()
     }
 
+    /// The status line picks its glyph from words, and a notice may have none of
+    /// them: a corrupt store's carries a parse error's text, and drew a green `✓`.
+    #[test]
+    fn a_recovery_notice_is_drawn_as_a_warning_whatever_it_says() {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        app.ui.current_tab = Tab::Diagnose;
+        for notice in [
+            "resolver authority journal cannot be inspected: expected value at line 1 column 1; \
+             preserved at /var/lib/netwatch/resolver-v2; review with sudo netwatch resolver status",
+            "resolver authority journal cannot be inspected: Permission denied (os error 13); \
+             preserved at /var/lib/netwatch/resolver-v2; review with sudo netwatch resolver status",
+            "cannot inspect recovery-v2 at /state: unsupported version; evidence preserved",
+            "recovery required for 2026-0908-02: an older netwatch may have left a change",
+            "invalid or unsupported journal /cache/applied.json: expected value; original preserved",
+        ] {
+            app.diagnose.journal = crate::diagnose::remediation::Journal::with_notice(notice);
+            let screen = rows(&draw(&mut app));
+            let start = &notice[..24];
+            let line = screen
+                .iter()
+                .find(|row| row.contains(start))
+                .unwrap_or_else(|| panic!("{notice} is not on screen:\n{}", screen.join("\n")));
+            assert!(line.contains(&format!("! {start}")), "{line}");
+            assert!(!line.contains('✓') && !line.contains('✕'), "{line}");
+        }
+    }
+
     /// A refused capture shows on the first screen, with the fix, instead of
     /// only on the Packets tab.
     #[test]

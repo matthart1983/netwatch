@@ -23,6 +23,12 @@ All notable changes to NetWatch will be documented in this file.
   columns are not renamed or removed, and new ones are added at the end.
 
 ### Fixed
+- **Graphs are readable on the default theme.** `dark` drew upload from
+  `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
+  every throughput graph all but vanished. A graph's colours now hold at least 4:1
+  from its baseline up to the series colour, on every theme that sets its own
+  colours. That makes the quiet part of the graph brighter on all of them, and
+  download and sparklines too.
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
   the plain Linux asset has been the static binary, and the `-static` name went
   away, but aqua's registry, which mise reads, still asked for it. Every release
@@ -43,6 +49,85 @@ All notable changes to NetWatch will be documented in this file.
   across TLS records, or whose segments arrive out of order, is still not
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
+- **An ordinary user's Diagnose no longer reports an error for a resolver store only
+  root can read.** One `sudo netwatch resolver set` or `recover` leaves
+  `/var/lib/netwatch` private to root. Every later TUI or daemon session that was not
+  root then showed `resolver authority journal cannot be inspected: Permission denied`
+  on the Diagnose status line and in the log, in place of the status it would have shown.
+  It did this even when every record there was resolved, and that user could do nothing
+  to clear it. Such a session cannot tell resolved from unresolved, so it now leaves the
+  status line alone and logs one line at startup saying the store exists, this user cannot
+  read it, and to run `sudo netwatch resolver status`. `netwatch doctor` reports the same
+  as a new `resolver_store` capability. Root sessions still report unresolved records, and
+  any other failure to read the store is still reported to everyone.
+- **`netwatch resolver set` no longer leaves the resolver changed when its stdout is
+  closed or full.** The line announcing the change was the first write after making it,
+  so `sudo netwatch resolver set ... | head -0` or `> /dev/full` panicked there and exited
+  101 with the change in place and its record `applied`, until someone ran `recover`.
+  Since 0.31.1. Every line `status`, `set` and `recover` print now ignores a failed
+  write: `set` still restores at its deadline, and the exit status and any error on stderr
+  are the same as with a working stdout.
+- **A corrupt resolver store no longer shows a green check in Diagnose.** The status line
+  picks its mark from the words in the text, and `resolver authority journal cannot be
+  inspected: expected value at line 1 column 1` has none it warns on, so a root session
+  drew it with `✓`. Since 0.31.1. Every recovery notice is now drawn with `!`, whatever
+  it says. Some that mentioned an OS error used to get `✕`, and now get `!` too.
+- **A FIFO or a huge file in the cache no longer stops a session starting.** A FIFO at
+  `applied.json` or `baselines.json` blocked the daemon before its first log line and left
+  a TUI on the alternate screen ignoring Ctrl-C and `q`, and a symlink to `/dev/zero` read
+  until memory ran out. Any confined thread but capture can write the cache, so a
+  compromised parser could plant one for the next start. Sessions now read these two only
+  as regular files under a size limit, without following a symlink at that name. A bad
+  `applied.json` gets the usual notice, with `cannot read journal`, and bad baselines start
+  afresh. `applied.json` must also be this user's own, and baselines need not be, since a
+  `sudo` that keeps HOME leaves them root's. `config.toml`, `egress-policy.toml` and
+  `egress-profiles.json` still get an ordinary read.
+
+### Changed
+- **The notice for a resolver change left by 0.30 now names the file and says how
+  to put it back.** Netwatch 0.30 recorded live resolver changes in `applied.json`.
+  Since 0.31.1 nothing has restored an entry left open there, because nothing proves
+  who wrote the file. Diagnose said `automatic rollback disabled` and gave the backup,
+  but not the changed file or the next step, and nothing said that removing the journal
+  is what clears the notice. It now says all three. The steps are in [the recovery document](docs/recovery-store.md#legacy-journal):
+  compare `/etc/resolv.conf` with the text the entry says netwatch wrote, copy the backup
+  back as root only if they match, then remove `applied.json`, which is what clears the
+  notice. A backup file alone proves nothing, since no release removes them, so a session
+  that quit cleanly leaves one too. This only reaches someone whose 0.30
+  session was killed with a change in place. `netwatch resolver recover` restores what an
+  interrupted `netwatch resolver set` left, and tests now hold that to a journal and backup
+  a real 0.31.1 wrote.
+- **`netwatch resolver status` and `recover` no longer read as all clear when a 0.30
+  journal has an entry open.** On that host `recover` said `Recovered 0 resolver
+  operations` and `status` said `No resolver authority journal`, with `/etc/resolv.conf`
+  possibly still changed. Both now print the same notice, naming the file and the
+  backup, on Linux. They restore nothing from the journal. `recover`'s exit status stays
+  as it was and does not depend on the journal: 0 when no unresolved record is left in
+  its own store, 1 otherwise. A file a user can write must not be able to fail a root
+  command, so read the output, not just the exit status.
+- **A 0.30 journal entry marked `abandoned` now gets the notice too.** 0.30 and 0.31.0
+  wrote that state when a rollback gave up, either because the backup was missing, which
+  left the file as netwatch set it, or because the file had been edited since. Those
+  entries said nothing, so the resolver could still hold netwatch's change with `recover`
+  saying `Recovered 0`. The journal does not record which it was, so this notice says that
+  and does not offer the backup as the way back. If you have one, the notice stays until
+  you remove `applied.json`.
+
+### Removed
+- **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,
+  and the code that wrote the journal went in 0.33. That leaves netwatch reading
+  `applied.json` and never writing it or opening a path it names. The notices about
+  an unreadable journal no longer say `host changes blocked`, since no host change
+  was waiting on them. No behaviour changes beyond that wording.
+
+### Dependencies
+- **`unicode-width` is pinned to 0.2.2.** 0.2.3 counts a halfwidth katakana sound
+  mark (ﾞ or ﾟ) as one cell, which is correct, but ratatui already adds a cell for
+  each one, so `ﾊﾟ` measured 3 columns where terminals draw 2, and everything after
+  such a name in a row shifted right. tmux and xterm.js both draw `ﾊﾟﾊﾟ` in 4. A
+  `cargo install netwatch-tui` without `--locked` could already pick up 0.2.3; this
+  stops that from the next release on.
+- tokio 1.54.1, uuid 1.29.0, brotli 9.1.1 and webpki-roots 1.0.11.
 - **The egress export says `"proto": "tls"` only when a ClientHello named the
   destination.** It said `tls` for anything with a name, and a cleartext HTTP
   `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS

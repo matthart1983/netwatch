@@ -102,6 +102,19 @@ impl Default for GraphOpts {
 /// letting it compete with a busy one.
 const MIN_FADE_ALPHA: f32 = 0.30;
 
+/// The least a magnitude ramp's dimmest stop may contrast with the background.
+/// An area graph puts most of its ink near the baseline, so that end has to be
+/// readable, not only the peaks.
+const MIN_RAMP_CONTRAST: f64 = 4.0;
+
+/// The least the series colour may contrast with the background. It has to clear
+/// [`MIN_RAMP_CONTRAST`] by enough for the stops below it to climb.
+const MIN_SERIES_CONTRAST: f64 = 6.0;
+
+/// What a ramp is measured against when the theme leaves the background to the
+/// terminal, whose real colour netwatch can't know.
+const ASSUMED_DARK_BG: (u8, u8, u8) = (0x1a, 0x1b, 0x26);
+
 /// A five-stop color ramp, sampled 0.0..=1.0 along the axis it is applied to.
 ///
 /// One definition of "how netwatch colors a graph", shared by every renderer.
@@ -531,14 +544,55 @@ pub fn magnitude_ramp(base: Color, bg: Color) -> Ramp {
     // excluded upstream in `fade_ramp`, so mapping to RGB here does not
     // override anyone's palette.
     let (r, g, b) = to_rgb_or_default(base, (255, 255, 255));
-    let base = Color::Rgb(r, g, b);
+    // Named colours resolve to the VGA palette, where the default theme's upload
+    // series is (0, 0, 170): 1.6:1 on black at the series colour, less below it.
+    let behind = to_rgb_or_default(bg, ASSUMED_DARK_BG);
+    let base = with_contrast(Color::Rgb(r, g, b), behind, MIN_SERIES_CONTRAST);
+    // The floor moves up the fade rather than toward white, so it keeps the hue.
+    let floor = (0..=70)
+        .map(|step| MIN_FADE_ALPHA + step as f32 / 100.0)
+        .find(|&alpha| contrast(fade_color(base, bg, alpha, false), behind) >= MIN_RAMP_CONTRAST)
+        .unwrap_or(1.0);
     Ramp::new(vec![
-        fade_color(base, bg, MIN_FADE_ALPHA, false),
-        fade_color(base, bg, 0.62, false),
+        fade_color(base, bg, floor, false),
+        fade_color(base, bg, floor + (1.0 - floor) * 0.46, false),
         base,
         lighten(base, 0.42),
         lighten(base, 0.76),
     ])
+}
+
+/// `c`, moved away from the background only as far as `min` needs.
+fn with_contrast(c: Color, behind: (u8, u8, u8), min: f64) -> Color {
+    let away = if luminance(behind) < 0.18 {
+        Color::Rgb(255, 255, 255)
+    } else {
+        Color::Rgb(0, 0, 0)
+    };
+    (0..=100)
+        .map(|step| lerp(c, away, step as f32 / 100.0))
+        .find(|&moved| contrast(moved, behind) >= min)
+        .unwrap_or(away)
+}
+
+/// WCAG contrast ratio.
+fn contrast(c: Color, behind: (u8, u8, u8)) -> f64 {
+    let a = luminance(to_rgb_or_default(c, behind));
+    let b = luminance(behind);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// WCAG relative luminance.
+fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let linear = |v: u8| {
+        let v = v as f64 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
 }
 
 /// Linear blend, RGB only. Non-RGB inputs return `a` unchanged rather than
@@ -2004,5 +2058,39 @@ mod tests {
             base,
             "the middle of the ramp is the series colour"
         );
+    }
+
+    /// `dark` resolved its upload series to (0, 0, 170), so the graph's lower half
+    /// all but vanished on a dark terminal. Nothing below the series colour may
+    /// fall under the floor, and the floor must not flatten the gradient.
+    #[test]
+    fn every_theme_keeps_a_graph_readable_up_to_its_series_colour() {
+        for name in crate::theme::THEME_NAMES {
+            let theme = crate::theme::by_name(name);
+            if theme.defers_to_terminal() {
+                continue;
+            }
+            let behind = to_rgb_or_default(theme.bg, ASSUMED_DARK_BG);
+            for base in [theme.rx_rate, theme.tx_rate] {
+                let ramp = magnitude_ramp(base, theme.bg);
+                let mut previous = 0.0;
+                for step in 0..=10 {
+                    let c = contrast(ramp.at(step as f32 / 20.0), behind);
+                    assert!(
+                        c >= MIN_RAMP_CONTRAST,
+                        "{name} {base:?} at {step}: {c:.1}:1"
+                    );
+                    assert!(c > previous, "{name} {base:?} flattens at {step}");
+                    previous = c;
+                }
+            }
+        }
+    }
+
+    /// A series that is already readable keeps its own colour.
+    #[test]
+    fn a_readable_series_colour_is_left_alone() {
+        let base = Color::Rgb(0x50, 0xfa, 0x7b);
+        assert_eq!(magnitude_ramp(base, Color::Reset).at(0.5), base);
     }
 }

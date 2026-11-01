@@ -1405,6 +1405,15 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
             Some("netwatch resolver status; no recovery attempted by doctor"),
         );
     }
+    if let Some(refusal) = crate::diagnose::remediation::resolver::authority_refusal() {
+        snapshot.put(
+            "resolver_store",
+            State::NotChecked,
+            "authority_store_unreadable",
+            &refusal,
+            Some("sudo netwatch resolver status"),
+        );
+    }
     snapshot
 }
 

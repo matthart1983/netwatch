@@ -4,15 +4,9 @@
 # Same reasoning as `demo-lite-env.sh` — netwatch reads its config from
 # `dirs::config_dir()`, which derives from $HOME, so recording against the
 # operator's real config makes the GIF depend on whatever theme they happen to
-# have set. This one differs in two deliberate ways:
-#
-#   - `theme = "nord"`, NOT `"terminal"`. The Lite demo pins the terminal
-#     palette so its colours come from the user's own theme; that is correct
-#     there and fatal here. Dense encodes magnitude as a colour ramp, and a
-#     palette-deferring theme collapses every ramp to a single flat token by
-#     design (see `Ramps::from_theme`) — it would record the one feature the
-#     view exists to show as a solid block of one colour. Nord is RGB
-#     throughout, so the gradient survives.
+# have set. `theme = "terminal"` takes the colours from the tape's `Set Theme`,
+# which is diskwatch's `dark` palette, so the two tools' demos match. This one
+# differs in one deliberate way:
 #
 #   - `refresh_rate_ms = 250`. History gains one sample per refresh tick and
 #     the plot carries one sample per braille sub-column, so at the 500 ms
@@ -36,7 +30,7 @@ CFG_DIR="$DEMO_HOME/Library/Application Support/netwatch"
 mkdir -p "$CFG_DIR" "$DEMO_HOME/.config/netwatch"
 
 cat > "$CFG_DIR/config.toml" <<'TOML'
-theme = "nord"
+theme = "terminal"
 refresh_rate_ms = 250
 view = "full"
 graph_style = "dots"

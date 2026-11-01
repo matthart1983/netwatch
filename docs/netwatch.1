@@ -202,7 +202,10 @@ unmanaged files, and requires
 .BR \-\-unmanaged .
 .TP
 .B resolver recover
-Put a resolver changed by netwatch back.
+Put back a resolver that an interrupted
+.B resolver set
+changed. A change recorded by netwatch 0.30 is not restored; this prints a notice
+naming it, and it does not affect the exit status.
 .SH KEYS
 .B 1
 to
