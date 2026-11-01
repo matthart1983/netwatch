@@ -299,18 +299,15 @@ fn ctrl_c_typed_restores_the_terminal_and_exits_0() {
 }
 
 /// What the session logged, so a failure can show which worker held the exit.
+/// macOS keeps its cache under HOME, whatever XDG_CACHE_HOME says.
 fn logged(fixture: &Fixture) -> String {
-    fs::read_dir(fixture.0.join("cache/netwatch"))
-        .into_iter()
+    ["cache/netwatch", "Library/Caches/netwatch"]
+        .iter()
+        .filter_map(|dir| fs::read_dir(fixture.0.join(dir)).ok())
         .flatten()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("netwatch.log")
-        })
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().contains("netwatch.log"))
+        .map(|path| fs::read_to_string(path).unwrap())
         .collect()
 }
 
@@ -320,11 +317,15 @@ fn logged(fixture: &Fixture) -> String {
 #[test]
 fn q_does_not_wait_out_a_refresh_tick() {
     let fixture = Fixture::new();
-    fs::write(
-        fixture.0.join("config/netwatch/config.toml"),
-        "refresh_rate_ms = 5000\n",
-    )
-    .unwrap();
+    // macOS keeps its config under HOME, whatever XDG_CONFIG_HOME says.
+    for dir in ["config/netwatch", "Library/Application Support/netwatch"] {
+        fs::create_dir_all(fixture.0.join(dir)).unwrap();
+        fs::write(
+            fixture.0.join(dir).join("config.toml"),
+            "refresh_rate_ms = 5000\n",
+        )
+        .unwrap();
+    }
     let mut cmd = fixture.command();
     cmd.arg("--demo");
     let mut pty = Pty::spawn(cmd);
