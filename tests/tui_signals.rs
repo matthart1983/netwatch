@@ -298,6 +298,60 @@ fn ctrl_c_typed_restores_the_terminal_and_exits_0() {
     stops_cleanly(|pty| pty.master.write_all(b"\x03").unwrap());
 }
 
+/// A worker that outlives the shutdown deadline is named in the log, which is
+/// closed last so that the warning reaches it.
+#[test]
+fn a_worker_past_the_shutdown_deadline_is_logged() {
+    let source = include_str!("../src/main.rs");
+    let guard = source.find("let _worker_session").unwrap();
+    assert!(source.find("let _log_guard;").unwrap() < guard);
+}
+
+/// What the session logged, so a failure can show which worker held the exit.
+/// macOS keeps its cache under HOME, whatever XDG_CACHE_HOME says.
+fn logged(fixture: &Fixture) -> String {
+    ["cache/netwatch", "Library/Caches/netwatch"]
+        .iter()
+        .filter_map(|dir| fs::read_dir(fixture.0.join(dir)).ok())
+        .flatten()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().contains("netwatch.log"))
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect()
+}
+
+/// `q` gives the shell back without waiting out a refresh tick. The terminal
+/// thread polled for a whole tick before checking whether to stop, so the exit
+/// took that tick, up to the 2 seconds the session allows its workers.
+#[test]
+fn q_does_not_wait_out_a_refresh_tick() {
+    let fixture = Fixture::new();
+    // macOS keeps its config under HOME, whatever XDG_CONFIG_HOME says.
+    for dir in ["config/netwatch", "Library/Application Support/netwatch"] {
+        fs::create_dir_all(fixture.0.join(dir)).unwrap();
+        fs::write(
+            fixture.0.join(dir).join("config.toml"),
+            "refresh_rate_ms = 5000\n",
+        )
+        .unwrap();
+    }
+    let mut cmd = fixture.command();
+    cmd.arg("--demo");
+    let mut pty = Pty::spawn(cmd);
+    assert!(
+        pty.read_until(Duration::from_secs(20), first_frame),
+        "no first frame: {:?}",
+        pty.tail()
+    );
+    let pressed = Instant::now();
+    pty.master.write_all(b"q").unwrap();
+    let status = pty.wait(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{status}");
+    let took = pressed.elapsed();
+    let log = logged(&fixture);
+    assert!(took < Duration::from_millis(1900), "took {took:?}: {log}");
+}
+
 /// `netwatch --demo` with the pty as its controlling terminal, the way a
 /// terminal emulator or sshd runs it: closing the master hangs the pty up,
 /// every write fails, and the kernel sends netwatch SIGHUP. Linux only:

@@ -307,7 +307,10 @@ impl HealthProber {
             };
             run_cycle(&Network, cycle, &cancel, &snapshot, &nat_outcome);
             busy.store(false, Ordering::SeqCst);
-        });
+        })
+        // A probe only updates memory, and one to a network that isn't answering
+        // would otherwise hold the exit for the whole shutdown wait.
+        .not_waited_for();
     }
 }
 

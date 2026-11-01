@@ -106,6 +106,9 @@ fn main() -> Result<()> {
         netwatch::owner_only::create_dir_all(exports)?;
     }
     netwatch::sandbox::worker::install(sandbox_mode, sandbox_paths).map_err(anyhow::Error::msg)?;
+    // Declared before the session guard so it drops after it: the guard's warning
+    // about workers still running has to reach the log.
+    let _log_guard;
     let _worker_session = netwatch::sandbox::worker::SessionGuard;
     netwatch::sandbox::worker::preflight().map_err(anyhow::Error::msg)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -136,7 +139,7 @@ fn main() -> Result<()> {
     // non-blocking writer's worker flushes queued records on shutdown.
     // Installed after CLI flag handling so `--version` / `--help` don't
     // touch the cache dir.
-    let _log_guard = netwatch::logging::init();
+    _log_guard = netwatch::logging::init();
     config.warn_removed_keys();
     config
         .load_warnings

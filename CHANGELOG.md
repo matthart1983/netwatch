@@ -190,6 +190,12 @@ All notable changes to NetWatch will be documented in this file.
   was waiting on them. No behaviour changes beyond that wording.
 
 ### Fixed
+- **`q` gives your shell back at once.** The screen cleared straight away, but the
+  process stayed for one refresh tick, 1 second by default and up to 2 with a slower
+  `refresh_rate_ms`, with no prompt showing. Keys typed in that time could vanish,
+  because netwatch was still reading them. It now exits in about 50 ms, and a health probe to
+  a network that isn't answering no longer holds the exit either. The warning about
+  workers still running at the shutdown limit now reaches the log and names them.
 - **Graphs are readable on the default theme.** `dark` drew upload from
   `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
   every throughput graph all but vanished. A graph's colours now hold at least 4:1
