@@ -2,8 +2,13 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// The longest the terminal thread waits for input before checking whether it
+/// should stop. It polled for a whole tick, so a quit sat waiting for that tick
+/// with the shell already back, and this thread still reading the keys typed at it.
+const INPUT_WAIT: Duration = Duration::from_millis(50);
 
 pub enum AppEvent {
     Key(KeyEvent),
@@ -32,12 +37,14 @@ impl EventHandler {
         // crossterm::event::poll() is a blocking call that would tie up
         // a tokio worker thread permanently.
         crate::sandbox::worker::spawn("terminal", move || {
+            let mut last_tick = Instant::now();
             while !crate::sandbox::worker::stopping() {
                 // Re-read the tick rate each iteration so the settings popup
                 // can change refresh_rate_ms at runtime and have it take
                 // effect on the next poll without a restart.
-                let dur = Duration::from_millis(tick_rate_thread.load(Ordering::Relaxed) as u64);
-                if event::poll(dur).unwrap_or(false) {
+                let tick = Duration::from_millis(tick_rate_thread.load(Ordering::Relaxed) as u64);
+                let wait = tick.saturating_sub(last_tick.elapsed()).min(INPUT_WAIT);
+                if event::poll(wait).unwrap_or(false) {
                     match event::read() {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                             if tx.send(AppEvent::Key(key)).is_err() {
@@ -51,8 +58,11 @@ impl EventHandler {
                         }
                         _ => {}
                     }
-                } else if tx.send(AppEvent::Tick).is_err() {
-                    return;
+                } else if last_tick.elapsed() >= tick {
+                    if tx.send(AppEvent::Tick).is_err() {
+                        return;
+                    }
+                    last_tick = Instant::now();
                 }
             }
         });

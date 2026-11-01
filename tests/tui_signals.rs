@@ -298,6 +298,33 @@ fn ctrl_c_typed_restores_the_terminal_and_exits_0() {
     stops_cleanly(|pty| pty.master.write_all(b"\x03").unwrap());
 }
 
+/// `q` gives the shell back without waiting out a refresh tick. The terminal
+/// thread polled for a whole tick before checking whether to stop, so the exit
+/// took that tick, up to the 2 seconds the session allows its workers.
+#[test]
+fn q_does_not_wait_out_a_refresh_tick() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("config/netwatch/config.toml"),
+        "refresh_rate_ms = 5000\n",
+    )
+    .unwrap();
+    let mut cmd = fixture.command();
+    cmd.arg("--demo");
+    let mut pty = Pty::spawn(cmd);
+    assert!(
+        pty.read_until(Duration::from_secs(20), first_frame),
+        "no first frame: {:?}",
+        pty.tail()
+    );
+    let pressed = Instant::now();
+    pty.master.write_all(b"q").unwrap();
+    let status = pty.wait(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{status}");
+    let took = pressed.elapsed();
+    assert!(took < Duration::from_millis(1900), "took {took:?}");
+}
+
 /// `netwatch --demo` with the pty as its controlling terminal, the way a
 /// terminal emulator or sshd runs it: closing the master hangs the pty up,
 /// every write fails, and the kernel sends netwatch SIGHUP. Linux only:
