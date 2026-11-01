@@ -5,6 +5,12 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Graphs are readable on the default theme.** `dark` drew upload from
+  `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
+  every throughput graph all but vanished. A graph's colours now hold at least 4:1
+  from its baseline up to the series colour, on every theme that sets its own
+  colours. That makes the quiet part of the graph brighter on all of them, and
+  download and sparklines too.
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
   the plain Linux asset has been the static binary, and the `-static` name went
   away, but aqua's registry, which mise reads, still asked for it. Every release
@@ -95,6 +101,15 @@ All notable changes to NetWatch will be documented in this file.
   `applied.json` and never writing it or opening a path it names. The notices about
   an unreadable journal no longer say `host changes blocked`, since no host change
   was waiting on them. No behaviour changes beyond that wording.
+
+### Dependencies
+- **`unicode-width` is pinned to 0.2.2.** 0.2.3 counts a halfwidth katakana sound
+  mark (ﾞ or ﾟ) as one cell, which is correct, but ratatui already adds a cell for
+  each one, so `ﾊﾟ` measured 3 columns where terminals draw 2, and everything after
+  such a name in a row shifted right. tmux and xterm.js both draw `ﾊﾟﾊﾟ` in 4. A
+  `cargo install netwatch-tui` without `--locked` could already pick up 0.2.3; this
+  stops that from the next release on.
+- tokio 1.54.1, uuid 1.29.0, brotli 9.1.1 and webpki-roots 1.0.11.
 
 ## [0.39.0] - 2026-10-31
 
