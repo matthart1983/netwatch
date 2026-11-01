@@ -1184,7 +1184,7 @@ impl NetwatchConfig {
 
     /// What is at `path`, or `None` if there is nothing.
     fn read_file(path: &Path) -> Result<Option<ParsedConfig>, ConfigError> {
-        let contents = match fs::read_to_string(path) {
+        let contents = match crate::owner_only::read_user_file(path) {
             Ok(contents) => contents,
             // Nothing at the path at all. A symlink to a missing file is
             // something, and an error.
