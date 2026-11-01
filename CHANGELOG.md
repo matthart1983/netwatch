@@ -6,7 +6,7 @@ All notable changes to NetWatch will be documented in this file.
 
 ### Fixed
 - **Graphs are readable on the default theme.** `dark` drew upload from
-  `rgb(0, 0, 170)`, which is about 1.6:1 on a dark terminal, so the lower half of
+  `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
   every throughput graph all but vanished. A graph's colours now hold at least 4:1
   from its baseline up to the series colour, on every theme that sets its own
   colours. That makes the quiet part of the graph brighter on all of them, and

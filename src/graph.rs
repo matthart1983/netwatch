@@ -545,7 +545,7 @@ pub fn magnitude_ramp(base: Color, bg: Color) -> Ramp {
     // override anyone's palette.
     let (r, g, b) = to_rgb_or_default(base, (255, 255, 255));
     // Named colours resolve to the VGA palette, where the default theme's upload
-    // series is (0, 0, 170): 1.6:1 at the series colour and less below it.
+    // series is (0, 0, 170): 1.6:1 on black at the series colour, less below it.
     let behind = to_rgb_or_default(bg, ASSUMED_DARK_BG);
     let base = with_contrast(Color::Rgb(r, g, b), behind, MIN_SERIES_CONTRAST);
     // The floor moves up the fade rather than toward white, so it keeps the hue.
