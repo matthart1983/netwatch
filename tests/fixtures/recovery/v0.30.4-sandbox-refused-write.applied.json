@@ -1,0 +1,17 @@
+[
+  {
+    "id": "2026-0909-01-1",
+    "issue_id": "2026-0909-01",
+    "action": {
+      "action": "set_resolver",
+      "addr": "192.0.2.53"
+    },
+    "target": "/etc/resolv.conf",
+    "backup": "/etc/resolv.conf.netwatch-51002.bak",
+    "installed": "# set by the administrator\nsearch lan\nnameserver 192.0.2.53\noptions edns0\n",
+    "state": "pending",
+    "applied_at": "2026-09-09 09:15:03",
+    "pid": 51002,
+    "permanent": false
+  }
+]
