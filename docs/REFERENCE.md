@@ -3,7 +3,7 @@
 The complete reference for NetWatch: every keybinding, the display-filter language, the
 protocol decoders, TLS decryption, JA4 hunting, the capture export format, the sandbox, the
 Flight Recorder, themes, and configuration. For a quick start, see the [README](../README.md); for architecture and
-maintenance notes, see [WIKI.md](WIKI.md).
+maintenance notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - [Deep Packet Inspection](#deep-packet-inspection)
   - [Protocol decoders](#protocol-decoders)
@@ -51,20 +51,32 @@ detection — not full out-of-order resequencing; cross-segment TLS records aren
 with handshake timing, a hex/text payload viewer, packet bookmarks, BPF capture filters, and
 [PCAPNG and PCAP export](#capture-export).
 
+**Unreleased, after v0.39.0:** contiguous TCP segments can supply a split TLS
+ClientHello record. Gaps, out-of-order segments and ClientHello messages split
+across TLS records remain unsupported. v0.39.0 users must not assume this fix
+is present; see the [changelog](../CHANGELOG.md).
+
 ### TLS 1.3 / 1.2 decryption
 
 NetWatch can decrypt TLS 1.3 **and TLS 1.2** application data (plus QUIC 1-RTT) when a
 **cooperating client** exports its session secrets — the same `SSLKEYLOGFILE` mechanism
-Wireshark uses. It is read-only and debugging-oriented: it decrypts traffic *you* control,
-never third-party or malware traffic.
+Wireshark uses. Use it to debug traffic you are authorized to inspect. Decryption
+requires usable secrets and a supported, sufficiently complete capture; the origin
+of the traffic alone does not determine whether it can be decrypted.
 
 ```bash
 # 1. Point netwatch at a keylog file: set `tls_keylog_path` in your config
 #    (see Configuration). Empty by default — nothing is decrypted until you set it.
 
-# 2. Launch the client with the SAME path:
-SSLKEYLOGFILE=/tmp/sslkeylog.txt curl https://example.com
-SSLKEYLOGFILE=/tmp/sslkeylog.txt google-chrome     # Chrome, Firefox, Node, etc.
+# 2. Create a private directory and keylog file (keep this shell open):
+keylog_dir=$(mktemp -d)
+chmod 700 "$keylog_dir"
+(umask 077; touch "$keylog_dir/keys.log")
+# Set tls_keylog_path to this exact file, then restart netwatch and start capture.
+# Launch a client whose TLS backend supports SSLKEYLOGFILE with the SAME path:
+SSLKEYLOGFILE="$keylog_dir/keys.log" curl https://example.com
+# When finished, stop the client and netwatch before deleting the keylog:
+# rm -r -- "$keylog_dir"
 
 # 3. In the Packets tab, decrypted records render inline. Filter with:
 #    decrypted:true
@@ -82,10 +94,12 @@ just stays opaque.
 
 ### Threat hunting with JA4
 
-Every TLS ClientHello (and QUIC Initial) is fingerprinted with the
+Supported, sufficiently complete TLS ClientHello and QUIC Initial observations are fingerprinted with the
 [Foxio JA4](https://github.com/FoxIO-LLC/ja4) spec, with RFC 8701 GREASE filtering. A JA4
-fingerprint is stable across connections from the same client software, so you can pivot on
-one to find every flow from the same stack — a browser, a CLI tool, or a piece of malware:
+fingerprint can help group similar TLS stacks. It is not a unique application identity:
+different programs can share a fingerprint, and configuration/version changes can alter it.
+Incomplete handshakes may yield no fingerprint; an ECH outer name is not the hidden destination.
+Use a fingerprint to investigate matching observed flows:
 
 ```
 ja4:t13d1516h2_8daaf6152771_b186095e22b6
@@ -681,7 +695,7 @@ start, so there is nothing to validate.
 | `1`–`9`, `0` | Switch tabs (`9` Diagnose, `0` Egress) |
 | `P` | Promote observed egress baseline → `egress-policy.toml` |
 | `↑` `↓` | Navigate |
-| `p` | Pause / resume |
+| `p` | Pause / resume UI-driven updates; independent capture/workers can continue |
 | `r` | Force refresh |
 | `R` | Arm / reset flight recorder |
 | `F` | Freeze current incident window |
@@ -863,16 +877,26 @@ added to all three completions and the man page.
 
 ## Permissions
 
-| Feature | `netwatch` | `sudo netwatch` |
-|---------|:---:|:---:|
-| Interface stats & rates | ✅ | ✅ |
-| Active connections | ✅ | ✅ |
-| Network configuration | ✅ | ✅ |
-| Health probes (ICMP) | ❌ | ✅ |
-| Packet capture | ❌ | ✅ |
+Start with `netwatch doctor`; use `netwatch doctor --check-capture` for the optional
+bounded capture-open check. Missing measurements do not all require root.
 
-Degrades gracefully — features that need root show a clear message, never crash. On Linux,
-`setcap` (below) unlocks capture and eBPF without running as root.
+| Feature | Access and limits |
+| --- | --- |
+| Interface stats, configuration and connection observations | Generally available without elevation; visibility and ownership confidence vary by OS. |
+| DNS health | UDP queries do not inherently require root. |
+| ICMP health | Depends on OS ping permissions/capabilities; TCP fallback is available in relevant checks. |
+| Capture | Requires access to libpcap/BPF or Npcap and the selected interface. |
+| eBPF hints | Linux build/kernel/permissions must allow loading; hints do not by themselves verify ownership. |
+
+Prefer the restricted Linux recipe below or the service unit. Running as root
+reduces containment; see the [threat model](THREAT-MODEL.md). A successful static
+check does not prove live capture or complete diagnostic coverage.
+
+On macOS and FreeBSD, BPF device access depends on the host's installation and
+administrator policy. Use an administrator-managed capture access arrangement;
+do not make every `/dev/bpf*` device globally readable. On Windows, install Npcap
+and follow its configured capture access policy. See [doctor](doctor.md) for
+missing-library and access results, and [platform limits](CAPABILITIES.md).
 
 ### Running without sudo (Linux)
 
@@ -943,10 +967,11 @@ capabilities to its own service user.
 | `cap_bpf` | Loading the kernel-level process-attribution kprobe (kernel ≥ 5.10) |
 | `cap_perfmon` | Reading the BPF ring buffer the kprobe writes to |
 
-Without them netwatch still runs — it falls back to `ss`/`lsof`-style polling for process
-attribution and skips packet capture. The Connections header surfaces the active source
-(`attribution: ebpf`, `attribution: pktap`, or `attribution: lsof — ebpf unavailable: …`) so
-you can tell at a glance which path is live.
+Without capture access, interface/configuration views and available connection
+observations still work. Linux verifies procfs socket ownership where possible;
+eBPF supplies corroborative evidence. macOS, Windows and FreeBSD observations are
+unverified. Backend availability is not an ownership or coverage guarantee; see
+[attribution evidence](attribution.md).
 
 ---
 

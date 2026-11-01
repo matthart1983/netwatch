@@ -1,5 +1,8 @@
 # Diagnose implementation plan — 0.33, 0.34, Q1 2027
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](index.md).
+
 Date: 2026-09-26. Written against `diagnose-enhancements` at `df1dfba`.
 
 Sources:

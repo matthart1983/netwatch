@@ -1,5 +1,8 @@
 # QUIC 1-RTT Application-Data Decryption — Implementation Plan
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](index.md).
+
 **Status:** 2a ✅ · 2b ✅ · 2c-i ✅ · 2c-ii ✅ (wired into capture; live-verified
 vs Chrome HTTP/3) · 3a ✅ (HTTP/3 body decompression — gzip/deflate/brotli,
 offset-0; live-verified) · 3b next (cross-packet STREAM reassembly) · 2d polish

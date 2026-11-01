@@ -25,8 +25,10 @@ Thanks for your interest. This guide covers everything you need to make a clean 
 git clone https://github.com/matthart1983/netwatch
 cd netwatch
 
-# macOS / Linux
-sudo cargo run --release
+# Build as your normal user; do not run Cargo as root.
+cargo build --release
+./target/release/netwatch doctor
+./target/release/netwatch
 
 # Run tests and checks before every PR
 cargo test
@@ -34,7 +36,11 @@ cargo fmt --check
 cargo clippy --all-targets
 ```
 
-**Linux only:** install `libpcap-dev` before building.
+Use the minimum Rust version declared in `Cargo.toml` or newer.
+
+**Linux:** install your distribution's libpcap development package (for example,
+`libpcap-dev` on Debian/Ubuntu) before building. Live capture requires separate
+[permission setup](docs/REFERENCE.md#permissions); ordinary builds do not.
 
 **Windows:** download the [Npcap SDK](https://npcap.com) and set `LIB` to the SDK's `Lib\x64` directory.
 
@@ -42,164 +48,41 @@ cargo clippy --all-targets
 
 ## Architecture overview
 
-> **New here?** Take the interactive [Architecture Tour](docs/architecture-tour.html) — an 18-slide,
-> kernel-up walkthrough of the runtime, the DPI/decryption pipeline, eBPF attribution, and the
-> sandbox. Open it in a browser, or read on for the text map.
->
-> **Working on the eBPF subsystem?** The [eBPF Deep Dive](docs/ebpf-deep-dive.html) is a 23-slide
-> interactive deck that builds eBPF from first principles up to NetWatch's real aya kprobe — with
-> drive-able simulations of the verifier, the issue-#38 timing bug, and the full
-> `connect()` → process-name trace.
+Start with the [current architecture](docs/ARCHITECTURE.md),
+[attribution evidence](docs/attribution.md) and [threat model](docs/THREAT-MODEL.md).
+The [Architecture Tour](docs/architecture-tour.html) and
+[eBPF Deep Dive](docs/ebpf-deep-dive.html) are historical teaching illustrations,
+not current API, ownership or security contracts.
 
-```
-src/
-├── main.rs                  — Entry point, CLI arg parsing, root error handling
-├── app.rs                   — App struct (all state), event loop, tick logic
-├── config.rs                — NetwatchConfig: TOML load/save, defaults
-├── theme.rs                 — Color palettes
-├── platform.rs              — OS-specific helpers (interface info, etc.)
-├── collectors/
-│   ├── packets.rs           — libpcap capture, packet parsing, stream reassembly
-│   ├── connections.rs       — Active connections via lsof/netstat, timeline
-│   ├── health.rs            — Gateway + DNS RTT probes
-│   ├── traffic.rs           — Per-interface bandwidth accounting
-│   ├── processes.rs         — Per-process bandwidth via packets + connections
-│   ├── network_intel.rs     — Port scan / beaconing / DNS tunnel detection
-│   ├── incident.rs          — Flight recorder (rolling 5-minute capture window)
-│   ├── geo.rs               — Offline GeoIP lookups from .mmdb files
-│   └── insights.rs          — Ollama AI analysis (opt-in)
-└── ui/
-    ├── mod.rs               — Tab dispatch: routes current_tab to the right renderer
-    ├── widgets.rs           — Shared: header, footer, tab bar, format helpers
-    ├── dashboard.rs         — Tab 1
-    ├── connections.rs       — Tab 2
-    ├── interfaces.rs        — Tab 3
-    ├── packets.rs           — Tab 4
-    ├── stats.rs             — Tab 5
-    ├── topology.rs          — Tab 6
-    ├── timeline.rs          — Tab 7
-    ├── processes.rs         — Tab 8
-    ├── insights.rs          — Tab 9 (opt-in)
-    └── settings.rs          — Settings overlay (`,` key)
-```
-
-### Event loop lifecycle
-
-Every iteration of the main loop in `app.rs`:
-
-1. **Tick** (`app.tick()`) — fires on a timer (default 1s). Updates all collectors: refreshes connections, submits snapshots to insights, checks bandwidth.
-2. **Event** — a terminal event (key, mouse, resize) arrives. Key events update `app` state directly. No async — everything is synchronous.
-3. **Render** — `ui::render()` dispatches to the active tab's renderer based on `app.current_tab`.
-
-State shared between threads (collectors running in background threads) is always `Arc<Mutex<T>>` or `Arc<RwLock<T>>`. The main thread only reads these during render and writes to them indirectly through the collector's public API.
-
----
+The [source map](docs/ARCHITECTURE.md#source-map) owns the module inventory.
+Terminal events, UI ticks and independently running collectors have different
+lifecycles; see [worker creation and shutdown](docs/runtime-lifecycle.md).
 
 ## Adding a new tab
 
-**Step 1** — Add the variant to `Tab` in `app.rs`:
-
-```rust
-pub enum Tab {
-    // existing...
-    MyNewTab,
-}
-```
-
-**Step 2** — Add it to `BASE_TABS` in `ui/widgets.rs`:
-
-```rust
-const BASE_TABS: &[Tab] = &[
-    // existing...
-    Tab::MyNewTab,
-];
-```
-
-**Step 3** — Add a label entry in `tab_label()` in `ui/widgets.rs`:
-
-```rust
-Tab::MyNewTab => ("9", "MyTab"),
-```
-
-Update the number prefix to be one higher than the last tab, and increment the `all_base_tabs_reachable` test assertion.
-
-**Step 4** — Add scroll state fields to `App` if needed (e.g., `my_new_tab_scroll: usize`).
-
-**Step 5** — Create `src/ui/my_new_tab.rs` with a `pub fn render(f: &mut Frame, app: &App, area: Rect)`. Use any existing tab as a template. The standard layout is:
-
-```rust
-let chunks = Layout::default()
-    .direction(Direction::Vertical)
-    .constraints([
-        Constraint::Length(3), // header
-        Constraint::Min(0),    // content
-        Constraint::Length(3), // footer
-    ])
-    .split(area);
-
-widgets::render_header(f, app, chunks[0]);
-// render content into chunks[1]
-widgets::render_footer(f, app, chunks[2], hints);
-```
-
-**Step 6** — Register the module and dispatch in `ui/mod.rs`:
-
-```rust
-pub mod my_new_tab;
-
-// inside render():
-Tab::MyNewTab => my_new_tab::render(f, &app, area),
-```
-
-**Step 7** — Add the keybinding in `app.rs` (in the global key handler):
-
-```rust
-KeyCode::Char('9') => { app.current_tab = Tab::MyNewTab; }
-```
-
-**Step 8** — Handle scroll keys for the new tab in `app.rs`. Search for `Tab::Insights` scroll handling to see the pattern.
-
----
+1. Update `Tab` in `src/app.rs` and the labels/order in `src/ui/widgets.rs`.
+2. Add the renderer and dispatch in `src/ui/mod.rs`, and state where the existing
+   application groups the relevant UI state.
+3. Update input routing and scrolling in `src/app.rs`. The digits `1`–`9` and `0`
+   are already assigned; choose and document navigation without replacing an
+   existing tab's shortcut. Check full, lite and dense behavior separately.
+4. Update persisted tab names/aliases in `src/config.rs`, help, reference and wiki
+   orientation. Preserve existing configuration aliases where appropriate.
+5. Exercise navigation and relevant routing tests; assert reachable behavior,
+   rather than only incrementing a tab-count assertion.
 
 ## Adding a new collector
 
-Collectors live in `src/collectors/`. A collector is typically a struct that:
+Collectors live in `src/collectors/`. Separate preparation from starting work,
+use the runtime's managed worker/policy entry mechanism, and register resource
+ownership and shutdown behavior. Do not copy an unmanaged infinite thread into
+`new()`; static commands such as doctor must not accidentally start collectors.
 
-- Holds shared state behind `Arc<Mutex<T>>` or `Arc<RwLock<T>>`
-- Spawns a background thread in `new()` or `start()`
-- Exposes a read method (e.g., `get_connections()`) that locks and clones
-
-Minimal template:
-
-```rust
-pub struct MyCollector {
-    data: Arc<Mutex<Vec<MyData>>>,
-}
-
-impl MyCollector {
-    pub fn new() -> Self {
-        let data: Arc<Mutex<Vec<MyData>>> = Arc::new(Mutex::new(Vec::new()));
-        let data_clone = Arc::clone(&data);
-
-        thread::spawn(move || {
-            loop {
-                // collect and update data_clone
-                thread::sleep(Duration::from_secs(5));
-            }
-        });
-
-        Self { data }
-    }
-
-    pub fn get_data(&self) -> Vec<MyData> {
-        self.data.lock().unwrap().clone()
-    }
-}
-```
-
-Add the collector as a field on `App` and call `MyCollector::new()` in `App::new()`.
-
----
+Use an existing collector with matching I/O and lifecycle needs as a template.
+Define cancellation, deadlines, bounded buffers, error reporting and permitted
+filesystem/network access before integrating it. Update the
+[runtime inventory](docs/runtime-lifecycle.md), [threat model](docs/THREAT-MODEL.md)
+and [outbound inventory](docs/THREAT-MODEL.md#outbound-inventory) when applicable.
 
 ## Adding a setting
 
@@ -325,3 +208,12 @@ fails the macOS job.
 The lints check that a comment exists. Whether it is true is for review, as is
 the `# Safety` section on an unsafe function that is not `pub`, which clippy
 does not ask for.
+
+## Documentation changes
+
+Update the affected current reference and wiki sources together; see
+[documentation ownership and release checks](docs/wiki-maintenance.md).
+Run `python3 scripts/wiki.py --check` and
+`python3 -m unittest discover -s tests/docs -v` for documentation tooling changes.
+Changes limited to prose do not require rebuilding unrelated Rust targets.
+Keep released behavior, unreleased changes and historical design intent distinct.

@@ -5,10 +5,9 @@ JSON without starting collectors. Its optional bounded capture check reports onl
 the isolated check's results. Live Settings and startup use the same capability
 model with runtime observations; static configuration is never a health verdict.
 
-This matrix describes the implementation as of 18 October 2026 (0.35.4); the
-FreeBSD column dates from 0.35, the Windows process-attribution cell from
-0.38 (earlier versions polled `netstat -ano` and `tasklist`), and the capture
-authority row from 0.39. It is not a claim
+This matrix describes the v0.39.0 capability baseline. Later development changes
+must be labeled with their release status. Windows switched from `netstat -ano`
+and `tasklist` polling to IP Helper in 0.38. This is not a claim
 that every backend was exercised on every supported OS. Linux unit tests do not
 establish macOS or Windows runtime parity.
 
@@ -113,7 +112,10 @@ This audit checked [tab/config mapping](../src/config.rs),
 [Linux policy](../src/sandbox/linux.rs), and
 [Insights snapshot/worker](../src/collectors/insights.rs).
 
-PR05 implements worker entry policy and Settings reporting. A broader runtime
-capability snapshot and a `doctor` command remain planned. See the [implementation progress](research/implementation-progress.md).
+Worker entry policy, live Settings reporting and the [doctor capability snapshot](doctor.md)
+are implemented. Static doctor results, optional capture checks and session observations
+have different scopes; see [where each value can be read](doctor.md#where-each-value-can-be-read).
+Pending privileged and cross-platform acceptance above remains pending; availability
+of the command does not establish those results.
 
 The [threat model](THREAT-MODEL.md) details containment and privilege limits.

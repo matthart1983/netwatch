@@ -1,5 +1,8 @@
 # Plan: Horizon 3 — egress policy linter (observe → promote → warn)
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](index.md).
+
 **Drafted:** 2026-07-04
 **Status (2026-07-28):** shipped through v0.27.0. Since then, on
 `feat/egress-tree-ux`: byte accounting, the grouped tree and the verdict
