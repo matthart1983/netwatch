@@ -76,9 +76,9 @@ const PERSIST_INTERVAL_SECS: u64 = 60;
 /// move meaningful volume in under a few seconds. Erring high would trade
 /// the feature's whole point for tidiness.
 const UNDECLARED_SETTLE_TICKS: u64 = 3;
-/// Schema tag stamped on the NDJSON export's `_meta` line. Bump the minor
-/// when adding fields (additive/back-compatible), the major on a breaking
-/// change — the managed ingest keys off this.
+/// Schema tag stamped on the NDJSON export's `_meta` line. Additive fields do
+/// not change it, as with the other stable outputs: it stays v1.1 until a
+/// breaking change, which needs 2.0. The managed ingest keys off this.
 pub const EGRESS_EXPORT_SCHEMA: &str = "netwatch.egress.v1.1";
 
 /// One observed destination for a process.
@@ -100,17 +100,21 @@ pub struct EgressDest {
     /// ClientHello — the inner SNI is hidden by design, so a policy miss on
     /// this row may be "name unreadable", not real drift. Sticky once seen.
     pub ech: bool,
+    /// True when a flow named this destination with a cleartext HTTP `Host`
+    /// rather than a ClientHello, so the export's `proto` must not say `tls`.
+    /// Sticky once seen.
+    pub http_host: bool,
     /// Wall-clock times, not `Instant`: the evidence a human reviews at
     /// promote time ("known for 3 weeks" vs "showed up 40 seconds ago")
     /// must survive restarts, and the persisted baseline serializes them.
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
-    /// Number of observations (connection-refresh ticks this dest appeared).
-    ///
-    /// Because `observe` runs once per ~1 s connection tick, this is really a
-    /// *dwell time in ticks*, not an event count — a single long-lived
-    /// connection accrues one per second it stays open. The UI renders it as
-    /// a duration for exactly that reason; don't relabel it "hits".
+    /// Connection-ticks: `observe` runs once per ~1 s connection tick and adds
+    /// one for each connection to this dest. A single long-lived connection
+    /// accrues one per second it stays open, and six connections open for one
+    /// tick add six. So it is neither a count of connections nor a time. The UI
+    /// renders it as a duration, which holds for one connection at a time;
+    /// don't relabel it "hits".
     pub count: u64,
     /// Bytes attributed to this destination, accumulated from the per-tick
     /// rates on the connection table (`rate × elapsed`). Approximate by
@@ -217,7 +221,7 @@ pub struct EgressProfile {
 }
 
 /// One attributed egress flow-summary plus its policy verdict — the unit of
-/// the structured export (`netwatch.egress.v1`). Metadata only; no payload.
+/// the structured export ([`EGRESS_EXPORT_SCHEMA`]). Metadata only; no payload.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EgressRecord {
     pub process: String,
@@ -228,17 +232,20 @@ pub struct EgressRecord {
     /// Most recent concrete remote IP for this destination.
     pub ip: String,
     pub port: u16,
-    /// Coarse L7 class: `tls` when a ClientHello named the destination,
-    /// else `other`. Kept coarse on purpose — no payload inspection.
+    /// Coarse L7 class: `tls` when a ClientHello named the destination and no
+    /// flow to it has carried a cleartext HTTP `Host`, else `other`. The `Host`
+    /// is sticky, so a destination that saw both stays `other`.
+    /// Kept coarse on purpose — no payload inspection.
     pub proto: String,
     pub ech: bool,
     /// Unix seconds.
     pub first_seen: u64,
     pub last_seen: u64,
     pub count: u64,
-    /// Policy verdict at export time: `ok` | `drift` | `unreadable` (ECH,
-    /// name hidden) | `unchecked` (no rule for this process, observe mode) |
-    /// `undeclared` (no rule, under a policy declaring itself complete).
+    /// Policy verdict at export time: `ok` | `drift` | `blocked` (matched an
+    /// explicit block entry) | `unreadable` (ECH, name hidden) | `unchecked`
+    /// (no rule for this process, observe mode) | `undeclared` (no rule, under
+    /// a policy declaring itself complete).
     pub verdict: String,
     /// Which dimension admitted an `ok` verdict — `sni` | `ip` | `asn`.
     /// `None` for anything not admitted.
@@ -394,19 +401,21 @@ impl EgressProfiler {
 
             let sni = dest_hostname(&conn.app_protocol);
             let ech = flow_ech(&conn.app_protocol);
+            let http_host = flow_http_host(&conn.app_protocol);
             let asn_org = geo.lookup(ip).map(|g| g.org).filter(|o| !o.is_empty());
             // Rates are present only while packet capture is running, so
             // without it these stay zero and the UI shows "—" rather than a
             // confident 0 B.
             let out = (conn.tx_rate.unwrap_or(0.0) * elapsed).max(0.0) as u64;
             let inb = (conn.rx_rate.unwrap_or(0.0) * elapsed).max(0.0) as u64;
-            self.record_flow(
+            self.record_observed(
                 process,
                 ip,
                 port,
                 sni.clone(),
                 asn_org.clone(),
                 ech,
+                http_host,
                 wall,
                 out,
                 inb,
@@ -521,8 +530,9 @@ impl EgressProfiler {
     /// Whether a process has been observed long enough for strict mode to
     /// report it as undeclared.
     ///
-    /// `count` is dwell in observation ticks, so the longest-lived
-    /// destination is how long the process has been talking. Because the
+    /// `count` adds one per connection per tick, so the busiest destination
+    /// stands in for how long the process has been talking, and several
+    /// connections in one tick reach the limit sooner. Because the
     /// baseline persists, a program seen for hours in a previous session is
     /// settled immediately on restart — which is right: it is not new.
     fn process_is_settled(&self, process: &str) -> bool {
@@ -741,6 +751,8 @@ impl EgressProfiler {
         self.record_flow(process, ip, port, sni, asn_org, false, now, 0, 0);
     }
 
+    /// Test-facing shorthand for `record_observed` with `http_host: false`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn record_flow(
         &mut self,
@@ -750,6 +762,25 @@ impl EgressProfiler {
         sni: Option<String>,
         asn_org: Option<String>,
         ech: bool,
+        now: SystemTime,
+        bytes_out: u64,
+        bytes_in: u64,
+    ) {
+        self.record_observed(
+            process, ip, port, sni, asn_org, ech, false, now, bytes_out, bytes_in,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_observed(
+        &mut self,
+        process: &str,
+        ip: &str,
+        port: u16,
+        sni: Option<String>,
+        asn_org: Option<String>,
+        ech: bool,
+        http_host: bool,
         now: SystemTime,
         bytes_out: u64,
         bytes_in: u64,
@@ -766,6 +797,7 @@ impl EgressProfiler {
             port,
             ip,
             ech,
+            http_host,
             now,
             bytes_out,
             bytes_in,
@@ -856,6 +888,7 @@ impl EgressProfiler {
                     existing.first_seen = existing.first_seen.min(dest.first_seen);
                     existing.last_seen = existing.last_seen.max(dest.last_seen);
                     existing.ech |= dest.ech;
+                    existing.http_host |= dest.http_host;
                     if existing.sni.is_none() {
                         existing.sni = dest.sni;
                     }
@@ -890,6 +923,7 @@ impl EgressProfiler {
         port: u16,
         ip: &str,
         ech: bool,
+        http_host: bool,
         now: SystemTime,
         bytes_out: u64,
         bytes_in: u64,
@@ -917,6 +951,7 @@ impl EgressProfiler {
             dest.last_seen = now;
             dest.count += 1;
             dest.ech |= ech;
+            dest.http_host |= http_host;
             // Only ever upgrade the endpoint. A flow whose address we couldn't
             // read must not downgrade a destination we already know the IP for
             // — that turned named rows into blank ones on disk.
@@ -959,6 +994,7 @@ impl EgressProfiler {
                 port,
                 last_ip: ip.to_string(),
                 ech,
+                http_host,
                 first_seen: now,
                 last_seen: now,
                 count: 1,
@@ -1064,7 +1100,12 @@ impl EgressProfiler {
                     asn_org: dest.asn_org.clone(),
                     ip: dest.last_ip.clone(),
                     port: dest.port,
-                    proto: if dest.sni.is_some() { "tls" } else { "other" }.to_string(),
+                    proto: if dest.sni.is_some() && !dest.http_host {
+                        "tls"
+                    } else {
+                        "other"
+                    }
+                    .to_string(),
                     ech: dest.ech,
                     first_seen: unix_secs(dest.first_seen),
                     last_seen: unix_secs(dest.last_seen),
@@ -1097,7 +1138,8 @@ impl EgressProfiler {
         let file = std::fs::File::create(path)?;
         let mut w = std::io::BufWriter::new(file);
         let meta = serde_json::json!({
-            "_meta": { "schema": EGRESS_EXPORT_SCHEMA, "records": records.len() }
+            "_meta": { "schema": EGRESS_EXPORT_SCHEMA, "records": records.len() },
+            "metadata": crate::schemas::EGRESS.metadata(),
         });
         writeln!(w, "{meta}")?;
         for rec in &records {
@@ -1152,6 +1194,7 @@ impl EgressProfiler {
                             asn_org: d.asn_org.clone(),
                             ip: d.last_ip.clone(),
                             ech: d.ech,
+                            http_host: d.http_host,
                             first_seen: unix_secs(d.first_seen),
                             last_seen: unix_secs(d.last_seen),
                             count: d.count,
@@ -1240,6 +1283,7 @@ impl EgressProfiler {
                         port: dest.port,
                         last_ip,
                         ech: dest.ech,
+                        http_host: dest.http_host,
                         first_seen: from_unix_secs(dest.first_seen),
                         last_seen,
                         count: dest.count,
@@ -1376,6 +1420,10 @@ struct PersistedDest {
     ip: String,
     #[serde(default)]
     ech: bool,
+    /// A baseline saved before this existed reads as a ClientHello until the
+    /// flow is seen again.
+    #[serde(default)]
+    http_host: bool,
     first_seen: u64,
     last_seen: u64,
     count: u64,
@@ -1409,6 +1457,11 @@ fn flow_ech(p: &Option<AppProtocol>) -> bool {
         p,
         Some(AppProtocol::Tls { ech: true, .. }) | Some(AppProtocol::Quic { ech: true, .. })
     )
+}
+
+/// Whether the name [`dest_hostname`] reads came from a cleartext HTTP `Host`.
+fn flow_http_host(p: &Option<AppProtocol>) -> bool {
+    matches!(p, Some(AppProtocol::Http { host: Some(_), .. }))
 }
 
 #[cfg(test)]
@@ -2145,6 +2198,7 @@ block = {
             port: 443,
             last_ip: "1.2.3.4".into(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,
@@ -2184,6 +2238,7 @@ block = {
             port: 443,
             last_ip: "1.2.3.4".into(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,
@@ -2401,6 +2456,104 @@ block = {
         assert_eq!(recs[1].proto, "other");
     }
 
+    /// `proto` said `tls` for anything with a name, and a cleartext HTTP
+    /// `Host` fills the same field as an SNI, so plaintext exported as TLS.
+    #[test]
+    fn a_cleartext_http_host_exports_as_other_not_tls() {
+        use crate::collectors::connections::Connection;
+        let mk = |app_protocol| Connection {
+            protocol: "TCP".into(),
+            local_addr: "192.168.1.10:5000".into(),
+            remote_addr: "203.0.113.50:80".into(),
+            state: "ESTABLISHED".into(),
+            pid: Some(1),
+            process_name: Some("curl".into()),
+            handshake_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: Some(app_protocol),
+            retransmits: 0,
+            out_of_order: 0,
+        };
+        let http = |host: &str| AppProtocol::Http {
+            method: "GET".into(),
+            host: Some(host.into()),
+            path: None,
+            status: None,
+        };
+        let tls = |name: &str| AppProtocol::Tls {
+            sni: Some(name.into()),
+            alpn: None,
+            ech: false,
+            ja4: None,
+        };
+        let geo = crate::collectors::geo::GeoCache::new();
+        let mut p = EgressProfiler::new();
+        p.observe(
+            &[
+                mk(tls("both.example.com")),
+                mk(http("both.example.com")),
+                mk(http("plain.example.com")),
+                mk(tls("tls.example.com")),
+            ],
+            &geo,
+        );
+        // A later ClientHello does not undo the `Host` it has seen.
+        p.observe(&[mk(tls("both.example.com"))], &geo);
+        let protos = |p: &EgressProfiler| -> Vec<(Option<String>, String)> {
+            p.export_records()
+                .into_iter()
+                .map(|r| (r.sni, r.proto))
+                .collect()
+        };
+        let want = vec![
+            (Some("both.example.com".to_string()), "other".to_string()),
+            (Some("plain.example.com".to_string()), "other".to_string()),
+            (Some("tls.example.com".to_string()), "tls".to_string()),
+        ];
+        assert_eq!(protos(&p), want);
+
+        // Across a restart too, where the name alone would say tls again.
+        let path = scratch("http-host.json");
+        p.save_profiles(&path).unwrap();
+        let mut fresh = EgressProfiler::new();
+        fresh.load_profiles(&path);
+        assert_eq!(protos(&fresh), want);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The export's `count`, as schemas/egress.v1.1.schema.json describes it:
+    /// one per connection per tick, so it is not a time.
+    #[test]
+    fn count_adds_one_per_connection_per_tick() {
+        use crate::collectors::connections::Connection;
+        let connection = Connection {
+            protocol: "TCP".into(),
+            local_addr: "192.168.1.10:5000".into(),
+            remote_addr: "203.0.113.50:443".into(),
+            state: "ESTABLISHED".into(),
+            pid: Some(1),
+            process_name: Some("curl".into()),
+            handshake_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
+        };
+        let geo = crate::collectors::geo::GeoCache::new();
+        let mut p = EgressProfiler::new();
+        p.observe(&vec![connection.clone(); 6], &geo);
+        assert_eq!(p.export_records()[0].count, 6, "six connections, one tick");
+        p.observe(std::slice::from_ref(&connection), &geo);
+        p.observe(std::slice::from_ref(&connection), &geo);
+        assert_eq!(p.export_records()[0].count, 8, "and one more for two ticks");
+    }
+
     #[test]
     fn ech_flow_exports_as_unreadable_not_drift() {
         let mut p = EgressProfiler::new();
@@ -2454,6 +2607,168 @@ block = {
         assert_eq!(rec.process, "chrome");
         // No payload field ever leaks into the export.
         assert!(!lines[1].contains("payload") && !lines[1].contains("raw"));
+    }
+
+    /// The real writer, with a record for every verdict and `matched_by` the
+    /// export can give, against schemas/egress.v1.1.schema.json. It lives here
+    /// because the only way in from outside is a keypress on the Egress tab,
+    /// and an `asn` match needs a database a test does not have.
+    #[test]
+    fn the_export_matches_its_schema() {
+        use crate::schemas::{test_support as schema, EGRESS};
+        let export = |p: &EgressProfiler, name: &str| -> Vec<serde_json::Value> {
+            let path = scratch(name);
+            let written = p.export_ndjson(&path).unwrap();
+            let body = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let lines: Vec<serde_json::Value> = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            for line in &lines {
+                schema::check(EGRESS.file, line);
+            }
+            assert_eq!(lines[0]["_meta"]["records"], written);
+            assert_eq!(lines[0]["metadata"]["schema"], EGRESS.schema);
+            assert_eq!(lines[0]["metadata"]["schema"], lines[0]["_meta"]["schema"]);
+            assert_eq!(lines.len(), written + 1, "the header, then the records");
+            lines
+        };
+
+        let now = SystemTime::now();
+        let mut p = EgressProfiler::new();
+        let mut policy = EgressPolicy::default();
+        policy.process.insert(
+            "by-name".into(),
+            ProcessRule {
+                allow_sni: vec!["a.example.com".into()],
+                ..Default::default()
+            },
+        );
+        policy.process.insert(
+            "by-ip".into(),
+            ProcessRule {
+                allow_ip: vec!["203.0.113.2".into()],
+                ..Default::default()
+            },
+        );
+        policy.process.insert(
+            "by-asn".into(),
+            ProcessRule {
+                allow_asn: vec!["Example Org".into()],
+                ..Default::default()
+            },
+        );
+        policy.process.insert(
+            "blocked".into(),
+            ProcessRule {
+                allow_sni: vec!["a.example.com".into()],
+                block: BlockList {
+                    sni: vec!["b.example.com".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        p.record(
+            "by-name",
+            "203.0.113.1",
+            443,
+            sni("a.example.com"),
+            None,
+            now,
+        );
+        p.record(
+            "by-name",
+            "203.0.113.1",
+            443,
+            sni("c.example.com"),
+            None,
+            now,
+        );
+        p.record("by-ip", "203.0.113.2", 8443, None, None, now);
+        p.record(
+            "by-asn",
+            "203.0.113.3",
+            443,
+            None,
+            Some("Example Org".into()),
+            now,
+        );
+        p.record(
+            "blocked",
+            "203.0.113.4",
+            443,
+            sni("b.example.com"),
+            None,
+            now,
+        );
+        p.record_flow("by-name", "203.0.113.5", 443, None, None, true, now, 7, 9);
+        p.record("no-rule", "203.0.113.6", 53, None, None, now);
+        p.set_policy(Some(policy));
+        let lines = export(&p, "schema-all.ndjson");
+        let seen = |key: &str| -> std::collections::BTreeSet<String> {
+            lines[1..]
+                .iter()
+                .map(|l| l[key].as_str().unwrap_or("null").to_string())
+                .collect()
+        };
+        assert_eq!(
+            seen("verdict").into_iter().collect::<Vec<_>>(),
+            ["blocked", "drift", "ok", "unchecked", "unreadable"]
+        );
+        assert_eq!(
+            seen("matched_by").into_iter().collect::<Vec<_>>(),
+            ["asn", "ip", "null", "sni"]
+        );
+
+        // A policy that claims to be complete, then no policy at all.
+        let mut strict = EgressPolicy {
+            strict: true,
+            ..Default::default()
+        };
+        strict
+            .process
+            .insert("other".into(), ProcessRule::default());
+        p.set_policy(Some(strict));
+        let lines = export(&p, "schema-strict.ndjson");
+        assert!(lines[1..].iter().all(|l| l["verdict"] == "undeclared"));
+        p.set_policy(None);
+        let lines = export(&p, "schema-none.ndjson");
+        assert!(lines[1..].iter().all(|l| l["verdict"] == "unchecked"));
+
+        // An empty profiler still writes its header.
+        assert_eq!(
+            export(&EgressProfiler::new(), "schema-empty.ndjson").len(),
+            1
+        );
+
+        // `matched_by` is an open set, so the broader value a rule with no name
+        // restriction may get in a minor has to pass the file as published.
+        let mut broader = lines[1].clone();
+        broader["verdict"] = serde_json::json!("ok");
+        broader["matched_by"] = serde_json::json!("any_destination");
+        let published = schema::compile(&schema::load(EGRESS.file));
+        assert_eq!(schema::errors(&published, &broader), Vec::<String>::new());
+
+        // And the file refuses what the writer must not write.
+        let record = &lines[1];
+        for (what, change) in [
+            ("a record with no verdict", "verdict"),
+            ("a record with matched_by left out, not null", "matched_by"),
+        ] {
+            let mut bad = record.clone();
+            bad.as_object_mut().unwrap().remove(change);
+            schema::assert_rejected(EGRESS.file, &bad, what);
+        }
+        let mut bad = record.clone();
+        bad["sni"] = serde_json::Value::Null;
+        schema::assert_rejected(EGRESS.file, &bad, "a null sni, which is left out instead");
+        schema::assert_rejected(
+            EGRESS.file,
+            &serde_json::json!({ "note": "neither a header nor a record" }),
+            "a line that is neither",
+        );
     }
 
     // ── Field-report fixes ──
@@ -2729,6 +3044,7 @@ mod blank_and_split_regressions {
             port: 443,
             last_ip: ip.to_string(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,
@@ -3134,6 +3450,7 @@ ip = ["203.0.113.0/24"]
             port: 443,
             last_ip: ip.to_string(),
             ech,
+            http_host: false,
             first_seen: SystemTime::now(),
             last_seen: SystemTime::now(),
             count: 1,

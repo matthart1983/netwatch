@@ -4,6 +4,24 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Each stable JSON output has a published JSON Schema, and names it in a
+  `metadata` block.** `schemas/` holds one file for `diagnose run --format json`,
+  `doctor --json`, the egress NDJSON export, `diagnose export` and `uptime --json`,
+  and the tests validate what the real code writes against them, including a
+  degraded doctor run and a `diagnose run` with a finding. The five outputs had
+  four ways of saying what they were. Each now also has
+  `metadata.schema`, `schema_version`, `schema_url` and `netwatch_version`, at the
+  top level or on the first line of the NDJSON, and the old markers stay. The
+  schemas leave every object open, because a minor can add fields. They say which
+  value sets are closed and which can grow, and mark the fields a script should not
+  rely on as `deprecated`, such as doctor's `network_restricted`, which is always
+  false. Those stay until a major version. docs/REFERENCE.md has the rules. The
+  egress export stays `netwatch.egress.v1.1`: as with the other outputs, an added
+  field does not change its tag, and only a break does.
+  `uptime --csv` needs no version marker: its header row is the contract, so
+  columns are not renamed or removed, and new ones are added at the end.
+
 ### Fixed
 - **Graphs are readable on the default theme.** `dark` drew upload from
   `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
@@ -110,6 +128,25 @@ All notable changes to NetWatch will be documented in this file.
   `cargo install netwatch-tui` without `--locked` could already pick up 0.2.3; this
   stops that from the next release on.
 - tokio 1.54.1, uuid 1.29.0, brotli 9.1.1 and webpki-roots 1.0.11.
+- **The egress export says `"proto": "tls"` only when a ClientHello named the
+  destination.** It said `tls` for anything with a name, and a cleartext HTTP
+  `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
+  to anyone filtering on `proto`. Such a flow now says `other`, which is what the
+  field was documented to do, and a destination that has seen both stays `other`.
+  A destination in a baseline saved before this keeps saying `tls` until a
+  cleartext flow to it is seen again.
+
+- **`doctor --json` says `"interface": null` when a capture check selects
+  nothing.** With no `--interface` given and no interface up, or on Windows with no
+  Npcap, it wrote `"interface": ""`, which reads as a name. It now writes the null
+  it writes everywhere else there is no interface.
+
+### Migration
+- **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
+  name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
+  said `"tls"`, and keeps its name in `sni`.
+- **`doctor --json` consumers: test `interface` for null, not for an empty string.**
+  A capture check that selected no interface wrote `""` and now writes `null`.
 
 ## [0.39.0] - 2026-10-31
 
