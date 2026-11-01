@@ -77,18 +77,23 @@ The experimental [Linux resolver authority command](resolver-adapter.md) support
 changes to an explicitly confirmed unmanaged regular file. Managed resolvers and
 other platforms remain unsupported; automatic TUI/daemon edits stay disabled.
 Manual guidance and simulated demo remediation remain. TUI and daemon
-startup inspect the same legacy journal and report unresolved entries without
-executing its target or backup paths. Startup and shutdown leave legacy operations
+startup read the legacy journal that 0.30 wrote and report unresolved entries without
+opening its target or backup paths. Startup and shutdown leave legacy operations
 unchanged: their ownership cannot be verified, even when running as root or with
 `--no-sandbox`. Journal/backup locations are reported as unverified evidence for
 manual review. Demo startup/shutdown performs no recovery and does not save
-simulated baselines. Startup also inspects the [v2 recovery store](recovery-store.md)
-in durable state. Its Unix writer provides synced atomic replacement and a
+simulated baselines. Startup also inspects the per-user [v2 recovery store](recovery-store.md)
+in durable state, which no release has written. Its Unix writer provides synced atomic replacement and a
 per-store OS lock; it does not grant resolver authority or a host-wide lease.
 The Linux resolver CLI uses a separate root-owned shared authority store/lease at
-`/var/lib/netwatch/resolver-v2`; normal startup reports its unresolved evidence but
-does not perform privileged rollback. Windows v2 writes remain unavailable. The
-legacy journal is not crash-durable.
+`/var/lib/netwatch/resolver-v2`; normal startup as root reports its unresolved evidence but
+does not perform privileged rollback. Startup as anyone else cannot read that store, so it
+logs one line saying to run `sudo netwatch resolver status`, and `doctor` reports the same.
+`netwatch resolver recover` restores from that
+store and from nothing else. Windows v2 writes remain unavailable. Nothing has written
+the legacy journal since 0.31.0 and nothing restores from it, so an entry left open there
+is [restored by hand](recovery-store.md#legacy-journal); on Linux `resolver status` and
+`recover` print its notice.
 
 ## Security boundary
 

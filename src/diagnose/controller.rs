@@ -10,10 +10,10 @@ use crate::app::{export_dir, App};
 
 /// Everything the Diagnose tab owns.
 ///
-/// The engine, its baselines and the remediation journal live together
-/// because they are only meaningful together: an issue's σ figures come from
-/// the baselines, and its "applied" status comes from the journal. Splitting
-/// them across `App` would let a render read one without the others.
+/// The engine, its baselines and the recovery journal live together because
+/// the tab shows them together: an issue's σ figures come from the baselines,
+/// and the journal's notice takes the status line. Splitting them across `App`
+/// would let a render read one without the others.
 pub struct DiagnoseController {
     pub engine: crate::diagnose::Engine,
     pub baselines: crate::diagnose::baseline::BaselineStore,
@@ -307,11 +307,10 @@ impl App {
         &mut self,
         authority: crate::diagnose::remediation::RecoveryAuthority,
     ) {
-        let outcome = self.diagnose.journal.inspect_recovery(authority);
-        for detail in &outcome.abandoned {
+        for detail in self.diagnose.journal.inspect_recovery(authority) {
             tracing::warn!("remediation recovery: {detail}");
         }
-        if let Some(reason) = self.diagnose.journal.blocked_reason().map(str::to_owned) {
+        if let Some(reason) = self.diagnose.journal.recovery_notice().map(str::to_owned) {
             self.diagnose.set_status(reason);
         }
     }
@@ -843,7 +842,7 @@ pub fn build_diagnose_report(app: &App) -> crate::diagnose::report::Report {
             text: format!("{} · {}", i.title, i.subject.label()),
         })
         .collect();
-    if let Some(reason) = app.diagnose.journal.blocked_reason() {
+    if let Some(reason) = app.diagnose.journal.recovery_notice() {
         timeline.push(crate::diagnose::report::TimelineEvent {
             at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             kind: "recovery_status".into(),

@@ -11,7 +11,7 @@
 //! `std::fs` calls.
 
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -90,6 +90,70 @@ fn narrow_dir(dir: &Path, uid: u32) {
     if handle.metadata().is_ok_and(|meta| meta.uid() == uid) {
         let _ = handle.set_permissions(std::fs::Permissions::from_mode(DIR_MODE));
     }
+}
+
+/// Open `path` only if it is a regular file, without following a symlink there.
+/// An ordinary open of a FIFO blocks until something writes to it, and a link to
+/// `/dev/zero` reads forever.
+fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::other("a symbolic link"));
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok((file, metadata))
+}
+
+fn read_limited(file: File, limit: u64) -> io::Result<String> {
+    let mut text = String::new();
+    file.take(limit + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > limit {
+        return Err(io::Error::other(format!("over the {limit} byte limit")));
+    }
+    Ok(text)
+}
+
+/// Read back a file netwatch saved. The directories they live in can be written
+/// by any confined thread but capture, and these reads run before the terminal
+/// and signal handling that would let a session stop waiting. So what is at the
+/// path now may be something else, and anything but a regular file of at most
+/// `limit` bytes is an error.
+pub fn read_saved(path: &Path, limit: u64) -> io::Result<String> {
+    let (file, _) = open_regular(path)?;
+    read_limited(file, limit)
+}
+
+/// [`read_saved`], and also only from a file this user owns under one name. For
+/// a file whose contents are shown to whoever is running, who may be root with
+/// someone else's home.
+pub fn read_owned(path: &Path, limit: u64) -> io::Result<String> {
+    let (file, metadata) = open_regular(path)?;
+    #[cfg(unix)]
+    if !owned_once(&metadata, nix::unistd::geteuid().as_raw()) {
+        return Err(io::Error::other(
+            "not a single-link file owned by this user",
+        ));
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
+    read_limited(file, limit)
+}
+
+#[cfg(unix)]
+fn owned_once(metadata: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == uid && metadata.nlink() == 1
 }
 
 #[cfg(all(test, unix))]
@@ -174,6 +238,69 @@ mod tests {
 
         create_dir_all(&link).unwrap();
         assert_eq!(mode(&target), 0o755);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `read` on another thread, so a read that blocks fails here instead of
+    /// hanging the run.
+    fn within_seconds<T: Send + 'static>(read: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sent.send(read()));
+        received
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the read blocked")
+    }
+
+    #[test]
+    fn only_a_small_regular_file_is_read_back() {
+        for read in [read_saved, read_owned] {
+            let root = scratch("read");
+            std::fs::create_dir_all(&root).unwrap();
+            let file = root.join("saved");
+            std::fs::write(&file, "1234").unwrap();
+            assert_eq!(read(&file, 4).unwrap(), "1234");
+            assert!(read(&file, 3).is_err(), "over the limit");
+            assert_eq!(
+                read(&root.join("absent"), 4).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert!(read(&root, 4).is_err(), "a directory");
+
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(read(&link, 4).is_err(), "a symlink to a good file");
+
+            let zero = root.join("zero");
+            std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+            assert!(within_seconds(move || read(&zero, 4)).is_err());
+
+            let fifo = root.join("fifo");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            assert!(within_seconds(move || read(&fifo, 4)).is_err());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_second_name_or_another_owner_is_refused_only_where_ownership_matters() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch("owned");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("saved");
+        std::fs::write(&file, "1234").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        // Only root can give a file away, so the owner check is exercised with a
+        // uid that does not own this one.
+        assert!(owned_once(&metadata, metadata.uid()));
+        assert!(!owned_once(&metadata, metadata.uid().wrapping_add(1)));
+
+        std::fs::hard_link(&file, root.join("second")).unwrap();
+        assert!(read_owned(&file, 4).is_err());
+        assert_eq!(read_saved(&file, 4).unwrap(), "1234");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -12,7 +12,10 @@ on:
       - 'src/sandbox/**'
       - 'src/collectors/packets/**'
       - 'src/collectors/connections.rs'
+      - 'src/diagnose/remediation.rs'
+      - 'src/diagnose/remediation/**'
       - 'tests/capture_authority.rs'
+      - 'tests/recovery.rs'
       - 'scripts/capture-authority-audit.sh'
       - '.github/workflows/sandbox-lab.yml'
   schedule:
@@ -83,6 +86,7 @@ jobs:
         run: |
           cargo test --lib -- sandbox:: ui::settings::
           cargo test --test doctor
+          cargo test --test recovery
 
       - name: Keep the results
         if: always()

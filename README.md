@@ -26,6 +26,10 @@
   <em><code>netwatch --view dense</code>. Four boxes, no chrome, every keybind on a border. Download grows up from the axis, upload grows down.</em>
 </p>
 
+<p align="center">
+  Featured in <a href="https://www.youtube.com/watch?v=TBOtZ3mBktM&amp;t=112s">35 Self-Hosted Projects on GitHub</a> by Github Awesome.
+</p>
+
 One binary, no config. `netwatch` with capture permissions gives you live capture with L7 decode, process attribution where available, and a diagnostic engine that opens an issue when a learned baseline breaks and closes it when the fix holds.
 
 ## Install

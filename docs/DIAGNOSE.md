@@ -128,7 +128,7 @@ part of the interface:
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | completed, no issue — the rules that could be evaluated did not fire |
+| 0 | completed, and no issue counted; a beta rule's issue can still be listed |
 | 1 | completed, at least one open issue |
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |
@@ -173,6 +173,11 @@ only, `observations` holds the rest, and each finding carries a `kind` of
 or `not_run`, and a `why_not` when it did not run. Schema 1 listed
 observations under `issues` and wrote `passed` (`true`, `false` or `null`) on
 each check; recordings that carry `passed` still load.
+[`schemas/diagnose-run.v2.schema.json`](../schemas/diagnose-run.v2.schema.json)
+describes the output, and [JSON schemas](REFERENCE.md#json-schemas) has the
+rules it follows. `diagnose export` has
+[its own](../schemas/diagnose-export.v1.schema.json), which covers the bundle
+and not the recordings in it.
 
 ## Thresholds
 

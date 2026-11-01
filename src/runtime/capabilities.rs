@@ -160,6 +160,9 @@ pub struct NetRawTask {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
+    /// Read back as empty from a document older than the block.
+    #[serde(default)]
+    pub metadata: crate::schemas::Metadata,
     pub schema_version: u32,
     pub scope: String,
     pub platform: String,
@@ -189,6 +192,7 @@ impl CapabilitySnapshot {
     }
     fn configured_with(config: &NetwatchConfig, geoip: &DbStatus) -> Self {
         let mut snapshot = Self {
+            metadata: crate::schemas::DOCTOR.metadata(),
             schema_version: 1,
             scope: "static".into(),
             platform: std::env::consts::OS.into(),
@@ -1444,6 +1448,15 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
             Some("netwatch resolver status; no recovery attempted by doctor"),
         );
     }
+    if let Some(refusal) = crate::diagnose::remediation::resolver::authority_refusal() {
+        snapshot.put(
+            "resolver_store",
+            State::NotChecked,
+            "authority_store_unreadable",
+            &refusal,
+            Some("sudo netwatch resolver status"),
+        );
+    }
     snapshot
 }
 
@@ -1543,7 +1556,7 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
             let result = bounded_check(&interface, mode);
             match result {
                 Ok(result) => {
-                    snapshot.interface = Some(result.interface.clone());
+                    snapshot.interface = checked_interface(&result);
                     if result.opened {
                         snapshot.put(
                             "interface",
@@ -1605,6 +1618,11 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
         print!("{}", snapshot.text());
     }
     Ok(())
+}
+/// The interface a capture check names in the report. A check that selected
+/// nothing sends back an empty name, and the JSON has null for that.
+fn checked_interface(result: &CaptureResult) -> Option<String> {
+    (!result.interface.is_empty()).then(|| result.interface.clone())
 }
 fn bounded_check(interface: &str, mode: Mode) -> anyhow::Result<CaptureResult> {
     use std::process::{Command, Stdio};
@@ -1698,6 +1716,17 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn a_capture_check_that_selected_nothing_names_no_interface() {
+        let result = |interface: &str| CaptureResult {
+            interface: interface.into(),
+            opened: false,
+            error: Some("No up interface found".into()),
+            protection: None,
+        };
+        assert_eq!(checked_interface(&result("")), None);
+        assert_eq!(checked_interface(&result("eth0")).as_deref(), Some("eth0"));
+    }
     #[test]
     fn blocked_capture_child_is_terminated_at_deadline() {
         let child = std::process::Command::new(std::env::current_exe().unwrap())

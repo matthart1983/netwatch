@@ -2,6 +2,7 @@ use super::*;
 use crate::diagnose::remediation::{
     resolv_conf_with,
     store::{self, Adapter, Operation, Owner, Resource, State, Store},
+    Journal, RecoveryAuthority,
 };
 use nix::libc;
 use std::{
@@ -396,39 +397,100 @@ fn checkpoint(stage: &str) {
 }
 
 pub(super) fn authority_notice() -> Option<String> {
-    match store::inspect(Path::new(STATE_DIR)) {
+    authority_notice_at(Path::new(STATE_DIR), nix::unistd::geteuid().is_root())
+}
+
+fn authority_notice_at(directory: &Path, root: bool) -> Option<String> {
+    match store::inspect(directory) {
         Ok(None) => None,
         Ok(Some(snapshot)) => {
             let ids: Vec<_> = snapshot.operations.iter().filter(|o| o.state.unresolved()).map(|o| o.id.to_string()).collect();
-            (!ids.is_empty()).then(|| format!("resolver authority recovery required: {}; journal: {STATE_DIR}/journal.json; review with sudo netwatch resolver status", ids.join(", ")))
+            (!ids.is_empty()).then(|| format!("resolver authority recovery required: {}; journal: {}/journal.json; review with sudo netwatch resolver status", ids.join(", "), directory.display()))
         }
-        Err(error) => Some(format!("resolver authority journal cannot be inspected: {error}; preserved at {STATE_DIR}; review with sudo netwatch resolver status")),
+        // See `refused`. This session cannot tell resolved from unresolved, and a
+        // line on the Diagnose screen it can do nothing about would not help:
+        // `authority_refusal` puts it in the log and `doctor` instead.
+        Err(error) if refused(&error, root) => None,
+        Err(error) => Some(format!("resolver authority journal cannot be inspected: {error}; preserved at {}; review with sudo netwatch resolver status", directory.display())),
     }
 }
 
+/// `live_store` keeps the store private to root, so after one `set` or `recover`
+/// the kernel refuses every other user, whatever the store holds. Only the
+/// kernel's refusal counts: the store's own ownership and privacy checks also
+/// report PermissionDenied, and those are faults to report to anyone.
+fn refused(error: &io::Error, root: bool) -> bool {
+    !root && error.raw_os_error() == Some(libc::EACCES)
+}
+
+pub(super) fn authority_refusal() -> Option<String> {
+    authority_refusal_at(Path::new(STATE_DIR), nix::unistd::geteuid().is_root())
+}
+
+fn authority_refusal_at(directory: &Path, root: bool) -> Option<String> {
+    let error = store::inspect(directory).err()?;
+    refused(&error, root).then(|| {
+        format!(
+            "the root-owned resolver store {} exists and this user cannot read it, so whether \
+             it holds an unresolved change is unknown; run sudo netwatch resolver status",
+            directory.display()
+        )
+    })
+}
+
+/// What `status` and `recover` say about the legacy journal, which neither acts
+/// on: an empty authority store does not mean the resolver is as it was. Printed
+/// to a terminal, so nothing from the file reaches it unscrubbed.
+fn legacy_notice(path: PathBuf) -> Option<String> {
+    let mut journal = Journal::load(path);
+    journal.inspect_recovery(RecoveryAuthority::InspectOnly);
+    let notice = journal.recovery_notice()?;
+    Some(format!(
+        "Not restored by resolver recover: {}",
+        crate::ui::sanitize::display(notice)
+    ))
+}
+
 pub(super) fn command(request: Request) -> anyhow::Result<()> {
+    let reports_legacy = matches!(request, Request::Status | Request::Recover);
+    let result = run(request);
+    // After the result, where it gets read, and whether or not that succeeded.
+    // It never changes the result: the journal is outside recovery authority, so
+    // a file a user can write must not be able to fail a root command.
+    if reports_legacy {
+        if let Some(notice) = legacy_notice(Journal::default_path()) {
+            report(&notice);
+        }
+    }
+    result
+}
+
+fn run(request: Request) -> anyhow::Result<()> {
     match request {
         Request::Status => {
-            println!("{}", ownership()?.description());
+            report(ownership()?.description());
             match store::inspect(Path::new(STATE_DIR)) {
-                Ok(Some(snapshot)) => println!(
+                Ok(Some(snapshot)) => report(&format!(
                     "{} unresolved operations in {STATE_DIR}",
                     snapshot
                         .operations
                         .iter()
                         .filter(|o| o.state.unresolved())
                         .count()
-                ),
-                Ok(None) => println!("No resolver authority journal"),
-                Err(error) => {
-                    println!("Authority journal unavailable: {error}; inspect with root authority")
-                }
+                )),
+                Ok(None) => report("No resolver authority journal"),
+                Err(error) => report(&format!(
+                    "Authority journal unavailable: {error}; inspect with root authority"
+                )),
             }
             Ok(())
         }
         Request::Recover => {
             let mut session = Session::live()?;
-            println!("Recovered {} resolver operations", session.recover()?);
+            report(&format!(
+                "Recovered {} resolver operations",
+                session.recover()?
+            ));
             Ok(())
         }
         Request::Set { address, seconds } => {
@@ -443,14 +505,14 @@ pub(super) fn command(request: Request) -> anyhow::Result<()> {
                 let mut terminate = signal(SignalKind::terminate())?;
                 let mut session = Session::live()?;
                 let id = session.apply(address)?;
-                println!("Temporary resolver file change to {address}; effective resolution unverified; operation {id}; reverting in {seconds}s or on Ctrl-C/SIGTERM");
+                report(&format!("Temporary resolver file change to {address}; effective resolution unverified; operation {id}; reverting in {seconds}s or on Ctrl-C/SIGTERM"));
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(seconds)) => {},
                     _ = interrupt.recv() => {},
                     _ = terminate.recv() => {},
                 }
                 session.finish()?;
-                println!("Resolver restored; operation {id}");
+                report(&format!("Resolver restored; operation {id}"));
                 Ok(())
             })
         }
@@ -639,6 +701,178 @@ mod tests {
         owner.pid_namespace = None;
         assert_eq!(owner_status(&owner, uid), OwnerStatus::Unknown);
     }
+    /// What `netwatch resolver set` from 0.31.1, the first release with this
+    /// store, left behind when SIGKILLed: its journal and backup, captured from
+    /// that binary in a private root. Only the boot ID is edited, so the test
+    /// never runs in the boot that wrote it. The target's identity and owner are
+    /// set per run below, because they name a file and a user on that host.
+    const V0_31_1_JOURNAL: &str = include_str!(
+        "../../../../tests/fixtures/recovery/v0.31.1-killed-resolver-set/journal.json"
+    );
+    const V0_31_1_ID: &str = "bd204382-3ba1-46a0-a521-79de298b097e";
+    const V0_31_1_ORIGINAL: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/recovery/v0.31.1-killed-resolver-set/bd204382-3ba1-46a0-a521-79de298b097e.backup"
+    );
+    const V0_31_1_INSTALLED: &[u8] = include_bytes!(
+        "../../../../tests/fixtures/recovery/v0.31.1-killed-resolver-set/resolv.conf.installed"
+    );
+
+    /// A fixture root holding the 0.31.1 records in `state`, as an upgrade finds
+    /// them, with the target holding `current` and the operation in `state_name`.
+    fn upgraded_from_v0_31_1(state_name: &str, current: &[u8]) -> Fixture {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("resolv.conf");
+        std::fs::write(&target, current).unwrap();
+        let metadata = std::fs::metadata(&target).unwrap();
+        let mut journal: serde_json::Value = serde_json::from_str(V0_31_1_JOURNAL).unwrap();
+        let operation = &mut journal["operations"][0];
+        operation["state"] = state_name.into();
+        operation["owner"]["uid"] = nix::unistd::geteuid().as_raw().into();
+        operation["resource"]["target"] = target.to_str().unwrap().into();
+        operation["resource"]["device"] = metadata.dev().into();
+        operation["resource"]["inode"] = metadata.ino().into();
+        let state = fixture.0.join("state");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
+        for (name, bytes) in [
+            ("journal.json".to_owned(), journal.to_string().into_bytes()),
+            (format!("{V0_31_1_ID}.backup"), V0_31_1_ORIGINAL.to_vec()),
+        ] {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(state.join(name))
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        fixture
+    }
+
+    #[test]
+    fn records_from_v0_31_1_restore_the_resolver_after_an_upgrade() {
+        for (state, current) in [
+            ("applied", V0_31_1_INSTALLED),
+            // Killed after the target write, before Applied was recorded.
+            ("prepared", V0_31_1_INSTALLED),
+            // Killed before the target write: nothing to put back.
+            ("prepared", V0_31_1_ORIGINAL),
+            ("recovery_required", V0_31_1_INSTALLED),
+        ] {
+            let fixture = upgraded_from_v0_31_1(state, current);
+            let mut session = fixture.session().unwrap();
+            assert_eq!(session.recover().unwrap(), 1, "{state}");
+            assert_eq!(fixture.bytes(), V0_31_1_ORIGINAL, "{state}");
+            let operation = &session.store.snapshot().operations[0];
+            assert_eq!(operation.state, State::Reverted, "{state}");
+            // Once recorded, a later `recover` has nothing left to do.
+            assert_eq!(session.recover().unwrap(), 0, "{state}");
+        }
+    }
+
+    #[test]
+    fn a_v0_31_1_record_is_not_restored_over_a_later_edit() {
+        let fixture = upgraded_from_v0_31_1("applied", b"nameserver 192.0.2.99\n");
+        let mut session = fixture.session().unwrap();
+        assert!(session.recover().is_err());
+        assert_eq!(fixture.bytes(), b"nameserver 192.0.2.99\n");
+        assert!(session.store.snapshot().operations[0].state.unresolved());
+    }
+
+    /// A store with one unresolved record, inside a directory of its own.
+    fn store_with_a_record(parent: &Path) -> (PathBuf, Uuid) {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(parent)
+            .unwrap();
+        let directory = parent.join("resolver-v2");
+        let mut store = Store::open(&directory).unwrap();
+        let id = store
+            .prepare(
+                "resolver-command".into(),
+                Owner::current(),
+                Resource {
+                    adapter: Adapter::UnmanagedFile,
+                    target: "/synthetic/resolver".into(),
+                    device: 1,
+                    inode: 2,
+                },
+                b"original",
+                b"installed",
+            )
+            .unwrap();
+        (directory, id)
+    }
+
+    #[test]
+    fn a_store_root_keeps_private_is_only_a_notice_for_root() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: root passes the permission check this needs refused");
+            return;
+        }
+        let fixture = Fixture::new();
+        let parent = fixture.0.join("netwatch");
+        let (directory, id) = store_with_a_record(&parent);
+        // As `/var/lib/netwatch` is to anyone but root.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let other_user = authority_notice_at(&directory, false);
+        let root_refused = authority_notice_at(&directory, true);
+        let other_user_refusal = authority_refusal_at(&directory, false);
+        let root_refusal = authority_refusal_at(&directory, true);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(other_user, None);
+        // The log and doctor say what is known, and claim neither state.
+        let line = other_user_refusal.unwrap();
+        assert!(line.contains(&directory.display().to_string()), "{line}");
+        assert!(line.contains("sudo netwatch resolver status"), "{line}");
+        assert!(line.contains("unknown"), "{line}");
+        // A root session the kernel refuses (NFS root squash, say) still says so
+        // on the screen, so it gets no second line.
+        assert!(root_refused.unwrap().contains("cannot be inspected"));
+        assert_eq!(root_refusal, None);
+        assert_eq!(authority_refusal_at(&directory, false), None);
+        // A session that can read it gets the record.
+        let readable = authority_notice_at(&directory, false).unwrap();
+        assert!(readable.contains("recovery required"), "{readable}");
+        assert!(readable.contains(&id.to_string()), "{readable}");
+    }
+
+    #[test]
+    fn a_store_a_session_can_open_but_not_trust_is_still_reported() {
+        let fixture = Fixture::new();
+        let parent = fixture.0.join("netwatch");
+        let (directory, _) = store_with_a_record(&parent);
+        // The store's own privacy check says PermissionDenied too.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exposed = authority_notice_at(&directory, false).unwrap();
+        assert!(exposed.contains("cannot be inspected"), "{exposed}");
+        assert_eq!(authority_refusal_at(&directory, false), None);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(directory.join("journal.json"), b"corrupt").unwrap();
+        let corrupt = authority_notice_at(&directory, false).unwrap();
+        assert!(corrupt.contains("cannot be inspected"), "{corrupt}");
+        assert_eq!(authority_refusal_at(&directory, false), None);
+    }
+
+    #[test]
+    fn the_legacy_notice_is_scrubbed_and_absent_when_nothing_is_open() {
+        let fixture = Fixture::new();
+        let journal = fixture.0.join("applied.json");
+        assert_eq!(legacy_notice(journal.clone()), None);
+        std::fs::write(&journal, "[]").unwrap();
+        assert_eq!(legacy_notice(journal.clone()), None);
+        std::fs::write(
+            &journal,
+            r#"[{"issue_id":"a\u001b[2Jb","target":"/etc/resolv.conf","backup":null,"state":"applied"}]"#,
+        )
+        .unwrap();
+        let notice = legacy_notice(journal).unwrap();
+        assert!(!notice.contains('\u{1b}'), "{notice:?}");
+        assert!(notice.contains("/etc/resolv.conf"), "{notice}");
+    }
+
     #[test]
     fn resolver_crash_child() {
         let Some(root) = std::env::var_os("NETWATCH_RESOLVER_TEST_ROOT") else {

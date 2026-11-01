@@ -279,10 +279,25 @@ write: /dev/null
    compromised parser can persist a setting such as `sandbox = "off"` for the
    next start. The capture thread has no write grant
    ([write grants](../src/sandbox/linux.rs#L427),
-   [capture layer](../src/sandbox/linux.rs#L487)).
+   [capture layer](../src/sandbox/linux.rs#L487)). They can write the cache too,
+   so `applied.json` and `baselines.json` may hold anything by the next start. A
+   session reads each only as a regular file under a size limit, without following a
+   symlink at that name, so a FIFO or a link to a device there cannot hang it. The
+   journal is evidence and nothing more: netwatch reads it only if this user owns it,
+   reports the paths it names, opens neither and writes neither, even as root
+   ([recovery store](recovery-store.md#legacy-journal)). `config.toml`,
+   `egress-policy.toml` and `egress-profiles.json` still get an ordinary read, so a FIFO
+   planted at one of them does stop the next start until it is removed.
 10. Subcommands returning before worker installation are outside this policy,
     including file-oriented operations ([dispatch](../src/main.rs#L20)). Static
     doctor is one, and opens the GeoIP databases it reports on unconfined.
+    `netwatch resolver set` and `recover` are others: as root they write
+    `/etc/resolv.conf` and `/var/lib/netwatch` unconfined, and they accept no target
+    or journal path from their arguments or a user's home
+    ([resolver adapter](resolver-adapter.md)). `status` and `recover` do read 0.30's
+    `applied.json` from the home they run with, even as root, but only to print a
+    notice: a regular, single-link file this user owns, up to 64 KiB, with control
+    characters replaced, the same read a session makes.
 11. `netwatch geoip update` installs the policy, downloads on main, which stays
     unconfined and keeps any capability the process started with, and undoes the
     gzip, reads and writes each database on a `geoip-update` parser thread. TLS

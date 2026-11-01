@@ -309,9 +309,10 @@ fn spark(samples: &[u64], width: usize) -> String {
         .collect()
 }
 
-/// Dwell rendered as a duration. `count` increments once per ~1 s connection
-/// tick, so it is seconds — showing it as a bare number reads as a request
-/// count, which it is not.
+/// Dwell rendered as a duration. `count` adds one per connection per ~1 s
+/// tick, so it is seconds for one connection at a time and runs fast for
+/// several — showing it as a bare number reads as a request count, which it
+/// is not.
 fn dwell(count: u64) -> String {
     match count {
         0 => "—".into(),
@@ -1131,6 +1132,7 @@ mod tests {
             port: 443,
             last_ip: "203.0.113.5".into(),
             ech: false,
+            http_host: false,
             first_seen: SystemTime::UNIX_EPOCH,
             last_seen: SystemTime::UNIX_EPOCH,
             count: 1,

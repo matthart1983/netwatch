@@ -252,6 +252,31 @@ fn a_removed_config_key_is_logged_once() {
     );
 }
 
+/// A FIFO in the cache used to stop a session before it drew anything, with the
+/// terminal already taken and keys and signals not yet handled.
+#[test]
+fn a_fifo_in_the_cache_does_not_hold_up_the_first_frame() {
+    for name in ["applied.json", "baselines.json"] {
+        let fixture = Fixture::new();
+        let fifo = fixture.0.join("cache/netwatch").join(name);
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let mut cmd = fixture.command();
+        cmd.arg("--demo");
+        let mut pty = Pty::spawn(cmd);
+        assert!(
+            pty.read_until(Duration::from_secs(30), first_frame),
+            "{name}: {}",
+            pty.tail()
+        );
+        kill(Pid::from_raw(pty.child.id() as i32), Signal::SIGTERM).unwrap();
+        assert!(pty.wait(Duration::from_secs(30)).success(), "{name}");
+    }
+}
+
 #[test]
 fn sigterm_restores_the_terminal_and_exits_0() {
     stops_cleanly(signal(Signal::SIGTERM));
