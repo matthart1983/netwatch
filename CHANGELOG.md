@@ -5,6 +5,12 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Graphs are readable on the default theme.** `dark` drew upload from
+  `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
+  every throughput graph all but vanished. A graph's colours now hold at least 4:1
+  from its baseline up to the series colour, on every theme that sets its own
+  colours. That makes the quiet part of the graph brighter on all of them, and
+  download and sparklines too.
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
   the plain Linux asset has been the static binary, and the `-static` name went
   away, but aqua's registry, which mise reads, still asked for it. Every release
