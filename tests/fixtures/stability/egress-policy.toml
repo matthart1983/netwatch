@@ -1,0 +1,21 @@
+# Every stable egress-policy.toml key. See config.toml beside this.
+strict = false
+alert = "blocked"
+
+[block]
+sni = ["*.example.com"]
+asn = ["Example, Inc."]
+ip = ["192.0.2.0/24"]
+ports = [23]
+
+[process.curl]
+allow_sni = ["example.com"]
+allow_asn = ["Example, Inc."]
+allow_ip = ["198.51.100.0/24"]
+allow_ports = [443]
+
+[process.curl.block]
+sni = ["*.example.org"]
+asn = ["Example, Inc."]
+ip = ["203.0.113.0/24"]
+ports = [25]

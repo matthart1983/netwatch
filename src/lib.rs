@@ -1,3 +1,9 @@
+//! netwatch's internals, exposed so that its binary, examples and tests can reach
+//! them. **This is not a public API.** It can change in any release, whatever the
+//! version number suggests, and [STABILITY.md] doesn't cover it.
+//!
+//! [STABILITY.md]: https://github.com/matthart1983/netwatch/blob/main/STABILITY.md
+
 // Clippy lints deliberately allowed crate-wide. Each is a decision, not an
 // oversight — the alternative clippy suggests is worse for this codebase, and
 // leaving them as warnings meant the real signal was buried in noise nobody
