@@ -7,3 +7,9 @@ Read [what NetWatch sends](@repo@/docs/REFERENCE.md#what-netwatch-sends-off-this
 `third_party_probes = false` disables the named default probes, not all outbound traffic: configured targets, user actions, Insights, remote ingestion and resolver/gateway checks have separate behavior. Local GeoIP lookup does not contact an online lookup service.
 
 See the [outbound inventory](@repo@/docs/THREAT-MODEL.md#outbound-inventory), [[AI Insights]] and [[Daemon and Metrics]].
+
+<!-- include: docs/REFERENCE.md#what-netwatch-sends-off-this-machine -->
+
+<!-- include: docs/REFERENCE.md#configuration -->
+
+<!-- include: docs/ARCHITECTURE.md#configuration-and-persistence -->

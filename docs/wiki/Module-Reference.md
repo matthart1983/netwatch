@@ -10,3 +10,7 @@ Use the [source tree](@repo@/src) and [architecture guide](@repo@/docs/ARCHITECT
 - `src/ui/`: rendering; `src/config.rs`: configuration.
 
 See [[Build System]] and [[Testing]]. Copied struct definitions and line counts are not maintained here.
+
+<!-- include: docs/ARCHITECTURE.md#source-map -->
+
+<!-- include: CONTRIBUTING.md#adding-a-new-collector -->

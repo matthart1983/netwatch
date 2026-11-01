@@ -7,3 +7,9 @@ Follow [CONTRIBUTING](@repo@/CONTRIBUTING.md) for formatting, Clippy and ordinar
 Test counts are not a coverage guarantee. [Capabilities](@repo@/docs/CAPABILITIES.md), [attribution](@repo@/docs/attribution.md) and [performance](@repo@/docs/PERFORMANCE.md) distinguish measured results from pending acceptance.
 
 Run `python3 scripts/wiki.py --check` for maintained documentation links and wiki sources. See [wiki maintenance](@repo@/docs/wiki-maintenance.md).
+
+<!-- include: CONTRIBUTING.md#testing -->
+
+<!-- include: docs/PERFORMANCE.md#running-them -->
+
+<!-- include: docs/DIAGNOSE.md#reproducible-verification -->

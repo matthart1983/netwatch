@@ -7,3 +7,13 @@ Enable AI Insights in Settings and configure an Ollama-compatible endpoint and a
 Requests include addresses, DNS names, decoded packet summaries and network measurements. A remote endpoint receives those data; plain HTTP off-host is warned about but still sent. A localhost endpoint does not prove local-only inference because its server may forward requests.
 
 Commentary can be wrong or disagree with findings and is not validated against Diagnose issue objects. See [disclosure and limitations](@repo@/docs/INSIGHTS.md#data-sent-to-the-endpoint).
+
+<!-- include: docs/INSIGHTS.md#setup -->
+
+<!-- include: docs/INSIGHTS.md#timing-and-retained-data -->
+
+<!-- include: docs/INSIGHTS.md#data-sent-to-the-endpoint -->
+
+<!-- include: docs/INSIGHTS.md#troubleshooting -->
+
+<!-- include: docs/INSIGHTS.md#disabling -->

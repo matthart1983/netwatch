@@ -59,6 +59,43 @@ class DocumentationChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'inventory differ'):
             wiki.validate()
 
+    def test_include_section_preserves_code_and_rebases_link_target_only(self):
+        (self.root / 'reference.md').write_text(
+            '# Reference\n\n## Setup\n\n[reference.md](reference.md#setup)\n'
+            '```sh\n## Not a section\necho example\n```\n'
+            '### Detail\nkeep this\n## Next\ndo not include\n')
+        page = self.root / 'docs/wiki/Home.md'
+        page.write_text('# Home\n\n<!-- include: reference.md#setup -->\n')
+        expanded = wiki.expand_source(page)
+        self.assertIn('[reference.md](@repo@/reference.md#setup)', expanded)
+        self.assertIn('## Not a section\necho example', expanded)
+        self.assertIn('### Detail\nkeep this', expanded)
+        self.assertNotIn('do not include', expanded)
+        wiki.validate()
+
+    def test_include_missing_section_fails(self):
+        (self.root / 'docs/wiki/Home.md').write_text(
+            '# Home\n\n<!-- include: reference.md#missing -->\n')
+        with self.assertRaisesRegex(ValueError, 'Missing include section'):
+            wiki.validate()
+
+    def test_include_requires_maintained_source(self):
+        (self.root / 'docs/wiki/Home.md').write_text(
+            '# Home\n\n<!-- include: ../outside.md -->\n')
+        with self.assertRaisesRegex(ValueError, 'maintained document'):
+            wiki.validate()
+
+    def test_include_nested_heading_is_promoted(self):
+        (self.root / 'reference.md').write_text(
+            '# Reference\n## Parent\n### Child\ntext\n#### Nested\nmore\n')
+        page = self.root / 'docs/wiki/Home.md'
+        page.write_text('# Home\n\n<!-- include: reference.md#child -->\n')
+        expanded = wiki.expand_source(page)
+        self.assertIn('## Child\n', expanded)
+        self.assertIn('### Nested\n', expanded)
+        self.assertNotIn('## Parent', expanded)
+
+
     def test_release_tag_mismatch_is_reported(self):
         with patch.object(wiki, 'git', return_value='b' * 40):
             with self.assertRaisesRegex(ValueError, 'tag and manifest commit differ'):

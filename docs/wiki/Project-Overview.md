@@ -5,3 +5,7 @@ Use NetWatch to inspect local traffic, correlate connection observations and inv
 The full view has ten tabs; lite and dense provide alternative layouts. Diagnose findings and optional AI commentary have different evidence models. Empty findings do not establish network health.
 
 See the [README](@repo@/README.md), [[Tab System]], [[Diagnose and Coverage]] and [[Platform Support]].
+
+<!-- include: docs/ARCHITECTURE.md#what-ships-today -->
+
+<!-- include: docs/REFERENCE.md#how-it-works -->

@@ -7,3 +7,7 @@ Threads share memory and open descriptors. An already-open capture descriptor re
 This is defense in depth, not isolation against arbitrary native code or a guarantee that a compromised process cannot reach secrets. Strict mode requires its specified policy entries; it does not mean no network access for the process.
 
 Read the [threat model](@repo@/docs/THREAT-MODEL.md), [capability matrix](@repo@/docs/CAPABILITIES.md) and [[Doctor]] for exact limits and observed enforcement. The threat model owns the policy inventory; this page does not duplicate it.
+
+<!-- include: docs/REFERENCE.md#landlock-sandbox-linux -->
+
+<!-- include: docs/THREAT-MODEL.md#what-containment-does-not-cover -->

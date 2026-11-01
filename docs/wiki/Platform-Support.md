@@ -5,3 +5,5 @@ Linux, macOS, Windows and FreeBSD have backends and release targets. Their capab
 The [capability matrix](@repo@/docs/CAPABILITIES.md) owns feature and platform-tier details. Build success, automated tests, privileged capture acceptance and runtime feature parity are different claims. Pending validation stays pending.
 
 See [[Permissions]], [[Doctor]] and [[eBPF Process Attribution]].
+
+<!-- include: docs/CAPABILITIES.md -->

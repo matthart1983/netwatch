@@ -142,7 +142,10 @@ Background threads that run external commands use an `AtomicBool` busy guard to 
 
 ## Testing
 
-Unit tests live inline (`#[cfg(test)] mod tests`). There are no integration tests yet. Before opening a PR:
+Unit tests live inline (`#[cfg(test)] mod tests`); integration and acceptance tests
+live under `tests/`. Some suites require namespaces, privileges or live endpoints.
+Use the relevant workflow to reproduce those conditions rather than assuming
+every test is offline. Before opening a PR:
 
 ```bash
 cargo test                   # all tests

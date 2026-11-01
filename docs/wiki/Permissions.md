@@ -7,3 +7,5 @@ On Linux, follow the [restricted group and file-capability recipe](@repo@/docs/R
 The [systemd service](@repo@/packaging/README.md) grants capabilities to its service user; its binary needs no file capabilities. Do not apply the file-capability recipe indiscriminately to that deployment.
 
 macOS/FreeBSD require administrator-managed BPF access; do not make every `/dev/bpf*` device globally readable. Windows requires Npcap and its configured access policy. See [platform permissions](@repo@/docs/REFERENCE.md#permissions). Root access does not establish complete attribution or sandbox containment.
+
+<!-- include: docs/REFERENCE.md#permissions -->

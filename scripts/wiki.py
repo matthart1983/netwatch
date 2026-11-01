@@ -61,6 +61,65 @@ def anchors(text):
     return found
 
 
+INCLUDE = re.compile(r'^<!-- include: ([\w./-]+\.md)(?:#([\w-]+))? -->$', re.MULTILINE)
+
+
+def expand_source(path):
+    """Embed maintained sections, preserving examples and rebasing their links."""
+    def include(match):
+        name, section = match.groups()
+        source = (ROOT / name).resolve()
+        if name not in MAINTAINED or not source.is_relative_to(ROOT):
+            raise ValueError(f'Include must name a maintained document: {name}')
+        text = source.read_text()
+        lines = text.splitlines(keepends=True)
+        headings, counts, fence = [], {}, None
+        for i, line in enumerate(lines):
+            marker = re.match(r'^\s*(`{3,}|~{3,})', line)
+            if marker:
+                token = marker[1]
+                if fence is None:
+                    fence = token
+                elif token[0] == fence[0] and len(token) >= len(fence):
+                    fence = None
+                continue
+            heading = re.match(r'^(#{1,6})\s+', line) if fence is None else None
+            if heading:
+                slug = next(iter(anchors(line)))
+                n = counts.get(slug, 0)
+                counts[slug] = n + 1
+                headings.append((i, len(heading[1]), slug if n == 0 else f'{slug}-{n}'))
+        if section:
+            selected = next((h for h in headings if h[2] == section), None)
+            if selected is None:
+                raise ValueError(f'Missing include section: {name}#{section}')
+            start, level, _ = selected
+            end = next((i for i, depth, _ in headings if i > start and depth <= level), len(lines))
+        else:
+            start, end, level = 0, len(lines), 1
+        selected_headings = {i: depth for i, depth, _ in headings if start <= i < end}
+        for i, depth in selected_headings.items():
+            lines[i] = re.sub(r'^#{1,6}', '#' * min(6, depth + 2 - level), lines[i])
+        text = ''.join(lines[start:end]).strip()
+        def rebase(link):
+            raw = link[1]
+            url = urlsplit(raw)
+            if url.scheme or url.netloc or raw.startswith('@repo@/'):
+                return link[0]
+            dest = (source.parent / unquote(url.path)).resolve() if url.path else source
+            if not dest.is_relative_to(ROOT):
+                raise ValueError(f'Included link escapes repository: {raw}')
+            target = '@repo@/' + dest.relative_to(ROOT).as_posix()
+            if url.fragment:
+                target += '#' + url.fragment
+            offset = link.start(1) - link.start()
+            return link[0][:offset] + target + link[0][offset + len(raw):]
+        text = LINK.sub(rebase, text)
+        target = name + ('#' + section if section else '')
+        return text + f'\n\n_Shared with the [maintained reference](@repo@/{target})._\n'
+    return INCLUDE.sub(include, path.read_text())
+
+
 def validate():
     manifest = json.loads((ROOT / 'docs/wiki-manifest.json').read_text())
     pages = manifest['pages']
@@ -83,7 +142,7 @@ def validate():
     files = MAINTAINED + [f'docs/wiki/{p}.md' for p in pages]
     for name in files:
         path = ROOT / name
-        text = prose(path.read_text())
+        text = prose(expand_source(path))
         for match in WIKI.finditer(re.sub(r"`+[^`]*`+", "", text)):
             slug = (match[2] or match[1]).replace(' ', '-')
             if slug not in pages:
@@ -125,7 +184,7 @@ def main():
                 raise ValueError(f'{name} differs from {ref}; commit sources before rendering')
         args.output.mkdir(parents=True, exist_ok=False)
         for page in manifest['pages']:
-            text = (ROOT / f'docs/wiki/{page}.md').read_text()
+            text = expand_source(ROOT / f'docs/wiki/{page}.md')
             title, _, body = text.partition('\n')
             header = (f"> Release baseline: [{manifest['release']}]({BASE}/releases/tag/{manifest['release']}). "
                       f"Reviewed {manifest['reviewed']}. "

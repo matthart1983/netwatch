@@ -8,7 +8,7 @@ instead of copying their tables into a second guide.
 
 ## Wiki sources and rendering
 
-`docs/wiki/*.md` contains the public wiki's concise guides. The JSON manifest
+`docs/wiki/*.md` contains standalone wiki guides and shared-section directives. The JSON manifest
 records the release baseline, peeled release commit, review date and complete
 page inventory. Existing slugs are retained for inbound links. `@repo@` links
 resolve to an immutable documentation commit, not a moving branch. Wiki links
@@ -74,3 +74,17 @@ Markdown file/heading links, wiki targets and source inventory. It does not prov
 semantic correctness or external URL availability. Historical plans/changelogs
 are outside its blocking link scope; links *to* them still resolve. External
 network checks belong in a separate, nonblocking review to avoid flaky releases.
+
+## Shared detail without duplicate maintenance
+
+A wiki source can embed a whole maintained document or a section with
+`<!-- include: docs/REFERENCE.md#permissions -->`. The renderer includes that
+section and its subsections, adjusts heading depth and pins relative links to
+the source document. Whole-document includes use the same syntax without an
+anchor. Only documents in the checker's maintained inventory may be included.
+Missing sections fail validation; fenced code headings are not section boundaries.
+
+Write task-oriented introductions and worked examples around the shared material.
+A topic page should let readers perform the task and interpret results without
+leaving the wiki. Source links provide provenance and related context, not a
+replacement for substantive documentation.

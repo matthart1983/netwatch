@@ -628,7 +628,8 @@ line whenever a loaded database says it is DB-IP's, wherever the file came from.
 | `/` | Display filter |
 | `s` | Stream view |
 | `w` | Preview and export the shown packets as PCAPNG or PCAP |
-| `x` | Clear packets |
+| `x` | Toggle expert findings filter |
+| `X` | Clear retained packets and bookmarks |
 | `m` | Bookmark packet |
 | `n`/`N` | Next/prev bookmark |
 | `f` | Auto-follow |

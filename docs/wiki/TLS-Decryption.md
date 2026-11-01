@@ -7,3 +7,5 @@ Follow the [protected keylog setup and cipher support](@repo@/docs/REFERENCE.md#
 TLS 1.2 legacy CBC is unsupported. TLS 1.3 observed KeyUpdate is handled, but missed-update recovery and capture gaps have limits; see the [decryptor contract](@repo@/src/dpi/tls_decrypt.rs). v0.39.0 lacks the later split-TCP-ClientHello fix. Missing keys or insufficient handshake data leave traffic opaque.
 
 [[Sandbox]] is defense in depth, not a guarantee that the configured keylog is the only secret reachable by the process. The origin of traffic does not itself determine decryptability.
+
+<!-- include: docs/REFERENCE.md#tls-13--12-decryption -->

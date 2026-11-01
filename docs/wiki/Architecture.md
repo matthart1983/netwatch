@@ -5,3 +5,7 @@ The TUI coordinates collectors and UI state; daemon mode runs collectors without
 Read the [architecture guide](@repo@/docs/ARCHITECTURE.md), [runtime lifecycle](@repo@/docs/runtime-lifecycle.md) and [recovery store](@repo@/docs/recovery-store.md). Sessions can persist baselines, uptime and recovery evidence as well as preferences and exports. They are not wholly ephemeral.
 
 [[Sandbox]] describes the security boundary; [[Configuration and Privacy]] covers outbound behavior.
+
+<!-- include: docs/ARCHITECTURE.md#runtime-architecture -->
+
+<!-- include: docs/ARCHITECTURE.md#configuration-and-persistence -->
