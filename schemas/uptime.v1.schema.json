@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/uptime.v1.schema.json",
+  "title": "netwatch uptime --json, schema 1",
+  "description": "The outage report. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
+  "type": "object",
+  "required": ["metadata", "schema", "since", "until", "outages", "summary"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "description": "Names this output's schema. Every stable netwatch output has this block, at the same path.",
+      "required": ["schema", "schema_version", "schema_url", "netwatch_version"],
+      "properties": {
+        "schema": { "const": "netwatch.uptime.v1" },
+        "schema_version": { "const": "1" },
+        "schema_url": { "const": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/uptime.v1.schema.json" },
+        "netwatch_version": { "type": "string", "description": "The netwatch that wrote this document." }
+      }
+    },
+    "schema": { "const": 1, "description": "The integer form of metadata.schema_version." },
+    "since": { "type": "string", "format": "date-time", "description": "Start of the report period, RFC 3339 with this host's UTC offset." },
+    "until": { "type": "string", "format": "date-time", "description": "End of the report period, RFC 3339 with this host's UTC offset." },
+    "outages": {
+      "type": "array",
+      "description": "Oldest first.",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "duration_secs", "hop", "ended"],
+        "properties": {
+          "start": { "type": "string", "format": "date-time", "description": "RFC 3339 with this host's UTC offset. An outage that began before the report period shows since here." },
+          "end": { "type": "string", "format": "date-time", "description": "RFC 3339 with this host's UTC offset. For an outage still going on, the end of the report period, and for one netwatch stopped watching, the last time it looked. Read ended before treating this as a recovery." },
+          "duration_secs": { "type": "integer", "minimum": 0 },
+          "hop": {
+            "type": "string",
+            "description": "The nearest hop that was down: gateway means the LAN or router, internet means the ISP or beyond, dns means name resolution alone. Open set: a minor may add a hop, so a filter on one value keeps working and code that lists every hop needs a default.",
+            "examples": ["gateway", "internet", "dns"]
+          },
+          "ended": {
+            "enum": ["recovered", "monitoring_stopped", "ongoing"],
+            "description": "How the outage ended: a reply came back, netwatch stopped or went quiet while it was still down, or it is still down. Closed set: a new value needs netwatch 2.0, because each one decides whether end is a real recovery time."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["outages", "down_secs", "up_secs", "unknown_secs", "unmonitored_secs", "uptime_pct"],
+      "properties": {
+        "outages": { "type": "integer", "minimum": 0 },
+        "down_secs": { "type": "integer", "minimum": 0 },
+        "up_secs": { "type": "integer", "minimum": 0 },
+        "unknown_secs": { "type": "integer", "minimum": 0, "description": "Monitored, but the internet probe measured nothing. Neither up nor down." },
+        "unmonitored_secs": { "type": "integer", "minimum": 0, "description": "No netwatch was running, or the log has a gap of over three minutes. Never counted as up." },
+        "uptime_pct": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Up time as a share of the time known to be up or down. Null when no such time exists, or when the internet hop was never measured in the period."
+        }
+      }
+    }
+  }
+}

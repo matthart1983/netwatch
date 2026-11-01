@@ -16,6 +16,7 @@ maintenance notes, see [WIKI.md](WIKI.md).
   - [Flight Recorder](#flight-recorder)
   - [Landlock sandbox (Linux)](#landlock-sandbox-linux)
 - [Command line](#command-line)
+- [JSON schemas](#json-schemas)
 - [Keyboard controls](#keyboard-controls)
 - [Permissions](#permissions)
   - [Running without sudo (Linux)](#running-without-sudo-linux)
@@ -350,16 +351,17 @@ Sharp edges handled for you:
   drift" could be silenced by the very thing drifting. `chmod 644` or stricter.
 
 **Structured export.** Press `e` on the Egress tab to write the attributed
-records as **NDJSON** (`netwatch.egress.v1`) — one JSON object per line, preceded
-by a `_meta` line naming the schema. Each record is metadata only (process, SNI,
+records as **NDJSON** (`netwatch.egress.v1.1`) — one JSON object per line, preceded
+by a header line naming the schema. Each record is metadata only (process, SNI,
 ASN org, IP, port, coarse proto, ECH flag, first/last-seen, count, policy
-verdict) — never any payload. This is the ingest contract the managed layer consumes; the
+verdict, what admitted it, approximate bytes) — never any payload. This is the ingest contract the managed layer consumes; the
 same `policy.toml` the TUI lints with is the file a managed layer would
-distribute.
+distribute. [`schemas/egress.v1.1.schema.json`](../schemas/egress.v1.1.schema.json)
+describes both kinds of line.
 
 ```json
-{"_meta":{"schema":"netwatch.egress.v1","records":2}}
-{"process":"chrome","sni":"mail.google.com","asn_org":"Google LLC","ip":"142.250.66.101","port":443,"proto":"tls","ech":false,"first_seen":1751600000,"last_seen":1751603600,"count":42,"verdict":"ok"}
+{"_meta":{"records":1,"schema":"netwatch.egress.v1.1"},"metadata":{"netwatch_version":"0.40.0","schema":"netwatch.egress.v1.1","schema_url":"https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/egress.v1.1.schema.json","schema_version":"1.1"}}
+{"process":"chrome","sni":"mail.google.com","asn_org":"Google LLC","ip":"142.250.66.101","port":443,"proto":"tls","ech":false,"first_seen":1751600000,"last_seen":1751603600,"count":42,"verdict":"ok","matched_by":"sni","bytes_out":18200,"bytes_in":940000}
 ```
 
 ```toml
@@ -459,7 +461,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch` | The TUI. Flags below. |
 | `netwatch daemon` (also `--daemon`, `--headless`) | The collectors with no screen. With `--metrics` or `--metrics-addr`, serves [Prometheus metrics](observability-export.md). |
 | `netwatch doctor [--json] [--check-capture] [--interface NAME]` | Read-only setup report: what this host lets netwatch see. `--check-capture` tries a real capture. See [doctor.md](doctor.md). |
-| `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue. 1: at least one open issue. 2: no usable observation in the budget. 3: bad arguments or no session. |
+| `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue counted. 1: at least one open issue counted. 2: no usable observation in the budget. 3: bad arguments or no session. |
 | `netwatch diagnose coverage [--json] [--seconds N] [--test ID]` | Which checks have their inputs on this host, and why the others do not. |
 | `netwatch diagnose episodes [DIR]` | List recorded incident episodes. |
 | `netwatch diagnose replay [--json] FILE\|DIR...` | Replay episodes through the engine and report any divergence. |
@@ -522,9 +524,13 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   measured, the text leaves the figure out and `--json` gives `"uptime_pct": null`, outages or
   not.
 
-`--json` and `--csv` carry the same outages for an ISP ticket or a chart. Both are versioned
-(`"schema": 1` in JSON) and covered by the 1.0 compatibility promise. Each outage's `ended` is
-`recovered`, `monitoring_stopped` (netwatch stopped while it was still down) or `ongoing`.
+`--json` and `--csv` carry the same outages for an ISP ticket or a chart, and the 1.0 compatibility
+promise covers both. The JSON is versioned (`"schema": 1`), and
+[`schemas/uptime.v1.schema.json`](../schemas/uptime.v1.schema.json) describes it. The CSV has no
+version marker and is covered by its header row, `start,end,duration_secs,hop,ended`: columns are
+not renamed or removed, and new ones are added at the end, so read columns by header name. Each
+outage's `ended` is `recovered`, `monitoring_stopped` (netwatch stopped while it was still down)
+or `ongoing`.
 
 The log is `~/.local/state/netwatch/uptime/`, one small file per day (about 80 KB), kept 90
 days, readable only by you. Nothing is uploaded. `record_uptime = false` turns it off.
@@ -562,6 +568,111 @@ IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0. Settings and `netwatch d
 line whenever a loaded database says it is DB-IP's, wherever the file came from.
 
 ---
+
+## JSON schemas
+
+Five outputs are part of the 1.0 compatibility promise. Each has a JSON Schema (draft 2020-12)
+under [`schemas/`](../schemas), which ships in the repository and the published crate. The tests
+run the real code behind each output and validate what it writes against these files, so a schema
+that stops describing its output fails CI.
+
+| Output | Schema file | `metadata.schema` | Older marker, still written |
+|---|---|---|---|
+| `netwatch diagnose run --format json` | `diagnose-run.v2.schema.json` | `netwatch.diagnose-run.v2` | `"schema": 2` |
+| `netwatch doctor --json` | `doctor.v1.schema.json` | `netwatch.doctor.v1` | `"schema_version": 1` |
+| The Egress tab's NDJSON export | `egress.v1.1.schema.json` | `netwatch.egress.v1.1` | `_meta.schema` |
+| `netwatch diagnose export`, once gunzipped | `diagnose-export.v1.schema.json` | `netwatch.diagnose-export.v1` | `"format": "netwatch-episode-export"`, `"version": 1` |
+| `netwatch uptime --json` | `uptime.v1.schema.json` | `netwatch.uptime.v1` | `"schema": 1` |
+
+**Finding the schema from the output.** Each output has the same `metadata` object at its top
+level. In the egress export it is on the first line, and that file's schema validates one line at a
+time.
+
+```json
+"metadata": {
+  "schema": "netwatch.uptime.v1",
+  "schema_version": "1",
+  "schema_url": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/uptime.v1.schema.json",
+  "netwatch_version": "0.40.0"
+}
+```
+
+`schema_version` is a string because the egress export's is `1.1`. Use this block in new code.
+The older markers stay, with their meanings unchanged. Mind `version`: in `diagnose run` it is the
+netwatch version, and in `diagnose export` it is the version of the bundle format.
+
+**What can change in a 1.x minor.** A minor can add a field anywhere, so ignore fields you do not
+know. No schema here closes an object, so a validator using one of these files keeps passing when
+that happens. A break needs netwatch 2.0 and a new schema file, and a published file is never
+removed or renamed. The files describe what 0.40 and later write. A field added after that is not
+made `required` in an existing file, so older documents stay valid. An added field changes no
+output's name or version, so `netwatch.egress.v1.1` stays that until a break, like the others.
+
+**Required and null.** A field is `required` only where netwatch always writes it. Some can be
+absent and some can be null, and the two are not interchangeable. An egress record leaves `sni`
+out when there is no name but writes `"matched_by": null`. The schema says which is which.
+
+**Value sets.** A set that a script has to branch on to read the document correctly is closed. A new
+value needs 2.0, the schema lists it as an `enum`, and its description says `Closed set`. These are:
+
+- `diagnose run`: `outcome`, `exit`, a finding's `kind` and `severity`, a check's `state`, and
+  `verify.predicate`
+- `doctor`: a capability's `state`
+- `uptime`: an outage's `ended`
+
+Every other listed set is open, including rule ids, capability ids, doctor's `reason` codes,
+`why_not`, an egress `verdict` and an outage's `hop`. A minor can add to these, so a
+validator must not refuse a new value. The schema lists the values known today under `examples`, its
+description says `Open set`, and it says what to do with a value you do not know. An existing value
+keeps its meaning.
+
+**Deprecated fields.** A field marked `deprecated` in a schema tells a consumer nothing useful, so do
+not rely on it. netwatch keeps writing it, and it goes only in a major version. The schema leaves it
+out of `required`. In `doctor` that is `network_restricted`, which is always false. In `diagnose run`
+it is a finding's `artifacts`, `suppressed_by`, `tests` and `verification`, which a run leaves empty,
+and a remediation step's `key`, `action`, `reversible`, `requires` and `applied`, which belong to the
+TUI.
+
+**What is outside the promise.**
+
+- Text in words, such as `detail`, `title`, `completeness` and `redaction`, can be reworded. Each
+  such field says so. `reason` is a stable code in `doctor` and free text in `diagnose run`'s
+  `coverage`.
+- A `diagnose run` finding with `"beta": true` follows the schema, but its rule can change thresholds
+  or disappear.
+- Each entry in `diagnose export`'s `episodes` is a recording in the episode format, which is
+  experimental. The schema covers the bundle around them and each one's `schema_version`.
+
+**Names that stay as they are.** These read oddly and are frozen anyway, so read them as described.
+
+- A `diagnose run` finding's `state` is an object, `{"state": "open"}`, so the value is at
+  `.state.state`. A check's `state` is a plain string.
+- An egress record's `sni` holds the destination's name, which can be a cleartext HTTP `Host`. `proto`
+  says `tls` only when a ClientHello supplied it and no flow to that destination carried a `Host`.
+- An egress record's `"matched_by": "sni"` also covers a rule that declares no name restriction at
+  all, so it does not always mean one named endpoint. `matched_by` is an open set, so a minor can add
+  a broader value for such a rule.
+- `ruleset` in `diagnose run` is how many rules the build's catalogue holds. It grows between releases
+  and is not a version.
+- `window_seconds` at the top level of `diagnose run` is how long the run sampled, and can have a
+  fraction. `window_secs` on a finding's evidence is an integer, the seconds of data that value
+  summarises.
+
+**Times.** Four formats are in use, and one name can differ between outputs: `since` is RFC 3339 in
+`uptime` and local time in a `diagnose run` finding.
+
+| Format | Fields |
+|---|---|
+| Local wall-clock time with no UTC offset, such as `2026-11-01 08:58:52`. This is not UTC, so do not parse it as UTC. | `diagnose run`: a finding's `since`, `last_seen` and `stale_since`. `diagnose export`: `created`. The deprecated `tests` and `verification` use it too, but a run leaves them empty. |
+| RFC 3339 with the host's UTC offset | `diagnose run`: `started_at`. `uptime`: `since`, `until`, and an outage's `start` and `end`. |
+| Unix seconds | Egress record: `first_seen` and `last_seen`. |
+| Unix milliseconds | `doctor`: `attribution_coverage.completed_at_utc_ms`. |
+
+In `diagnose run`, `started_at` gives the host's offset for the rest of the document. `diagnose export`
+gives none. A minor can add fields that carry an offset, and the fields above keep their format.
+
+`diagnose run` prints no JSON for exit 3, which means bad arguments or a session that could not
+start, so there is nothing to validate.
 
 ## Keyboard controls
 

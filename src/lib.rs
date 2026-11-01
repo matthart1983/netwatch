@@ -49,6 +49,7 @@ pub mod platform;
 pub mod remote;
 pub mod runtime;
 pub mod sandbox;
+pub mod schemas;
 pub mod sort;
 pub mod state;
 pub mod theme;
