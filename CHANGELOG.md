@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.40.0] - 2026-11-04
 
 ### Migration
 - **Add `--unstable` to `diagnose replay`, `diagnose features` and `diagnose corpus`.**
