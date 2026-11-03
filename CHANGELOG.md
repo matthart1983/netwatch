@@ -28,50 +28,6 @@ All notable changes to NetWatch will be documented in this file.
   said `"tls"`, and keeps its name in `sni`.
 - **`doctor --json` consumers: test `interface` for null, not for an empty string.**
   A capture check that selected no interface wrote `""` and now writes `null`.
-- **A save writes only what the session changed.** Settings and the Diagnose target
-  toggle rewrote the whole file from the session's copy. A key netwatch does not read
-  went, with the warning about it and every comment in the file. So did a hand edit made
-  while netwatch ran, which is how `sandbox = "strict"` could go back to `on` when a
-  session saved a theme. `refresh_rate_ms = 50` became 100 and `view = "future_view"`
-  became `full` on an unrelated save. Every save also wrote every default, growing a
-  one-line file to 49 lines and holding today's defaults there when a release changed
-  one. Now a save compares the session's values with what it loaded and changes those
-  keys in the file, keeping the line's comment. Everything else stays as the file has it.
-  If you and the session changed the same key, the session's value wins for that key
-  alone. A target is found by `name`, so entries reordered by hand keep their own
-  comments and keys, a target added by hand survives, and `d` changes only that target's
-  `enabled`. `d` on a target the file no longer has fails and leaves the file. `--view`
-  is for one run, and a save no longer makes it the default. With nothing to write, the
-  file is not touched. A save that does write drops a byte-order mark and ends every line
-  in LF. Removing `geoip_online` also removes a comment directly above it. If the result
-  would not read back as the file plus those changes, the save fails and the file stays.
-- **A save that cannot finish keeps the old file.** `config.toml` and `egress-policy.toml`
-  were truncated and then written, so a full disk could leave half a file. A config cut
-  off at `view = "ful` then stopped netwatch starting, and a lost policy silences every
-  rule. The new contents now go to a temporary file beside the old one, are synced and are
-  renamed over it. The file keeps its mode, a symlink stays and its target is what changes,
-  and a file you made read-only stays refused. Where a rename cannot work, in a directory
-  you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
-  place, as before. The learned egress baseline is written the same way.
-- **A warning that cannot be printed no longer changes how `diagnose run` ends.** With
-  stderr on a full disk or a closed pipe, printing panicked, so `diagnose run --format json`
-  exited 101 with no report, which is not one of its statuses. A failed write to stderr or
-  to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
-  the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
-- **A failed save in Settings stays on screen.** Its status was the last row of the
-  popup's list, so a short terminal cut it off, and with eight unknown keys at 120 columns
-  it needed 44 rows. It now has a row of its own above the footer, at any height the popup
-  opens at, and `✗ Save failed` is in the error colour, not the success one.
-- **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
-  thing that writes defaults. A new file gets every key. A file that exists gains the
-  keys it lacks and keeps what it has, values included. It no longer writes
-  `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
-  append a TOML error, so the file then failed to load with `config_invalid`.
-- **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
-  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key in the
-  rule was lost, with the comments in it and directly above it, and for the file's first
-  rule, the file's header. They all stay now. A list that gains an entry is rewritten on one
-  line, so a comment inside that list goes, and its line's own comment stays.
 
 ### Added
 - **`STABILITY.md` says what 1.0 promises.** Subcommands, long flags, `config.toml`
@@ -181,6 +137,17 @@ All notable changes to NetWatch will be documented in this file.
   saying `Recovered 0`. The journal does not record which it was, so this notice says that
   and does not offer the backup as the way back. If you have one, the notice stays until
   you remove `applied.json`.
+- **The egress export says `"proto": "tls"` only when a ClientHello named the
+  destination.** It said `tls` for anything with a name, and a cleartext HTTP
+  `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
+  to anyone filtering on `proto`. Such a flow now says `other`, which is what the
+  field was documented to do, and a destination that has seen both stays `other`.
+  A destination in a baseline saved before this keeps saying `tls` until a
+  cleartext flow to it is seen again.
+- **`doctor --json` says `"interface": null` when a capture check selects
+  nothing.** With no `--interface` given and no interface up, or on Windows with no
+  Npcap, it wrote `"interface": ""`, which reads as a name. It now writes the null
+  it writes everywhere else there is no interface.
 
 ### Removed
 - **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,
@@ -202,6 +169,50 @@ All notable changes to NetWatch will be documented in this file.
   from its baseline up to the series colour, on every theme that sets its own
   colours. That makes the quiet part of the graph brighter on all of them, and
   download and sparklines too.
+- **A save writes only what the session changed.** Settings and the Diagnose target
+  toggle rewrote the whole file from the session's copy. A key netwatch does not read
+  went, with the warning about it and every comment in the file. So did a hand edit made
+  while netwatch ran, which is how `sandbox = "strict"` could go back to `on` when a
+  session saved a theme. `refresh_rate_ms = 50` became 100 and `view = "future_view"`
+  became `full` on an unrelated save. Every save also wrote every default, growing a
+  one-line file to 49 lines and holding today's defaults there when a release changed
+  one. Now a save compares the session's values with what it loaded and changes those
+  keys in the file, keeping the line's comment. Everything else stays as the file has it.
+  If you and the session changed the same key, the session's value wins for that key
+  alone. A target is found by `name`, so entries reordered by hand keep their own
+  comments and keys, a target added by hand survives, and `d` changes only that target's
+  `enabled`. `d` on a target the file no longer has fails and leaves the file. `--view`
+  is for one run, and a save no longer makes it the default. With nothing to write, the
+  file is not touched. A save that does write drops a byte-order mark and ends every line
+  in LF. Removing `geoip_online` also removes a comment directly above it. If the result
+  would not read back as the file plus those changes, the save fails and the file stays.
+- **A save that cannot finish keeps the old file.** `config.toml` and `egress-policy.toml`
+  were truncated and then written, so a full disk could leave half a file. A config cut
+  off at `view = "ful` then stopped netwatch starting, and a lost policy silences every
+  rule. The new contents now go to a temporary file beside the old one, are synced and are
+  renamed over it. The file keeps its mode, a symlink stays and its target is what changes,
+  and a file you made read-only stays refused. Where a rename cannot work, in a directory
+  you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
+  place, as before. The learned egress baseline is written the same way.
+- **A warning that cannot be printed no longer changes how `diagnose run` ends.** With
+  stderr on a full disk or a closed pipe, printing panicked, so `diagnose run --format json`
+  exited 101 with no report, which is not one of its statuses. A failed write to stderr or
+  to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
+  the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
+- **A failed save in Settings stays on screen.** Its status was the last row of the
+  popup's list, so a short terminal cut it off, and with eight unknown keys at 120 columns
+  it needed 44 rows. It now has a row of its own above the footer, at any height the popup
+  opens at, and `✗ Save failed` is in the error colour, not the success one.
+- **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
+  thing that writes defaults. A new file gets every key. A file that exists gains the
+  keys it lacks and keeps what it has, values included. It no longer writes
+  `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
+  append a TOML error, so the file then failed to load with `config_invalid`.
+- **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
+  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key in the
+  rule was lost, with the comments in it and directly above it, and for the file's first
+  rule, the file's header. They all stay now. A list that gains an entry is rewritten on one
+  line, so a comment inside that list goes, and its line's own comment stays.
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
   the plain Linux asset has been the static binary, and the `-static` name went
   away, but aqua's registry, which mise reads, still asked for it. Every release
@@ -266,18 +277,6 @@ All notable changes to NetWatch will be documented in this file.
   `cargo install netwatch-tui` without `--locked` could already pick up 0.2.3; this
   stops that from the next release on.
 - tokio 1.54.1, uuid 1.29.0, brotli 9.1.1 and webpki-roots 1.0.11.
-- **The egress export says `"proto": "tls"` only when a ClientHello named the
-  destination.** It said `tls` for anything with a name, and a cleartext HTTP
-  `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
-  to anyone filtering on `proto`. Such a flow now says `other`, which is what the
-  field was documented to do, and a destination that has seen both stays `other`.
-  A destination in a baseline saved before this keeps saying `tls` until a
-  cleartext flow to it is seen again.
-
-- **`doctor --json` says `"interface": null` when a capture check selects
-  nothing.** With no `--interface` given and no interface up, or on Windows with no
-  Npcap, it wrote `"interface": ""`, which reads as a name. It now writes the null
-  it writes everywhere else there is no interface.
 
 ## [0.39.0] - 2026-10-31
 
