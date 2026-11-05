@@ -1966,6 +1966,7 @@ fn shutdown_deadline() {
 pub async fn run_headless(
     remote: Option<&crate::remote::RemotePublisher>,
     metrics: Option<&crate::metrics::MetricsExporter>,
+    flow_log: Option<crate::collectors::flow_log::FlowLogConfig>,
     sandbox_mode: crate::sandbox::Mode,
 ) -> Result<()> {
     install_collector_panic_flag();
@@ -1982,11 +1983,20 @@ pub async fn run_headless(
     // Prime the collectors so the first published snapshot isn't empty.
     crate::runtime::bootstrap::prime_collectors(&mut app);
 
+    // Started after priming, so the first table it sees is a real one.
+    let mut flows = flow_log.map(|config| {
+        (
+            crate::collectors::flow_log::FlowTracker::new(config.loopback),
+            crate::collectors::flow_log::FlowWriter::start(&config),
+        )
+    });
+
     tracing::info!(
         target: "netwatch::daemon",
         tick_rate_ms = tick_rate,
         remote = remote.is_some(),
         metrics = metrics.is_some(),
+        flow_log = flows.is_some(),
         "netwatch daemon started"
     );
 
@@ -2001,6 +2011,13 @@ pub async fn run_headless(
         tokio::select! {
             _ = ticker.tick() => {
                 app.tick();
+                if let Some((tracker, writer)) = &mut flows {
+                    writer.send(&tracker.observe(
+                        &app.connection_collector.connections(),
+                        &app.geo_cache,
+                        &app.packet_collector.dns_cache,
+                    ));
+                }
                 let healthy = !collectors_panicked();
                 if let Some(publisher) = remote {
                     publisher.update(
@@ -2028,7 +2045,12 @@ pub async fn run_headless(
         }
     }
 
-    // Graceful shutdown: stop capture, then flush whatever is still buffered.
+    // Graceful shutdown: close the open flows, stop capture, then flush
+    // whatever is still buffered.
+    if let Some((mut tracker, writer)) = flows {
+        writer.send(&tracker.finish());
+        writer.shutdown(std::time::Duration::from_secs(3));
+    }
     finish_session(&mut app);
     if let Some(publisher) = remote {
         publisher.shutdown(std::time::Duration::from_secs(8));

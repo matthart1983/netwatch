@@ -15,6 +15,9 @@ EnvironmentFile=/etc/netwatch/agent.env
 # systemd-managed CacheDirectory so a service user without $HOME still logs.
 Environment=XDG_CACHE_HOME=/var/cache/netwatch
 ExecStart=/usr/bin/netwatch daemon
+# Experimental connection log (process -> destination), to
+# /var/cache/netwatch/netwatch/flows/ or, with stdout, to the journal:
+#ExecStart=/usr/bin/netwatch daemon --flow-log file
 
 Restart=on-failure
 RestartSec=5s

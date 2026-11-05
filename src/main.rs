@@ -167,9 +167,13 @@ fn main() -> Result<()> {
             exporter
         });
 
+        let flow_log =
+            netwatch::collectors::flow_log::FlowLogConfig::resolve(options.flow_log, &config);
+
         return runtime.block_on(app::run_headless(
             remote_publisher.as_ref(),
             metrics.as_ref(),
+            flow_log,
             sandbox_mode,
         ));
     }

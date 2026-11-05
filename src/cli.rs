@@ -33,6 +33,8 @@ pub struct Run {
     pub insecure_remote: bool,
     pub metrics: bool,
     pub metrics_addr: Option<String>,
+    /// `--flow-log`: where the daemon writes its connection log. Experimental.
+    pub flow_log: Option<crate::collectors::flow_log::FlowLogMode>,
 }
 // One option catalogue supplies both accepted spellings and help text.
 const OPTIONS: &[(&str, bool, &str)] = &[
@@ -54,6 +56,7 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--sandbox-strict", false, "Require sandbox enforcement"),
     ("--metrics", false, "Daemon metrics on 127.0.0.1:9464"),
     ("--metrics-addr", true, "Daemon metrics address"),
+    ("--flow-log", true, "Experimental: daemon connection log"),
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 /// What `--api-key` prints on stderr. Names the replacement and why, and it is a
@@ -170,6 +173,16 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
             }
             "--metrics" => run.metrics = true,
             "--metrics-addr" => run.metrics_addr = Some(value(&mut rest, arg)?),
+            "--flow-log" => {
+                let name = value(&mut rest, arg)?;
+                run.flow_log = Some(
+                    crate::collectors::flow_log::FlowLogMode::by_name(&name)
+                        .filter(|m| m.enabled())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--flow-log expects file, stdout, or both")
+                        })?,
+                );
+            }
             _ => unreachable!(),
         }
     }
@@ -178,6 +191,9 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
     }
     if !run.daemon && (run.metrics || run.metrics_addr.is_some()) {
         anyhow::bail!("metrics options require daemon mode");
+    }
+    if !run.daemon && run.flow_log.is_some() {
+        anyhow::bail!("--flow-log requires daemon mode");
     }
     if run.metrics && run.metrics_addr.is_some() {
         anyhow::bail!("choose --metrics or --metrics-addr");
@@ -218,6 +234,28 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn flow_log_is_a_daemon_option_with_a_mode() {
+        use crate::collectors::flow_log::FlowLogMode;
+        for (s, mode) in [
+            ("daemon --flow-log file", FlowLogMode::File),
+            ("daemon --flow-log stdout", FlowLogMode::Stdout),
+            ("--flow-log both daemon", FlowLogMode::Both),
+        ] {
+            match command(s).unwrap() {
+                Command::Run(run) => assert_eq!(run.flow_log, Some(mode), "{s}"),
+                _ => panic!("{s}"),
+            }
+        }
+        for s in [
+            "--flow-log file",
+            "daemon --flow-log",
+            "daemon --flow-log off",
+            "daemon --flow-log typo",
+        ] {
+            assert!(command(s).is_err(), "{s}");
+        }
     }
     #[test]
     fn ambiguous_or_missing_values_fail_before_startup() {

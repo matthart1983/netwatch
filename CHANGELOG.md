@@ -2,6 +2,17 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **A flow log for the daemon (experimental).** `netwatch daemon --flow-log file|stdout|both`, or
+  `[experimental] flow_log` in `config.toml`, writes an NDJSON line when a connection appears
+  and when it closes: process, pid, local and remote address, and on close the duration, the
+  SNI or HTTP `Host`, reverse DNS, ASN, country and approximate bytes. Files are daily,
+  0600, under `<cache>/netwatch/flows/`, and kept for `flow_log_keep_days` (14). It is built
+  from the polled connection table, so a connection shorter than one poll is not seen.
+  `schemas/flow.v0.schema.json` describes the lines. See REFERENCE, Flow log.
+
 ## [0.40.0] - 2026-11-04
 
 ### Migration

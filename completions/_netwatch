@@ -30,6 +30,7 @@ _netwatch() {
         '--sandbox-strict[Require sandbox enforcement]' \
         '--metrics[Daemon metrics on 127.0.0.1:9464]' \
         '--metrics-addr=[Daemon metrics address]:addr:' \
+        '--flow-log=[Experimental: daemon connection log]:mode:(file stdout both)' \
         '--daemon[Headless mode (alias: --headless)]' \
         '--headless[Alias for --daemon]' \
         '--generate-config[Write default config and exit]' \

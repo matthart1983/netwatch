@@ -14,13 +14,17 @@ _netwatch() {
 
     local subcommands="daemon doctor diagnose uptime geoip resolver"
     local options="--remote --api-key --insecure-remote --view --lite --demo \
-        --no-sandbox --sandbox-strict --metrics --metrics-addr --daemon \
+        --no-sandbox --sandbox-strict --metrics --metrics-addr --flow-log --daemon \
         --headless --generate-config --help -h --version -V"
 
     # Options that take a value: complete the value, not another flag.
     case "${prev}" in
         --view)
             COMPREPLY=( $(compgen -W "full lite dense" -- "${cur}") )
+            return 0
+            ;;
+        --flow-log)
+            COMPREPLY=( $(compgen -W "file stdout both" -- "${cur}") )
             return 0
             ;;
         --interface)

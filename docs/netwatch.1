@@ -101,6 +101,14 @@ Expose daemon metrics on 127.0.0.1:9464.
 .BI \-\-metrics\-addr " ADDR"
 Address for daemon metrics.
 .TP
+.BI \-\-flow\-log " file|stdout|both"
+Experimental. With
+.BR daemon ,
+log each connection's open and close (process, destination, duration) as NDJSON
+to daily files under the cache directory's
+.I netwatch/flows
+and/or to standard output.
+.TP
 .B \-\-daemon
 Headless mode, no terminal UI. Alias:
 .BR \-\-headless .

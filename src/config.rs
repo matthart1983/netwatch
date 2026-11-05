@@ -215,14 +215,33 @@ pub struct NetwatchConfig {
 /// day it ships, so a setting that might not last starts here, as a field, and
 /// can change or go away in any release.
 ///
-/// Nothing belongs in it yet, so it has no fields. It exists now so that the
-/// table parses, and has the meaning documented, before anything uses it. A key
-/// in it this version does not read is expected, from another version, rather
-/// than a mistake, so it is [`ConfigWarningKind::UnreadExperimentalKey`], and a
-/// save keeps it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A key in it this version does not read is expected, from another version,
+/// rather than a mistake, so it is [`ConfigWarningKind::UnreadExperimentalKey`],
+/// and a save keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ExperimentalConfig {}
+pub struct ExperimentalConfig {
+    /// The daemon's connection log: `off`, `file`, `stdout` or `both`. See
+    /// [`crate::collectors::flow_log`]. `daemon --flow-log` overrides it.
+    pub flow_log: String,
+    /// Daily flow-log files kept before the oldest is deleted.
+    pub flow_log_keep_days: usize,
+    /// Whether connections to and from loopback addresses are logged.
+    pub flow_log_loopback: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            flow_log: "off".into(),
+            flow_log_keep_days: DEFAULT_FLOW_LOG_KEEP_DAYS,
+            flow_log_loopback: false,
+        }
+    }
+}
+
+const DEFAULT_FLOW_LOG_KEEP_DAYS: usize = 14;
+const MAX_FLOW_LOG_KEEP_DAYS: usize = 3650;
 
 /// Saved only once it holds something, so `--generate-config` writes no empty
 /// table.
@@ -1331,6 +1350,15 @@ impl NetwatchConfig {
         if self.insights_endpoint.is_empty() {
             self.insights_endpoint = "local".into();
         }
+        // Like `view`, a typo turns the log off rather than stopping netwatch.
+        if crate::collectors::flow_log::FlowLogMode::by_name(&self.experimental.flow_log).is_none()
+        {
+            self.experimental.flow_log = ExperimentalConfig::default().flow_log;
+        }
+        self.experimental.flow_log_keep_days = self
+            .experimental
+            .flow_log_keep_days
+            .clamp(1, MAX_FLOW_LOG_KEEP_DAYS);
     }
 
     /// Write what this session changed to the platform location, creating parent
@@ -1925,6 +1953,29 @@ hostname = "b.example"
             Err(ConfigError::Parse { .. })
         ));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The flow-log keys are read, so they raise no warning, and a bad value
+    /// turns the log off rather than failing the load.
+    #[test]
+    fn flow_log_keys_are_read_and_a_bad_mode_turns_it_off() {
+        let dir = scratch("flow-log");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "[experimental]\nflow_log = \"both\"\nflow_log_keep_days = 0\nflow_log_loopback = true\n",
+        )
+        .unwrap();
+        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.load_warnings, []);
+        assert_eq!(cfg.experimental.flow_log, "both");
+        assert_eq!(cfg.experimental.flow_log_keep_days, 1);
+        assert!(cfg.experimental.flow_log_loopback);
+
+        fs::write(&path, "[experimental]\nflow_log = \"typo\"\n").unwrap();
+        let cfg = NetwatchConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.experimental.flow_log, "off");
+        assert_eq!(cfg.experimental, ExperimentalConfig::default());
     }
 
     /// `*` is a named entry as well as an array's, for the policy's

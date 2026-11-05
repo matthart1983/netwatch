@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/flow.v0.schema.json",
+  "title": "netwatch daemon flow log, netwatch.flow.v0",
+  "description": "One line of the flow log that netwatch daemon --flow-log writes. This validates a line, not a file. Each daily file starts with the header; stdout starts with it once. Every later line is an event. Experimental: this format is outside the 1.0 compatibility promise and can change in any release. Ignore fields you do not know.",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "#/$defs/flow" },
+    { "$ref": "#/$defs/dropped" }
+  ],
+  "$defs": {
+    "header": {
+      "type": "object",
+      "description": "The first line of a file, and of stdout.",
+      "required": ["_meta", "metadata"],
+      "properties": {
+        "_meta": {
+          "type": "object",
+          "required": ["schema"],
+          "properties": {
+            "schema": { "const": "netwatch.flow.v0", "description": "The same name as metadata.schema." }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Names this output's schema, at the same path as every other netwatch output.",
+          "required": ["schema", "schema_version", "schema_url", "netwatch_version"],
+          "properties": {
+            "schema": { "const": "netwatch.flow.v0" },
+            "schema_version": { "const": "0" },
+            "schema_url": { "const": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/flow.v0.schema.json" },
+            "netwatch_version": { "type": "string", "description": "The netwatch that wrote this file." }
+          }
+        }
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC, RFC 3339 with milliseconds and a Z suffix."
+    },
+    "flow": {
+      "type": "object",
+      "description": "A connection that appeared in the polled connection table (open), or reached a closing TCP state, left the table, or was still open when the daemon stopped (close). Metadata only, never payload. A connection shorter than one poll interval is never seen.",
+      "required": ["ts", "event", "proto", "process", "pid", "attribution", "local", "remote", "state", "observed_by"],
+      "properties": {
+        "ts": { "$ref": "#/$defs/timestamp", "description": "The poll that saw the event, not the moment of connect() or close()." },
+        "event": { "enum": ["open", "close"], "description": "Closed set." },
+        "proto": {
+          "type": "string",
+          "description": "Transport, as the connection table names it. Open set.",
+          "examples": ["TCP", "UDP"]
+        },
+        "process": { "type": ["string", "null"], "description": "The owning process's name, the latest one known. Null when attribution found no owner." },
+        "pid": { "type": ["integer", "null"], "minimum": 0, "description": "The owning process's id. Null when unknown." },
+        "attribution": {
+          "type": "string",
+          "description": "How the owner was matched. Open set.",
+          "examples": ["lsof", "procfs", "pktap", "ebpf", "sockstat", "iphelper"]
+        },
+        "local": { "type": "string", "description": "Local address and port, as the connection table prints it." },
+        "remote": { "type": "string", "description": "Remote address and port, as the connection table prints it." },
+        "state": { "type": "string", "description": "TCP state at the event, as the platform names it; empty or a platform word for UDP. Free text." },
+        "reason": {
+          "enum": ["closed", "gone", "shutdown"],
+          "description": "close only. closed: the socket reached a closing TCP state, possibly at the poll that first saw it, so a flow shorter than a poll still gets an open and a close. gone: it left the table with no closing state seen. shutdown: the daemon stopped while it was open. Closed set."
+        },
+        "duration_ms": { "type": "integer", "minimum": 0, "description": "close only. From the poll that opened it to the poll that closed it." },
+        "host": { "type": "string", "description": "The destination's name from a TLS or QUIC SNI, or a cleartext HTTP Host. Needs packet capture. Absent when none was read." },
+        "host_source": {
+          "type": "string",
+          "description": "Where host came from. Open set.",
+          "examples": ["sni", "http"]
+        },
+        "rdns": { "type": "string", "description": "Reverse-DNS name of the remote address, when resolved while the flow was open." },
+        "asn_org": { "type": "string", "description": "Organisation of the remote address from the ASN database. Absent with no database." },
+        "country": { "type": "string", "description": "ISO country code of the remote address from the GeoIP database. Absent with no database." },
+        "app_protocol": {
+          "type": "string",
+          "description": "Application protocol the packet decoder recognised. Open set.",
+          "examples": ["tls", "quic", "http", "dns", "ssh", "mqtt", "stun", "bittorrent", "netbios", "snmp", "ssdp", "ftp", "llmnr", "dhcp", "ntp"]
+        },
+        "bytes_out": { "type": "integer", "minimum": 0, "description": "close only. Approximate, from per-tick rates. Zero without packet capture, which does not mean no traffic." },
+        "bytes_in": { "type": "integer", "minimum": 0, "description": "close only. Approximate, from per-tick rates. Zero without packet capture, which does not mean no traffic." },
+        "retransmits": { "type": "integer", "minimum": 0, "description": "close only. TCP retransmits seen on the flow; zero without capture." },
+        "observed_by": {
+          "type": "string",
+          "description": "How the event was observed. poll: a connection-table poll. Open set.",
+          "examples": ["poll"]
+        }
+      }
+    },
+    "dropped": {
+      "type": "object",
+      "description": "Events the writer could not keep up with, written as soon as it caught up.",
+      "required": ["ts", "event", "count"],
+      "properties": {
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "event": { "const": "dropped" },
+        "count": { "type": "integer", "minimum": 1, "description": "Events lost since the previous line." }
+      }
+    }
+  }
+}
