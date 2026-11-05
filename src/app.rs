@@ -2040,7 +2040,7 @@ pub async fn run_headless(
     // Graceful shutdown: close the open flows, stop capture, then flush
     // whatever is still buffered.
     if let Some(flows) = flows {
-        flows.finish();
+        flows.finish(&app);
     }
     finish_session(&mut app);
     if let Some(publisher) = remote {

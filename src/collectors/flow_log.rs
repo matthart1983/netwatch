@@ -171,6 +171,9 @@ pub struct FlowEvent {
     pub host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_source: Option<&'static str>,
+    /// Only ever `true`: see [`ConnectLine::ech`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ech: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rdns: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,8 +213,232 @@ pub struct ConnectLine {
     pub process: String,
     pub pid: u32,
     pub attribution: AttributionSource,
+    /// The client side of the captured stream this connect started, when
+    /// one was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
     pub remote: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_source: Option<&'static str>,
+    /// Only ever `true`: the ClientHello carried Encrypted ClientHello, so
+    /// `host` is the outer, public name, not the one the client asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ech: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_protocol: Option<&'static str>,
     pub observed_by: &'static str,
+}
+
+/// A captured stream a connect may have started: its client and server
+/// sides and what the decoder made of it.
+#[derive(Debug, Clone)]
+pub struct WireStream {
+    pub index: u32,
+    pub proto: &'static str,
+    pub client: std::net::SocketAddr,
+    pub server: std::net::SocketAddr,
+    pub app_protocol: Option<crate::dpi::AppProtocol>,
+}
+
+/// Ticks a connect waits for its stream's ClientHello before it is written
+/// with what is known by then.
+const CONNECT_HOLD_TICKS: u32 = 2;
+
+/// Joins connects, which name the process but have no source port and come
+/// before any handshake, to the captured stream each one started, which has
+/// the source port and the SNI. A stream counts as a connect's when it goes
+/// to the same destination over the same transport, began after the connect
+/// was read, was started from this side, and no earlier connect took it.
+#[derive(Debug, Default)]
+pub struct ConnectJoin {
+    /// Each waiting connect, the lowest stream index it can have started,
+    /// and the ticks it has waited.
+    pending: Vec<(ConnectSeen, u32, u32)>,
+    claimed: std::collections::HashSet<u32>,
+    /// The tracker's `next_index` at the last two ticks.
+    marks: std::collections::VecDeque<u32>,
+    loopback: bool,
+}
+
+impl ConnectJoin {
+    pub fn new(loopback: bool) -> Self {
+        Self {
+            loopback,
+            ..Self::default()
+        }
+    }
+
+    /// The lowest index a stream started by a connect read now can have: the
+    /// tracker's next index two ticks ago. One tick ago is not enough: a
+    /// connect read this tick may have happened just before the last read,
+    /// and its SYN been counted before it.
+    fn floor(&self) -> u32 {
+        if self.marks.len() < 2 {
+            0
+        } else {
+            self.marks[0]
+        }
+    }
+
+    pub fn push(&mut self, seen: impl IntoIterator<Item = ConnectSeen>) {
+        let floor = self.floor();
+        for mut c in seen {
+            let ip = c.remote.ip().to_canonical();
+            if !self.loopback && is_loopback(&ip.to_string()) {
+                continue;
+            }
+            c.remote = std::net::SocketAddr::new(ip, c.remote.port());
+            self.pending.push((c, floor, 0));
+        }
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The lowest stream index any waiting connect can have started.
+    pub fn since(&self) -> u32 {
+        self.pending
+            .iter()
+            .map(|(_, floor, _)| *floor)
+            .min()
+            .unwrap_or_else(|| self.floor())
+    }
+
+    /// Destinations the waiting connects went to, to pick streams by.
+    pub fn wanted(&self) -> std::collections::HashSet<(&'static str, std::net::SocketAddr)> {
+        self.pending
+            .iter()
+            .map(|(c, _, _)| (c.proto, c.remote))
+            .collect()
+    }
+
+    /// One tick: match what can be matched, write what has waited long
+    /// enough. `next_index` is the stream tracker's, read with `streams`.
+    pub fn tick(&mut self, next_index: u32, streams: &[WireStream]) -> Vec<ConnectLine> {
+        let lines = self.resolve(streams, false);
+        if self.marks.back().is_some_and(|m| next_index < *m) {
+            // The tracker wrapped and started again at 0.
+            self.marks.clear();
+            self.claimed.clear();
+            for (_, floor, _) in &mut self.pending {
+                *floor = 0;
+            }
+        }
+        self.marks.push_back(next_index);
+        while self.marks.len() > 2 {
+            self.marks.pop_front();
+        }
+        // A claim matters only while a connect could still match its stream.
+        let keep = self.since().min(self.floor());
+        self.claimed.retain(|i| *i >= keep);
+        lines
+    }
+
+    /// Write every waiting connect now, for shutdown.
+    pub fn flush(&mut self, streams: &[WireStream]) -> Vec<ConnectLine> {
+        self.resolve(streams, true)
+    }
+
+    fn resolve(&mut self, streams: &[WireStream], all: bool) -> Vec<ConnectLine> {
+        let mut lines = Vec::new();
+        let mut waiting = Vec::new();
+        for (seen, floor, ticks) in std::mem::take(&mut self.pending) {
+            let stream = streams
+                .iter()
+                .filter(|w| {
+                    w.index >= floor
+                        && w.proto == seen.proto
+                        && w.server == seen.remote
+                        && !self.claimed.contains(&w.index)
+                })
+                .min_by_key(|w| w.index);
+            let named =
+                stream.is_some_and(|w| super::egress::dest_hostname(&w.app_protocol).is_some());
+            if named || all || ticks + 1 >= CONNECT_HOLD_TICKS {
+                if let Some(w) = stream {
+                    self.claimed.insert(w.index);
+                }
+                lines.push(connect_line(seen, stream));
+            } else {
+                waiting.push((seen, floor, ticks + 1));
+            }
+        }
+        self.pending = waiting;
+        lines
+    }
+}
+
+fn connect_line(c: ConnectSeen, stream: Option<&WireStream>) -> ConnectLine {
+    let app = stream.and_then(|w| w.app_protocol.clone());
+    let host = super::egress::dest_hostname(&app);
+    ConnectLine {
+        ts: timestamp(c.wall),
+        event: "connect",
+        proto: c.proto,
+        process: c.comm,
+        pid: c.pid,
+        attribution: AttributionSource::Ebpf,
+        local: stream.map(|w| w.client.to_string()),
+        remote: c.remote.to_string(),
+        host_source: host.as_ref().map(|_| {
+            if super::egress::flow_http_host(&app) {
+                "http"
+            } else {
+                "sni"
+            }
+        }),
+        host,
+        ech: super::egress::flow_ech(&app).then_some(true),
+        app_protocol: app.as_ref().map(crate::dpi::AppProtocol::tag),
+        observed_by: "ebpf",
+    }
+}
+
+/// The streams in `tracker` at index `since` or later that go to one of
+/// `wanted` and were started from this side.
+pub fn wire_streams(
+    tracker: &super::packets::StreamTracker,
+    since: u32,
+    wanted: &std::collections::HashSet<(&'static str, std::net::SocketAddr)>,
+) -> Vec<WireStream> {
+    use super::packets::StreamProtocol;
+    let addr = |(ip, port): &(String, u16)| -> Option<std::net::SocketAddr> {
+        let ip: std::net::IpAddr = ip.parse().ok()?;
+        Some(std::net::SocketAddr::new(ip.to_canonical(), *port))
+    };
+    tracker
+        .all_streams
+        .values()
+        .filter(|s| s.index >= since)
+        .filter_map(|s| {
+            let proto = match s.key.protocol {
+                StreamProtocol::Tcp => "TCP",
+                StreamProtocol::Udp => "UDP",
+            };
+            let (a, b) = (addr(&s.key.addr_a)?, addr(&s.key.addr_b)?);
+            let (client, server) = if wanted.contains(&(proto, b)) {
+                (a, b)
+            } else if wanted.contains(&(proto, a)) {
+                (b, a)
+            } else {
+                return None;
+            };
+            // A stream the far side started is an inbound one.
+            if s.initiator.as_ref().and_then(addr) == Some(server) {
+                return None;
+            }
+            Some(WireStream {
+                index: s.index,
+                proto,
+                client,
+                server,
+                app_protocol: s.app_protocol.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Who owns a flow socket polling found no owner for, from a source other
@@ -242,6 +469,7 @@ struct FlowState {
     state: String,
     host: Option<String>,
     host_source: Option<&'static str>,
+    ech: bool,
     rdns: Option<String>,
     geo: Option<GeoInfo>,
     geo_looked_up: bool,
@@ -263,6 +491,7 @@ impl FlowState {
             state: String::new(),
             host: None,
             host_source: None,
+            ech: false,
             rdns: None,
             geo: None,
             geo_looked_up: false,
@@ -313,24 +542,6 @@ impl FlowTracker {
             &|ip| geo.lookup(ip),
             hint,
         )
-    }
-
-    /// The lines for connects the kprobes saw, loopback left out as for flows.
-    pub fn connects(&self, seen: impl IntoIterator<Item = ConnectSeen>) -> Vec<ConnectLine> {
-        seen.into_iter()
-            .filter(|c| self.loopback || !is_loopback(&c.remote.ip().to_canonical().to_string()))
-            .map(|c| ConnectLine {
-                ts: timestamp(c.wall),
-                event: "connect",
-                proto: c.proto,
-                process: c.comm,
-                pid: c.pid,
-                attribution: AttributionSource::Ebpf,
-                remote: std::net::SocketAddr::new(c.remote.ip().to_canonical(), c.remote.port())
-                    .to_string(),
-                observed_by: "ebpf",
-            })
-            .collect()
     }
 
     fn observe_at(
@@ -535,6 +746,7 @@ fn update(
                 "sni"
             });
             flow.host = Some(host);
+            flow.ech = super::egress::flow_ech(&conn.app_protocol);
         }
     }
     if let Some(p) = &conn.app_protocol {
@@ -578,6 +790,7 @@ fn event(
         duration_ms: close.then(|| now.duration_since(flow.opened).as_millis() as u64),
         host: flow.host.clone(),
         host_source: flow.host_source,
+        ech: flow.ech.then_some(true),
         rdns: flow.rdns.clone(),
         asn_org: flow.geo.as_ref().and_then(|g| nonempty(&g.org)),
         country: flow.geo.as_ref().and_then(|g| nonempty(&g.country_code)),
@@ -605,6 +818,7 @@ pub struct DaemonFlowLog {
     tracker: FlowTracker,
     writer: FlowWriter,
     connects: Option<Receiver<ConnectSeen>>,
+    join: ConnectJoin,
 }
 
 impl DaemonFlowLog {
@@ -627,6 +841,7 @@ impl DaemonFlowLog {
             tracker: FlowTracker::new(config.loopback),
             writer: FlowWriter::start(config, sources(ebpf)),
             connects,
+            join: ConnectJoin::new(config.loopback),
         }
     }
 
@@ -634,8 +849,9 @@ impl DaemonFlowLog {
     /// happened before the poll that follows them.
     pub fn tick(&mut self, app: &crate::app::App) {
         if let Some(rx) = &self.connects {
-            let seen: Vec<ConnectSeen> = rx.try_iter().take(CONNECT_QUEUE_CAP).collect();
-            self.writer.send(&self.tracker.connects(seen));
+            self.join.push(rx.try_iter().take(CONNECT_QUEUE_CAP));
+            let (next_index, streams) = self.streams(app);
+            self.writer.send(&self.join.tick(next_index, &streams));
         }
         #[cfg(feature = "ebpf")]
         if let Some(t) = &app.conn_tracker {
@@ -674,11 +890,26 @@ impl DaemonFlowLog {
         self.writer.send(&events);
     }
 
+    /// The tracker's next stream index, and the streams waiting connects may
+    /// have started. Empty without capture, or with nothing waiting.
+    fn streams(&self, app: &crate::app::App) -> (u32, Vec<WireStream>) {
+        let tracker =
+            crate::app::safe_lock(&app.packet_collector.stream_tracker, "flow_log::streams");
+        let next_index = tracker.next_index();
+        let streams = if self.join.is_waiting() {
+            wire_streams(&tracker, self.join.since(), &self.join.wanted())
+        } else {
+            Vec::new()
+        };
+        (next_index, streams)
+    }
+
     /// Close what is open and let the writer drain.
-    pub fn finish(mut self) {
+    pub fn finish(mut self, app: &crate::app::App) {
         if let Some(rx) = &self.connects {
-            let seen: Vec<ConnectSeen> = rx.try_iter().collect();
-            self.writer.send(&self.tracker.connects(seen));
+            self.join.push(rx.try_iter());
+            let (_, streams) = self.streams(app);
+            self.writer.send(&self.join.flush(&streams));
         }
         self.writer.send(&self.tracker.finish());
         self.writer.shutdown(Duration::from_secs(3));
@@ -1442,37 +1673,159 @@ mod tests {
         );
     }
 
-    #[test]
-    fn connects_become_lines_without_loopback() {
-        let t = FlowTracker::new(false);
-        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
-        let seen = |remote: &str| ConnectSeen {
-            proto: "TCP",
+    fn seen(proto: &'static str, remote: &str) -> ConnectSeen {
+        ConnectSeen {
+            proto,
             pid: 4242,
             comm: "curl".into(),
             remote: remote.parse().unwrap(),
-            wall,
-        };
-        let lines = t.connects([
-            seen("93.184.215.14:443"),
-            seen("127.0.0.1:8080"),
-            seen("[::1]:8080"),
-            seen("[::ffff:1.1.1.1]:53"),
-        ]);
-        let remotes: Vec<_> = lines.iter().map(|l| l.remote.as_str()).collect();
-        assert_eq!(remotes, ["93.184.215.14:443", "1.1.1.1:53"]);
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
+        }
+    }
+
+    fn wire(index: u32, client: &str, server: &str, sni: Option<&str>) -> WireStream {
+        WireStream {
+            index,
+            proto: "TCP",
+            client: client.parse().unwrap(),
+            server: server.parse().unwrap(),
+            app_protocol: sni.map(|s| AppProtocol::Tls {
+                sni: Some(s.into()),
+                alpn: None,
+                ech: false,
+                ja4: None,
+            }),
+        }
+    }
+
+    /// A connect shorter than a poll still gets its SNI and source port from
+    /// the stream it started.
+    #[test]
+    fn a_connect_takes_the_sni_and_local_port_of_its_stream() {
+        let mut join = ConnectJoin::new(false);
+        join.push([seen("TCP", "5.255.255.242:443")]);
+        assert!(join.is_waiting());
+        // The ClientHello has not been decoded yet: it waits.
+        let first = join.tick(11, &[wire(10, "10.0.0.5:59694", "5.255.255.242:443", None)]);
+        assert!(first.is_empty());
+        let lines = join.tick(
+            12,
+            &[wire(
+                10,
+                "10.0.0.5:59694",
+                "5.255.255.242:443",
+                Some("ya.ru"),
+            )],
+        );
+        assert_eq!(lines.len(), 1);
         let json = serde_json::to_value(&lines[0]).unwrap();
         assert_eq!(json["event"], "connect");
         assert_eq!(json["process"], "curl");
+        assert_eq!(json["pid"], 4242);
+        assert_eq!(json["local"], "10.0.0.5:59694");
+        assert_eq!(json["remote"], "5.255.255.242:443");
+        assert_eq!(json["host"], "ya.ru");
+        assert_eq!(json["host_source"], "sni");
+        assert_eq!(json["app_protocol"], "tls");
         assert_eq!(json["attribution"], "ebpf");
-        assert_eq!(json["observed_by"], "ebpf");
         assert_eq!(json["ts"], "2026-09-21T14:13:20.000Z");
-        assert_eq!(
-            FlowTracker::new(true)
-                .connects([seen("127.0.0.1:8080")])
-                .len(),
-            1
+        assert!(json.get("ech").is_none());
+        assert!(!join.is_waiting());
+    }
+
+    /// Two connects to one destination take its streams in order, and a
+    /// stream one took is not given to another.
+    #[test]
+    fn connects_to_one_destination_take_one_stream_each() {
+        let mut join = ConnectJoin::new(false);
+        join.push([seen("TCP", "1.1.1.1:443"), seen("TCP", "1.1.1.1:443")]);
+        let streams = [
+            wire(21, "10.0.0.5:2", "1.1.1.1:443", Some("b.example")),
+            wire(20, "10.0.0.5:1", "1.1.1.1:443", Some("a.example")),
+        ];
+        let lines = join.tick(22, &streams);
+        let hosts: Vec<_> = lines.iter().map(|l| l.host.as_deref().unwrap()).collect();
+        assert_eq!(hosts, ["a.example", "b.example"]);
+        // A third connect later finds both taken, waits, then goes bare.
+        join.push([seen("TCP", "1.1.1.1:443")]);
+        assert!(join.tick(22, &streams).is_empty());
+        let late = join.tick(22, &streams);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].local, None);
+        assert_eq!(late[0].host, None);
+    }
+
+    #[test]
+    fn a_connect_with_no_stream_is_written_after_the_hold_and_at_shutdown() {
+        let mut join = ConnectJoin::new(false);
+        join.push([seen("UDP", "[2606:4700::1111]:443")]);
+        assert!(join.tick(0, &[]).is_empty());
+        let lines = join.tick(0, &[]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].remote, "[2606:4700::1111]:443");
+        assert_eq!(lines[0].local, None);
+
+        join.push([seen("TCP", "9.9.9.9:443")]);
+        assert_eq!(join.flush(&[]).len(), 1);
+        assert!(!join.is_waiting());
+    }
+
+    #[test]
+    fn connects_leave_out_loopback_and_unmap_v4() {
+        let mut join = ConnectJoin::new(false);
+        join.push([
+            seen("TCP", "127.0.0.1:8080"),
+            seen("TCP", "[::1]:8080"),
+            seen("TCP", "[::ffff:1.1.1.1]:53"),
+        ]);
+        let lines = join.flush(&[]);
+        let remotes: Vec<_> = lines.iter().map(|l| l.remote.as_str()).collect();
+        assert_eq!(remotes, ["1.1.1.1:53"]);
+        let mut with = ConnectJoin::new(true);
+        with.push([seen("TCP", "127.0.0.1:8080")]);
+        assert_eq!(with.flush(&[]).len(), 1);
+    }
+
+    /// The streams a waiting connect can match: newer than the mark, to a
+    /// wanted destination, started from this side.
+    #[test]
+    fn wire_streams_pick_outbound_streams_to_wanted_destinations() {
+        use super::super::packets::{Stream, StreamKey, StreamProtocol, StreamTracker};
+        let mut tracker = StreamTracker::new();
+        let mut add =
+            |index: u32, local: (&str, u16), remote: (&str, u16), initiator: (&str, u16)| {
+                let key = StreamKey::new(StreamProtocol::Tcp, local.0, local.1, remote.0, remote.1);
+                let mut s = Stream::new(index, key, 0);
+                s.initiator = Some((initiator.0.to_string(), initiator.1));
+                tracker.all_streams.insert(index, s);
+            };
+        add(
+            1,
+            ("10.0.0.5", 1000),
+            ("5.255.255.242", 443),
+            ("10.0.0.5", 1000),
         );
+        add(
+            5,
+            ("10.0.0.5", 1001),
+            ("5.255.255.242", 443),
+            ("10.0.0.5", 1001),
+        );
+        add(6, ("10.0.0.5", 1002), ("8.8.8.8", 443), ("10.0.0.5", 1002));
+        // Started by the far side: not a connect from here.
+        add(
+            7,
+            ("10.0.0.5", 2000),
+            ("5.255.255.242", 443),
+            ("5.255.255.242", 443),
+        );
+        let wanted = [("TCP", "5.255.255.242:443".parse().unwrap())]
+            .into_iter()
+            .collect();
+        let found = wire_streams(&tracker, 2, &wanted);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].index, 5);
+        assert_eq!(found[0].client.to_string(), "10.0.0.5:1001");
     }
 
     /// The real writer's lines, an open, every kind of close and a dropped
@@ -1547,6 +1900,24 @@ mod tests {
         docs.push(
             serde_json::json!({"ts": "2026-11-05T10:00:00.000Z", "event": "dropped", "count": 2}),
         );
+        let mut join = ConnectJoin::new(false);
+        join.push([
+            seen("TCP", "93.184.215.14:443"),
+            seen("UDP", "[2606:4700::1111]:443"),
+        ]);
+        let mut named = wire(
+            3,
+            "10.0.0.5:51234",
+            "93.184.215.14:443",
+            Some("example.com"),
+        );
+        if let Some(AppProtocol::Tls { ech, .. }) = &mut named.app_protocol {
+            *ech = true;
+        }
+        let lines = join.flush(&[named]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].ech, Some(true));
+        docs.extend(lines.iter().map(|c| serde_json::to_value(c).unwrap()));
         for doc in &docs {
             assert_eq!(errors(&validator, doc), Vec::<String>::new(), "{doc}");
         }

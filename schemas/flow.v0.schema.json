@@ -191,6 +191,10 @@
             "http"
           ]
         },
+        "ech": {
+          "const": true,
+          "description": "Present only when the ClientHello carried Encrypted ClientHello: host is then the outer, public name, not the one the client asked for."
+        },
         "rdns": {
           "type": "string",
           "description": "Reverse-DNS name of the remote address, when resolved while the flow was open."
@@ -272,7 +276,7 @@
     },
     "connect": {
       "type": "object",
-      "description": "One connect() of a TCP or connected UDP socket, as the eBPF probes saw it at connect entry: the moment, the process and the destination. Seen even when the connection is shorter than a poll. The source address is not chosen yet at that point, so there is no local side, and a refused or failed connect is still a connect.",
+      "description": "One connect() of a TCP or connected UDP socket, as the eBPF probes saw it at connect entry: the moment, the process and the destination. Seen even when the connection is shorter than a poll. Written a tick or two later, joined to the captured stream it started when there is one: that gives local and, from the ClientHello, host. A refused or failed connect is still a connect.",
       "required": [
         "ts",
         "event",
@@ -311,9 +315,50 @@
         "attribution": {
           "const": "ebpf"
         },
+        "local": {
+          "type": "string",
+          "description": "The client side of the captured stream this connect started: the source address and port. Absent without capture, or when no stream matched."
+        },
         "remote": {
           "type": "string",
           "description": "Destination address and port, IPv6 in brackets."
+        },
+        "host": {
+          "type": "string",
+          "description": "The TLS or QUIC SNI, or HTTP Host, of the matched stream. Absent when there was none to read in time."
+        },
+        "host_source": {
+          "type": "string",
+          "description": "Where host came from. Open set.",
+          "examples": [
+            "sni",
+            "http"
+          ]
+        },
+        "ech": {
+          "const": true,
+          "description": "Present only when the ClientHello carried Encrypted ClientHello: host is then the outer, public name, not the one the client asked for."
+        },
+        "app_protocol": {
+          "type": "string",
+          "description": "What the decoder made of the matched stream. Open set.",
+          "examples": [
+            "tls",
+            "quic",
+            "http",
+            "dns",
+            "ssh",
+            "mqtt",
+            "stun",
+            "bittorrent",
+            "netbios",
+            "snmp",
+            "ssdp",
+            "ftp",
+            "llmnr",
+            "dhcp",
+            "ntp"
+          ]
         },
         "observed_by": {
           "const": "ebpf"

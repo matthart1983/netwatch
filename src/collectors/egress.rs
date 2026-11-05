@@ -1469,7 +1469,7 @@ pub(crate) fn dest_hostname(p: &Option<AppProtocol>) -> Option<String> {
 
 /// Whether the flow's ClientHello carried an `encrypted_client_hello`
 /// extension — the outer SNI (if any) is a decoy and the real name is hidden.
-fn flow_ech(p: &Option<AppProtocol>) -> bool {
+pub(crate) fn flow_ech(p: &Option<AppProtocol>) -> bool {
     matches!(
         p,
         Some(AppProtocol::Tls { ech: true, .. }) | Some(AppProtocol::Quic { ech: true, .. })

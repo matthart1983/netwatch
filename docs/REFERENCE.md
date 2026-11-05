@@ -542,9 +542,19 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
   {"ts":"2026-11-05T10:00:01.012Z","event":"connect","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","remote":"93.184.215.14:443","observed_by":"ebpf"}
   ```
 
-  `process` is the kernel's 15-character `comm`. There is no `local`: the probes fire before the
-  kernel picks the source port, which is also why they cannot say which socket in the table is
-  whose. So a flow polling left without an owner takes the connect's process only when one
+  `process` is the kernel's 15-character `comm`. The probes fire before the kernel picks the
+  source port, so the line waits up to two ticks for packet capture to see the stream the connect
+  started (same transport and destination, begun after the connect, started from this side, not
+  taken by an earlier connect) and takes its `local` and, from the ClientHello, `host`:
+
+  ```json
+  {"ts":"…","event":"connect","proto":"TCP","process":"curl","pid":942955,"attribution":"ebpf","local":"10.210.6.92:59694","remote":"5.255.255.242:443","host":"ya.ru","host_source":"sni","app_protocol":"tls","observed_by":"ebpf"}
+  ```
+
+  Without capture, or with no ClientHello in time, the line has no `local` or `host`. TLS 1.3
+  and QUIC send the SNI in the clear like TLS 1.2; only Encrypted ClientHello hides it, and then
+  the line says `"ech": true` and `host` is the outer, public name. The table cannot say which
+  socket a connect is either, for the same missing source port. So a flow polling left without an owner takes the connect's process only when one
   process alone connected to that destination within five seconds, with `attribution: "ebpf"`;
   a verified owner on a later poll replaces it. With two processes on one destination, the flow
   keeps a null `process`.

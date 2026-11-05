@@ -18,6 +18,9 @@ All notable changes to NetWatch will be documented in this file.
   `connect` line with its pid, process name and destination, including connections shorter
   than a poll, and a flow polling left ownerless takes the process when one process alone
   connected to that destination. The file header's `_meta.sources` says whether eBPF is active.
+  A `connect` line waits up to two ticks for the captured stream it started and takes that
+  stream's source port and SNI, so a connection shorter than a poll still says where it went
+  by name. `"ech": true` marks a name Encrypted ClientHello replaced.
 - **The packaged unit grants `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`**, which only the
   proc-broker thread keeps, so the flow log names other users' processes too.
 
