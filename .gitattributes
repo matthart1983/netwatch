@@ -9,3 +9,4 @@ tests/fixtures/pcap/*.golden text eol=lf
 
 # Built packages, committed as-is.
 dist/*.deb binary
+dist/*.dmg binary
