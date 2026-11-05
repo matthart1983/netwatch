@@ -63,7 +63,10 @@ fn main() -> Result<()> {
     if api_key_flag {
         netwatch::logging::stderr_line(&format!("warning: {}", netwatch::cli::API_KEY_DEPRECATION));
     }
-    let config = NetwatchConfig::load()?;
+    let mut config = NetwatchConfig::load()?;
+    // The daemon's flow-log flags override the file before the sandbox paths
+    // are taken from it, so a `--flow-log-dir` gets its write grant.
+    netwatch::collectors::flow_log::apply_cli(&mut config, options.flow_log, options.flow_log_dir);
     // The TUI is about to hide stderr, and these are back in view when it
     // quits. A daemon's go to the journal. Nothing else here reports them twice:
     // `load` says nothing, however many times a session calls it.
@@ -167,8 +170,7 @@ fn main() -> Result<()> {
             exporter
         });
 
-        let flow_log =
-            netwatch::collectors::flow_log::FlowLogConfig::resolve(options.flow_log, &config);
+        let flow_log = netwatch::collectors::flow_log::FlowLogConfig::resolve(&config);
 
         return runtime.block_on(app::run_headless(
             remote_publisher.as_ref(),

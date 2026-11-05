@@ -224,6 +224,10 @@ pub struct ExperimentalConfig {
     /// The daemon's connection log: `off`, `file`, `stdout` or `both`. See
     /// [`crate::collectors::flow_log`]. `daemon --flow-log` overrides it.
     pub flow_log: String,
+    /// Directory for the daily flow-log files. Empty is `<cache>/netwatch/flows`.
+    /// Must be a directory netwatch's user owns, mode 0700, such as the one
+    /// systemd's `LogsDirectory=netwatch` with `LogsDirectoryMode=0700` makes.
+    pub flow_log_dir: String,
     /// Daily flow-log files kept before the oldest is deleted.
     pub flow_log_keep_days: usize,
     /// Whether connections to and from loopback addresses are logged.
@@ -234,6 +238,7 @@ impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
             flow_log: "off".into(),
+            flow_log_dir: String::new(),
             flow_log_keep_days: DEFAULT_FLOW_LOG_KEEP_DAYS,
             flow_log_loopback: false,
         }

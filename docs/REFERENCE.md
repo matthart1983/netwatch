@@ -498,6 +498,7 @@ TUI flags:
 | `--api-key KEY` | Deprecated: the key shows in the process list. Use `NETWATCH_API_KEY`. Accepted through 1.x, with a warning that does not include the key, and goes in 2.0. What it does is experimental, with `--remote`. |
 | `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
 | `--flow-log file\|stdout\|both` | With `daemon`: write the [flow log](#flow-log). Overrides `[experimental] flow_log`. Experimental. |
+| `--flow-log-dir DIR` | With `daemon`: the flow log's files go to `DIR`, for example `/var/log/netwatch`. Overrides `[experimental] flow_log_dir`. Experimental. |
 
 ### Flow log
 
@@ -518,8 +519,12 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
 - **Where.** `file` writes `flows.YYYY-MM-DD.ndjson`, one per UTC day, in the `flows` directory
   of netwatch's cache (`~/.cache/netwatch/flows` on Linux; under the packaged systemd unit,
   `/var/cache/netwatch/netwatch/flows`). Files are 0600 in a 0700 directory, and those older
-  than `flow_log_keep_days` (default 14) are deleted when the day changes. `stdout` writes the
-  same lines to standard output, which a systemd unit sends to the journal.
+  than `flow_log_keep_days` (default 14) are deleted when the day changes; netwatch rotates
+  them itself, so no logrotate rule is needed. `flow_log_dir` (or `--flow-log-dir`) puts them
+  elsewhere, such as `/var/log/netwatch`. That directory gets a sandbox write grant of its
+  own, and must belong to the user netwatch runs as, with mode 0700: systemd's
+  `LogsDirectory=netwatch` with `LogsDirectoryMode=0700` makes one. `stdout` writes the same
+  lines to standard output, which a systemd unit sends to the journal.
 - **What.** Each file, and stdout, starts with a header naming the schema,
   [`schemas/flow.v0.schema.json`](../schemas/flow.v0.schema.json). Then `open` and `close`
   events. `close` has a `reason`: `closed` when the socket reached a closing TCP state,
@@ -1117,8 +1122,9 @@ writes the new name. No key has been renamed so far. `geoip_online` below was re
 
 The `[experimental]` table is for settings that can still change, and is outside the 1.0
 compatibility promise. A key in it can change meaning or go away in any release. It holds the
-[flow log](#flow-log)'s `flow_log` (`off`, `file`, `stdout` or `both`), `flow_log_keep_days`
-(14) and `flow_log_loopback` (false). A key in it this version does not read is expected rather than a mistake, so it does not
+[flow log](#flow-log)'s `flow_log` (`off`, `file`, `stdout` or `both`), `flow_log_dir`
+(empty: the cache directory's `flows`), `flow_log_keep_days` (14) and `flow_log_loopback`
+(false). A key in it this version does not read is expected rather than a mistake, so it does not
 warn as unknown. stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
 `ready`, Settings lists it, and the TUI's bottom row says nothing. A save keeps the table.
 

@@ -58,6 +58,15 @@ impl FlowLogMode {
         }
     }
 
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::File => "file",
+            Self::Stdout => "stdout",
+            Self::Both => "both",
+        }
+    }
+
     pub fn enabled(self) -> bool {
         self != Self::Off
     }
@@ -82,19 +91,40 @@ pub struct FlowLogConfig {
 }
 
 impl FlowLogConfig {
-    /// `cli` wins over the config file. `None` when the log is off.
-    pub fn resolve(cli: Option<FlowLogMode>, cfg: &crate::config::NetwatchConfig) -> Option<Self> {
+    /// What `cfg` asks for, after [`apply_cli`]. `None` when the log is off.
+    pub fn resolve(cfg: &crate::config::NetwatchConfig) -> Option<Self> {
         let exp = &cfg.experimental;
-        let mode = cli
-            .or_else(|| FlowLogMode::by_name(&exp.flow_log))
-            .filter(|m| m.enabled())?;
+        let mode = FlowLogMode::by_name(&exp.flow_log).filter(|m| m.enabled())?;
         Some(Self {
             mode,
-            dir: default_dir(),
+            dir: configured_dir(cfg).or_else(default_dir),
             keep_days: exp.flow_log_keep_days.max(1),
             loopback: exp.flow_log_loopback,
         })
     }
+}
+
+/// `daemon --flow-log` and `--flow-log-dir` win over `[experimental]`.
+pub fn apply_cli(
+    cfg: &mut crate::config::NetwatchConfig,
+    mode: Option<FlowLogMode>,
+    dir: Option<String>,
+) {
+    if let Some(mode) = mode {
+        cfg.experimental.flow_log = mode.name().into();
+    }
+    if let Some(dir) = dir {
+        cfg.experimental.flow_log_dir = dir;
+    }
+}
+
+/// A `flow_log_dir` the files go to, when the log writes files. It is outside
+/// netwatch's own directories, so the sandbox grants it on its own.
+pub fn configured_dir(cfg: &crate::config::NetwatchConfig) -> Option<PathBuf> {
+    let exp = &cfg.experimental;
+    let writes_files = FlowLogMode::by_name(&exp.flow_log).is_some_and(FlowLogMode::file);
+    let dir = exp.flow_log_dir.trim();
+    (writes_files && !dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
 /// `<cache>/netwatch/flows`, beside the log files.
@@ -1143,13 +1173,32 @@ mod tests {
     #[test]
     fn cli_wins_over_config_and_off_means_none() {
         let mut cfg = crate::config::NetwatchConfig::default();
-        assert!(FlowLogConfig::resolve(None, &cfg).is_none());
+        assert!(FlowLogConfig::resolve(&cfg).is_none());
         cfg.experimental.flow_log = "file".into();
-        let resolved = FlowLogConfig::resolve(None, &cfg).unwrap();
+        let resolved = FlowLogConfig::resolve(&cfg).unwrap();
         assert_eq!(resolved.mode, FlowLogMode::File);
         assert_eq!(resolved.keep_days, 14);
-        let resolved = FlowLogConfig::resolve(Some(FlowLogMode::Stdout), &cfg).unwrap();
-        assert_eq!(resolved.mode, FlowLogMode::Stdout);
+        assert_eq!(resolved.dir, default_dir());
+        assert_eq!(configured_dir(&cfg), None);
+
+        apply_cli(
+            &mut cfg,
+            Some(FlowLogMode::Both),
+            Some("/var/log/netwatch".into()),
+        );
+        let resolved = FlowLogConfig::resolve(&cfg).unwrap();
+        assert_eq!(resolved.mode, FlowLogMode::Both);
+        assert_eq!(
+            resolved.dir.as_deref(),
+            Some(std::path::Path::new("/var/log/netwatch"))
+        );
+        assert_eq!(configured_dir(&cfg), resolved.dir);
+
+        // Stdout alone writes no file, so it needs no directory.
+        apply_cli(&mut cfg, Some(FlowLogMode::Stdout), None);
+        assert_eq!(configured_dir(&cfg), None);
+        apply_cli(&mut cfg, None, None);
+        assert_eq!(cfg.experimental.flow_log, "stdout");
     }
 
     /// The real writer's lines, an open, every kind of close and a dropped

@@ -14,7 +14,7 @@ _netwatch() {
 
     local subcommands="daemon doctor diagnose uptime geoip resolver"
     local options="--remote --api-key --insecure-remote --view --lite --demo \
-        --no-sandbox --sandbox-strict --metrics --metrics-addr --flow-log --daemon \
+        --no-sandbox --sandbox-strict --metrics --metrics-addr --flow-log --flow-log-dir --daemon \
         --headless --generate-config --help -h --version -V"
 
     # Options that take a value: complete the value, not another flag.
@@ -31,6 +31,10 @@ _netwatch() {
             local ifaces
             ifaces=$(ls /sys/class/net 2>/dev/null)
             COMPREPLY=( $(compgen -W "${ifaces}" -- "${cur}") )
+            return 0
+            ;;
+        --flow-log-dir)
+            COMPREPLY=( $(compgen -d -- "${cur}") )
             return 0
             ;;
         --remote|--api-key|--metrics-addr|--seconds|--out|--schema|--since)

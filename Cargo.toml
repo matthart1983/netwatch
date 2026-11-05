@@ -256,6 +256,20 @@ assets = [
     ["CHANGELOG.md", "usr/share/doc/netwatch/CHANGELOG.md", "644"],
 ]
 
+# The fork's package: `scripts/build-deb.sh` builds it with
+# `cargo deb --variant flowlog`. Same files and name as the base; the unit it
+# ships runs the daemon with the connection log, and the maintainer scripts
+# create the service user and start it.
+[package.metadata.deb.variants.flowlog]
+name = "netwatch"
+maintainer = "Iurii Kolesov <iurii.kolesov@alberblanc.com>"
+extended-description = """\
+netwatch with a connection log: the daemon, run as a systemd service under \
+its own unprivileged user, writes one NDJSON line when a connection opens and \
+one when it closes (process, pid, destination, SNI/host, duration) to \
+/var/log/netwatch. Also the terminal UI: live per-connection throughput with \
+application-protocol decoding, process attribution and a diagnostic engine."""
+
 [package.metadata.generate-rpm]
 name = "netwatch"
 summary = "Real-time network diagnostics in your terminal"

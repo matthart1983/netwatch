@@ -35,6 +35,8 @@ pub struct Run {
     pub metrics_addr: Option<String>,
     /// `--flow-log`: where the daemon writes its connection log. Experimental.
     pub flow_log: Option<crate::collectors::flow_log::FlowLogMode>,
+    /// `--flow-log-dir`: where `--flow-log file` writes. Experimental.
+    pub flow_log_dir: Option<String>,
 }
 // One option catalogue supplies both accepted spellings and help text.
 const OPTIONS: &[(&str, bool, &str)] = &[
@@ -57,6 +59,11 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--metrics", false, "Daemon metrics on 127.0.0.1:9464"),
     ("--metrics-addr", true, "Daemon metrics address"),
     ("--flow-log", true, "Experimental: daemon connection log"),
+    (
+        "--flow-log-dir",
+        true,
+        "Experimental: directory for the connection log",
+    ),
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 /// What `--api-key` prints on stderr. Names the replacement and why, and it is a
@@ -183,6 +190,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
                         })?,
                 );
             }
+            "--flow-log-dir" => run.flow_log_dir = Some(value(&mut rest, arg)?),
             _ => unreachable!(),
         }
     }
@@ -192,8 +200,8 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
     if !run.daemon && (run.metrics || run.metrics_addr.is_some()) {
         anyhow::bail!("metrics options require daemon mode");
     }
-    if !run.daemon && run.flow_log.is_some() {
-        anyhow::bail!("--flow-log requires daemon mode");
+    if !run.daemon && (run.flow_log.is_some() || run.flow_log_dir.is_some()) {
+        anyhow::bail!("flow log options require daemon mode");
     }
     if run.metrics && run.metrics_addr.is_some() {
         anyhow::bail!("choose --metrics or --metrics-addr");
@@ -248,8 +256,14 @@ mod tests {
                 _ => panic!("{s}"),
             }
         }
+        match command("daemon --flow-log file --flow-log-dir /var/log/netwatch").unwrap() {
+            Command::Run(run) => assert_eq!(run.flow_log_dir.as_deref(), Some("/var/log/netwatch")),
+            _ => panic!(),
+        }
         for s in [
             "--flow-log file",
+            "--flow-log-dir /var/log/netwatch",
+            "daemon --flow-log-dir",
             "daemon --flow-log",
             "daemon --flow-log off",
             "daemon --flow-log typo",

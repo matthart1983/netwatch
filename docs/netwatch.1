@@ -109,6 +109,13 @@ to daily files under the cache directory's
 .I netwatch/flows
 and/or to standard output.
 .TP
+.BI \-\-flow\-log\-dir " DIR"
+Experimental. Directory for the
+.B \-\-flow\-log
+files, such as
+.IR /var/log/netwatch .
+It must belong to the user netwatch runs as, mode 0700.
+.TP
 .B \-\-daemon
 Headless mode, no terminal UI. Alias:
 .BR \-\-headless .

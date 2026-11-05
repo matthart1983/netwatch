@@ -50,6 +50,7 @@ fn threat_model_policy_tables_match_code() {
         geoip_db_dir: Some("<city-file>".into()),
         geoip_asn_db_dir: Some("<asn-file>".into()),
         keylog_dir: Some("<keylog-file>".into()),
+        flow_log_dir: Some("<flow-log>".into()),
     };
     // The rules the ruleset is built from, so each row's label is the one
     // the ruleset gives its path.

@@ -24,6 +24,24 @@ The URL must be `https://`. netwatch refuses an `http://` URL, which would
 send the API key in cleartext, unless `--insecure-remote` is also given; for
 a unit, that means adding the flag to `ExecStart` or `ProgramArguments`.
 
+## Debian / Ubuntu package with the connection log (this fork)
+
+```sh
+scripts/build-deb.sh                     # → target/netwatch_<version>+flowlog1_amd64.deb
+sudo apt install ./target/netwatch_*+flowlog1_amd64.deb
+sudo tail -f /var/log/netwatch/flows.$(date -u +%F).ndjson
+```
+
+The script builds a static musl binary with libpcap 1.10.5 linked in, as the
+upstream release does, so the package depends on nothing; it needs musl-tools,
+flex, bison, the `x86_64-unknown-linux-musl` rustup target and cargo-deb, none
+of them as root. Installing creates the `netwatch` system user and enables and
+starts `netwatch.service`, which runs
+`netwatch daemon --flow-log file --flow-log-dir /var/log/netwatch`. The unit
+gives the service its capabilities; the binary carries none. Removing the
+package stops the service; purging also deletes `/var/cache/netwatch` and
+`/var/lib/netwatch`, and leaves the log in `/var/log/netwatch`.
+
 ## Linux (systemd)
 
 ```sh

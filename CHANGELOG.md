@@ -11,7 +11,9 @@ All notable changes to NetWatch will be documented in this file.
   SNI or HTTP `Host`, reverse DNS, ASN, country and approximate bytes. Files are daily,
   0600, under `<cache>/netwatch/flows/`, and kept for `flow_log_keep_days` (14). It is built
   from the polled connection table, so a connection shorter than one poll is not seen.
-  `schemas/flow.v0.schema.json` describes the lines. See REFERENCE, Flow log.
+  `schemas/flow.v0.schema.json` describes the lines. `--flow-log-dir` or `flow_log_dir`
+  moves the files, to `/var/log/netwatch` say, with a sandbox write grant of its own.
+  See REFERENCE, Flow log.
 
 ## [0.40.0] - 2026-11-04
 
