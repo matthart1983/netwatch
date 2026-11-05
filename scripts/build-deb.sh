@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Build the fork's .deb: a static musl x86_64 binary with libpcap linked in, as
-# the upstream release does, packaged by cargo-deb's `flowlog` variant with the
-# service set up for the connection log.
+# the upstream release does, with the service set up for the connection log.
+# The package itself depends on nothing; install it with
+# `sudo apt install ./target/netwatch_<version>_amd64.deb`.
 #
 #   scripts/build-deb.sh [DEB_VERSION]      # default: <crate version>+flowlog1
 #
-# Needs, all without root:
-#   - the rustup toolchain rust-toolchain/override picks, with the
-#     x86_64-unknown-linux-musl target (`rustup target add x86_64-unknown-linux-musl`)
-#   - musl-gcc (Debian/Ubuntu: musl-tools), make, flex, bison, curl
-#   - cargo-deb on PATH, or CARGO_DEB=/path/to/cargo-deb
+# Build dependencies, all from apt:
+#   sudo apt install musl-tools flex bison make curl file binutils dpkg-dev linux-libc-dev
+# and Rust at least the crate's rust-version, with the musl target. Ubuntu's
+# apt Rust is older than that, so it comes from rustup:
+#   rustup target add x86_64-unknown-linux-musl
+# Nothing here runs as root.
 #
 # The libpcap tarball is checked against the SHA-256 pinned below, taken from
 # the release whose tcpdump.org signature (key E089DEF1D9C15D0D) verified.
@@ -23,14 +25,28 @@ TARGET=x86_64-unknown-linux-musl
 LIBPCAP_VERSION=1.10.5
 LIBPCAP_SHA256=37ced90a19a302a7f32e458224a00c365c117905c2cd35ac544b6880a81488f0
 CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+RUST_VERSION="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 DEB_VERSION="${1:-${CRATE_VERSION}+flowlog1}"
-CARGO_DEB="${CARGO_DEB:-cargo-deb}"
+MAINTAINER="Iurii Kolesov <iurii.kolesov@alberblanc.com>"
 WORK="$ROOT/target/deb-build"
 
-for tool in musl-gcc make flex bison curl "$CARGO_DEB"; do
-    command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }
+# tool → the apt package that has it
+missing=()
+for pair in musl-gcc:musl-tools make:make flex:flex bison:bison curl:curl \
+    file:file strip:binutils dpkg-deb:dpkg-deb gcc:gcc; do
+    command -v "${pair%%:*}" >/dev/null || missing+=("${pair#*:}")
 done
-rustup target list --installed | grep -qx "$TARGET" \
+[ -d /usr/include/linux ] || missing+=(linux-libc-dev)
+if [ ${#missing[@]} -gt 0 ]; then
+    echo "missing build dependencies: sudo apt install ${missing[*]}" >&2
+    exit 1
+fi
+have_rust="$(rustc --version 2>/dev/null | awk '{print $2}')"
+if [ -z "$have_rust" ] || [ "$(printf '%s\n%s\n' "$RUST_VERSION" "$have_rust" | sort -V | head -1)" != "$RUST_VERSION" ]; then
+    echo "need Rust >= $RUST_VERSION (have ${have_rust:-none}); apt's is older, use rustup" >&2
+    exit 1
+fi
+rustup target list --installed 2>/dev/null | grep -qx "$TARGET" \
     || { echo "missing rust target: rustup target add $TARGET" >&2; exit 1; }
 
 # ── static libpcap ──────────────────────────────────────────────────────────
@@ -90,9 +106,61 @@ fi
 "$bin" --version
 
 # ── package ─────────────────────────────────────────────────────────────────
-"$CARGO_DEB" --no-build --target "$TARGET" --variant flowlog \
-    --deb-version "$DEB_VERSION" --output target/
+# Laid out by hand and built with dpkg-deb. The file list is the one
+# [package.metadata.deb] in Cargo.toml gives cargo-deb, which upstream's
+# release uses; keep the two in step.
+STAGE="$WORK/stage"
+rm -rf "$STAGE"
+install -Dm755 "$bin" "$STAGE/usr/bin/netwatch"
+strip --strip-unneeded "$STAGE/usr/bin/netwatch"
+install -Dm644 completions/netwatch.bash "$STAGE/usr/share/bash-completion/completions/netwatch"
+install -Dm644 completions/_netwatch "$STAGE/usr/share/zsh/site-functions/_netwatch"
+install -Dm644 completions/netwatch.fish "$STAGE/usr/share/fish/vendor_completions.d/netwatch.fish"
+install -Dm644 docs/netwatch.1 "$STAGE/usr/share/man/man1/netwatch.1"
+gzip -9n "$STAGE/usr/share/man/man1/netwatch.1"
+install -Dm644 packaging/systemd/netwatch.service "$STAGE/usr/lib/systemd/system/netwatch.service"
+install -Dm644 README.md "$STAGE/usr/share/doc/netwatch/README.md"
+install -Dm644 CHANGELOG.md "$STAGE/usr/share/doc/netwatch/CHANGELOG.md"
+{
+    echo "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/"
+    echo "Upstream-Name: netwatch"
+    echo "Source: https://github.com/yuri-research-ai/netwatch"
+    echo
+    echo "Files: *"
+    echo "Copyright: 2026, Matt Hartley"
+    echo "License: MIT"
+    sed 's/^$/./; s/^/ /' LICENSE
+} >"$STAGE/usr/share/doc/netwatch/copyright"
+chmod 644 "$STAGE/usr/share/doc/netwatch/copyright"
+
+mkdir -p "$STAGE/DEBIAN"
+for script in postinst prerm postrm; do
+    install -m755 "packaging/debian/$script" "$STAGE/DEBIAN/$script"
+done
+cat >"$STAGE/DEBIAN/control" <<CONTROL
+Package: netwatch
+Version: $DEB_VERSION
+Architecture: amd64
+Maintainer: $MAINTAINER
+Installed-Size: $(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)
+Section: net
+Priority: optional
+Homepage: https://github.com/yuri-research-ai/netwatch
+Description: Network diagnostics in your terminal, with a connection log
+ netwatch with a connection log: the daemon, run as a systemd service under
+ its own unprivileged user, writes one NDJSON line when a connection opens and
+ one when it closes (process, pid, destination, SNI/host, duration) to
+ /var/log/netwatch. Also the terminal UI: live per-connection throughput with
+ application-protocol decoding, process attribution and a diagnostic engine.
+ .
+ The binary is static (musl, libpcap linked in), so the package has no
+ dependencies.
+CONTROL
+(cd "$STAGE" && find . -path ./DEBIAN -prune -o -type f -printf '%P\0' \
+    | sort -z | xargs -0 md5sum >DEBIAN/md5sums)
+
 deb="target/netwatch_${DEB_VERSION}_amd64.deb"
+dpkg-deb --root-owner-group -Zxz --build "$STAGE" "$deb" >/dev/null
 dpkg-deb --info "$deb" | sed -n '/Package:/,$p'
 dpkg-deb --contents "$deb"
 echo
