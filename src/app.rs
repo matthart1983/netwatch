@@ -1984,12 +1984,8 @@ pub async fn run_headless(
     crate::runtime::bootstrap::prime_collectors(&mut app);
 
     // Started after priming, so the first table it sees is a real one.
-    let mut flows = flow_log.map(|config| {
-        (
-            crate::collectors::flow_log::FlowTracker::new(config.loopback),
-            crate::collectors::flow_log::FlowWriter::start(&config),
-        )
-    });
+    let mut flows =
+        flow_log.map(|config| crate::collectors::flow_log::DaemonFlowLog::start(&config, &app));
 
     tracing::info!(
         target: "netwatch::daemon",
@@ -2011,12 +2007,8 @@ pub async fn run_headless(
         tokio::select! {
             _ = ticker.tick() => {
                 app.tick();
-                if let Some((tracker, writer)) = &mut flows {
-                    writer.send(&tracker.observe(
-                        &app.connection_collector.connections(),
-                        &app.geo_cache,
-                        &app.packet_collector.dns_cache,
-                    ));
+                if let Some(flows) = &mut flows {
+                    flows.tick(&app);
                 }
                 let healthy = !collectors_panicked();
                 if let Some(publisher) = remote {
@@ -2047,9 +2039,8 @@ pub async fn run_headless(
 
     // Graceful shutdown: close the open flows, stop capture, then flush
     // whatever is still buffered.
-    if let Some((mut tracker, writer)) = flows {
-        writer.send(&tracker.finish());
-        writer.shutdown(std::time::Duration::from_secs(3));
+    if let Some(flows) = flows {
+        flows.finish();
     }
     finish_session(&mut app);
     if let Some(publisher) = remote {

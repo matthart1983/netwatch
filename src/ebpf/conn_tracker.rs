@@ -29,9 +29,10 @@
 use netwatch_sdk::ebpf::{ConnectEvent, EbpfError, EbpfEvent, EventSource, Protocol};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Lifetime of a cache entry after the matching kprobe last fired. Matches
 /// the PKTAP TTL — long enough to span a few lsof poll cycles, short
@@ -44,6 +45,10 @@ pub struct EbpfAttribution {
     pub pid: u32,
     pub comm: String,
     pub seen_at: Instant,
+    /// Until when another process's connect to the same key makes this
+    /// entry ambiguous. `None` when no other process was seen within
+    /// [`MAX_MATCH_AGE`](crate::collectors::attribution::MAX_MATCH_AGE).
+    pub ambiguous_until: Option<Instant>,
 }
 
 /// `(protocol, daddr, dport)` — keyed on transport plus destination. The
@@ -80,6 +85,21 @@ impl EbpfAttributor {
             .cloned()
     }
 
+    /// [`lookup`](Self::lookup), but only when one process alone connected
+    /// to this destination within the match window. The flow log uses it to
+    /// name a flow socket polling left without an owner; with two processes
+    /// on one `daddr:dport` there is no telling which socket is whose.
+    pub fn lookup_unambiguous(
+        &self,
+        proto: Protocol,
+        daddr: IpAddr,
+        dport: u16,
+    ) -> Option<EbpfAttribution> {
+        let now = Instant::now();
+        self.lookup(proto, daddr, dport)
+            .filter(|a| a.ambiguous_until.is_none_or(|until| until <= now))
+    }
+
     #[cfg(test)]
     pub(crate) fn record_for_test(&self, proto: Protocol, addr: IpAddr, port: u16, pid: u32) {
         self.record(
@@ -88,15 +108,29 @@ impl EbpfAttributor {
                 pid,
                 comm: "test".into(),
                 seen_at: Instant::now(),
+                ambiguous_until: None,
             },
         );
     }
 
-    fn record(&self, key: AttrKey, attr: EbpfAttribution) {
+    fn record(&self, key: AttrKey, mut attr: EbpfAttribution) {
+        let window = crate::collectors::attribution::MAX_MATCH_AGE;
         if let Ok(mut cache) = self.cache.lock() {
             // Bound the cache: a connect() storm could otherwise add entries
             // faster than the TTL evicts them within the window. On overflow
             // for a new key, drop the oldest entry by `seen_at`.
+            if let Some(previous) = cache.get(&key) {
+                let other_recent = previous.pid != attr.pid
+                    && attr.seen_at.duration_since(previous.seen_at) <= window;
+                let still_ambiguous = previous
+                    .ambiguous_until
+                    .filter(|until| *until > attr.seen_at);
+                attr.ambiguous_until = if other_recent {
+                    Some(attr.seen_at + window)
+                } else {
+                    still_ambiguous
+                };
+            }
             if cache.len() >= MAX_ATTR_ENTRIES && !cache.contains_key(&key) {
                 if let Some(oldest) = cache.iter().min_by_key(|(_, a)| a.seen_at).map(|(k, _)| *k) {
                     cache.remove(&oldest);
@@ -119,13 +153,57 @@ impl EbpfAttributor {
 pub struct ConnTracker {
     pub attributor: Arc<EbpfAttributor>,
     stop: Arc<AtomicBool>,
+    tap: Arc<Tap>,
     /// The worker owns the `EventSource`, so the programs stay attached for
     /// as long as it runs and detach when it exits. Held here to join on
     /// drop.
     worker: Option<crate::sandbox::worker::WorkerHandle>,
 }
 
+/// Where the drain thread copies each connect, for the flow log. Empty until
+/// someone subscribes; a full queue counts instead of blocking the drain.
+#[derive(Default)]
+struct Tap {
+    tx: Mutex<Option<SyncSender<crate::collectors::flow_log::ConnectSeen>>>,
+    dropped: AtomicU64,
+}
+
+impl Tap {
+    fn send(&self, evt: &ConnectEvent) {
+        let Ok(guard) = self.tx.lock() else { return };
+        let Some(tx) = guard.as_ref() else { return };
+        let seen = crate::collectors::flow_log::ConnectSeen {
+            proto: match evt.protocol {
+                Protocol::Tcp => "TCP",
+                Protocol::Udp => "UDP",
+            },
+            pid: evt.tgid,
+            comm: evt.comm.clone(),
+            remote: std::net::SocketAddr::new(evt.daddr, evt.dport),
+            wall: SystemTime::now(),
+        };
+        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = tx.try_send(seen) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl ConnTracker {
+    /// Every connect from now on, as the kprobes saw it, up to `cap` queued.
+    /// One subscriber: a second call replaces the first.
+    pub fn subscribe(&self, cap: usize) -> Receiver<crate::collectors::flow_log::ConnectSeen> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(cap);
+        if let Ok(mut slot) = self.tap.tx.lock() {
+            *slot = Some(tx);
+        }
+        rx
+    }
+
+    /// Connects the subscriber's queue had no room for, since the last call.
+    pub fn take_dropped(&self) -> u64 {
+        self.tap.dropped.swap(0, Ordering::Relaxed)
+    }
+
     /// Load and attach the BPF programs, then drain decoded events into the
     /// attribution cache.
     ///
@@ -154,7 +232,9 @@ impl ConnTracker {
         let stop = Arc::new(AtomicBool::new(false));
         let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel::<Result<(), EbpfError>>(1);
 
+        let tap = Arc::new(Tap::default());
         let thread_attr = Arc::clone(&attributor);
+        let thread_tap = Arc::clone(&tap);
         let thread_stop = Arc::clone(&stop);
         let sandboxed = !matches!(worker::mode(), Mode::Disabled);
         let handle = worker::spawn_retaining("ebpf", Retain::BpfLoad, move || {
@@ -190,7 +270,12 @@ impl ConnTracker {
                 // recv_timeout so the loop checks the stop flag even
                 // when the kprobe is silent for long stretches.
                 match rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(EbpfEvent::Connect(evt)) => record_connect(&thread_attr, evt),
+                    Ok(EbpfEvent::Connect(evt)) => {
+                        if !evt.daddr.is_unspecified() && evt.dport != 0 {
+                            thread_tap.send(&evt);
+                        }
+                        record_connect(&thread_attr, evt)
+                    }
                     // `EbpfEvent` is non_exhaustive; ignore variants
                     // from future SDK phases (accept/close/…) until
                     // we have a use for them.
@@ -212,6 +297,7 @@ impl ConnTracker {
             Ok(Ok(())) => Ok(Self {
                 attributor,
                 stop,
+                tap,
                 worker: Some(handle),
             }),
             Ok(Err(e)) => Err(e),
@@ -249,6 +335,7 @@ fn record_connect(attributor: &Arc<EbpfAttributor>, evt: ConnectEvent) {
             pid: evt.tgid,
             comm: evt.comm,
             seen_at: Instant::now(),
+            ambiguous_until: None,
         },
     );
 }
@@ -397,8 +484,58 @@ mod freshness_tests {
                 pid: 1,
                 comm: "old".into(),
                 seen_at: Instant::now() - Duration::from_secs(6),
+                ambiguous_until: None,
             },
         );
         assert!(a.lookup(Protocol::Tcp, addr, 443).is_none());
+    }
+
+    fn at(pid: u32, ago_ms: u64) -> EbpfAttribution {
+        EbpfAttribution {
+            pid,
+            comm: format!("p{pid}"),
+            seen_at: Instant::now() - Duration::from_millis(ago_ms),
+            ambiguous_until: None,
+        }
+    }
+
+    /// One process alone on a destination names it; a second process on the
+    /// same destination within the window makes it nobody's until the
+    /// window passes, even if the first connects again meanwhile.
+    #[test]
+    fn two_processes_on_one_destination_name_neither() {
+        let a = EbpfAttributor::new();
+        let addr = "93.184.215.14".parse().unwrap();
+        a.record((Protocol::Tcp, addr, 443), at(10, 3000));
+        assert_eq!(
+            a.lookup_unambiguous(Protocol::Tcp, addr, 443)
+                .map(|x| x.pid),
+            Some(10)
+        );
+        a.record((Protocol::Tcp, addr, 443), at(20, 2000));
+        assert!(a.lookup_unambiguous(Protocol::Tcp, addr, 443).is_none());
+        // Still the latest for the collector's corroboration.
+        assert_eq!(a.lookup(Protocol::Tcp, addr, 443).map(|x| x.pid), Some(20));
+        a.record((Protocol::Tcp, addr, 443), at(20, 1000));
+        assert!(
+            a.lookup_unambiguous(Protocol::Tcp, addr, 443).is_none(),
+            "same pid again does not clear it"
+        );
+        // Another protocol is another key.
+        a.record((Protocol::Udp, addr, 443), at(30, 0));
+        assert_eq!(
+            a.lookup_unambiguous(Protocol::Udp, addr, 443)
+                .map(|x| x.pid),
+            Some(30)
+        );
+        // Long apart, it is the same process reconnecting, not a collision.
+        let b = EbpfAttributor::new();
+        b.record((Protocol::Tcp, addr, 443), at(10, 9000));
+        b.record((Protocol::Tcp, addr, 443), at(20, 0));
+        assert_eq!(
+            b.lookup_unambiguous(Protocol::Tcp, addr, 443)
+                .map(|x| x.pid),
+            Some(20)
+        );
     }
 }

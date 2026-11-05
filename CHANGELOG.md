@@ -14,6 +14,12 @@ All notable changes to NetWatch will be documented in this file.
   `schemas/flow.v0.schema.json` describes the lines. `--flow-log-dir` or `flow_log_dir`
   moves the files, to `/var/log/netwatch` say, with a sandbox write grant of its own.
   See REFERENCE, Flow log.
+- **eBPF in the flow log.** Where the connect probes load, each `connect()` gets a
+  `connect` line with its pid, process name and destination, including connections shorter
+  than a poll, and a flow polling left ownerless takes the process when one process alone
+  connected to that destination. The file header's `_meta.sources` says whether eBPF is active.
+- **The packaged unit grants `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`**, which only the
+  proc-broker thread keeps, so the flow log names other users' processes too.
 
 ## [0.40.0] - 2026-11-04
 

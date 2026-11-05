@@ -188,6 +188,37 @@ pub struct FlowEvent {
     pub observed_by: &'static str,
 }
 
+/// One `connect()` the eBPF kprobes saw: TCP, or a connected UDP socket.
+/// The kernel has not picked the source address yet when they fire, so there
+/// is no local side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectSeen {
+    pub proto: &'static str,
+    pub pid: u32,
+    /// The task's 15-character `comm`.
+    pub comm: String,
+    pub remote: std::net::SocketAddr,
+    pub wall: SystemTime,
+}
+
+/// The line a [`ConnectSeen`] becomes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConnectLine {
+    pub ts: String,
+    pub event: &'static str,
+    pub proto: &'static str,
+    pub process: String,
+    pub pid: u32,
+    pub attribution: AttributionSource,
+    pub remote: String,
+    pub observed_by: &'static str,
+}
+
+/// Who owns a flow socket polling found no owner for, from a source other
+/// than the table: `(proto, remote ip, remote port)` to `(pid, name)`. The
+/// daemon passes the eBPF connect cache, unambiguous matches only.
+pub type OwnerHint<'a> = &'a dyn Fn(&str, &str, u16) -> Option<(u32, String)>;
+
 /// A flow is its 5-tuple. Not the pid: attribution can arrive a tick late, and
 /// a pid joining the key would close and reopen the same connection.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -272,6 +303,7 @@ impl FlowTracker {
         connections: &[Connection],
         geo: &GeoCache,
         dns: &DnsCache,
+        hint: OwnerHint,
     ) -> Vec<FlowEvent> {
         self.observe_at(
             connections,
@@ -279,7 +311,26 @@ impl FlowTracker {
             SystemTime::now(),
             &|ip| dns.lookup(ip),
             &|ip| geo.lookup(ip),
+            hint,
         )
+    }
+
+    /// The lines for connects the kprobes saw, loopback left out as for flows.
+    pub fn connects(&self, seen: impl IntoIterator<Item = ConnectSeen>) -> Vec<ConnectLine> {
+        seen.into_iter()
+            .filter(|c| self.loopback || !is_loopback(&c.remote.ip().to_canonical().to_string()))
+            .map(|c| ConnectLine {
+                ts: timestamp(c.wall),
+                event: "connect",
+                proto: c.proto,
+                process: c.comm,
+                pid: c.pid,
+                attribution: AttributionSource::Ebpf,
+                remote: std::net::SocketAddr::new(c.remote.ip().to_canonical(), c.remote.port())
+                    .to_string(),
+                observed_by: "ebpf",
+            })
+            .collect()
     }
 
     fn observe_at(
@@ -289,6 +340,7 @@ impl FlowTracker {
         wall: SystemTime,
         rdns: &dyn Fn(&str) -> Option<String>,
         geo: &dyn Fn(&str) -> Option<GeoInfo>,
+        hint: OwnerHint,
     ) -> Vec<FlowEvent> {
         let elapsed = self
             .last_observe
@@ -327,7 +379,7 @@ impl FlowTracker {
                 continue;
             };
             flow.seen = tick;
-            update(flow, conn, remote_ip, elapsed, rdns, geo);
+            update(flow, conn, remote_ip, elapsed, rdns, geo, hint);
             if is_new {
                 events.push(event(&key, flow, FlowEventKind::Open, &ts, now, None));
             }
@@ -447,6 +499,7 @@ fn update(
     elapsed: f64,
     rdns: &dyn Fn(&str) -> Option<String>,
     geo: &dyn Fn(&str) -> Option<GeoInfo>,
+    hint: OwnerHint,
 ) {
     flow.state.clone_from(&conn.state);
     // Attribution can arrive late or improve; an unattributed tick never
@@ -457,6 +510,22 @@ fn update(
     }
     if conn.pid.is_some() {
         flow.pid = conn.pid;
+    }
+    // Polling found no owner (another user's socket without the broker's
+    // capabilities, or one caught closing): take the process the connect
+    // kprobe saw, if it agrees with any pid the table does have. A verified
+    // owner on a later tick replaces it.
+    if flow.process.is_none() && conn.process_name.is_none() {
+        let port = crate::app::addr_parts(&conn.remote_addr)
+            .1
+            .and_then(|p| p.parse::<u16>().ok());
+        if let Some((pid, comm)) = port.and_then(|port| hint(&conn.protocol, remote_ip, port)) {
+            if conn.pid.is_none_or(|p| p == pid) {
+                flow.process = Some(comm);
+                flow.pid = Some(pid);
+                flow.attribution = AttributionSource::Ebpf;
+            }
+        }
     }
     if flow.host.is_none() {
         if let Some(host) = super::egress::dest_hostname(&conn.app_protocol) {
@@ -524,14 +593,121 @@ fn timestamp(wall: SystemTime) -> String {
     DateTime::<Utc>::from(wall).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+// ── Daemon ─────────────────────────────────────────────────────────────────
+
+/// Connects the kprobes may queue between two ticks before they are dropped
+/// and counted.
+const CONNECT_QUEUE_CAP: usize = 8192;
+
+/// The flow log as `netwatch daemon` runs it: the poll tracker, the eBPF
+/// connect stream when the probes loaded, and the writer.
+pub struct DaemonFlowLog {
+    tracker: FlowTracker,
+    writer: FlowWriter,
+    connects: Option<Receiver<ConnectSeen>>,
+}
+
+impl DaemonFlowLog {
+    pub fn start(config: &FlowLogConfig, app: &crate::app::App) -> Self {
+        let status = app.attribution_status();
+        let ebpf = match &status {
+            crate::app::AttributionStatus::Active(_) => Ok(()),
+            crate::app::AttributionStatus::Failed(_, error) => Err(error.as_str()),
+            crate::app::AttributionStatus::Lsof => Err("not built with eBPF"),
+        };
+        tracing::info!(target: "netwatch::flow_log", ebpf = ?ebpf, "flow log started");
+        #[cfg(feature = "ebpf")]
+        let connects = app
+            .conn_tracker
+            .as_ref()
+            .map(|t| t.subscribe(CONNECT_QUEUE_CAP));
+        #[cfg(not(feature = "ebpf"))]
+        let connects = None;
+        Self {
+            tracker: FlowTracker::new(config.loopback),
+            writer: FlowWriter::start(config, sources(ebpf)),
+            connects,
+        }
+    }
+
+    /// Write what changed since the last tick: connects first, as they
+    /// happened before the poll that follows them.
+    pub fn tick(&mut self, app: &crate::app::App) {
+        if let Some(rx) = &self.connects {
+            let seen: Vec<ConnectSeen> = rx.try_iter().take(CONNECT_QUEUE_CAP).collect();
+            self.writer.send(&self.tracker.connects(seen));
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(t) = &app.conn_tracker {
+            self.writer.count_dropped(t.take_dropped());
+        }
+        #[cfg(feature = "ebpf")]
+        let attributor = app.conn_tracker.as_ref().map(|t| &t.attributor);
+        let hint = |proto: &str, ip: &str, port: u16| -> Option<(u32, String)> {
+            #[cfg(feature = "ebpf")]
+            {
+                use netwatch_sdk::ebpf::Protocol;
+                let proto = if proto.eq_ignore_ascii_case("tcp") {
+                    Protocol::Tcp
+                } else if proto.eq_ignore_ascii_case("udp") {
+                    Protocol::Udp
+                } else {
+                    return None;
+                };
+                let ip: std::net::IpAddr = ip.split('%').next()?.parse().ok()?;
+                attributor?
+                    .lookup_unambiguous(proto, ip.to_canonical(), port)
+                    .map(|a| (a.pid, a.comm))
+            }
+            #[cfg(not(feature = "ebpf"))]
+            {
+                let _ = (proto, ip, port);
+                None
+            }
+        };
+        let events = self.tracker.observe(
+            &app.connection_collector.connections(),
+            &app.geo_cache,
+            &app.packet_collector.dns_cache,
+            &hint,
+        );
+        self.writer.send(&events);
+    }
+
+    /// Close what is open and let the writer drain.
+    pub fn finish(mut self) {
+        if let Some(rx) = &self.connects {
+            let seen: Vec<ConnectSeen> = rx.try_iter().collect();
+            self.writer.send(&self.tracker.connects(seen));
+        }
+        self.writer.send(&self.tracker.finish());
+        self.writer.shutdown(Duration::from_secs(3));
+    }
+}
+
 // ── Writer ─────────────────────────────────────────────────────────────────
 
-/// The header line each file starts with.
-fn header() -> serde_json::Value {
+/// The header line each file starts with. `sources` says what the events
+/// come from, such as whether the eBPF probes loaded.
+fn header(sources: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut meta = serde_json::json!({ "schema": FLOW_SCHEMA });
+    if let Some(sources) = sources {
+        meta["sources"] = sources.clone();
+    }
     serde_json::json!({
-        "_meta": { "schema": FLOW_SCHEMA },
+        "_meta": meta,
         "metadata": crate::schemas::FLOW.metadata(),
     })
+}
+
+/// `_meta.sources` for a session: polling always, eBPF when it loaded.
+pub fn sources(ebpf: Result<(), &str>) -> serde_json::Value {
+    match ebpf {
+        Ok(()) => serde_json::json!({ "poll": true, "ebpf": "active" }),
+        Err(error) => {
+            serde_json::json!({ "poll": true, "ebpf": "unavailable", "ebpf_error": error })
+        }
+    }
 }
 
 /// Queues lines for the writer thread. Never blocks the caller.
@@ -542,7 +718,7 @@ pub struct FlowWriter {
 }
 
 impl FlowWriter {
-    pub fn start(config: &FlowLogConfig) -> Self {
+    pub fn start(config: &FlowLogConfig, sources: serde_json::Value) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_CAP);
         let dropped = Arc::new(AtomicU64::new(0));
         let sink = Sink {
@@ -551,8 +727,9 @@ impl FlowWriter {
                 .file()
                 .then(|| config.dir.clone())
                 .flatten()
-                .map(|dir| DailyFiles::new(dir, config.keep_days)),
+                .map(|dir| DailyFiles::new(dir, config.keep_days).with_sources(&sources)),
             stdout: config.mode.stdout(),
+            header: header(Some(&sources)).to_string(),
         };
         if config.mode.file() && sink.files.is_none() {
             tracing::warn!(target: "netwatch::flow_log", "no cache directory; flow log file disabled");
@@ -568,7 +745,7 @@ impl FlowWriter {
         }
     }
 
-    pub fn send(&self, events: &[FlowEvent]) {
+    pub fn send<T: Serialize>(&self, events: &[T]) {
         let Some(tx) = &self.tx else { return };
         for event in events {
             let Ok(line) = serde_json::to_string(event) else {
@@ -580,6 +757,14 @@ impl FlowWriter {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+    }
+
+    /// Add events lost before they reached this queue, such as connects the
+    /// kprobe tap had no room for, to the next `dropped` line.
+    pub fn count_dropped(&self, count: u64) {
+        if count > 0 {
+            self.dropped.fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -605,6 +790,8 @@ impl FlowWriter {
 struct Sink {
     files: Option<DailyFiles>,
     stdout: bool,
+    /// Written to stdout once, at start.
+    header: String,
 }
 
 impl Sink {
@@ -636,7 +823,7 @@ fn run_writer(
     clock: impl Fn() -> DateTime<Utc>,
 ) {
     if sink.stdout {
-        sink.write(&header().to_string(), clock());
+        crate::logging::stdout_text(&format!("{}\n", sink.header));
     }
     let report_dropped = |sink: &mut Sink| {
         let count = dropped.swap(0, Ordering::Relaxed);
@@ -678,6 +865,7 @@ fn run_writer(
 struct DailyFiles {
     dir: PathBuf,
     keep: usize,
+    header: String,
     current: Option<(NaiveDate, std::io::BufWriter<std::fs::File>)>,
     /// One warning per failure streak, not one per line.
     failing: bool,
@@ -688,9 +876,15 @@ impl DailyFiles {
         Self {
             dir,
             keep: keep.max(1),
+            header: header(None).to_string(),
             current: None,
             failing: false,
         }
+    }
+
+    fn with_sources(mut self, sources: &serde_json::Value) -> Self {
+        self.header = header(Some(sources)).to_string();
+        self
     }
 
     fn path_for(&self, day: NaiveDate) -> PathBuf {
@@ -735,7 +929,7 @@ impl DailyFiles {
         let mut file = std::io::BufWriter::new(file);
         // A file reopened the same day already has its header.
         if empty {
-            writeln!(file, "{}", header())?;
+            writeln!(file, "{}", self.header)?;
         }
         Ok(file)
     }
@@ -817,6 +1011,10 @@ mod tests {
         None
     }
 
+    fn no_hint(_: &str, _: &str, _: u16) -> Option<(u32, String)> {
+        None
+    }
+
     struct Clock {
         start: Instant,
         wall: SystemTime,
@@ -843,7 +1041,7 @@ mod tests {
         conns: &[Connection],
     ) -> Vec<FlowEvent> {
         let (now, wall) = clock.at(secs);
-        t.observe_at(conns, now, wall, &no_rdns, &no_geo)
+        t.observe_at(conns, now, wall, &no_rdns, &no_geo, &no_hint)
     }
 
     const LOCAL: &str = "10.0.0.5:51234";
@@ -964,6 +1162,7 @@ mod tests {
                     org: "Google LLC".into(),
                 })
             },
+            &no_hint,
         );
         let close = &close[0];
         assert_eq!(close.process.as_deref(), Some("curl"));
@@ -997,6 +1196,7 @@ mod tests {
                     org: "Google LLC".into(),
                 })
             },
+            &no_hint,
         );
         let close = observe(&mut t, &clock, 1, &[]);
         assert_eq!(close[0].rdns.as_deref(), Some("fra16s.1e100.net"));
@@ -1125,6 +1325,7 @@ mod tests {
         let sink = Sink {
             files: Some(DailyFiles::new(dir.clone(), 14)),
             stdout: false,
+            header: String::new(),
         };
         let now = day("2026-11-05T10:00:00Z");
         run_writer(rx, sink, &dropped, || now);
@@ -1201,6 +1402,79 @@ mod tests {
         assert_eq!(cfg.experimental.flow_log, "stdout");
     }
 
+    /// A flow polling left ownerless takes the connect kprobe's process, and
+    /// a verified owner on a later tick replaces it. A hint that names a
+    /// different pid than the table does is not taken.
+    #[test]
+    fn an_ownerless_flow_takes_the_ebpf_owner_until_polling_verifies_one() {
+        let clock = Clock::new();
+        let mut t = FlowTracker::new(false);
+        let mut c = conn(LOCAL, REMOTE, "ESTABLISHED");
+        c.process_name = None;
+        c.pid = None;
+        c.attribution = AttributionSource::Lsof;
+        let (now, wall) = clock.at(0);
+        let hint = |proto: &str, ip: &str, port: u16| {
+            assert_eq!((proto, ip, port), ("TCP", "142.250.66.101", 443));
+            Some((4242, "curl".to_string()))
+        };
+        let open = t.observe_at(&[c.clone()], now, wall, &no_rdns, &no_geo, &hint);
+        assert_eq!(open[0].process.as_deref(), Some("curl"));
+        assert_eq!(open[0].pid, Some(4242));
+        assert_eq!(open[0].attribution, AttributionSource::Ebpf);
+
+        c.process_name = Some("curl-verified".into());
+        c.pid = Some(4242);
+        c.attribution = AttributionSource::Procfs;
+        observe(&mut t, &clock, 1, &[c]);
+        let close = observe(&mut t, &clock, 2, &[]);
+        assert_eq!(close[0].process.as_deref(), Some("curl-verified"));
+        assert_eq!(close[0].attribution, AttributionSource::Procfs);
+
+        let mut t = FlowTracker::new(false);
+        let mut other = conn(LOCAL, REMOTE, "ESTABLISHED");
+        other.process_name = None;
+        other.pid = Some(1);
+        let open = t.observe_at(&[other], now, wall, &no_rdns, &no_geo, &hint);
+        assert_eq!(
+            open[0].process, None,
+            "pid 1 in the table, 4242 in the hint"
+        );
+    }
+
+    #[test]
+    fn connects_become_lines_without_loopback() {
+        let t = FlowTracker::new(false);
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let seen = |remote: &str| ConnectSeen {
+            proto: "TCP",
+            pid: 4242,
+            comm: "curl".into(),
+            remote: remote.parse().unwrap(),
+            wall,
+        };
+        let lines = t.connects([
+            seen("93.184.215.14:443"),
+            seen("127.0.0.1:8080"),
+            seen("[::1]:8080"),
+            seen("[::ffff:1.1.1.1]:53"),
+        ]);
+        let remotes: Vec<_> = lines.iter().map(|l| l.remote.as_str()).collect();
+        assert_eq!(remotes, ["93.184.215.14:443", "1.1.1.1:53"]);
+        let json = serde_json::to_value(&lines[0]).unwrap();
+        assert_eq!(json["event"], "connect");
+        assert_eq!(json["process"], "curl");
+        assert_eq!(json["attribution"], "ebpf");
+        assert_eq!(json["observed_by"], "ebpf");
+        assert_eq!(json["ts"], "2026-09-21T14:13:20.000Z");
+        assert_eq!(
+            FlowTracker::new(true)
+                .connects([seen("127.0.0.1:8080")])
+                .len(),
+            1
+        );
+    }
+
     /// The real writer's lines, an open, every kind of close and a dropped
     /// line, against schemas/flow.v0.schema.json with its open parts closed.
     #[test]
@@ -1236,7 +1510,11 @@ mod tests {
                     org: "Example".into(),
                 })
             },
+            &|proto, _, _| (proto == "UDP").then(|| (99, "quic-client".into())),
         );
+        assert!(events
+            .iter()
+            .any(|e| e.attribution == AttributionSource::Ebpf && e.pid == Some(99)));
         events.extend(observe(
             &mut t,
             &clock,
@@ -1260,7 +1538,11 @@ mod tests {
             assert!(reasons.contains(&reason), "{reasons:?}");
         }
 
-        let mut docs: Vec<serde_json::Value> = vec![header()];
+        let mut docs: Vec<serde_json::Value> = vec![
+            header(None),
+            header(Some(&sources(Ok(())))),
+            header(Some(&sources(Err("permission denied")))),
+        ];
         docs.extend(events.iter().map(|e| serde_json::to_value(e).unwrap()));
         docs.push(
             serde_json::json!({"ts": "2026-11-05T10:00:00.000Z", "event": "dropped", "count": 2}),

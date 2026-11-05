@@ -45,7 +45,10 @@ apt's Rust is older than the crate's `rust-version`. The build itself runs
 without root. Installing creates the `netwatch` system user and enables and
 starts `netwatch.service`, which runs
 `netwatch daemon --flow-log file --flow-log-dir /var/log/netwatch`. The unit
-gives the service its capabilities; the binary carries none. Removing the
+gives the service its capabilities; the binary carries none. Besides capture
+and eBPF, it grants CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH, which only the
+proc-broker thread keeps, to read other processes' sockets: without them every
+process but netwatch itself is logged with a null `process`. Removing the
 package stops the service; purging also deletes `/var/cache/netwatch` and
 `/var/lib/netwatch`, and leaves the log in `/var/log/netwatch`.
 

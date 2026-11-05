@@ -32,10 +32,17 @@ RestartSec=5s
 # With the sandbox on, the daemon drops CAP_NET_RAW from its threads once capture
 # has opened. The open capture descriptor can still capture and inject on any
 # interface in this network namespace.
+#
+# Which process owns a socket comes from reading every process's /proc/<pid>/fd,
+# which for other users' processes takes CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE.
+# Only the proc-broker thread keeps them; every other thread drops both at entry.
+# Without them the connection log names netwatch's own sockets only. Remove
+# both to trade attribution for a smaller grant: CAP_SYS_PTRACE is what lets a
+# process inspect, and attach to, any other.
 User=netwatch
 Group=netwatch
-AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_PERFMON
-CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 
 # Defense in depth — netwatch also applies its own Landlock sandbox post-init.

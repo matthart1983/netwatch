@@ -533,14 +533,30 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
   `rdns`, `asn_org`, `country`) and approximate byte counts. Names and bytes need packet
   capture; `asn_org` and `country` need the [GeoIP databases](#geoip-databases). Metadata
   only, never payload.
+- **eBPF.** Where the connect probes load (Linux, `CAP_BPF` and `CAP_PERFMON`; the header's
+  `_meta.sources.ebpf` says `active` or `unavailable` with `ebpf_error`), every `connect()` of a
+  TCP or connected UDP socket also gets a line, as it happens, even for a connection shorter than
+  a poll:
+
+  ```json
+  {"ts":"2026-11-05T10:00:01.012Z","event":"connect","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","remote":"93.184.215.14:443","observed_by":"ebpf"}
+  ```
+
+  `process` is the kernel's 15-character `comm`. There is no `local`: the probes fire before the
+  kernel picks the source port, which is also why they cannot say which socket in the table is
+  whose. So a flow polling left without an owner takes the connect's process only when one
+  process alone connected to that destination within five seconds, with `attribution: "ebpf"`;
+  a verified owner on a later poll replaces it. With two processes on one destination, the flow
+  keeps a null `process`.
 - **What it skips.** Listening and unconnected sockets, and loopback unless
   `flow_log_loopback = true`.
 - **Limits.** The log is built from the connection table, polled every `refresh_rate_ms`.
   A connection that opens and closes between two polls is not logged, and `ts` is the poll that
   saw the event, not the `connect()` (`observed_by: "poll"`). One caught already closing, in
   TIME-WAIT say, gets its `open` and `close` together, often with a null `process`: the kernel
-  no longer ties a closing socket to its owner. eBPF attribution (`cap_bpf,cap_perfmon`) sees
-  the `connect()` and names it. Without eBPF, or root, sockets of
+  no longer ties a closing socket to its owner. Its `connect` line, with eBPF, names it.
+  Reading other users' sockets takes `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` for the
+  proc-broker thread; the packaged unit grants them. Without eBPF, or root, sockets of
   other users' processes can have a null `process`. If the writer falls behind by 8192 lines,
   later events are dropped and a `{"event":"dropped","count":N}` line says how many.
 
