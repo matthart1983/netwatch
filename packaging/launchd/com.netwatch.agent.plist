@@ -2,15 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  netwatch fleet agent (macOS LaunchDaemon).
+  netwatch daemon (macOS LaunchDaemon), with the flow log on.
 
-  Install:
+  The .dmg from scripts/build-dmg.sh installs this file and the binary. By hand:
+    sudo install -m0755 target/release/netwatch /usr/local/bin/netwatch
+    sudo mkdir -p /var/log/netwatch && sudo chmod 0700 /var/log/netwatch
     sudo cp packaging/launchd/com.netwatch.agent.plist /Library/LaunchDaemons/
-    sudo cp target/release/netwatch /usr/local/bin/netwatch
-    # edit the endpoint + key below, then:
+    sudo chown root:wheel /Library/LaunchDaemons/com.netwatch.agent.plist
     sudo launchctl bootstrap system /Library/LaunchDaemons/com.netwatch.agent.plist
 
-  The daemon flushes its durable queue on SIGTERM; launchd sends SIGTERM on
+  The daemon flushes its log queue on SIGTERM; launchd sends SIGTERM on
   unload and waits ExitTimeOut seconds before SIGKILL.
 -->
 <plist version="1.0">
@@ -22,15 +23,11 @@
     <array>
         <string>/usr/local/bin/netwatch</string>
         <string>daemon</string>
+        <string>--flow-log</string>
+        <string>file</string>
+        <string>--flow-log-dir</string>
+        <string>/var/log/netwatch</string>
     </array>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>NETWATCH_REMOTE_URL</key>
-        <string>https://cloud.example.com</string>
-        <key>NETWATCH_API_KEY</key>
-        <string>replace-me</string>
-    </dict>
 
     <key>RunAtLoad</key>
     <true/>

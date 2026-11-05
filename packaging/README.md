@@ -78,10 +78,14 @@ it needs no `setcap` and no group restriction.
 
 ```sh
 sudo install -m0755 target/release/netwatch /usr/local/bin/netwatch
+sudo mkdir -p /var/log/netwatch && sudo chmod 0700 /var/log/netwatch
 sudo cp packaging/launchd/com.netwatch.agent.plist /Library/LaunchDaemons/
-# edit NETWATCH_REMOTE_URL / NETWATCH_API_KEY in the plist, then:
+sudo chown root:wheel /Library/LaunchDaemons/com.netwatch.agent.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.netwatch.agent.plist
 ```
+
+The plist runs `netwatch daemon` with the flow log on, written to `/var/log/netwatch`.
+The `.dmg` from `scripts/build-dmg.sh` does the same steps from an installer.
 
 Full eBPF/PKTAP attribution on macOS requires root; without it the daemon falls
 back to lsof/ss-based attribution.
