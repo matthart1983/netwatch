@@ -1,16 +1,40 @@
 #!/bin/sh
-# Deliberately does NOT grant capabilities.
+# Creates the `netwatch` system user the service runs as, then enables and
+# (re)starts netwatch.service, which writes the connection log to
+# /var/log/netwatch.
 #
-# netwatch needs CAP_NET_RAW (and CAP_BPF/CAP_PERFMON for eBPF attribution) to
-# capture. A package that silently hands a binary raw-socket access is a
-# decision for the administrator, not the packager, so this prints the commands
-# instead of running them. `sudo netwatch` works without them.
+# Deliberately does NOT grant capabilities to the binary. The service gets
+# CAP_NET_RAW, CAP_BPF and CAP_PERFMON from its unit (AmbientCapabilities), so
+# the file stays 0755 with none. For the interactive TUI, granting them is a
+# decision for the administrator, so this prints the commands instead.
 set -e
 
 if [ "$1" = "configure" ]; then
+    if ! getent group netwatch >/dev/null; then
+        groupadd --system netwatch
+    fi
+    if ! getent passwd netwatch >/dev/null; then
+        useradd --system --gid netwatch --home-dir /var/lib/netwatch \
+            --no-create-home --shell /usr/sbin/nologin \
+            --comment "netwatch daemon" netwatch
+    fi
+
+    # Not in a container or chroot without systemd: nothing to start.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null || true
+        systemctl enable netwatch.service >/dev/null 2>&1 || true
+        # An upgrade restarts onto the new binary.
+        systemctl restart netwatch.service || true
+    fi
+
     cat <<'MSG'
 
-netwatch is installed. Packet capture needs elevated access. Prefer to
+netwatch is installed, and netwatch.service is running as user `netwatch`.
+Connection log: /var/log/netwatch/flows.YYYY-MM-DD.ndjson (UTC days, 14 kept)
+  sudo tail -f /var/log/netwatch/flows.$(date -u +%F).ndjson
+  systemctl status netwatch; journalctl -u netwatch
+
+For the interactive TUI, packet capture needs elevated access. Prefer to
 restrict the binary to a group and grant the capabilities to it:
 
   sudo groupadd -f netwatch

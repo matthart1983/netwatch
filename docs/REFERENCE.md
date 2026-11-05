@@ -436,7 +436,7 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   | Threads | TCP bind and connect | socket(2) |
   | --- | --- | --- |
   | Main and the network workers (reverse DNS, WHOIS, GeoIP, health, traceroute, Insights, remote, Diagnose probes, blocking pool) | Allowed | Allowed |
-  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink, and the others have not been audited for the filter |
+  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, flow log, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink, and the others have not been audited for the filter |
   | Capture, keylog, metrics listener and client | Denied from Linux 6.7 | EPERM |
 
   `netwatch doctor --json` reports the kernel's ABI and what a parser thread enforces
@@ -467,7 +467,7 @@ The [man page](netwatch.1) carries the same list.
 | Command | What it does |
 |---------|--------------|
 | `netwatch` | The TUI. Flags below. |
-| `netwatch daemon` (also `--daemon`, `--headless`) | The collectors with no screen. With `--metrics` or `--metrics-addr`, serves [Prometheus metrics](observability-export.md). |
+| `netwatch daemon` (also `--daemon`, `--headless`) | The collectors with no screen. With `--metrics` or `--metrics-addr`, serves [Prometheus metrics](observability-export.md). With `--flow-log`, writes a [flow log](#flow-log). |
 | `netwatch doctor [--json] [--check-capture] [--interface NAME]` | Read-only setup report: what this host lets netwatch see. `--check-capture` tries a real capture. See [doctor.md](doctor.md). |
 | `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue counted. 1: at least one open issue counted. 2: no usable observation in the budget. 3: bad arguments or no session. |
 | `netwatch diagnose coverage [--json] [--seconds N] [--test ID]` | Which checks have their inputs on this host, and why the others do not. |
@@ -497,6 +497,101 @@ TUI flags:
 | `--insecure-remote` | Allow an `http://` remote URL. Accepted through 1.x; experimental, with `--remote`. |
 | `--api-key KEY` | Deprecated: the key shows in the process list. Use `NETWATCH_API_KEY`. Accepted through 1.x, with a warning that does not include the key, and goes in 2.0. What it does is experimental, with `--remote`. |
 | `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
+| `--flow-log file\|stdout\|both` | With `daemon`: write the [flow log](#flow-log). Overrides `[experimental] flow_log`. Experimental. |
+| `--flow-log-dir DIR` | With `daemon`: the flow log's files go to `DIR`, for example `/var/log/netwatch`. Overrides `[experimental] flow_log_dir`. Experimental. |
+
+### Flow log
+
+Experimental. `netwatch daemon --flow-log file` (or `stdout`, or `both`) writes one line when a
+connection appears and one when it closes: which process, to where, for how long. Set it in
+`config.toml` instead with `[experimental] flow_log = "file"`; the flag wins.
+
+```bash
+netwatch daemon --flow-log both
+tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.event=="close") | {process, remote, host, duration_ms}'
+```
+
+```json
+{"ts":"2026-11-05T10:00:01.120Z","event":"open","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","local":"10.0.0.5:51234","remote":"93.184.215.14:443","state":"ESTABLISHED","observed_by":"poll"}
+{"ts":"2026-11-05T10:00:02.121Z","event":"close","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","local":"10.0.0.5:51234","remote":"93.184.215.14:443","state":"TIME-WAIT","reason":"closed","duration_ms":1001,"host":"example.com","host_source":"sni","asn_org":"Edgecast Inc.","country":"US","app_protocol":"tls","bytes_out":812,"bytes_in":3417,"retransmits":0,"observed_by":"poll"}
+```
+
+- **Where.** `file` writes `flows.YYYY-MM-DD.ndjson`, one per UTC day, in the `flows` directory
+  of netwatch's cache (`~/.cache/netwatch/flows` on Linux; under the packaged systemd unit,
+  `/var/cache/netwatch/netwatch/flows`). Files are 0600 in a 0700 directory, and those older
+  than `flow_log_keep_days` (default 14) are deleted when the day changes; netwatch rotates
+  them itself, so no logrotate rule is needed. `flow_log_dir` (or `--flow-log-dir`) puts them
+  elsewhere, such as `/var/log/netwatch`. That directory gets a sandbox write grant of its
+  own, and must belong to the user netwatch runs as, with mode 0700: systemd's
+  `LogsDirectory=netwatch` with `LogsDirectoryMode=0700` makes one. `stdout` writes the same
+  lines to standard output, which a systemd unit sends to the journal.
+- **What.** Each file, and stdout, starts with a header naming the schema,
+  [`schemas/flow.v0.schema.json`](../schemas/flow.v0.schema.json). Then `open` and `close`
+  events. `close` has a `reason`: `closed` when the socket reached a closing TCP state,
+  `gone` when it left the table without one, `shutdown` when the daemon stopped. It also has
+  the names learned while the flow was open (`host` from a TLS or QUIC SNI or an HTTP `Host`,
+  `rdns`, `asn_org`, `country`) and approximate byte counts. Names and bytes need packet
+  capture; `asn_org` and `country` need the [GeoIP databases](#geoip-databases). Metadata
+  only, never payload.
+- **eBPF.** Where the connect probes load (Linux, `CAP_BPF` and `CAP_PERFMON`; the header's
+  `_meta.sources.ebpf` says `active` or `unavailable` with `ebpf_error`), every `connect()` of a
+  TCP or connected UDP socket also gets a line, as it happens, even for a connection shorter than
+  a poll:
+
+  ```json
+  {"ts":"2026-11-05T10:00:01.012Z","event":"connect","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","remote":"93.184.215.14:443","observed_by":"ebpf"}
+  ```
+
+  `process` is the kernel's 15-character `comm`. The probes fire before the kernel picks the
+  source port, so the line waits up to two ticks for packet capture to see the stream the connect
+  started (same transport and destination, begun after the connect, started from this side, not
+  taken by an earlier connect) and takes its `local` and, from the ClientHello, `host`:
+
+  ```json
+  {"ts":"…","event":"connect","proto":"TCP","process":"curl","pid":942955,"attribution":"ebpf","local":"10.210.6.92:59694","remote":"5.255.255.242:443","host":"ya.ru","host_source":"sni","app_protocol":"tls","observed_by":"ebpf"}
+  ```
+
+  Without capture, or with no ClientHello in time, the line has no `local` or `host`. The UDP
+  probes sit on both `ip{4,6}_datagram_connect` and the inner function they call, so one
+  `connect()` fires two or three of them; copies from one thread to one destination within
+  20 µs of each other are written once. `ts` is the kernel's time for the probe. A burst of UDP
+  connects from one process to every address a name resolved to, with no traffic after, is
+  glibc's `getaddrinfo` choosing between them (RFC 6724), not traffic. TLS 1.3
+  and QUIC send the SNI in the clear like TLS 1.2; only Encrypted ClientHello hides it, and then
+  the line says `"ech": true` and `host` is the outer, public name. The table cannot say which
+  socket a connect is either, for the same missing source port. So a flow polling left without an owner takes the connect's process only when one
+  process alone connected to that destination within five seconds, with `attribution: "ebpf"`;
+  a verified owner on a later poll replaces it. With two processes on one destination, the flow
+  keeps a null `process`.
+- **DNS.** With capture, every DNS exchange over UDP port 53 gets a line: the query and its
+  response, paired by client, server and transaction id, named by the owner of the client
+  socket (the connection table's verified owner, else the socket's `connect` line):
+
+  ```json
+  {"ts":"…","event":"dns","proto":"UDP","process":"python3","pid":1002265,"attribution":"ebpf","local":"10.210.6.92:60281","server":"10.200.6.2:53","qname":"pypi.org","qtype":"A","rcode":"NOERROR","latency_ms":4.1,"answers":["151.101.0.223"],"cnames":["dualstack.python.map.fastly.net"],"observed_by":"capture"}
+  ```
+
+  No response within three ticks is `"rcode":"timeout"`; a response whose query capture missed
+  is written alone with `"query_seen":false`. The answers also feed `dns_name` on `connect`,
+  `open` and `close`: the name asked for an address, through any CNAME, for the answer's TTL
+  (kept at least a minute, at most a day). It works where SNI cannot, without TLS and under ECH,
+  and is missing where capture sees no DNS: encrypted DNS (DoT, DoH), a resolver's cached
+  answer from before netwatch started, or an interface capture does not listen on. An
+  application asking `systemd-resolved` on `127.0.0.53` talks over loopback; the line capture
+  sees is the resolver's own query upstream, named `systemd-resolve`.
+- **What it skips.** Listening and unconnected sockets, and loopback unless
+  `flow_log_loopback = true`.
+- **Limits.** The log is built from the connection table, polled every `refresh_rate_ms`.
+  A connection that opens and closes between two polls is not logged, and `ts` is the poll that
+  saw the event, not the `connect()` (`observed_by: "poll"`). One caught already closing, in
+  TIME-WAIT say, gets its `open` and `close` together, often with a null `process`: the kernel
+  no longer ties a closing socket to its owner. Its `connect` line, with eBPF, names it.
+  Reading other users' sockets takes `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` for the
+  proc-broker thread; the packaged unit grants them. Without eBPF, or root, sockets of
+  other users' processes can have a null `process`. If the writer falls behind by 8192 lines,
+  later events are dropped and a `{"event":"dropped","count":N}` line says how many.
+
+The format is experimental: it can change in any release.
 
 ### Uptime report
 
@@ -596,6 +691,9 @@ that stops describing its output fails CI.
 | The Egress tab's NDJSON export | `egress.v1.1.schema.json` | `netwatch.egress.v1.1` | `_meta.schema` |
 | `netwatch diagnose export`, once gunzipped | `diagnose-export.v1.schema.json` | `netwatch.diagnose-export.v1` | `"format": "netwatch-episode-export"`, `"version": 1` |
 | `netwatch uptime --json` | `uptime.v1.schema.json` | `netwatch.uptime.v1` | `"schema": 1` |
+
+The [flow log](#flow-log) has a schema too, `flow.v0.schema.json` (`netwatch.flow.v0`), checked
+the same way, but it is experimental and outside the promise.
 
 **Finding the schema from the output.** Each output has the same `metadata` object at its top
 level. In the egress export it is on the first line, and that file's schema validates one line at a
@@ -1070,8 +1168,10 @@ warns `<old> was renamed <new> in <release>` in the same places. `netwatch docto
 writes the new name. No key has been renamed so far. `geoip_online` below was removed.
 
 The `[experimental]` table is for settings that can still change, and is outside the 1.0
-compatibility promise. A key in it can change meaning or go away in any release. Nothing is in
-it yet. A key in it this version does not read is expected rather than a mistake, so it does not
+compatibility promise. A key in it can change meaning or go away in any release. It holds the
+[flow log](#flow-log)'s `flow_log` (`off`, `file`, `stdout` or `both`), `flow_log_dir`
+(empty: the cache directory's `flows`), `flow_log_keep_days` (14) and `flow_log_loopback`
+(false). A key in it this version does not read is expected rather than a mistake, so it does not
 warn as unknown. stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
 `ready`, Settings lists it, and the TUI's bottom row says nothing. A save keeps the table.
 

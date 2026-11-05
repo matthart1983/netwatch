@@ -1,0 +1,504 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/flow.v0.schema.json",
+  "title": "netwatch daemon flow log, netwatch.flow.v0",
+  "description": "One line of the flow log that netwatch daemon --flow-log writes. This validates a line, not a file. Each daily file starts with the header; stdout starts with it once. Every later line is an event: open and close from polling the connection table, connect from the eBPF probes when they loaded, dns from DNS exchanges seen in capture, and dropped. Experimental: this format is outside the 1.0 compatibility promise and can change in any release. Ignore fields you do not know.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/header"
+    },
+    {
+      "$ref": "#/$defs/flow"
+    },
+    {
+      "$ref": "#/$defs/connect"
+    },
+    {
+      "$ref": "#/$defs/dns"
+    },
+    {
+      "$ref": "#/$defs/dropped"
+    }
+  ],
+  "$defs": {
+    "header": {
+      "type": "object",
+      "description": "The first line of a file, and of stdout.",
+      "required": [
+        "_meta",
+        "metadata"
+      ],
+      "properties": {
+        "_meta": {
+          "type": "object",
+          "required": [
+            "schema"
+          ],
+          "properties": {
+            "schema": {
+              "const": "netwatch.flow.v0",
+              "description": "The same name as metadata.schema."
+            },
+            "sources": {
+              "type": "object",
+              "description": "What this session's events come from. Absent in files written before 0.40.0+flowlog2.",
+              "properties": {
+                "poll": {
+                  "type": "boolean",
+                  "description": "open and close events from polling the connection table. Always true."
+                },
+                "ebpf": {
+                  "type": "string",
+                  "description": "active: the connect probes loaded, so connect events follow and ownerless flows can take their owner. unavailable: they did not; ebpf_error says why. Open set.",
+                  "examples": [
+                    "active",
+                    "unavailable"
+                  ]
+                },
+                "ebpf_error": {
+                  "type": "string",
+                  "description": "Why the probes did not load. Free text."
+                }
+              }
+            }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Names this output's schema, at the same path as every other netwatch output.",
+          "required": [
+            "schema",
+            "schema_version",
+            "schema_url",
+            "netwatch_version"
+          ],
+          "properties": {
+            "schema": {
+              "const": "netwatch.flow.v0"
+            },
+            "schema_version": {
+              "const": "0"
+            },
+            "schema_url": {
+              "const": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/flow.v0.schema.json"
+            },
+            "netwatch_version": {
+              "type": "string",
+              "description": "The netwatch that wrote this file."
+            }
+          }
+        }
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC, RFC 3339 with milliseconds and a Z suffix."
+    },
+    "flow": {
+      "type": "object",
+      "description": "A connection that appeared in the polled connection table (open), or reached a closing TCP state, left the table, or was still open when the daemon stopped (close). Metadata only, never payload. A connection shorter than one poll interval is never seen.",
+      "required": [
+        "ts",
+        "event",
+        "proto",
+        "process",
+        "pid",
+        "attribution",
+        "local",
+        "remote",
+        "state",
+        "observed_by"
+      ],
+      "properties": {
+        "ts": {
+          "$ref": "#/$defs/timestamp",
+          "description": "The poll that saw the event, not the moment of connect() or close()."
+        },
+        "event": {
+          "enum": [
+            "open",
+            "close"
+          ],
+          "description": "Closed set."
+        },
+        "proto": {
+          "type": "string",
+          "description": "Transport, as the connection table names it. Open set.",
+          "examples": [
+            "TCP",
+            "UDP"
+          ]
+        },
+        "process": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The owning process's name, the latest one known. Null when attribution found no owner."
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "The owning process's id. Null when unknown."
+        },
+        "attribution": {
+          "type": "string",
+          "description": "How the owner was matched. ebpf: polling found no owner, and one process alone connected to this destination within five seconds, per the connect probes; a verified owner on a later poll replaces it. Open set.",
+          "examples": [
+            "lsof",
+            "procfs",
+            "pktap",
+            "ebpf",
+            "sockstat",
+            "iphelper"
+          ]
+        },
+        "local": {
+          "type": "string",
+          "description": "Local address and port, as the connection table prints it."
+        },
+        "remote": {
+          "type": "string",
+          "description": "Remote address and port, as the connection table prints it."
+        },
+        "state": {
+          "type": "string",
+          "description": "TCP state at the event, as the platform names it; empty or a platform word for UDP. Free text."
+        },
+        "reason": {
+          "enum": [
+            "closed",
+            "gone",
+            "shutdown"
+          ],
+          "description": "close only. closed: the socket reached a closing TCP state, possibly at the poll that first saw it, so a flow shorter than a poll still gets an open and a close. gone: it left the table with no closing state seen. shutdown: the daemon stopped while it was open. Closed set."
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "close only. From the poll that opened it to the poll that closed it."
+        },
+        "host": {
+          "type": "string",
+          "description": "The destination's name from a TLS or QUIC SNI, or a cleartext HTTP Host. Needs packet capture. Absent when none was read."
+        },
+        "host_source": {
+          "type": "string",
+          "description": "Where host came from. Open set.",
+          "examples": [
+            "sni",
+            "http"
+          ]
+        },
+        "ech": {
+          "const": true,
+          "description": "Present only when the ClientHello carried Encrypted ClientHello: host is then the outer, public name, not the one the client asked for."
+        },
+        "dns_name": {
+          "type": "string",
+          "description": "The name a DNS answer seen in capture gave this address: the name the client asked, not a CNAME target. Absent when no answer for it was seen, or it expired."
+        },
+        "rdns": {
+          "type": "string",
+          "description": "Reverse-DNS name of the remote address, when resolved while the flow was open."
+        },
+        "asn_org": {
+          "type": "string",
+          "description": "Organisation of the remote address from the ASN database. Absent with no database."
+        },
+        "country": {
+          "type": "string",
+          "description": "ISO country code of the remote address from the GeoIP database. Absent with no database."
+        },
+        "app_protocol": {
+          "type": "string",
+          "description": "Application protocol the packet decoder recognised. Open set.",
+          "examples": [
+            "tls",
+            "quic",
+            "http",
+            "dns",
+            "ssh",
+            "mqtt",
+            "stun",
+            "bittorrent",
+            "netbios",
+            "snmp",
+            "ssdp",
+            "ftp",
+            "llmnr",
+            "dhcp",
+            "ntp"
+          ]
+        },
+        "bytes_out": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "close only. Approximate, from per-tick rates. Zero without packet capture, which does not mean no traffic."
+        },
+        "bytes_in": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "close only. Approximate, from per-tick rates. Zero without packet capture, which does not mean no traffic."
+        },
+        "retransmits": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "close only. TCP retransmits seen on the flow; zero without capture."
+        },
+        "observed_by": {
+          "type": "string",
+          "description": "How the event was observed. poll: a connection-table poll. Open set.",
+          "examples": [
+            "poll"
+          ]
+        }
+      }
+    },
+    "dropped": {
+      "type": "object",
+      "description": "Events the writer could not keep up with, written as soon as it caught up.",
+      "required": [
+        "ts",
+        "event",
+        "count"
+      ],
+      "properties": {
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "event": {
+          "const": "dropped"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Events lost since the previous line."
+        }
+      }
+    },
+    "connect": {
+      "type": "object",
+      "description": "One connect() of a TCP or connected UDP socket, as the eBPF probes saw it at connect entry: the moment, the process and the destination. Seen even when the connection is shorter than a poll. Written a tick or two later, joined to the captured stream it started when there is one: that gives local and, from the ClientHello, host. A refused or failed connect is still a connect.",
+      "required": [
+        "ts",
+        "event",
+        "proto",
+        "process",
+        "pid",
+        "attribution",
+        "remote",
+        "observed_by"
+      ],
+      "properties": {
+        "ts": {
+          "$ref": "#/$defs/timestamp",
+          "description": "When netwatch read the event, within milliseconds of the connect()."
+        },
+        "event": {
+          "const": "connect"
+        },
+        "proto": {
+          "type": "string",
+          "description": "Transport. Open set.",
+          "examples": [
+            "TCP",
+            "UDP"
+          ]
+        },
+        "process": {
+          "type": "string",
+          "description": "The task's comm: the process name, cut to 15 characters."
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The process id (thread-group id) that called connect()."
+        },
+        "attribution": {
+          "const": "ebpf"
+        },
+        "local": {
+          "type": "string",
+          "description": "The client side of the captured stream this connect started: the source address and port. Absent without capture, or when no stream matched."
+        },
+        "remote": {
+          "type": "string",
+          "description": "Destination address and port, IPv6 in brackets."
+        },
+        "host": {
+          "type": "string",
+          "description": "The TLS or QUIC SNI, or HTTP Host, of the matched stream. Absent when there was none to read in time."
+        },
+        "host_source": {
+          "type": "string",
+          "description": "Where host came from. Open set.",
+          "examples": [
+            "sni",
+            "http"
+          ]
+        },
+        "ech": {
+          "const": true,
+          "description": "Present only when the ClientHello carried Encrypted ClientHello: host is then the outer, public name, not the one the client asked for."
+        },
+        "app_protocol": {
+          "type": "string",
+          "description": "What the decoder made of the matched stream. Open set.",
+          "examples": [
+            "tls",
+            "quic",
+            "http",
+            "dns",
+            "ssh",
+            "mqtt",
+            "stun",
+            "bittorrent",
+            "netbios",
+            "snmp",
+            "ssdp",
+            "ftp",
+            "llmnr",
+            "dhcp",
+            "ntp"
+          ]
+        },
+        "dns_name": {
+          "type": "string",
+          "description": "The name a DNS answer seen in capture gave this address: the name the client asked, not a CNAME target. Absent when no answer for it was seen, or it expired."
+        },
+        "observed_by": {
+          "const": "ebpf"
+        }
+      }
+    },
+    "dns": {
+      "type": "object",
+      "description": "One DNS exchange over UDP port 53 seen in capture: the query and, when it came, the response, paired by client, server and transaction id. A response for a query capture did not see is written on its own. Encrypted DNS (DoT, DoH) and exchanges on interfaces capture does not see are absent.",
+      "required": [
+        "ts",
+        "event",
+        "proto",
+        "process",
+        "pid",
+        "local",
+        "server",
+        "qname",
+        "qtype",
+        "rcode",
+        "observed_by"
+      ],
+      "properties": {
+        "ts": {
+          "$ref": "#/$defs/timestamp",
+          "description": "The query packet's capture time, or the response's when no query was seen."
+        },
+        "event": {
+          "const": "dns"
+        },
+        "proto": {
+          "const": "UDP"
+        },
+        "process": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Who owns the client socket: from the connection table when it verified one, else from the socket's connect line. Null when neither knew."
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "attribution": {
+          "type": "string",
+          "description": "How the owner was matched. Absent with a null process. Open set.",
+          "examples": [
+            "procfs",
+            "ebpf",
+            "lsof",
+            "sockstat",
+            "iphelper",
+            "pktap"
+          ]
+        },
+        "local": {
+          "type": "string",
+          "description": "The client's address and port."
+        },
+        "server": {
+          "type": "string",
+          "description": "The resolver's address and port."
+        },
+        "qname": {
+          "type": "string",
+          "description": "The name asked, lowercased."
+        },
+        "qtype": {
+          "type": "string",
+          "description": "The query type by name, or TYPE<n>. Open set.",
+          "examples": [
+            "A",
+            "AAAA",
+            "CNAME",
+            "HTTPS",
+            "MX",
+            "NS",
+            "PTR",
+            "SOA",
+            "SRV",
+            "SVCB",
+            "TXT",
+            "ANY"
+          ]
+        },
+        "rcode": {
+          "type": "string",
+          "description": "The response code by name, RCODE<n> for others, or timeout when no response came within three ticks. Open set.",
+          "examples": [
+            "NOERROR",
+            "FORMERR",
+            "SERVFAIL",
+            "NXDOMAIN",
+            "NOTIMP",
+            "REFUSED",
+            "timeout"
+          ]
+        },
+        "latency_ms": {
+          "type": "number",
+          "minimum": 0,
+          "description": "From query to response, by capture time, to a tenth of a millisecond. Absent without both."
+        },
+        "answers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The A and AAAA addresses in the answer section, in order."
+        },
+        "cnames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The CNAME targets in the answer section, in order."
+        },
+        "query_seen": {
+          "const": false,
+          "description": "Present only when the response came for a query capture did not see."
+        },
+        "observed_by": {
+          "const": "capture"
+        }
+      }
+    }
+  }
+}

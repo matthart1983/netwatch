@@ -2,6 +2,34 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **A flow log for the daemon (experimental).** `netwatch daemon --flow-log file|stdout|both`, or
+  `[experimental] flow_log` in `config.toml`, writes an NDJSON line when a connection appears
+  and when it closes: process, pid, local and remote address, and on close the duration, the
+  SNI or HTTP `Host`, reverse DNS, ASN, country and approximate bytes. Files are daily,
+  0600, under `<cache>/netwatch/flows/`, and kept for `flow_log_keep_days` (14). It is built
+  from the polled connection table, so a connection shorter than one poll is not seen.
+  `schemas/flow.v0.schema.json` describes the lines. `--flow-log-dir` or `flow_log_dir`
+  moves the files, to `/var/log/netwatch` say, with a sandbox write grant of its own.
+  See REFERENCE, Flow log.
+- **eBPF in the flow log.** Where the connect probes load, each `connect()` gets a
+  `connect` line with its pid, process name and destination, including connections shorter
+  than a poll, and a flow polling left ownerless takes the process when one process alone
+  connected to that destination. The file header's `_meta.sources` says whether eBPF is active.
+  A `connect` line waits up to two ticks for the captured stream it started and takes that
+  stream's source port and SNI, so a connection shorter than a poll still says where it went
+  by name. `"ech": true` marks a name Encrypted ClientHello replaced.
+- **DNS in the flow log.** A `dns` line per exchange seen in capture: process, client and
+  resolver, name, type, response code, latency, addresses and CNAMEs. The answers give
+  `connect`, `open` and `close` a `dns_name` for their destination. The DNS decoder now reads
+  answer records (A, AAAA, CNAME, compressed names, bounded).
+- One UDP `connect()` is one `connect` line: the copies the wrapper and inner datagram probes
+  both report are dropped, and `ts` comes from the kernel's clock.
+- **The packaged unit grants `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`**, which only the
+  proc-broker thread keeps, so the flow log names other users' processes too.
+
 ## [0.40.0] - 2026-11-04
 
 ### Migration

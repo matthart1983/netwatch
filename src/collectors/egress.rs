@@ -1458,7 +1458,7 @@ pub fn default_profiles_path() -> Option<PathBuf> {
         .map(|d| d.join("netwatch").join("egress-profiles.json"))
 }
 
-fn dest_hostname(p: &Option<AppProtocol>) -> Option<String> {
+pub(crate) fn dest_hostname(p: &Option<AppProtocol>) -> Option<String> {
     match p {
         Some(AppProtocol::Tls { sni: Some(s), .. }) => Some(s.clone()),
         Some(AppProtocol::Quic { sni: Some(s), .. }) => Some(s.clone()),
@@ -1469,7 +1469,7 @@ fn dest_hostname(p: &Option<AppProtocol>) -> Option<String> {
 
 /// Whether the flow's ClientHello carried an `encrypted_client_hello`
 /// extension — the outer SNI (if any) is a decoy and the real name is hidden.
-fn flow_ech(p: &Option<AppProtocol>) -> bool {
+pub(crate) fn flow_ech(p: &Option<AppProtocol>) -> bool {
     matches!(
         p,
         Some(AppProtocol::Tls { ech: true, .. }) | Some(AppProtocol::Quic { ech: true, .. })
@@ -1477,7 +1477,7 @@ fn flow_ech(p: &Option<AppProtocol>) -> bool {
 }
 
 /// Whether the name [`dest_hostname`] reads came from a cleartext HTTP `Host`.
-fn flow_http_host(p: &Option<AppProtocol>) -> bool {
+pub(crate) fn flow_http_host(p: &Option<AppProtocol>) -> bool {
     matches!(p, Some(AppProtocol::Http { host: Some(_), .. }))
 }
 

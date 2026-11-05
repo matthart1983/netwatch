@@ -33,6 +33,7 @@ This takes effect at 1.0.0. Until then 0.40 and its release candidates hold to i
 - The JSON in PCAPNG packet comments. Saved files stay valid PCAP and PCAPNG, but the comment keys can change.
 - Episode, features, corpus and replay formats
 - `diagnose corpus`, `replay` and `features`, which need `--unstable`
+- The daemon's flow log: `--flow-log` and its NDJSON format (`netwatch.flow.v0`)
 - Anything under `[experimental]` in `config.toml`
 
 **Not covered at all.** The TUI's layout and keybindings, all human-readable text including warnings and `report.md`, log messages, and file locations. Keybinding changes are noted in the CHANGELOG.

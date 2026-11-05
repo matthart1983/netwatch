@@ -1,20 +1,28 @@
 [Unit]
-Description=netwatch fleet agent (headless network forensics)
-Documentation=https://github.com/matthart1983/netwatch
+Description=netwatch agent (headless network forensics and connection log)
+Documentation=https://github.com/yuri-research-ai/netwatch
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Endpoint + API key live here, not in the unit or argv (keeps the key out of
-# `ps`). Create /etc/netwatch/agent.env with:
+# Optional. To stream to a backend, put the endpoint and API key here, not in
+# the unit or argv (keeps the key out of `ps`). Create /etc/netwatch/agent.env:
 #   NETWATCH_REMOTE_URL=https://cloud.example.com
 #   NETWATCH_API_KEY=...
-EnvironmentFile=/etc/netwatch/agent.env
-# dirs::cache_dir() honors XDG_CACHE_HOME on Linux; point logs at the
-# systemd-managed CacheDirectory so a service user without $HOME still logs.
+EnvironmentFile=-/etc/netwatch/agent.env
+# The service user has no home. netwatch prepares its config, cache and state
+# directories before its sandbox applies, so each points at a directory
+# systemd makes and gives to the service user. Config, if you want one, is
+# /var/lib/netwatch/config/netwatch/config.toml.
+Environment=HOME=/var/lib/netwatch
+Environment=XDG_CONFIG_HOME=/var/lib/netwatch/config
+Environment=XDG_STATE_HOME=/var/lib/netwatch
 Environment=XDG_CACHE_HOME=/var/cache/netwatch
-ExecStart=/usr/bin/netwatch daemon
+# Experimental connection log (which process connected where): daily NDJSON
+# files in /var/log/netwatch, kept 14 days. `--flow-log both` also sends each
+# line to the journal.
+ExecStart=/usr/bin/netwatch daemon --flow-log file --flow-log-dir /var/log/netwatch
 
 Restart=on-failure
 RestartSec=5s
@@ -24,17 +32,30 @@ RestartSec=5s
 # With the sandbox on, the daemon drops CAP_NET_RAW from its threads once capture
 # has opened. The open capture descriptor can still capture and inject on any
 # interface in this network namespace.
+#
+# Which process owns a socket comes from reading every process's /proc/<pid>/fd,
+# which for other users' processes takes CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE.
+# Only the proc-broker thread keeps them; every other thread drops both at entry.
+# Without them the connection log names netwatch's own sockets only. Remove
+# both to trade attribution for a smaller grant: CAP_SYS_PTRACE is what lets a
+# process inspect, and attach to, any other.
 User=netwatch
 Group=netwatch
-AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_PERFMON
-CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 
 # Defense in depth — netwatch also applies its own Landlock sandbox post-init.
+# Its write grants need each directory owned by the service user and 0700.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 CacheDirectory=netwatch
+CacheDirectoryMode=0700
+StateDirectory=netwatch
+StateDirectoryMode=0700
+LogsDirectory=netwatch
+LogsDirectoryMode=0700
 
 # The daemon flushes its durable queue on SIGTERM (bounded ~8s); give it room.
 KillSignal=SIGTERM

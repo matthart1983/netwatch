@@ -105,6 +105,202 @@ impl Classifier for DnsClassifier {
     }
 }
 
+/// A DNS message as the flow log needs it: the question, and for a response
+/// the answer records it can use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsMessage {
+    pub txid: u16,
+    pub is_response: bool,
+    pub qname: String,
+    pub qtype: u16,
+    /// `Some` on a response only.
+    pub rcode: Option<u8>,
+    pub answers: Vec<DnsAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsAnswer {
+    /// The record's owner name.
+    pub name: String,
+    pub ttl: u32,
+    pub data: DnsRecordData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsRecordData {
+    Addr(std::net::IpAddr),
+    Cname(String),
+}
+
+/// Answer records kept from one message; the rest are skipped.
+const MAX_ANSWERS: usize = 64;
+/// Compression pointers followed while reading one name. A well-formed name
+/// needs few; a loop needs this many to be stopped.
+const MAX_POINTER_HOPS: usize = 16;
+
+const TYPE_A: u16 = 1;
+const TYPE_CNAME: u16 = 5;
+const TYPE_AAAA: u16 = 28;
+
+/// Parse a whole DNS message over UDP: header, the first question, and the
+/// A, AAAA and CNAME records of the answer section. `None` for anything that
+/// is not a DNS message with one readable question. Names are made safe to
+/// print, like [`DnsClassifier`]'s.
+pub fn parse_message(payload: &[u8]) -> Option<DnsMessage> {
+    if payload.len() < HEADER_LEN {
+        return None;
+    }
+    let u16_at = |at: usize| -> Option<u16> {
+        Some(u16::from_be_bytes([
+            *payload.get(at)?,
+            *payload.get(at + 1)?,
+        ]))
+    };
+    let txid = u16_at(0)?;
+    let is_response = payload[2] & 0x80 != 0;
+    let rcode = is_response.then_some(payload[3] & 0x0F);
+    if u16_at(4)? == 0 {
+        return None;
+    }
+    let qdcount = u16_at(4)? as usize;
+    let ancount = u16_at(6)? as usize;
+
+    let (qname, mut pos) = read_name(payload, HEADER_LEN)?;
+    if qname.is_empty() {
+        return None;
+    }
+    let qtype = u16_at(pos)?;
+    pos += 4;
+    // Any further questions are skipped, not read: one is the norm.
+    for _ in 1..qdcount {
+        pos = skip_name(payload, pos)? + 4;
+    }
+
+    let mut answers = Vec::new();
+    if is_response {
+        for _ in 0..ancount {
+            let Some((name, after)) = read_name(payload, pos) else {
+                break;
+            };
+            let (Some(rtype), Some(ttl_hi), Some(ttl_lo), Some(rdlen)) = (
+                u16_at(after),
+                u16_at(after + 4),
+                u16_at(after + 6),
+                u16_at(after + 8),
+            ) else {
+                break;
+            };
+            let rdata = after + 10;
+            let end = rdata + rdlen as usize;
+            if end > payload.len() {
+                break;
+            }
+            let ttl = (u32::from(ttl_hi) << 16) | u32::from(ttl_lo);
+            let data = match (rtype, rdlen) {
+                (TYPE_A, 4) => {
+                    let b: [u8; 4] = payload[rdata..end].try_into().ok()?;
+                    Some(DnsRecordData::Addr(std::net::Ipv4Addr::from(b).into()))
+                }
+                (TYPE_AAAA, 16) => {
+                    let b: [u8; 16] = payload[rdata..end].try_into().ok()?;
+                    Some(DnsRecordData::Addr(std::net::Ipv6Addr::from(b).into()))
+                }
+                (TYPE_CNAME, _) => read_name(payload, rdata).map(|(n, _)| DnsRecordData::Cname(n)),
+                _ => None,
+            };
+            if let Some(data) = data {
+                if answers.len() < MAX_ANSWERS {
+                    answers.push(DnsAnswer { name, ttl, data });
+                }
+            }
+            pos = end;
+        }
+    }
+    Some(DnsMessage {
+        txid,
+        is_response,
+        qname,
+        qtype,
+        rcode,
+        answers,
+    })
+}
+
+/// Read the name at `start`, following compression pointers, and return it
+/// with the position just past it in the record (not past a pointer's
+/// target). Lowercased, as names compare case-insensitively.
+fn read_name(payload: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    let mut pos = start;
+    let mut after = None;
+    let mut hops = 0;
+    loop {
+        let len = *payload.get(pos)? as usize;
+        if len == 0 {
+            pos += 1;
+            break;
+        }
+        match len & 0xC0 {
+            0xC0 => {
+                let low = *payload.get(pos + 1)? as usize;
+                hops += 1;
+                if hops > MAX_POINTER_HOPS {
+                    return None;
+                }
+                after.get_or_insert(pos + 2);
+                pos = ((len & 0x3F) << 8) | low;
+            }
+            0x00 => {
+                let label = payload.get(pos + 1..pos + 1 + len)?;
+                if name.len() + len + 1 > MAX_QNAME_LEN {
+                    return None;
+                }
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.push_str(&String::from_utf8_lossy(label).to_ascii_lowercase());
+                pos += 1 + len;
+            }
+            // 0x40 and 0x80 are reserved label types.
+            _ => return None,
+        }
+    }
+    Some((display_owned(name), after.unwrap_or(pos)))
+}
+
+/// The position just past the name at `start`, without reading it.
+fn skip_name(payload: &[u8], start: usize) -> Option<usize> {
+    let mut pos = start;
+    loop {
+        let len = *payload.get(pos)? as usize;
+        match len {
+            0 => return Some(pos + 1),
+            l if l & 0xC0 == 0xC0 => return Some(pos + 2),
+            l if l & 0xC0 == 0 => pos += 1 + l,
+            _ => return None,
+        }
+    }
+}
+
+/// The usual name of a query type, and `TYPE<n>` (RFC 3597) for the rest.
+pub fn qtype_label(qtype: u16) -> String {
+    match qtype {
+        1 => "A".into(),
+        2 => "NS".into(),
+        5 => "CNAME".into(),
+        6 => "SOA".into(),
+        12 => "PTR".into(),
+        15 => "MX".into(),
+        16 => "TXT".into(),
+        28 => "AAAA".into(),
+        33 => "SRV".into(),
+        64 => "SVCB".into(),
+        65 => "HTTPS".into(),
+        255 => "ANY".into(),
+        other => format!("TYPE{other}"),
+    }
+}
+
 /// Short label for a DNS RCODE (RFC 1035 §4.1.1 + common extensions).
 pub fn rcode_label(rcode: u8) -> String {
     match rcode {
@@ -136,6 +332,101 @@ mod tests {
         // qtype = A (0x0001), qclass = IN (0x0001)
         0x00, 0x01, 0x00, 0x01,
     ];
+
+    /// A response for `www.example.com` A: a CNAME to `edge.example.net`,
+    /// then that name's A and AAAA records, owner names compressed.
+    fn cname_response() -> Vec<u8> {
+        let mut m = vec![
+            0x12, 0x34, 0x81, 0x80, // id, QR RD RA, NOERROR
+            0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, // qd 1, an 4
+        ];
+        // question at 12: www.example.com A IN
+        m.extend_from_slice(b"\x03www\x07example\x03com\x00");
+        m.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        // CNAME: owner -> 12, ttl 300, rdata edge.example.net
+        m.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2C]);
+        let rdata = b"\x04edge\x07example\x03net\x00";
+        m.extend_from_slice(&[0x00, rdata.len() as u8]);
+        let target = m.len() as u8;
+        m.extend_from_slice(rdata);
+        // A for edge.example.net (pointer to the CNAME target), ttl 60
+        m.extend_from_slice(&[0xC0, target, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C]);
+        m.extend_from_slice(&[0x00, 0x04, 93, 184, 215, 14]);
+        // AAAA
+        m.extend_from_slice(&[0xC0, target, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C]);
+        m.extend_from_slice(&[0x00, 0x10]);
+        m.extend_from_slice(&[0x26, 0x06, 0x28, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        // An MX the parser skips
+        m.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x0F, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C]);
+        m.extend_from_slice(&[0x00, 0x04, 0x00, 0x0A, 0xC0, 0x0C]);
+        m
+    }
+
+    #[test]
+    fn parse_message_reads_cname_a_and_aaaa_answers() {
+        let msg = parse_message(&cname_response()).unwrap();
+        assert_eq!(msg.txid, 0x1234);
+        assert!(msg.is_response);
+        assert_eq!(msg.qname, "www.example.com");
+        assert_eq!(msg.qtype, 1);
+        assert_eq!(msg.rcode, Some(0));
+        assert_eq!(msg.answers.len(), 3, "{:?}", msg.answers);
+        assert_eq!(msg.answers[0].name, "www.example.com");
+        assert_eq!(msg.answers[0].ttl, 300);
+        assert_eq!(
+            msg.answers[0].data,
+            DnsRecordData::Cname("edge.example.net".into())
+        );
+        assert_eq!(msg.answers[1].name, "edge.example.net");
+        assert_eq!(
+            msg.answers[1].data,
+            DnsRecordData::Addr("93.184.215.14".parse().unwrap())
+        );
+        assert_eq!(
+            msg.answers[2].data,
+            DnsRecordData::Addr("2606:2800::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_message_reads_a_query_and_lowercases() {
+        let mut q = QUERY_EXAMPLE_COM_A.to_vec();
+        q[13] = b'E';
+        let msg = parse_message(&q).unwrap();
+        assert!(!msg.is_response);
+        assert_eq!(msg.qname, "example.com");
+        assert_eq!(msg.rcode, None);
+        assert!(msg.answers.is_empty());
+        assert_eq!(qtype_label(msg.qtype), "A");
+        assert_eq!(qtype_label(65), "HTTPS");
+        assert_eq!(qtype_label(999), "TYPE999");
+    }
+
+    /// Hostile input ends in `None` or in fewer answers, never a panic or a
+    /// hang: pointer loops, pointers past the end, truncation at every byte.
+    #[test]
+    fn parse_message_survives_hostile_input() {
+        let good = cname_response();
+        for cut in 0..good.len() {
+            let _ = parse_message(&good[..cut]);
+        }
+        // A question name that points at itself.
+        let mut looped = QUERY_EXAMPLE_COM_A[..12].to_vec();
+        looped.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+        assert_eq!(parse_message(&looped), None);
+        // A pointer past the end.
+        let mut far = QUERY_EXAMPLE_COM_A[..12].to_vec();
+        far.extend_from_slice(&[0xFF, 0xFF, 0x00, 0x01, 0x00, 0x01]);
+        assert_eq!(parse_message(&far), None);
+        // An answer count far beyond the records present.
+        let mut many = good.clone();
+        many[7] = 0xFF;
+        assert_eq!(parse_message(&many).unwrap().answers.len(), 3);
+        // A reserved label type.
+        let mut reserved = QUERY_EXAMPLE_COM_A.to_vec();
+        reserved[12] = 0x40;
+        assert_eq!(parse_message(&reserved), None);
+    }
 
     #[test]
     fn extracts_qname_and_qtype() {

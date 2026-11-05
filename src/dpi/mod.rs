@@ -125,6 +125,30 @@ pub enum AppProtocol {
     Ntp { version: u8, mode: u8 },
 }
 
+impl AppProtocol {
+    /// The lowercase name display filters match (`tls`, `quic`, …) and the
+    /// flow log writes.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Tls { .. } => "tls",
+            Self::Quic { .. } => "quic",
+            Self::Http { .. } => "http",
+            Self::Dns { .. } => "dns",
+            Self::Ssh { .. } => "ssh",
+            Self::Mqtt { .. } => "mqtt",
+            Self::Stun { .. } => "stun",
+            Self::BitTorrent { .. } => "bittorrent",
+            Self::NetBios { .. } => "netbios",
+            Self::Snmp { .. } => "snmp",
+            Self::Ssdp { .. } => "ssdp",
+            Self::Ftp { .. } => "ftp",
+            Self::Llmnr { .. } => "llmnr",
+            Self::Dhcp { .. } => "dhcp",
+            Self::Ntp { .. } => "ntp",
+        }
+    }
+}
+
 pub trait Classifier {
     /// `Some(protocol)` when this classifier recognizes the payload,
     /// `None` to fall through to the next classifier.

@@ -30,6 +30,10 @@ pub struct SandboxPaths {
     /// at quit, both after the sandbox is applied. Read-only would lose
     /// the baseline every session.
     pub state_dir: Option<PathBuf>,
+    /// `[experimental] flow_log_dir` (or `daemon --flow-log-dir`), only when
+    /// the flow log writes files there. The default, under the cache
+    /// directory, needs no grant of its own.
+    pub flow_log_dir: Option<PathBuf>,
 }
 
 impl SandboxPaths {
@@ -63,6 +67,7 @@ impl SandboxPaths {
             keylog_dir,
             cwd,
             state_dir,
+            flow_log_dir: crate::collectors::flow_log::configured_dir(cfg),
         }
     }
 }
@@ -80,6 +85,7 @@ impl SandboxPaths {
             &self.config_dir,
             &self.state_dir,
             &self.cwd,
+            &self.flow_log_dir,
         ]
         .into_iter()
         .flatten()

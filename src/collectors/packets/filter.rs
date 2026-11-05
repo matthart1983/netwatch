@@ -402,24 +402,10 @@ fn matches(expr: &FilterExpr, pkt: &CapturedPacket, index_space: Option<&IndexSp
                     .as_ref()
                     .is_some_and(|pt| lowercase_contains(&String::from_utf8_lossy(pt), s))
         }
-        FilterExpr::AppProto(tag) => match &pkt.app_protocol {
-            Some(crate::dpi::AppProtocol::Tls { .. }) => "tls" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Quic { .. }) => "quic" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Http { .. }) => "http" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Dns { .. }) => "dns" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Ssh { .. }) => "ssh" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Mqtt { .. }) => "mqtt" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Stun { .. }) => "stun" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::BitTorrent { .. }) => "bittorrent" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::NetBios { .. }) => "netbios" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Snmp { .. }) => "snmp" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Ssdp { .. }) => "ssdp" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Ftp { .. }) => "ftp" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Llmnr { .. }) => "llmnr" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Dhcp { .. }) => "dhcp" == tag.as_str(),
-            Some(crate::dpi::AppProtocol::Ntp { .. }) => "ntp" == tag.as_str(),
-            None => false,
-        },
+        FilterExpr::AppProto(tag) => pkt
+            .app_protocol
+            .as_ref()
+            .is_some_and(|p| p.tag() == tag.as_str()),
         FilterExpr::Sni(needle) => match &pkt.app_protocol {
             Some(crate::dpi::AppProtocol::Tls { sni: Some(h), .. }) => {
                 h.to_lowercase().contains(needle.as_str())
