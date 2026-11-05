@@ -166,10 +166,48 @@ pub struct ConnTracker {
 struct Tap {
     tx: Mutex<Option<SyncSender<crate::collectors::flow_log::ConnectSeen>>>,
     dropped: AtomicU64,
+    repeats: Mutex<Repeats>,
+}
+
+/// Gap under which a second event from one thread to one destination is the
+/// same `connect()` seen by another probe. The UDP family has a probe on both
+/// `ip{4,6}_datagram_connect` and the `__` inner they call, and a v6 socket's
+/// v4-mapped connect goes on into `__ip4_datagram_connect`: one syscall, two
+/// or three events, microseconds apart. A second real `connect()` needs a
+/// return to userspace and a new syscall between them.
+const SAME_CONNECT_GAP: chrono::TimeDelta = chrono::TimeDelta::microseconds(20);
+
+/// The last event from each thread, to tell a second probe's copy of one
+/// `connect()` from a new one.
+#[derive(Default)]
+struct Repeats {
+    last: HashMap<u32, (Protocol, IpAddr, u16, chrono::DateTime<chrono::Utc>)>,
+}
+
+impl Repeats {
+    /// Whether `evt` is the same `connect()` as the thread's previous event.
+    /// The chain is followed, so a third probe's copy is caught as well.
+    fn is_repeat(&mut self, evt: &ConnectEvent) -> bool {
+        if self.last.len() >= MAX_ATTR_ENTRIES {
+            self.last.clear();
+        }
+        let key = (evt.protocol, evt.daddr, evt.dport);
+        let previous = self
+            .last
+            .insert(evt.pid, (key.0, key.1, key.2, evt.timestamp));
+        previous.is_some_and(|(proto, daddr, dport, at)| {
+            (proto, daddr, dport) == key
+                && evt.timestamp >= at
+                && evt.timestamp - at < SAME_CONNECT_GAP
+        })
+    }
 }
 
 impl Tap {
     fn send(&self, evt: &ConnectEvent) {
+        if self.repeats.lock().is_ok_and(|mut r| r.is_repeat(evt)) {
+            return;
+        }
         let Ok(guard) = self.tx.lock() else { return };
         let Some(tx) = guard.as_ref() else { return };
         let seen = crate::collectors::flow_log::ConnectSeen {
@@ -180,7 +218,8 @@ impl Tap {
             pid: evt.tgid,
             comm: evt.comm.clone(),
             remote: std::net::SocketAddr::new(evt.daddr, evt.dport),
-            wall: SystemTime::now(),
+            // The kernel's own clock for the probe, converted by the SDK.
+            wall: SystemTime::from(evt.timestamp),
         };
         if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = tx.try_send(seen) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -488,6 +527,51 @@ mod freshness_tests {
             },
         );
         assert!(a.lookup(Protocol::Tcp, addr, 443).is_none());
+    }
+
+    fn event(tid: u32, port: u16, at_us: i64) -> ConnectEvent {
+        ConnectEvent {
+            protocol: Protocol::Udp,
+            tgid: 100,
+            pid: tid,
+            comm: "python3".into(),
+            saddr: "0.0.0.0".parse().unwrap(),
+            daddr: "104.17.246.112".parse().unwrap(),
+            sport: 0,
+            dport: port,
+            timestamp: chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap()
+                + chrono::TimeDelta::microseconds(at_us),
+        }
+    }
+
+    /// The wrapper and inner probes' copies of one connect are one; a second
+    /// connect, another thread, or another destination is not.
+    #[test]
+    fn a_second_probe_on_one_connect_is_not_a_second_connect() {
+        let mut r = Repeats::default();
+        assert!(!r.is_repeat(&event(1, 443, 0)));
+        assert!(r.is_repeat(&event(1, 443, 2)), "inner probe, 2 µs later");
+        assert!(r.is_repeat(&event(1, 443, 5)), "a third copy, v4-mapped");
+        assert!(!r.is_repeat(&event(1, 443, 200)), "a new connect()");
+        assert!(!r.is_repeat(&event(2, 443, 201)), "another thread");
+        assert!(!r.is_repeat(&event(1, 53, 202)), "another destination");
+        assert!(!r.is_repeat(&event(1, 443, 203)));
+    }
+
+    #[test]
+    fn the_tap_writes_one_connect_per_syscall() {
+        let tap = Tap::default();
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        *tap.tx.lock().unwrap() = Some(tx);
+        for e in [event(1, 443, 0), event(1, 443, 1), event(1, 443, 500)] {
+            tap.send(&e);
+        }
+        let seen: Vec<_> = rx.try_iter().collect();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0].wall,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000)
+        );
     }
 
     fn at(pid: u32, ago_ms: u64) -> EbpfAttribution {

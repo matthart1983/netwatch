@@ -551,13 +551,34 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
   {"ts":"…","event":"connect","proto":"TCP","process":"curl","pid":942955,"attribution":"ebpf","local":"10.210.6.92:59694","remote":"5.255.255.242:443","host":"ya.ru","host_source":"sni","app_protocol":"tls","observed_by":"ebpf"}
   ```
 
-  Without capture, or with no ClientHello in time, the line has no `local` or `host`. TLS 1.3
+  Without capture, or with no ClientHello in time, the line has no `local` or `host`. The UDP
+  probes sit on both `ip{4,6}_datagram_connect` and the inner function they call, so one
+  `connect()` fires two or three of them; copies from one thread to one destination within
+  20 µs of each other are written once. `ts` is the kernel's time for the probe. A burst of UDP
+  connects from one process to every address a name resolved to, with no traffic after, is
+  glibc's `getaddrinfo` choosing between them (RFC 6724), not traffic. TLS 1.3
   and QUIC send the SNI in the clear like TLS 1.2; only Encrypted ClientHello hides it, and then
   the line says `"ech": true` and `host` is the outer, public name. The table cannot say which
   socket a connect is either, for the same missing source port. So a flow polling left without an owner takes the connect's process only when one
   process alone connected to that destination within five seconds, with `attribution: "ebpf"`;
   a verified owner on a later poll replaces it. With two processes on one destination, the flow
   keeps a null `process`.
+- **DNS.** With capture, every DNS exchange over UDP port 53 gets a line: the query and its
+  response, paired by client, server and transaction id, named by the owner of the client
+  socket (the connection table's verified owner, else the socket's `connect` line):
+
+  ```json
+  {"ts":"…","event":"dns","proto":"UDP","process":"python3","pid":1002265,"attribution":"ebpf","local":"10.210.6.92:60281","server":"10.200.6.2:53","qname":"pypi.org","qtype":"A","rcode":"NOERROR","latency_ms":4.1,"answers":["151.101.0.223"],"cnames":["dualstack.python.map.fastly.net"],"observed_by":"capture"}
+  ```
+
+  No response within three ticks is `"rcode":"timeout"`; a response whose query capture missed
+  is written alone with `"query_seen":false`. The answers also feed `dns_name` on `connect`,
+  `open` and `close`: the name asked for an address, through any CNAME, for the answer's TTL
+  (kept at least a minute, at most a day). It works where SNI cannot, without TLS and under ECH,
+  and is missing where capture sees no DNS: encrypted DNS (DoT, DoH), a resolver's cached
+  answer from before netwatch started, or an interface capture does not listen on. An
+  application asking `systemd-resolved` on `127.0.0.53` talks over loopback; the line capture
+  sees is the resolver's own query upstream, named `systemd-resolve`.
 - **What it skips.** Listening and unconnected sockets, and loopback unless
   `flow_log_loopback = true`.
 - **Limits.** The log is built from the connection table, polled every `refresh_rate_ms`.

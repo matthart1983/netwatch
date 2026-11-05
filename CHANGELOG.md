@@ -21,6 +21,12 @@ All notable changes to NetWatch will be documented in this file.
   A `connect` line waits up to two ticks for the captured stream it started and takes that
   stream's source port and SNI, so a connection shorter than a poll still says where it went
   by name. `"ech": true` marks a name Encrypted ClientHello replaced.
+- **DNS in the flow log.** A `dns` line per exchange seen in capture: process, client and
+  resolver, name, type, response code, latency, addresses and CNAMEs. The answers give
+  `connect`, `open` and `close` a `dns_name` for their destination. The DNS decoder now reads
+  answer records (A, AAAA, CNAME, compressed names, bounded).
+- One UDP `connect()` is one `connect` line: the copies the wrapper and inner datagram probes
+  both report are dropped, and `ts` comes from the kernel's clock.
 - **The packaged unit grants `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`**, which only the
   proc-broker thread keeps, so the flow log names other users' processes too.
 

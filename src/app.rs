@@ -502,6 +502,9 @@ pub struct App {
     /// port}` baselines learned from the live connection table.
     pub egress_profiler: crate::collectors::egress::EgressProfiler,
     intel_last_pkt_id: u64,
+    /// DNS messages seen in capture since the flow log last took them. `None`
+    /// unless the daemon's flow log asked for them.
+    pub(crate) dns_tap: Option<Vec<crate::collectors::flow_log::DnsWire>>,
     /// Linux-only kernel attribution path. Holds the SDK's `EventSource`
     /// (loaded BPF program + reader thread) and an `EbpfAttributor` cache
     /// the connection collector overlays onto lsof/ss-derived rows. None
@@ -692,6 +695,7 @@ impl App {
                 p
             },
             intel_last_pkt_id: 0,
+            dns_tap: None,
             #[cfg(feature = "ebpf")]
             conn_tracker: None,
             #[cfg(feature = "ebpf")]
@@ -1521,6 +1525,11 @@ impl App {
             // share it — that's what lets the latency match actually pair up.
             if pkt.protocol == "DNS" || pkt.protocol == "mDNS" {
                 let payload = crate::collectors::packets::extract_udp_app_payload(&pkt.raw_bytes);
+                if pkt.protocol == "DNS" {
+                    if let Some(tap) = self.dns_tap.as_mut() {
+                        crate::collectors::flow_log::tap_dns(tap, pkt, &payload);
+                    }
+                }
                 if payload.len() >= 12 {
                     let txid = u16::from_be_bytes([payload[0], payload[1]]);
                     if let Some(crate::dpi::AppProtocol::Dns { qname, rcode, .. }) =
@@ -1985,7 +1994,7 @@ pub async fn run_headless(
 
     // Started after priming, so the first table it sees is a real one.
     let mut flows =
-        flow_log.map(|config| crate::collectors::flow_log::DaemonFlowLog::start(&config, &app));
+        flow_log.map(|config| crate::collectors::flow_log::DaemonFlowLog::start(&config, &mut app));
 
     tracing::info!(
         target: "netwatch::daemon",
@@ -2008,7 +2017,7 @@ pub async fn run_headless(
             _ = ticker.tick() => {
                 app.tick();
                 if let Some(flows) = &mut flows {
-                    flows.tick(&app);
+                    flows.tick(&mut app);
                 }
                 let healthy = !collectors_panicked();
                 if let Some(publisher) = remote {

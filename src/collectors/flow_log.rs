@@ -174,6 +174,9 @@ pub struct FlowEvent {
     /// Only ever `true`: see [`ConnectLine::ech`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ech: Option<bool>,
+    /// See [`ConnectLine::dns_name`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rdns: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,6 +231,9 @@ pub struct ConnectLine {
     pub ech: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_protocol: Option<&'static str>,
+    /// The name a DNS answer seen in capture gave `remote`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
     pub observed_by: &'static str,
 }
 
@@ -355,8 +361,12 @@ impl ConnectJoin {
                         && !self.claimed.contains(&w.index)
                 })
                 .min_by_key(|w| w.index);
-            let named =
-                stream.is_some_and(|w| super::egress::dest_hostname(&w.app_protocol).is_some());
+            // A name, or a DNS stream's first message: nothing more is coming
+            // that the line would carry.
+            let named = stream.is_some_and(|w| {
+                super::egress::dest_hostname(&w.app_protocol).is_some()
+                    || matches!(w.app_protocol, Some(crate::dpi::AppProtocol::Dns { .. }))
+            });
             if named || all || ticks + 1 >= CONNECT_HOLD_TICKS {
                 if let Some(w) = stream {
                     self.claimed.insert(w.index);
@@ -393,6 +403,7 @@ fn connect_line(c: ConnectSeen, stream: Option<&WireStream>) -> ConnectLine {
         host,
         ech: super::egress::flow_ech(&app).then_some(true),
         app_protocol: app.as_ref().map(crate::dpi::AppProtocol::tag),
+        dns_name: None,
         observed_by: "ebpf",
     }
 }
@@ -470,6 +481,7 @@ struct FlowState {
     host: Option<String>,
     host_source: Option<&'static str>,
     ech: bool,
+    dns_name: Option<String>,
     rdns: Option<String>,
     geo: Option<GeoInfo>,
     geo_looked_up: bool,
@@ -492,6 +504,7 @@ impl FlowState {
             host: None,
             host_source: None,
             ech: false,
+            dns_name: None,
             rdns: None,
             geo: None,
             geo_looked_up: false,
@@ -533,6 +546,7 @@ impl FlowTracker {
         geo: &GeoCache,
         dns: &DnsCache,
         hint: OwnerHint,
+        dns_name: &dyn Fn(&str) -> Option<String>,
     ) -> Vec<FlowEvent> {
         self.observe_at(
             connections,
@@ -541,6 +555,7 @@ impl FlowTracker {
             &|ip| dns.lookup(ip),
             &|ip| geo.lookup(ip),
             hint,
+            dns_name,
         )
     }
 
@@ -552,6 +567,7 @@ impl FlowTracker {
         rdns: &dyn Fn(&str) -> Option<String>,
         geo: &dyn Fn(&str) -> Option<GeoInfo>,
         hint: OwnerHint,
+        dns_name: &dyn Fn(&str) -> Option<String>,
     ) -> Vec<FlowEvent> {
         let elapsed = self
             .last_observe
@@ -590,7 +606,7 @@ impl FlowTracker {
                 continue;
             };
             flow.seen = tick;
-            update(flow, conn, remote_ip, elapsed, rdns, geo, hint);
+            update(flow, conn, remote_ip, elapsed, rdns, geo, hint, dns_name);
             if is_new {
                 events.push(event(&key, flow, FlowEventKind::Open, &ts, now, None));
             }
@@ -711,8 +727,12 @@ fn update(
     rdns: &dyn Fn(&str) -> Option<String>,
     geo: &dyn Fn(&str) -> Option<GeoInfo>,
     hint: OwnerHint,
+    dns_name: &dyn Fn(&str) -> Option<String>,
 ) {
     flow.state.clone_from(&conn.state);
+    if flow.dns_name.is_none() {
+        flow.dns_name = dns_name(remote_ip);
+    }
     // Attribution can arrive late or improve; an unattributed tick never
     // erases what an earlier one learned.
     if conn.process_name.is_some() {
@@ -791,6 +811,7 @@ fn event(
         host: flow.host.clone(),
         host_source: flow.host_source,
         ech: flow.ech.then_some(true),
+        dns_name: flow.dns_name.clone(),
         rdns: flow.rdns.clone(),
         asn_org: flow.geo.as_ref().and_then(|g| nonempty(&g.org)),
         country: flow.geo.as_ref().and_then(|g| nonempty(&g.country_code)),
@@ -806,11 +827,324 @@ fn timestamp(wall: SystemTime) -> String {
     DateTime::<Utc>::from(wall).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+// ── DNS ────────────────────────────────────────────────────────────────────
+
+/// One DNS message seen in capture, with its addresses and the packet's time.
+#[derive(Debug, Clone)]
+pub struct DnsWire {
+    pub at: SystemTime,
+    pub src: std::net::SocketAddr,
+    pub dst: std::net::SocketAddr,
+    pub msg: crate::dpi::dns::DnsMessage,
+}
+
+/// Messages the tap holds between two ticks; past this they are left out.
+const MAX_DNS_TAP: usize = 65_536;
+
+/// Parse `payload`, a captured packet's UDP payload on port 53, into the tap.
+pub(crate) fn tap_dns(
+    tap: &mut Vec<DnsWire>,
+    pkt: &super::packets::CapturedPacket,
+    payload: &[u8],
+) {
+    if tap.len() >= MAX_DNS_TAP {
+        return;
+    }
+    let (Some(sport), Some(dport)) = (pkt.src_port, pkt.dst_port) else {
+        return;
+    };
+    let ip = |s: &str| {
+        s.parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| ip.to_canonical())
+    };
+    let (Some(src), Some(dst)) = (ip(&pkt.src_ip), ip(&pkt.dst_ip)) else {
+        return;
+    };
+    let Some(msg) = crate::dpi::dns::parse_message(payload) else {
+        return;
+    };
+    tap.push(DnsWire {
+        at: SystemTime::UNIX_EPOCH + Duration::from_nanos(pkt.timestamp_ns),
+        src: std::net::SocketAddr::new(src, sport),
+        dst: std::net::SocketAddr::new(dst, dport),
+        msg,
+    });
+}
+
+/// Addresses held in the name cache, and how long a name is kept whatever
+/// TTL the answer gave.
+const MAX_NAMES: usize = 65_536;
+const MIN_NAME_TTL: Duration = Duration::from_secs(60);
+const MAX_NAME_TTL: Duration = Duration::from_secs(86_400);
+
+/// Which name each address was the answer for, from DNS responses seen in
+/// capture. The name is the one asked, so a CNAME chain gives the address
+/// the name the client used, not the CDN's.
+#[derive(Debug, Default)]
+pub struct NameCache {
+    names: HashMap<std::net::IpAddr, (String, SystemTime)>,
+}
+
+impl NameCache {
+    pub fn learn(&mut self, msg: &crate::dpi::dns::DnsMessage, at: SystemTime) {
+        use crate::dpi::dns::DnsRecordData;
+        if !msg.is_response || msg.rcode != Some(0) {
+            return;
+        }
+        // The names the question reaches through CNAMEs.
+        let mut chain = vec![msg.qname.as_str()];
+        for _ in 0..msg.answers.len() {
+            let before = chain.len();
+            for a in &msg.answers {
+                if let DnsRecordData::Cname(target) = &a.data {
+                    if chain.contains(&a.name.as_str()) && !chain.contains(&target.as_str()) {
+                        chain.push(target);
+                    }
+                }
+            }
+            if chain.len() == before {
+                break;
+            }
+        }
+        for a in &msg.answers {
+            if let DnsRecordData::Addr(ip) = a.data {
+                if chain.contains(&a.name.as_str()) {
+                    let ttl =
+                        Duration::from_secs(u64::from(a.ttl)).clamp(MIN_NAME_TTL, MAX_NAME_TTL);
+                    self.names
+                        .insert(ip.to_canonical(), (msg.qname.clone(), at + ttl));
+                }
+            }
+        }
+        if self.names.len() > MAX_NAMES {
+            self.names.retain(|_, (_, until)| *until > at);
+            if self.names.len() > MAX_NAMES {
+                self.names.clear();
+            }
+        }
+    }
+
+    pub fn lookup(&self, ip: &str, now: SystemTime) -> Option<String> {
+        let ip: std::net::IpAddr = ip.split('%').next()?.parse().ok()?;
+        self.names
+            .get(&ip.to_canonical())
+            .filter(|(_, until)| *until > now)
+            .map(|(name, _)| name.clone())
+    }
+}
+
+/// Ticks a query waits for its response before it is written as a timeout.
+const DNS_TIMEOUT_TICKS: u32 = 3;
+
+/// One DNS exchange: the query, and the response when one came.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DnsLine {
+    pub ts: String,
+    pub event: &'static str,
+    pub proto: &'static str,
+    pub process: Option<String>,
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<AttributionSource>,
+    pub local: String,
+    pub server: String,
+    pub qname: String,
+    pub qtype: String,
+    /// The response's RCODE by name, or `timeout` when none came.
+    pub rcode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cnames: Vec<String>,
+    /// Only ever `false`: the response came for a query capture did not see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_seen: Option<bool>,
+    pub observed_by: &'static str,
+}
+
+#[derive(Debug)]
+struct PendingDns {
+    client: std::net::SocketAddr,
+    server: std::net::SocketAddr,
+    txid: u16,
+    query: Option<(SystemTime, String, u16)>,
+    response: Option<(SystemTime, crate::dpi::dns::DnsMessage)>,
+    ticks: u32,
+}
+
+/// Owner of a local socket: `(pid, process, how it was matched)`.
+pub type SocketOwner<'a> =
+    &'a dyn Fn(std::net::SocketAddr) -> Option<(u32, String, AttributionSource)>;
+
+/// Pairs DNS queries with their responses by client, server and txid.
+#[derive(Debug, Default)]
+pub struct DnsJoin {
+    pending: Vec<PendingDns>,
+    loopback: bool,
+}
+
+impl DnsJoin {
+    pub fn new(loopback: bool) -> Self {
+        Self {
+            loopback,
+            ..Self::default()
+        }
+    }
+
+    pub fn push(&mut self, wires: impl IntoIterator<Item = DnsWire>) {
+        for w in wires {
+            let (client, server) = if w.msg.is_response {
+                (w.dst, w.src)
+            } else {
+                (w.src, w.dst)
+            };
+            if !self.loopback
+                && [client, server]
+                    .iter()
+                    .any(|a| is_loopback(&a.ip().to_string()))
+            {
+                continue;
+            }
+            let txid = w.msg.txid;
+            if w.msg.is_response {
+                let open = self.pending.iter_mut().find(|p| {
+                    p.client == client
+                        && p.server == server
+                        && p.txid == txid
+                        && p.response.is_none()
+                });
+                match open {
+                    Some(p) => p.response = Some((w.at, w.msg)),
+                    None => self.pending.push(PendingDns {
+                        client,
+                        server,
+                        txid,
+                        query: None,
+                        response: Some((w.at, w.msg)),
+                        ticks: 0,
+                    }),
+                }
+            } else {
+                // A retransmitted query with the same id is the same exchange.
+                if self.pending.iter().any(|p| {
+                    p.client == client
+                        && p.server == server
+                        && p.txid == txid
+                        && p.response.is_none()
+                }) {
+                    continue;
+                }
+                self.pending.push(PendingDns {
+                    client,
+                    server,
+                    txid,
+                    query: Some((w.at, w.msg.qname, w.msg.qtype)),
+                    response: None,
+                    ticks: 0,
+                });
+            }
+        }
+    }
+
+    /// Write the exchanges that are done: answered and a tick old, so the
+    /// socket's connect has had its turn to name the owner, or past the
+    /// timeout. `all` writes everything, for shutdown.
+    pub fn tick(&mut self, owner: SocketOwner, all: bool) -> Vec<DnsLine> {
+        let mut lines = Vec::new();
+        let mut waiting = Vec::new();
+        for mut p in std::mem::take(&mut self.pending) {
+            let done =
+                all || (p.response.is_some() && p.ticks >= 1) || p.ticks >= DNS_TIMEOUT_TICKS;
+            if done {
+                lines.push(dns_line(p, owner));
+            } else {
+                p.ticks += 1;
+                waiting.push(p);
+            }
+        }
+        self.pending = waiting;
+        lines.sort_by(|a, b| a.ts.cmp(&b.ts));
+        lines
+    }
+}
+
+fn dns_line(p: PendingDns, owner: SocketOwner) -> DnsLine {
+    use crate::dpi::dns::{qtype_label, rcode_label, DnsRecordData};
+    let (pid, process, attribution) = match owner(p.client) {
+        Some((pid, name, how)) => (Some(pid), Some(name), Some(how)),
+        None => (None, None, None),
+    };
+    let (ts, qname, qtype, query_seen) = match (&p.query, &p.response) {
+        (Some((at, qname, qtype)), _) => (*at, qname.clone(), *qtype, None),
+        (None, Some((at, msg))) => (*at, msg.qname.clone(), msg.qtype, Some(false)),
+        (None, None) => (SystemTime::now(), String::new(), 0, None),
+    };
+    let mut answers = Vec::new();
+    let mut cnames = Vec::new();
+    let (rcode, latency_ms) = match &p.response {
+        Some((at, msg)) => {
+            for a in &msg.answers {
+                match &a.data {
+                    DnsRecordData::Addr(ip) => answers.push(ip.to_string()),
+                    DnsRecordData::Cname(target) => cnames.push(target.clone()),
+                }
+            }
+            let latency = p
+                .query
+                .as_ref()
+                .and_then(|(q, _, _)| at.duration_since(*q).ok())
+                .map(|d| (d.as_secs_f64() * 10_000.0).round() / 10.0);
+            (rcode_label(msg.rcode.unwrap_or(0)), latency)
+        }
+        None => ("timeout".to_string(), None),
+    };
+    DnsLine {
+        ts: timestamp(ts),
+        event: "dns",
+        proto: "UDP",
+        process,
+        pid,
+        attribution,
+        local: p.client.to_string(),
+        server: p.server.to_string(),
+        qname,
+        qtype: qtype_label(qtype),
+        rcode,
+        latency_ms,
+        answers,
+        cnames,
+        query_seen,
+        observed_by: "capture",
+    }
+}
+
+/// How long a connect's socket is remembered as its process's, for the DNS
+/// exchanges on it.
+const SOCKET_OWNER_TTL: Duration = Duration::from_secs(60);
+
 // ── Daemon ─────────────────────────────────────────────────────────────────
 
 /// Connects the kprobes may queue between two ticks before they are dropped
 /// and counted.
 const CONNECT_QUEUE_CAP: usize = 8192;
+
+/// Sockets remembered from connect lines before the expired ones are cleared.
+const MAX_ATTR_OWNERS: usize = 65_536;
+
+/// `"1.2.3.4:53"` or `"[::1]:53"`, as the connection table prints them.
+fn parse_socket(addr: &str) -> Option<std::net::SocketAddr> {
+    let (Some(ip), Some(port)) = crate::app::addr_parts(addr) else {
+        return None;
+    };
+    let ip: std::net::IpAddr = ip.split('%').next()?.parse().ok()?;
+    Some(std::net::SocketAddr::new(
+        ip.to_canonical(),
+        port.parse().ok()?,
+    ))
+}
 
 /// The flow log as `netwatch daemon` runs it: the poll tracker, the eBPF
 /// connect stream when the probes loaded, and the writer.
@@ -819,10 +1153,15 @@ pub struct DaemonFlowLog {
     writer: FlowWriter,
     connects: Option<Receiver<ConnectSeen>>,
     join: ConnectJoin,
+    dns: DnsJoin,
+    names: NameCache,
+    /// Local sockets the connect lines named, with when that stops counting.
+    owners: HashMap<std::net::SocketAddr, (u32, String, Instant)>,
 }
 
 impl DaemonFlowLog {
-    pub fn start(config: &FlowLogConfig, app: &crate::app::App) -> Self {
+    pub fn start(config: &FlowLogConfig, app: &mut crate::app::App) -> Self {
+        app.dns_tap = Some(Vec::new());
         let status = app.attribution_status();
         let ebpf = match &status {
             crate::app::AttributionStatus::Active(_) => Ok(()),
@@ -842,17 +1181,31 @@ impl DaemonFlowLog {
             writer: FlowWriter::start(config, sources(ebpf)),
             connects,
             join: ConnectJoin::new(config.loopback),
+            dns: DnsJoin::new(config.loopback),
+            names: NameCache::default(),
+            owners: HashMap::new(),
         }
     }
 
     /// Write what changed since the last tick: connects first, as they
     /// happened before the poll that follows them.
-    pub fn tick(&mut self, app: &crate::app::App) {
+    pub fn tick(&mut self, app: &mut crate::app::App) {
+        let now = SystemTime::now();
+        // Answers first, so this tick's lines can carry the names they gave.
+        let wires = app.dns_tap.as_mut().map(std::mem::take).unwrap_or_default();
+        for w in &wires {
+            self.names.learn(&w.msg, w.at);
+        }
+        self.dns.push(wires);
+
         if let Some(rx) = &self.connects {
             self.join.push(rx.try_iter().take(CONNECT_QUEUE_CAP));
             let (next_index, streams) = self.streams(app);
-            self.writer.send(&self.join.tick(next_index, &streams));
+            let mut lines = self.join.tick(next_index, &streams);
+            self.annotate(&mut lines, now);
+            self.writer.send(&lines);
         }
+        self.write_dns(app, false);
         #[cfg(feature = "ebpf")]
         if let Some(t) = &app.conn_tracker {
             self.writer.count_dropped(t.take_dropped());
@@ -881,13 +1234,65 @@ impl DaemonFlowLog {
                 None
             }
         };
+        let names = &self.names;
         let events = self.tracker.observe(
             &app.connection_collector.connections(),
             &app.geo_cache,
             &app.packet_collector.dns_cache,
             &hint,
+            &|ip| names.lookup(ip, now),
         );
         self.writer.send(&events);
+    }
+
+    /// Give connect lines the name their destination was the answer for, and
+    /// remember the sockets they name for the DNS exchanges on them.
+    fn annotate(&mut self, lines: &mut [ConnectLine], now: SystemTime) {
+        let until = Instant::now() + SOCKET_OWNER_TTL;
+        for line in lines {
+            if let Some(ip) = line
+                .remote
+                .rsplit_once(':')
+                .map(|(ip, _)| ip.trim_matches(['[', ']']))
+            {
+                line.dns_name = self.names.lookup(ip, now);
+            }
+            if let Some(local) = line.local.as_deref().and_then(|l| l.parse().ok()) {
+                self.owners
+                    .insert(local, (line.pid, line.process.clone(), until));
+            }
+        }
+        if self.owners.len() > MAX_ATTR_OWNERS {
+            let now = Instant::now();
+            self.owners.retain(|_, (_, _, until)| *until > now);
+        }
+    }
+
+    /// Write the DNS exchanges that are done, each named by the socket's owner:
+    /// a verified one from the table first, then the one its connect named.
+    fn write_dns(&mut self, app: &crate::app::App, all: bool) {
+        let table: HashMap<std::net::SocketAddr, (u32, String, AttributionSource)> = app
+            .connection_collector
+            .connections()
+            .iter()
+            .filter(|c| c.protocol.eq_ignore_ascii_case("udp"))
+            .filter_map(|c| {
+                let local = parse_socket(&c.local_addr)?;
+                Some((local, (c.pid?, c.process_name.clone()?, c.attribution)))
+            })
+            .collect();
+        let now = Instant::now();
+        let owners = &self.owners;
+        let owner = |local: std::net::SocketAddr| {
+            table.get(&local).cloned().or_else(|| {
+                owners
+                    .get(&local)
+                    .filter(|(_, _, until)| *until > now)
+                    .map(|(pid, name, _)| (*pid, name.clone(), AttributionSource::Ebpf))
+            })
+        };
+        let lines = self.dns.tick(&owner, all);
+        self.writer.send(&lines);
     }
 
     /// The tracker's next stream index, and the streams waiting connects may
@@ -906,11 +1311,15 @@ impl DaemonFlowLog {
 
     /// Close what is open and let the writer drain.
     pub fn finish(mut self, app: &crate::app::App) {
+        let now = SystemTime::now();
         if let Some(rx) = &self.connects {
             self.join.push(rx.try_iter());
             let (_, streams) = self.streams(app);
-            self.writer.send(&self.join.flush(&streams));
+            let mut lines = self.join.flush(&streams);
+            self.annotate(&mut lines, now);
+            self.writer.send(&lines);
         }
+        self.write_dns(app, true);
         self.writer.send(&self.tracker.finish());
         self.writer.shutdown(Duration::from_secs(3));
     }
@@ -1246,6 +1655,10 @@ mod tests {
         None
     }
 
+    fn no_name(_: &str) -> Option<String> {
+        None
+    }
+
     struct Clock {
         start: Instant,
         wall: SystemTime,
@@ -1272,7 +1685,7 @@ mod tests {
         conns: &[Connection],
     ) -> Vec<FlowEvent> {
         let (now, wall) = clock.at(secs);
-        t.observe_at(conns, now, wall, &no_rdns, &no_geo, &no_hint)
+        t.observe_at(conns, now, wall, &no_rdns, &no_geo, &no_hint, &no_name)
     }
 
     const LOCAL: &str = "10.0.0.5:51234";
@@ -1394,6 +1807,7 @@ mod tests {
                 })
             },
             &no_hint,
+            &no_name,
         );
         let close = &close[0];
         assert_eq!(close.process.as_deref(), Some("curl"));
@@ -1428,6 +1842,7 @@ mod tests {
                 })
             },
             &no_hint,
+            &no_name,
         );
         let close = observe(&mut t, &clock, 1, &[]);
         assert_eq!(close[0].rdns.as_deref(), Some("fra16s.1e100.net"));
@@ -1649,7 +2064,7 @@ mod tests {
             assert_eq!((proto, ip, port), ("TCP", "142.250.66.101", 443));
             Some((4242, "curl".to_string()))
         };
-        let open = t.observe_at(&[c.clone()], now, wall, &no_rdns, &no_geo, &hint);
+        let open = t.observe_at(&[c.clone()], now, wall, &no_rdns, &no_geo, &hint, &no_name);
         assert_eq!(open[0].process.as_deref(), Some("curl"));
         assert_eq!(open[0].pid, Some(4242));
         assert_eq!(open[0].attribution, AttributionSource::Ebpf);
@@ -1666,7 +2081,7 @@ mod tests {
         let mut other = conn(LOCAL, REMOTE, "ESTABLISHED");
         other.process_name = None;
         other.pid = Some(1);
-        let open = t.observe_at(&[other], now, wall, &no_rdns, &no_geo, &hint);
+        let open = t.observe_at(&[other], now, wall, &no_rdns, &no_geo, &hint, &no_name);
         assert_eq!(
             open[0].process, None,
             "pid 1 in the table, 4242 in the hint"
@@ -1828,6 +2243,203 @@ mod tests {
         assert_eq!(found[0].client.to_string(), "10.0.0.5:1001");
     }
 
+    fn dns_msg(
+        txid: u16,
+        response: bool,
+        qname: &str,
+        answers: Vec<(&str, &str)>,
+    ) -> crate::dpi::dns::DnsMessage {
+        use crate::dpi::dns::{DnsAnswer, DnsMessage, DnsRecordData};
+        DnsMessage {
+            txid,
+            is_response: response,
+            qname: qname.into(),
+            qtype: 1,
+            rcode: response.then_some(0),
+            answers: answers
+                .into_iter()
+                .map(|(name, data)| DnsAnswer {
+                    name: name.into(),
+                    ttl: 300,
+                    data: match data.parse() {
+                        Ok(ip) => DnsRecordData::Addr(ip),
+                        Err(_) => DnsRecordData::Cname(data.into()),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn dns_wire(ms: u64, src: &str, dst: &str, msg: crate::dpi::dns::DnsMessage) -> DnsWire {
+        DnsWire {
+            at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_000_000_000 + ms),
+            src: src.parse().unwrap(),
+            dst: dst.parse().unwrap(),
+            msg,
+        }
+    }
+
+    const CLIENT: &str = "10.210.6.92:60281";
+    const RESOLVER: &str = "10.200.6.2:53";
+
+    /// An address gets the name that was asked, through the CNAME chain, for
+    /// as long as the answer's TTL; a failed answer teaches nothing.
+    #[test]
+    fn the_name_cache_learns_the_asked_name_through_cnames() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let mut names = NameCache::default();
+        names.learn(
+            &dns_msg(
+                1,
+                true,
+                "pypi.org",
+                vec![
+                    ("pypi.org", "dualstack.python.map.fastly.net"),
+                    ("dualstack.python.map.fastly.net", "151.101.0.223"),
+                    ("dualstack.python.map.fastly.net", "2a04:4e42::223"),
+                    ("unrelated.example", "9.9.9.9"),
+                ],
+            ),
+            at,
+        );
+        assert_eq!(
+            names.lookup("151.101.0.223", at).as_deref(),
+            Some("pypi.org")
+        );
+        assert_eq!(
+            names.lookup("2a04:4e42::223", at).as_deref(),
+            Some("pypi.org")
+        );
+        assert_eq!(
+            names.lookup("::ffff:151.101.0.223", at).as_deref(),
+            Some("pypi.org")
+        );
+        assert_eq!(
+            names.lookup("9.9.9.9", at),
+            None,
+            "not on the question's chain"
+        );
+        assert_eq!(
+            names.lookup("151.101.0.223", at + Duration::from_secs(301)),
+            None
+        );
+
+        let mut failed = dns_msg(2, true, "evil.example", vec![("evil.example", "6.6.6.6")]);
+        failed.rcode = Some(3);
+        names.learn(&failed, at);
+        assert_eq!(names.lookup("6.6.6.6", at), None);
+        // A query teaches nothing either.
+        names.learn(
+            &dns_msg(3, false, "q.example", vec![("q.example", "7.7.7.7")]),
+            at,
+        );
+        assert_eq!(names.lookup("7.7.7.7", at), None);
+    }
+
+    fn owner_of(local: std::net::SocketAddr) -> Option<(u32, String, AttributionSource)> {
+        (local.to_string() == CLIENT)
+            .then(|| (1002265, "python3".to_string(), AttributionSource::Ebpf))
+    }
+
+    fn no_owner(_: std::net::SocketAddr) -> Option<(u32, String, AttributionSource)> {
+        None
+    }
+
+    #[test]
+    fn a_query_and_its_answer_are_one_line_with_the_socket_owner() {
+        let mut join = DnsJoin::new(false);
+        join.push([
+            dns_wire(0, CLIENT, RESOLVER, dns_msg(7, false, "pypi.org", vec![])),
+            dns_wire(0, CLIENT, RESOLVER, dns_msg(7, false, "pypi.org", vec![])), // retransmit
+            dns_wire(
+                4,
+                RESOLVER,
+                CLIENT,
+                dns_msg(
+                    7,
+                    true,
+                    "pypi.org",
+                    vec![
+                        ("pypi.org", "dualstack.python.map.fastly.net"),
+                        ("dualstack.python.map.fastly.net", "151.101.0.223"),
+                    ],
+                ),
+            ),
+        ]);
+        // Answered, but a tick young: the socket's connect gets its turn first.
+        assert!(join.tick(&owner_of, false).is_empty());
+        let lines = join.tick(&owner_of, false);
+        assert_eq!(lines.len(), 1);
+        let json = serde_json::to_value(&lines[0]).unwrap();
+        assert_eq!(json["event"], "dns");
+        assert_eq!(json["process"], "python3");
+        assert_eq!(json["pid"], 1002265);
+        assert_eq!(json["attribution"], "ebpf");
+        assert_eq!(json["local"], CLIENT);
+        assert_eq!(json["server"], RESOLVER);
+        assert_eq!(json["qname"], "pypi.org");
+        assert_eq!(json["qtype"], "A");
+        assert_eq!(json["rcode"], "NOERROR");
+        assert_eq!(json["latency_ms"], 4.0);
+        assert_eq!(json["answers"], serde_json::json!(["151.101.0.223"]));
+        assert_eq!(
+            json["cnames"],
+            serde_json::json!(["dualstack.python.map.fastly.net"])
+        );
+        assert_eq!(json["ts"], "2026-09-21T14:13:20.000Z");
+        assert!(json.get("query_seen").is_none());
+    }
+
+    #[test]
+    fn an_unanswered_query_times_out_and_a_lone_answer_is_still_written() {
+        let mut join = DnsJoin::new(false);
+        join.push([dns_wire(
+            0,
+            CLIENT,
+            RESOLVER,
+            dns_msg(8, false, "slow.example", vec![]),
+        )]);
+        for _ in 0..DNS_TIMEOUT_TICKS {
+            assert!(join.tick(&no_owner, false).is_empty());
+        }
+        let lines = join.tick(&no_owner, false);
+        assert_eq!(lines[0].rcode, "timeout");
+        assert_eq!(lines[0].process, None);
+        assert_eq!(lines[0].latency_ms, None);
+
+        join.push([dns_wire(
+            9,
+            RESOLVER,
+            CLIENT,
+            dns_msg(9, true, "late.example", vec![]),
+        )]);
+        let lines = join.tick(&no_owner, true);
+        assert_eq!(lines[0].qname, "late.example");
+        assert_eq!(lines[0].query_seen, Some(false));
+        assert_eq!(
+            lines[0].local, CLIENT,
+            "the client is the response's destination"
+        );
+    }
+
+    #[test]
+    fn dns_on_loopback_is_left_out_unless_asked_for() {
+        let q = || {
+            dns_wire(
+                0,
+                "127.0.0.1:40000",
+                "127.0.0.53:53",
+                dns_msg(1, false, "a.example", vec![]),
+            )
+        };
+        let mut join = DnsJoin::new(false);
+        join.push([q()]);
+        assert!(join.tick(&no_owner, true).is_empty());
+        let mut with = DnsJoin::new(true);
+        with.push([q()]);
+        assert_eq!(with.tick(&no_owner, true).len(), 1);
+    }
+
     /// The real writer's lines, an open, every kind of close and a dropped
     /// line, against schemas/flow.v0.schema.json with its open parts closed.
     #[test]
@@ -1864,6 +2476,7 @@ mod tests {
                 })
             },
             &|proto, _, _| (proto == "UDP").then(|| (99, "quic-client".into())),
+            &|ip| (ip == "142.250.66.101").then(|| "www.google.com".to_string()),
         );
         assert!(events
             .iter()
@@ -1914,10 +2527,47 @@ mod tests {
         if let Some(AppProtocol::Tls { ech, .. }) = &mut named.app_protocol {
             *ech = true;
         }
-        let lines = join.flush(&[named]);
+        let mut lines = join.flush(&[named]);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].ech, Some(true));
+        lines[0].dns_name = Some("example.com".into());
         docs.extend(lines.iter().map(|c| serde_json::to_value(c).unwrap()));
+        let mut dns = DnsJoin::new(false);
+        dns.push([
+            dns_wire(0, CLIENT, RESOLVER, dns_msg(7, false, "pypi.org", vec![])),
+            dns_wire(
+                4,
+                RESOLVER,
+                CLIENT,
+                dns_msg(
+                    7,
+                    true,
+                    "pypi.org",
+                    vec![
+                        ("pypi.org", "dualstack.python.map.fastly.net"),
+                        ("dualstack.python.map.fastly.net", "151.101.0.223"),
+                    ],
+                ),
+            ),
+            dns_wire(
+                5,
+                "10.210.6.92:1",
+                RESOLVER,
+                dns_msg(8, false, "slow.example", vec![]),
+            ),
+            dns_wire(
+                6,
+                RESOLVER,
+                "10.210.6.92:2",
+                dns_msg(9, true, "late.example", vec![]),
+            ),
+        ]);
+        let dns_lines = dns.tick(&owner_of, true);
+        assert_eq!(dns_lines.len(), 3);
+        docs.extend(dns_lines.iter().map(|d| serde_json::to_value(d).unwrap()));
+        assert!(events
+            .iter()
+            .any(|e| e.dns_name.as_deref() == Some("www.google.com")));
         for doc in &docs {
             assert_eq!(errors(&validator, doc), Vec::<String>::new(), "{doc}");
         }
