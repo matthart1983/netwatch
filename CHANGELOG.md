@@ -27,8 +27,15 @@ All notable changes to NetWatch will be documented in this file.
   answer records (A, AAAA, CNAME, compressed names, bounded).
 - One UDP `connect()` is one `connect` line: the copies the wrapper and inner datagram probes
   both report are dropped, and `ts` comes from the kernel's clock.
-- **The packaged unit grants `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`**, which only the
-  proc-broker thread keeps, so the flow log names other users' processes too.
+
+### Fixed
+- **The packaged systemd unit starts under a service user with no home.** It exited with
+  EACCES while preparing `~/.config` and `~/.local/state`; `HOME` and `XDG_*` now point at
+  systemd-managed directories (0700), and `/etc/netwatch/agent.env` is optional. The flow log
+  stays off in the unit; packaging/README.md shows the drop-in that turns it on, and the two
+  capabilities that let it name other users' processes.
+- The `.deb` stops the service when the package is removed, and a purge deletes
+  `/var/cache/netwatch` and `/var/lib/netwatch`.
 
 ## [0.40.0] - 2026-11-04
 

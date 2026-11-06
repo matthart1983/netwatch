@@ -1578,7 +1578,12 @@ impl DailyFiles {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
-        let oldest_kept = today - chrono::Days::new(self.keep as u64 - 1);
+        // A `flow_log_keep_days` reaching before chrono's first date keeps
+        // everything; plain subtraction would panic the writer.
+        let Some(oldest_kept) = today.checked_sub_days(chrono::Days::new(self.keep as u64 - 1))
+        else {
+            return;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(day) = name.to_str().and_then(file_day) else {
@@ -1955,6 +1960,19 @@ mod tests {
             assert_eq!(mode(&third), 0o600);
             assert_eq!(mode(&dir), 0o700);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_huge_keep_days_keeps_everything_instead_of_panicking() {
+        let root = scratch("keep-huge");
+        let dir = root.join("flows");
+        let mut files = DailyFiles::new(dir.clone(), usize::MAX);
+        files.write("{\"n\":1}", day("2026-11-01T12:00:00Z"));
+        files.write("{\"n\":2}", day("2026-11-02T12:00:00Z"));
+        files.flush();
+        assert!(file_for(&dir, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()).exists());
+        assert!(file_for(&dir, NaiveDate::from_ymd_opt(2026, 11, 2).unwrap()).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

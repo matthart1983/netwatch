@@ -6,6 +6,3 @@ docs/diagnostic-coverage.md text eol=lf
 # Replayed byte for byte by tests/pcap_golden.rs, and compared as text.
 tests/fixtures/pcap/*.pcap binary
 tests/fixtures/pcap/*.golden text eol=lf
-
-# Built packages, committed as-is.
-dist/*.deb binary

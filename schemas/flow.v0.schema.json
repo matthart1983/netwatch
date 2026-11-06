@@ -41,7 +41,7 @@
             },
             "sources": {
               "type": "object",
-              "description": "What this session's events come from. Absent in files written before 0.40.0+flowlog2.",
+              "description": "What this session's events come from.",
               "properties": {
                 "poll": {
                   "type": "boolean",

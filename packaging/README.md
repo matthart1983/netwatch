@@ -24,34 +24,6 @@ The URL must be `https://`. netwatch refuses an `http://` URL, which would
 send the API key in cleartext, unless `--insecure-remote` is also given; for
 a unit, that means adding the flag to `ExecStart` or `ProgramArguments`.
 
-## Debian / Ubuntu package with the connection log (this fork)
-
-```sh
-scripts/build-deb.sh                     # → target/netwatch_<version>+flowlog1_amd64.deb
-sudo apt install ./target/netwatch_*+flowlog1_amd64.deb
-sudo tail -f /var/log/netwatch/flows.$(date -u +%F).ndjson
-```
-
-The script builds a static musl binary with libpcap 1.10.5 linked in, as the
-upstream release does, so the package depends on nothing at install time. To
-build it, the dependencies come from apt:
-
-```sh
-sudo apt install musl-tools flex bison make curl file binutils dpkg-dev linux-libc-dev
-```
-
-and Rust from rustup (`rustup target add x86_64-unknown-linux-musl`), since
-apt's Rust is older than the crate's `rust-version`. The build itself runs
-without root. Installing creates the `netwatch` system user and enables and
-starts `netwatch.service`, which runs
-`netwatch daemon --flow-log file --flow-log-dir /var/log/netwatch`. The unit
-gives the service its capabilities; the binary carries none. Besides capture
-and eBPF, it grants CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH, which only the
-proc-broker thread keeps, to read other processes' sockets: without them every
-process but netwatch itself is logged with a null `process`. Removing the
-package stops the service; purging also deletes `/var/cache/netwatch` and
-`/var/lib/netwatch`, and leaves the log in `/var/log/netwatch`.
-
 ## Linux (systemd)
 
 ```sh
@@ -73,6 +45,37 @@ threads once capture has opened. The open capture descriptor can still capture
 and inject on any interface in the network namespace. The unit grants these
 capabilities to its service user, so the binary carries none and can stay 0755:
 it needs no `setcap` and no group restriction.
+
+## Connection log (experimental)
+
+The unit runs `netwatch daemon` without the flow log. To turn it on, add a
+drop-in with `sudo systemctl edit netwatch`:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/netwatch daemon --flow-log file --flow-log-dir /var/log/netwatch
+```
+
+The unit's `LogsDirectory=netwatch` makes `/var/log/netwatch`, owned by the
+service user with mode 0700, which the flow log's sandbox write grant requires.
+Files are daily (`flows.YYYY-MM-DD.ndjson`, UTC days) and kept for 14 days;
+`--flow-log both` also sends each line to the journal. See REFERENCE, Flow log.
+
+As the unit stands, the log names a process only where the service user can
+read its sockets, or where eBPF saw the `connect()`. To name other users'
+processes too, add these lines to the same drop-in:
+
+```ini
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+```
+
+The proc-broker thread uses them to read every process's `/proc/<pid>/fd`.
+Every other thread drops CAP_SYS_PTRACE; the sandboxed ones keep
+CAP_DAC_READ_SEARCH, but Landlock still limits which paths they open.
+CAP_SYS_PTRACE is what lets a process inspect, and attach to, any other, so
+this is a larger grant than capture needs.
 
 ## macOS (launchd)
 

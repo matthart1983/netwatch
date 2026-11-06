@@ -587,8 +587,9 @@ tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.eve
   TIME-WAIT say, gets its `open` and `close` together, often with a null `process`: the kernel
   no longer ties a closing socket to its owner. Its `connect` line, with eBPF, names it.
   Reading other users' sockets takes `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` for the
-  proc-broker thread; the packaged unit grants them. Without eBPF, or root, sockets of
-  other users' processes can have a null `process`. If the writer falls behind by 8192 lines,
+  proc-broker thread. The packaged unit leaves them out;
+  [packaging/README.md](../packaging/README.md) shows how to add them. Without them, eBPF
+  or root, sockets of other users' processes can have a null `process`. If the writer falls behind by 8192 lines,
   later events are dropped and a `{"event":"dropped","count":N}` line says how many.
 
 The format is experimental: it can change in any release.

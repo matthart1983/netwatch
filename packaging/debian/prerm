@@ -1,6 +1,6 @@
 #!/bin/sh
-# Stops and disables netwatch.service when the package is removed. An upgrade
-# leaves it running; postinst restarts it onto the new binary.
+# Stops and disables netwatch.service when the package is removed, so the
+# service does not outlive its binary. An upgrade leaves it running.
 set -e
 
 if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
