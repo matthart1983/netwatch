@@ -23,7 +23,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -1350,17 +1350,32 @@ pub fn sources(ebpf: Result<(), &str>) -> serde_json::Value {
     }
 }
 
+/// Add `count` to a drop counter, stopping at `u32::MAX` rather than wrapping.
+pub(crate) fn add_dropped(counter: &AtomicU32, count: u64) {
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    let mut seen = counter.load(Ordering::Relaxed);
+    while let Err(now) = counter.compare_exchange_weak(
+        seen,
+        seen.saturating_add(count),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        seen = now;
+    }
+}
+
 /// Queues lines for the writer thread. Never blocks the caller.
 pub struct FlowWriter {
     tx: Option<SyncSender<String>>,
-    dropped: Arc<AtomicU64>,
+    /// 32 bits: armv5te has no 64-bit atomics. Reset each time it is reported.
+    dropped: Arc<AtomicU32>,
     worker: Option<crate::sandbox::worker::WorkerHandle>,
 }
 
 impl FlowWriter {
     pub fn start(config: &FlowLogConfig, sources: serde_json::Value) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_CAP);
-        let dropped = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
         let sink = Sink {
             files: config
                 .mode
@@ -1394,7 +1409,7 @@ impl FlowWriter {
             match tx.try_send(line) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    add_dropped(&self.dropped, 1);
                 }
             }
         }
@@ -1404,7 +1419,7 @@ impl FlowWriter {
     /// kprobe tap had no room for, to the next `dropped` line.
     pub fn count_dropped(&self, count: u64) {
         if count > 0 {
-            self.dropped.fetch_add(count, Ordering::Relaxed);
+            add_dropped(&self.dropped, count);
         }
     }
 
@@ -1459,7 +1474,7 @@ impl Sink {
 fn run_writer(
     rx: Receiver<String>,
     mut sink: Sink,
-    dropped: &AtomicU64,
+    dropped: &AtomicU32,
     clock: impl Fn() -> DateTime<Utc>,
 ) {
     if sink.stdout {
@@ -1977,11 +1992,23 @@ mod tests {
     }
 
     #[test]
+    fn drop_counts_saturate_instead_of_wrapping() {
+        let counter = AtomicU32::new(u32::MAX - 1);
+        add_dropped(&counter, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
+        add_dropped(&counter, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
+        let counter = AtomicU32::new(0);
+        add_dropped(&counter, u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    #[test]
     fn the_writer_drains_its_queue_and_reports_what_it_dropped() {
         let root = scratch("writer");
         let dir = root.join("flows");
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        let dropped = AtomicU64::new(3);
+        let dropped = AtomicU32::new(3);
         for n in 0..2 {
             tx.send(format!("{{\"n\":{n}}}")).unwrap();
         }
@@ -2007,7 +2034,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         let writer = FlowWriter {
             tx: Some(tx),
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU32::new(0)),
             worker: None,
         };
         let clock = Clock::new();

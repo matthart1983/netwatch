@@ -29,7 +29,7 @@
 use netwatch_sdk::ebpf::{ConnectEvent, EbpfError, EbpfEvent, EventSource, Protocol};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -165,7 +165,8 @@ pub struct ConnTracker {
 #[derive(Default)]
 struct Tap {
     tx: Mutex<Option<SyncSender<crate::collectors::flow_log::ConnectSeen>>>,
-    dropped: AtomicU64,
+    /// 32 bits: armv5te has no 64-bit atomics, and one tick never drops 2^32.
+    dropped: AtomicU32,
     repeats: Mutex<Repeats>,
 }
 
@@ -222,7 +223,7 @@ impl Tap {
             wall: SystemTime::from(evt.timestamp),
         };
         if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = tx.try_send(seen) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            crate::collectors::flow_log::add_dropped(&self.dropped, 1);
         }
     }
 }
@@ -240,7 +241,7 @@ impl ConnTracker {
 
     /// Connects the subscriber's queue had no room for, since the last call.
     pub fn take_dropped(&self) -> u64 {
-        self.tap.dropped.swap(0, Ordering::Relaxed)
+        u64::from(self.tap.dropped.swap(0, Ordering::Relaxed))
     }
 
     /// Load and attach the BPF programs, then drain decoded events into the
