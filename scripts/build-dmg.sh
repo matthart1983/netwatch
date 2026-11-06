@@ -2,11 +2,11 @@
 # Build a macOS (Apple Silicon) .dmg with the netwatch binary, the launchd
 # daemon definition and an installer.
 #
-#   scripts/build-dmg.sh [DMG_VERSION]   # default: <crate version>+flowlog5
+#   scripts/build-dmg.sh [DMG_VERSION]   # default: the crate version
 #   -> target/dmg/netwatch-<DMG_VERSION>-macos-arm64.dmg
 #
-# The crate version in Cargo.toml is unchanged; the suffix marks our build, the
-# same way the .deb does (dist/netwatch_0.40.0+flowlog4_amd64.deb).
+# The binary is not signed or notarized, so Gatekeeper asks before the
+# installer runs. Releases do not build or publish this yet.
 #
 # Must run on macOS arm64: it uses hdiutil, plutil and builds for the host target.
 # Needs a Rust toolchain >= the crate's rust-version (rustup is enough).
@@ -23,7 +23,7 @@ command -v plutil >/dev/null || { echo "plutil not found" >&2; exit 1; }
 command -v cargo >/dev/null || { echo "cargo not on PATH" >&2; exit 1; }
 
 CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-VERSION="${1:-${CRATE_VERSION}+flowlog5}"
+VERSION="${1:-${CRATE_VERSION}}"
 DMG_DIR="$ROOT/target/dmg"
 STAGE="$DMG_DIR/stage"
 DMG="$DMG_DIR/netwatch-${VERSION}-macos-arm64.dmg"
@@ -93,7 +93,9 @@ sudo xattr -d com.apple.quarantine "$DEST" 2>/dev/null || true
 echo "Installed: $("$DEST" --version)"
 
 echo
-read -r -p "Also run netwatch as a background daemon (starts at boot)? [y/N] " ans
+echo "netwatch can also run as a background daemon, started at boot, that logs"
+echo "every connection (process, pid, destination, host name) to /var/log/netwatch."
+read -r -p "Run the daemon and keep that connection log? [y/N] " ans
 if [ "$ans" = y ] || [ "$ans" = Y ]; then
     # Replace an existing registration, if any.
     if launchctl print "system/$LABEL" >/dev/null 2>&1; then
