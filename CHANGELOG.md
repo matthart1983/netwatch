@@ -31,6 +31,10 @@ All notable changes to NetWatch will be documented in this file.
   that copies it to `/usr/local/bin` and, if you say yes, runs the daemon at boot with the flow
   log in `/var/log/netwatch`. Releases do not publish it yet.
 
+### Changed
+- README: the header keeps the CI, release and Terminal Trove badges and states platform
+  support in text. Related adds kernwatch and drops NetWatch Cloud.
+
 ### Fixed
 - **The packaged systemd unit starts under a service user with no home.** It exited with
   EACCES while preparing `~/.config` and `~/.local/state`; `HOME` and `XDG_*` now point at
