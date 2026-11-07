@@ -513,6 +513,12 @@ pub(super) fn collect_read_write(paths: &SandboxPaths) -> Vec<PathBuf> {
     if let Some(cache) = &paths.cache_dir {
         out.push(cache.join("scratch"));
     }
+    // The daemon's flow log, when configured outside the cache directory
+    // (say /var/log/netwatch). Prepared and checked like the others: owned by
+    // this user, mode 0700.
+    if let Some(p) = &paths.flow_log_dir {
+        out.push(p.clone());
+    }
     // `/dev/null` is needed for various stdlib paths (e.g., NSS
     // canary opens).
     out.push(PathBuf::from("/dev/null"));

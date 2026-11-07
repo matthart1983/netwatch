@@ -187,6 +187,7 @@ write: <cache>
 write: <state>
 write: <exports>
 write: <cache>/scratch
+write: <flow-log>
 write: /dev/null
 <!-- /policy:grants -->
 ```

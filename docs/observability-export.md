@@ -9,7 +9,7 @@ Collector with a Prometheus receiver — no glue.
 > roadmap.) It is **aggregate-only by design** — per-flow forensics
 > (SNI/JA4/process) is high-cardinality and is intentionally kept out of metrics
 > to avoid the cardinality-driven cost blow-ups that plague host-priced
-> observability vendors. Per-flow signals belong in the flow-event/OTLP stream.
+> observability vendors. Per-flow signals belong in the [flow log](REFERENCE.md#flow-log).
 
 ## Enabling
 
@@ -90,5 +90,6 @@ scrape_configs:
 
 - **OTLP push** (gRPC/HTTP) to an OpenTelemetry Collector, with network
   attributes aligned to OpenTelemetry semantic conventions.
-- **Flow-event stream** (NDJSON / OTLP logs) for per-flow forensics, kept
-  separate from metrics to preserve low cardinality.
+- **Flow-event stream over OTLP logs.** The NDJSON half exists:
+  `netwatch daemon --flow-log` ([flow log](REFERENCE.md#flow-log)), experimental.
+  An OpenTelemetry Collector's `filelog` receiver can read its files today.

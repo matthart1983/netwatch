@@ -1,0 +1,16 @@
+#!/bin/sh
+# On purge, removes what the service kept in /var/cache/netwatch and
+# /var/lib/netwatch (baselines, learned egress profiles, uptime history).
+# The connection log in /var/log/netwatch stays: it is the record someone may
+# still need. Delete it by hand. The `netwatch` user stays too, as Debian
+# leaves system users, so files it owns elsewhere keep an owner.
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/cache/netwatch /var/lib/netwatch
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null || true
+fi
+
+exit 0

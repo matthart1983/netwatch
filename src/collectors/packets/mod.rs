@@ -1528,6 +1528,13 @@ impl StreamTracker {
         None
     }
 
+    /// The index the next new stream will get. Indices only grow (until a
+    /// wrap starts a new session at 0), so a stream whose index is at least
+    /// a value read earlier began after that read.
+    pub fn next_index(&self) -> u32 {
+        self.next_index
+    }
+
     /// DPI snapshot: classified L7 protocol per stream key. Only flows
     /// where classification succeeded appear in the map. Cheap clone
     /// per tick; the per-connection joiner looks up by `StreamKey`.

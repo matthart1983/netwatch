@@ -6,14 +6,21 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Endpoint + API key live here, not in the unit or argv (keeps the key out of
-# `ps`). Create /etc/netwatch/agent.env with:
+# Optional. To stream to a backend, put the endpoint and API key here, not in
+# the unit or argv (keeps the key out of `ps`). Create /etc/netwatch/agent.env:
 #   NETWATCH_REMOTE_URL=https://cloud.example.com
 #   NETWATCH_API_KEY=...
-EnvironmentFile=/etc/netwatch/agent.env
-# dirs::cache_dir() honors XDG_CACHE_HOME on Linux; point logs at the
-# systemd-managed CacheDirectory so a service user without $HOME still logs.
+EnvironmentFile=-/etc/netwatch/agent.env
+# The service user has no home. netwatch prepares its config, cache and state
+# directories before its sandbox applies, so each points at a directory
+# systemd makes and gives to the service user. Config, if you want one, is
+# /var/lib/netwatch/config/netwatch/config.toml.
+Environment=HOME=/var/lib/netwatch
+Environment=XDG_CONFIG_HOME=/var/lib/netwatch/config
+Environment=XDG_STATE_HOME=/var/lib/netwatch
 Environment=XDG_CACHE_HOME=/var/cache/netwatch
+# The experimental connection log is off. packaging/README.md shows the
+# drop-in that turns it on, writing to /var/log/netwatch (LogsDirectory below).
 ExecStart=/usr/bin/netwatch daemon
 
 Restart=on-failure
@@ -31,10 +38,16 @@ CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_PERFMON
 NoNewPrivileges=yes
 
 # Defense in depth — netwatch also applies its own Landlock sandbox post-init.
+# Its write grants need each directory owned by the service user and 0700.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 CacheDirectory=netwatch
+CacheDirectoryMode=0700
+StateDirectory=netwatch
+StateDirectoryMode=0700
+LogsDirectory=netwatch
+LogsDirectoryMode=0700
 
 # The daemon flushes its durable queue on SIGTERM (bounded ~8s); give it room.
 KillSignal=SIGTERM

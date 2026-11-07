@@ -59,7 +59,15 @@ pub const UPTIME: Output = Output {
     file: "uptime.v1.schema.json",
 };
 
-pub const ALL: [Output; 5] = [DIAGNOSE_RUN, DOCTOR, EGRESS, DIAGNOSE_EXPORT, UPTIME];
+/// The daemon's flow log (`--flow-log`). Experimental: listed here so the
+/// schema rules and tests cover it, but not covered by STABILITY.md.
+pub const FLOW: Output = Output {
+    schema: crate::collectors::flow_log::FLOW_SCHEMA,
+    version: "0",
+    file: "flow.v0.schema.json",
+};
+
+pub const ALL: [Output; 6] = [DIAGNOSE_RUN, DOCTOR, EGRESS, DIAGNOSE_EXPORT, UPTIME, FLOW];
 
 /// The block each stable output carries. Empty only when read back from a
 /// document older than the block.
