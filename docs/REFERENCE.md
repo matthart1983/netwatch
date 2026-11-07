@@ -623,8 +623,8 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   failing. Latency spikes are not outages.
 - **The hop** is the nearest one that failed: the gateway (your router or LAN), the internet
   probe (your ISP or beyond) or DNS alone.
-- **The internet probe** asks 1.1.1.1, and in a cycle where that gets no reply, 8.8.8.8 as
-  well. The internet counts as down only when neither answers, so an outage at one provider, or
+- **The internet probe** asks 1.1.1.1, and in a cycle where that gets no reply but the gateway
+  does, 8.8.8.8 as well. The internet counts as down only when neither answers, so an outage at one provider, or
   a network that blocks it, is not reported as your ISP's.
 - **Not monitored** is time when no netwatch was running, or a gap of more than three minutes in
   the log. It is never counted as up. Time when the internet probe could not be sent at all
@@ -1120,7 +1120,7 @@ its default endpoints to the code.
 | What | When | Where it goes | What it carries |
 |------|------|---------------|-----------------|
 | Reference DNS query | Automatically | 1.1.1.1 | A query for `dns.google` |
-| Internet reachability | Automatically | 1.1.1.1, with a TCP fallback on port 443; 8.8.8.8 the same way, only when 1.1.1.1 did not answer | A probe, no data |
+| Internet reachability | Automatically | 1.1.1.1, with a TCP fallback on port 443; 8.8.8.8 the same way, only when 1.1.1.1 did not answer and the gateway did | A probe, no data |
 | STUN | Automatically, about once a minute | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | A binding request, which reveals your public address to them |
 | Health probes | Automatically | Your gateway and the configured resolver | ICMP echoes, with TCP connects where those are dropped, and DNS queries |
 | Reverse DNS | Automatically, for addresses in this host's own connections | The system resolver | The addresses it looks up |

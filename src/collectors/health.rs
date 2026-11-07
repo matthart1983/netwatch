@@ -198,7 +198,8 @@ pub const STUN_EVERY: u32 = 12;
 pub const INTERNET_TARGET: &str = "1.1.1.1";
 
 /// Second internet target, asked only in a cycle where [`INTERNET_TARGET`]
-/// got no reply at all, with the same ICMP-then-TCP/443 probe. Google's
+/// got no reply at all and the gateway did, with the same ICMP-then-TCP/443
+/// probe. Google's
 /// resolver, on another operator's network from Cloudflare's, so the uptime
 /// log calls the internet down only when two unrelated networks stopped
 /// answering, not when one of them had an outage or this network blocks it.
@@ -378,8 +379,13 @@ fn run_cycle(
     if cancel.cancelled() {
         return;
     }
+    // Whether this cycle found no gateway, or one that answered nothing. Then
+    // the gateway takes the blame for any outage, so a second internet target
+    // could not change the verdict, and only slows the cycle down.
+    let mut gateway_silent = cycle.gateway.is_none();
     if let Some(gw) = cycle.gateway {
         let (rtt, loss) = probes.gateway(gw);
+        gateway_silent = matches!(loss, Loss::Measured(pct) if pct >= 100.0);
         let mut next = (**safe_read(snapshot, "health::probe::read_gw")).clone();
         if next.completed.gateway_target.as_deref() != Some(gw) {
             next.gateway_rtt_history.clear();
@@ -485,7 +491,12 @@ fn run_cycle(
         };
         // A second opinion before the uptime log counts this cycle as lost,
         // published in the same snapshot so the two always belong together.
+        // Not while the gateway is silent: an unreachable target takes about
+        // 6 s (three ICMP and three TCP attempts at 1 s), and a cycle that
+        // much longer kept the health lab's dns.failing from opening behind a
+        // dead gateway.
         let fallback = (cycle.third_party
+            && !gateway_silent
             && matches!(loss, Loss::Measured(pct) if pct >= 100.0)
             && !cancel.cancelled())
         .then(|| probes.internet(INTERNET_FALLBACK_TARGET).1);
@@ -1311,6 +1322,8 @@ mod tests {
     struct FakeProbes {
         asked: std::cell::RefCell<Vec<String>>,
         internet: Vec<(&'static str, Loss)>,
+        /// The gateway's loss; 0% when `None`.
+        gateway: Option<Loss>,
     }
 
     impl FakeProbes {
@@ -1322,7 +1335,11 @@ mod tests {
     impl Probes for FakeProbes {
         fn gateway(&self, target: &str) -> (Option<f64>, Loss) {
             self.saw(format!("gateway {target}"));
-            (Some(1.0), Loss::Measured(0.0))
+            match self.gateway {
+                Some(loss) if loss.pct() == Some(100.0) => (None, loss),
+                Some(loss) => (Some(1.0), loss),
+                None => (Some(1.0), Loss::Measured(0.0)),
+            }
         }
         fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe) {
             self.saw(format!("dns {server}"));
@@ -1467,6 +1484,38 @@ mod tests {
         let (asked, _) =
             one_cycle_with(false, lost(vec![(INTERNET_TARGET, Loss::Measured(100.0))]));
         assert!(!asked.iter().any(|a| a.contains("internet")), "{asked:?}");
+
+        // Nor behind a gateway that answered nothing: the gateway takes the
+        // blame anyway, and the extra probe only stretched the cycle.
+        let (asked, prober) = one_cycle_with(
+            true,
+            FakeProbes {
+                internet: vec![(INTERNET_TARGET, Loss::Measured(100.0))],
+                gateway: Some(Loss::Measured(100.0)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !asked.iter().any(|a| a.contains(INTERNET_FALLBACK_TARGET)),
+            "{asked:?}"
+        );
+        assert_eq!(prober.status().internet_fallback_loss, None);
+
+        // A gateway that could not be probed at all is unknown, not silent,
+        // so the internet may yet take the blame and still gets the second
+        // opinion.
+        let (asked, _) = one_cycle_with(
+            true,
+            FakeProbes {
+                internet: vec![(INTERNET_TARGET, Loss::Measured(100.0))],
+                gateway: Some(Loss::Unmeasured("blocked")),
+                ..Default::default()
+            },
+        );
+        assert!(
+            asked.iter().any(|a| a.contains(INTERNET_FALLBACK_TARGET)),
+            "{asked:?}"
+        );
     }
 
     // ── loss model ─────────────────────────────────────────────────────

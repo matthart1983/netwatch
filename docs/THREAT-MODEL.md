@@ -392,7 +392,7 @@ default `trace_target` is 1.1.1.1. See
 | Service | Destination and disclosure |
 | --- | --- |
 | Reference DNS | 1.1.1.1, querying dns.google; off with third_party_probes = false |
-| Internet reachability | 1.1.1.1, TCP fallback on port 443; 8.8.8.8 the same way, only in a cycle 1.1.1.1 did not answer; off with third_party_probes = false |
+| Internet reachability | 1.1.1.1, TCP fallback on port 443; 8.8.8.8 the same way, only in a cycle 1.1.1.1 did not answer and the gateway did; off with third_party_probes = false |
 | Startup trace | 1.1.1.1; TTL-limited trace (UDP, ICMP echo on Windows) on every TUI start, demo included; ignores trace_target; off with third_party_probes = false |
 | STUN | stun.l.google.com:19302 and stun.cloudflare.com:3478; public mapping; off with third_party_probes = false |
 | Traceroute on T | The selected peer on Connections or Topology; TTL-limited trace |

@@ -46,7 +46,8 @@ All notable changes to NetWatch will be documented in this file.
 - **An internet outage now needs two providers to stop answering.** In a probe cycle where
   1.1.1.1 gets no reply, the uptime log also asks 8.8.8.8, with the same ICMP-then-TCP/443
   probe, and counts the internet as down only if neither answers. An outage at Cloudflare, or a
-  network that blocks 1.1.1.1, was reported as your ISP's. The dashboard's internet tile and
+  network that blocks 1.1.1.1, was reported as your ISP's. It is not asked while the gateway
+  answers nothing, since the gateway takes the blame then. The dashboard's internet tile and
   Diagnose still read 1.1.1.1 alone, and `third_party_probes = false` stops both.
 - The release workflow publishes to crates.io by trusted publishing when the crate has
   it set up, and with the stored token otherwise.
