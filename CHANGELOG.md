@@ -51,8 +51,6 @@ All notable changes to NetWatch will be documented in this file.
 - The release workflow publishes to crates.io by trusted publishing when the crate has
   it set up, and with the stored token otherwise.
 - `scripts/release.sh` signs the tag (`git tag -s`) when git has a `user.signingkey`.
-
-### Changed
 - README: the header keeps the CI, release and Terminal Trove badges and states platform
   support in text. Related adds kernwatch and drops NetWatch Cloud.
 
