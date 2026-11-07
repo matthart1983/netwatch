@@ -1,25 +1,22 @@
-# NetWatch Dense on a white terminal: demo-dense.tape with a light palette.
+# NetWatch Dense on a light terminal: demo-dense.tape in netwatch's `paper` theme.
 #
 # Everything about the take (size, pre-roll, namespace, traffic, the tour and
 # the re-encode) is documented in demo-dense.tape and applies here unchanged.
-# Only the palette differs. demo-dense-env.sh pins `theme = "terminal"`, so
-# netwatch draws in the ANSI tokens below and this palette decides the look:
+# Only the theme differs. demo-dense-env.sh writes `theme = "terminal"`; the
+# hidden setup below switches the scratch config to `paper`, netwatch's
+# built-in light theme, which paints its own #f5f5f2 panel and has
+# contrast-checked text and rate colours (see the `contrast` tests in
+# src/theme.rs).
 #
-#   - foreground is primary text; `white` (ANSI 7) is secondary text, so it is
-#     a dark grey here, not white.
-#   - `brightBlack` colours borders and muted text AND fills the selected row,
-#     whose text is promoted to the foreground colour. #818b98 is the
-#     compromise that keeps muted text readable on white and dark text
-#     readable on the selection.
-#   - Graphs step from a base token to its bright variant as magnitude rises.
-#     On white, intensity means darker, so every bright variant is darker than
-#     its base: green #1f883d -> #0f5323, blue #0969da -> #0a3069.
-#   - `black` is only ever text_inverse, drawn on brand, tab and warning
-#     fills, so it is white here.
-#   - Yellow is GitHub's amber (#9a6700): pure yellow vanishes on white.
+# Why not `terminal` with a light palette, as the first light take did: the
+# terminal theme fills the selected row with ANSI 8 (bright black) on purpose,
+# and the same slot colours borders and muted text. On white, any grey dark
+# enough for muted text is too dark under the selected row's green and blue
+# rates, so the selection bar read as a dark band. `paper` has its own light
+# selection colour.
 #
-# Colours are GitHub's light palette, to match the profile README's light
-# banner.
+# The vhs palette below only colours the padding around netwatch's panel, so
+# its background matches paper's.
 #
 # Record on Linux with: vhs docs/media/demo-dense-light.tape
 # then re-encode as demo-dense.tape describes, with demo-dense-light.gif.
@@ -30,7 +27,7 @@ Set Shell "bash"
 Set FontSize 14
 Set Width 1250
 Set Height 930
-Set Theme {"name": "netwatch light", "black": "#ffffff", "red": "#cf222e", "green": "#1f883d", "yellow": "#9a6700", "blue": "#0969da", "magenta": "#8250df", "cyan": "#1b7c83", "white": "#59636e", "brightBlack": "#818b98", "brightRed": "#a40e26", "brightGreen": "#0f5323", "brightYellow": "#7d4e00", "brightBlue": "#0a3069", "brightMagenta": "#6639ba", "brightCyan": "#0e5a60", "brightWhite": "#1f2328", "background": "#ffffff", "foreground": "#1f2328", "selection": "#b6e3ff", "cursor": "#1f2328"}
+Set Theme {"name": "netwatch paper", "black": "#ffffff", "red": "#cf222e", "green": "#1f883d", "yellow": "#9a6700", "blue": "#0969da", "magenta": "#8250df", "cyan": "#1b7c83", "white": "#59636e", "brightBlack": "#818b98", "brightRed": "#a40e26", "brightGreen": "#0f5323", "brightYellow": "#7d4e00", "brightBlue": "#0a3069", "brightMagenta": "#6639ba", "brightCyan": "#0e5a60", "brightWhite": "#1f2328", "background": "#f5f5f2", "foreground": "#1f2328", "selection": "#b6e3ff", "cursor": "#1f2328"}
 Set TypingSpeed 30ms
 Set Framerate 10
 Set Padding 10
@@ -45,6 +42,8 @@ Enter
 Type "export PATH=$PWD/target/release:$PATH"
 Enter
 Type "NW_DEMO_HOME=$(./scripts/demo-dense-env.sh) && export XDG_CONFIG_HOME=$NW_DEMO_HOME/.config"
+Enter
+Type `sed -i 's/^theme = .*/theme = "paper"/' "$XDG_CONFIG_HOME/netwatch/config.toml"`
 Enter
 # Disable job control so setsid does not fork away from the PID we save.
 Type "set +m"

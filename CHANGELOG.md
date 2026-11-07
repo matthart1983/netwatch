@@ -57,6 +57,8 @@ All notable changes to NetWatch will be documented in this file.
 - README: the demo at the top is a light-terminal recording of the dense view
   (`docs/media/demo-dense-light.gif`, from `demo-dense-light.tape`). The dark
   `demo-dense.gif` is re-recorded on 0.40.0. FreeBSD is listed with the other platforms.
+- The light demo is recorded in the `paper` theme. Under `terminal` with a light palette
+  the selected row's ANSI 8 fill read as a dark band behind its green and blue rates.
 
 ### Fixed
 - **`paper`'s graph peaks are readable.** The top of every graph was lightened toward white,
