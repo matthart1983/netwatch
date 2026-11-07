@@ -12,9 +12,9 @@
 # below 1.0.0 and allows, where it allows no hyphen). scripts/release.sh writes
 # both. `spec_version_matches_the_crate` in tests/packaging.rs fails the build
 # if they drift.
-%global upstream 0.40.0
+%global upstream 1.0.0-rc.1
 Name:           netwatch
-Version:        0.40.0
+Version:        1.0.0~rc.1
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -100,6 +100,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Sat Nov 07 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 1.0.0~rc.1-1
+- the first 1.0 release candidate: an ISP outage report (netwatch uptime --md) behind a second internet target, the daemon's flow log (experimental), readable paper graphs, and release candidates in the release path
+
 * Wed Nov 04 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.40.0-1
 - the contract freeze: STABILITY.md says what 1.0 promises, a JSON Schema for each stable output, unknown config keys warn, --unstable on the experimental diagnose commands, and config saves that keep your edits
 

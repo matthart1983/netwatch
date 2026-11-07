@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [1.0.0-rc.1] - 2026-11-07
 
 ### Added
 - **`netwatch uptime --md`, a report for your ISP.** The same outages as Markdown to attach to
