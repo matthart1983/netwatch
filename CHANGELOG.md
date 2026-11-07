@@ -27,6 +27,9 @@ All notable changes to NetWatch will be documented in this file.
   answer records (A, AAAA, CNAME, compressed names, bounded).
 - One UDP `connect()` is one `connect` line: the copies the wrapper and inner datagram probes
   both report are dropped, and `ts` comes from the kernel's clock.
+- `scripts/build-dmg.sh` builds an unsigned Apple Silicon `.dmg`: the binary, and an installer
+  that copies it to `/usr/local/bin` and, if you say yes, runs the daemon at boot with the flow
+  log in `/var/log/netwatch`. Releases do not publish it yet.
 
 ### Fixed
 - **The packaged systemd unit starts under a service user with no home.** It exited with

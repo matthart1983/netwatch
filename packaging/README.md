@@ -86,5 +86,14 @@ sudo cp packaging/launchd/com.netwatch.agent.plist /Library/LaunchDaemons/
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.netwatch.agent.plist
 ```
 
+To keep the connection log as well, add `--flow-log`, `file`, `--flow-log-dir`
+and `/var/log/netwatch` to `ProgramArguments`, and create that directory first
+with `sudo install -d -m0700 /var/log/netwatch`.
+
+`scripts/build-dmg.sh` builds an Apple Silicon `.dmg` with the binary and an
+installer script. The installer copies netwatch to `/usr/local/bin` and asks
+before it starts a daemon, which runs with the connection log on. Neither the
+binary nor the `.dmg` is signed or notarized.
+
 Full eBPF/PKTAP attribution on macOS requires root; without it the daemon falls
 back to lsof/ss-based attribution.
