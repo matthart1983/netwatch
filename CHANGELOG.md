@@ -34,6 +34,18 @@ All notable changes to NetWatch will be documented in this file.
 - `scripts/build-dmg.sh` builds an unsigned Apple Silicon `.dmg`: the binary, and an installer
   that copies it to `/usr/local/bin` and, if you say yes, runs the daemon at boot with the flow
   log in `/var/log/netwatch`. Releases do not publish it yet.
+- **Release candidates.** `scripts/release.sh 1.0.0-rc.1 "summary"` makes one. The RPM
+  spec spells it `1.0.0~rc.1`, which RPM sorts below `1.0.0`. docs/PACKAGING.md, Release
+  candidates, says what each channel does with one and how to install it.
+- `install-check.yml` installs a published release from every channel (the assets with
+  their checksums and provenance, `.deb`, `.rpm`, apt, COPR, `cargo install`, binstall,
+  GHCR, Homebrew, Scoop) and checks that each one runs and reports the version. It runs
+  weekly and by hand after a release.
+
+### Changed
+- The release workflow publishes to crates.io by trusted publishing when the crate has
+  it set up, and with the stored token otherwise.
+- `scripts/release.sh` signs the tag (`git tag -s`) when git has a `user.signingkey`.
 
 ### Changed
 - **An internet outage now needs two providers to stop answering.** In a probe cycle where
@@ -43,6 +55,9 @@ All notable changes to NetWatch will be documented in this file.
   Diagnose still read 1.1.1.1 alone, and `third_party_probes = false` stops both.
 
 ### Fixed
+- A pre-release tag would have failed the release build: `cargo generate-rpm` rejects a
+  hyphen in the version. It now gets `1.0.0~rc.1`. The tag also no longer reaches the apt
+  repository or COPR, where `1.0.0~rc.1` would have been offered as an upgrade.
 - **The packaged systemd unit starts under a service user with no home.** It exited with
   EACCES while preparing `~/.config` and `~/.local/state`; `HOME` and `XDG_*` now point at
   systemd-managed directories (0700), and `/etc/netwatch/agent.env` is optional. The flow log
