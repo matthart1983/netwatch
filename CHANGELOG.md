@@ -32,6 +32,9 @@ All notable changes to NetWatch will be documented in this file.
   log in `/var/log/netwatch`. Releases do not publish it yet.
 
 ### Fixed
+- **`paper`'s graph peaks are readable.** The top of every graph was lightened toward white,
+  which on `paper`'s off-white background faded the peaks to 1.4:1. On a light background
+  they now darken instead, to 13:1, and the contrast test covers the whole ramp.
 - **The packaged systemd unit starts under a service user with no home.** It exited with
   EACCES while preparing `~/.config` and `~/.local/state`; `HOME` and `XDG_*` now point at
   systemd-managed directories (0700), and `/etc/netwatch/agent.env` is optional. The flow log
