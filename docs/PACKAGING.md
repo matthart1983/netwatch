@@ -70,6 +70,9 @@ Most of it is automatic. By hand:
 5. For a hotfix, merge `release/X.Y.Z` back into `main`. Until it is, CI on
    `main` fails its `tags-on-main` job, and the release guard refuses the
    next tag cut from `main`.
+6. A few hours later, once Homebrew and Scoop have caught up, run
+   `gh workflow run install-check.yml -f version=X.Y.Z`. It installs the
+   release from every channel and checks each one runs and reports X.Y.Z.
 
 The release workflow's first job runs `scripts/release-guard.sh`, which
 refuses a tag that is not Cargo.toml's version or has no CHANGELOG section.
@@ -85,7 +88,41 @@ guard prints, and then the release workflow.
 Once the guard passes, the workflow builds every target, produces the
 packages, generates `SHA256SUMS`, attests provenance, publishes to crates.io,
 and attaches everything to the GitHub release. Homebrew and Scoop follow on
-their own. COPR builds when its webhook fires.
+their own. The `copr` job asks COPR to build `main`'s spec.
+
+## Release candidates
+
+`scripts/release.sh 1.0.0-rc.1 "summary"` makes one, with the same checks and
+steps as a release. The suffix is `-alpha.N`, `-beta.N` or `-rc.N`, and each
+candidate has to come after the last (rc.2 after rc.1, rc after beta).
+
+What each channel does with a hyphenated tag:
+
+| Channel | Pre-release |
+|---|---|
+| GitHub release | published, marked pre-release; `/releases/latest` stays on the last release |
+| crates.io | published; `cargo install` and `cargo binstall` take it only when asked for by version |
+| GHCR | `:v1.0.0-rc.1`, never `:latest` |
+| `.deb` / `.rpm` assets | `1.0.0~rc.1-1`, which both sort below `1.0.0` |
+| apt repository, COPR | skipped: each has one channel that users upgrade from |
+| Homebrew, Scoop, conda-forge | not picked up; they follow releases |
+
+So a tester installs it with one of:
+
+```sh
+cargo binstall netwatch-tui@1.0.0-rc.1
+cargo install netwatch-tui --version 1.0.0-rc.1
+docker run --rm ghcr.io/matthart1983/netwatch:v1.0.0-rc.1 --version
+```
+
+or the assets on the release page. `install-check.yml -f version=1.0.0-rc.1`
+checks the channels a candidate reaches.
+
+From the first candidate to the release, `main` takes only fixes for bugs
+that would stop the release. Each such fix is another candidate, and the
+trial period starts again from it. The release itself is the last
+candidate's code: `release.sh X.Y.Z` still needs notes under `[Unreleased]`,
+so the release's summary goes there, and nothing else changes.
 
 ## Container image
 

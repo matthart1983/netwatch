@@ -6,9 +6,13 @@
 # nothing. Both exist on purpose: the release rpm installs anywhere, this one
 # is a normal Fedora package.
 #
-# COPR builds it via its SCM source method (see docs/PACKAGING.md), so `Version`
-# below must match Cargo.toml. `spec_version_matches_the_crate` in
-# tests/packaging.rs fails the build if they drift.
+# COPR builds it via its SCM source method (see docs/PACKAGING.md), so
+# `upstream` below must be Cargo.toml's version, and `Version` the same with a
+# pre-release's hyphen as a tilde (1.0.0-rc.1 is 1.0.0~rc.1, which RPM sorts
+# below 1.0.0 and allows, where it allows no hyphen). scripts/release.sh writes
+# both. `spec_version_matches_the_crate` in tests/packaging.rs fails the build
+# if they drift.
+%global upstream 0.40.0
 Name:           netwatch
 Version:        0.40.0
 Release:        1%{?dist}
@@ -16,7 +20,7 @@ Summary:        Real-time network diagnostics in your terminal
 
 License:        MIT
 URL:            https://github.com/matthart1983/netwatch
-Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
+Source0:        %{url}/archive/v%{upstream}/%{name}-%{upstream}.tar.gz
 
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -44,7 +48,7 @@ Running netwatch with sudo also works, but as root the sandbox is defence in
 depth only.
 
 %prep
-%autosetup -n %{name}-%{version}
+%autosetup -n %{name}-%{upstream}
 
 %build
 # Not %%cargo_build: that macro expects the vendored-dependency layout Fedora

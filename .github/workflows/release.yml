@@ -11,8 +11,9 @@ on:
         type: string
 
 # Read-only by default. The jobs that write say so: `release` (assets and
-# attestations), `container` (the image) and `apt` (the gh-pages repo). The
-# build jobs run third-party actions and compilers, and get no write scope.
+# attestations), `container` (the image), `apt` (the gh-pages repo) and
+# `publish` (an OIDC token for crates.io). The build jobs run third-party
+# actions and compilers, and get no write scope.
 permissions:
   contents: read
 
@@ -307,7 +308,13 @@ jobs:
             *) echo "no rpm arch mapping for ${{ matrix.target }}"; exit 1 ;;
           esac
           cargo deb --no-build --no-strip --target ${{ matrix.target }} --output .
-          cargo generate-rpm --target ${{ matrix.target }} --arch "${rpm_arch}" --output .
+          # RPM allows no hyphen in a version, and cargo-generate-rpm copies
+          # Cargo.toml's as it is, so a pre-release (1.0.0-rc.1) is given as
+          # 1.0.0~rc.1, which RPM sorts below 1.0.0. cargo-deb makes the same
+          # change on its own.
+          version="${RELEASE_TAG#v}"
+          cargo generate-rpm --target ${{ matrix.target }} --arch "${rpm_arch}" --output . \
+            --set-metadata "version = \"${version/-/\~}\""
           ls -l *.deb *.rpm
 
       # A package that installs but does not run is worse than no package.
@@ -587,6 +594,10 @@ jobs:
   # release ships (24.04 LTS is on 1.75, too old for this crate).
   apt:
     needs: release
+    # A pre-release (a hyphenated tag) stays off the apt repository: its one
+    # suite is `stable`, and `apt upgrade` would install 1.0.0~rc.1 over
+    # 0.40.0. Testers take the .deb from the GitHub release.
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -673,6 +684,9 @@ jobs:
   # skips cleanly when the secrets are absent.
   copr:
     needs: release
+    # COPR builds main's spec into the one repository Fedora users install
+    # from, so a pre-release would reach them as an update. Skipped, as apt is.
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Trigger a COPR build
@@ -694,6 +708,10 @@ jobs:
   publish:
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Trusted publishing to crates.io signs in with this run's OIDC token.
+      id-token: write
     # Allow re-running on a tag that's already on crates.io — manual
     # dispatches will often hit this since `cargo publish` is immutable.
     # Skip cleanly instead of failing the whole workflow.
@@ -709,6 +727,16 @@ jobs:
 
       - name: Install libpcap
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      # Trusted publishing: crates.io swaps this run's OIDC token for a
+      # short-lived publish token, so no long-lived secret is needed. Until
+      # the crate's trusted publisher is set up on crates.io (Settings →
+      # Trusted Publishing: matthart1983/netwatch, workflow release.yml), this
+      # step fails and the publish falls back to CARGO_REGISTRY_TOKEN.
+      - name: Get a crates.io token by trusted publishing
+        id: crates-io-auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       - name: Publish to crates.io (skip if already published)
         run: |
@@ -735,4 +763,4 @@ jobs:
             exit 1
           fi
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}

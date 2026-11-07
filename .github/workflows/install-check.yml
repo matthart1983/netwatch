@@ -1,0 +1,328 @@
+name: Install check
+
+# Installs a published release the way a user would, from each channel, and
+# checks that what got installed runs and is the version asked for. About a
+# quarter of netwatch's issues have been install failures, and none of the
+# other workflows install anything from a channel.
+#
+#   gh workflow run install-check.yml -f version=1.0.0-rc.1
+#
+# With no version it checks the latest release. It runs weekly, and on a pull
+# request that changes this file.
+#
+# A pre-release is checked only where one is published: the release assets,
+# crates.io (cargo install and binstall) and GHCR. apt, COPR, Homebrew and
+# Scoop are skipped for it, since they only carry releases.
+#
+# Homebrew and Scoop are other people's packages that follow a release within
+# hours, so a version behind is a warning there. A failed install is an error
+# everywhere.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to check, without the v (default: the latest release)'
+        required: false
+        type: string
+  schedule:
+    - cron: '17 6 * * 1'
+  pull_request:
+    paths:
+      - .github/workflows/install-check.yml
+
+permissions:
+  contents: read
+
+env:
+  REPO: matthart1983/netwatch
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASKED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ASKED}" ]; then
+            version="${ASKED#v}"
+          else
+            # `gh release view` with no tag is the latest non-pre-release.
+            tag=$(gh release view -R "${REPO}" --json tagName -q .tagName)
+            version="${tag#v}"
+          fi
+          gh release view "v${version}" -R "${REPO}" --json tagName > /dev/null ||
+            { echo "::error::no release v${version}"; exit 1; }
+          case "${version}" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "Checking v${version} (pre-release: ${prerelease})"
+          {
+            echo "version=${version}"
+            echo "tag=v${version}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Every asset matches SHA256SUMS and carries this repository's build
+  # provenance, as docs/REFERENCE.md#verifying-a-download tells users to check.
+  # Then the x86_64 tarballs, under both names, run.
+  assets:
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `gh attestation verify` reads the attestations.
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Download, verify and run
+        run: |
+          set -euo pipefail
+          mkdir assets && cd assets
+          gh release download "${TAG}" -R "${REPO}"
+          ls -l
+          sha256sum -c SHA256SUMS
+          for f in *.tar.gz *.zip *.deb *.rpm; do
+            gh attestation verify "$f" -R "${REPO}" > /dev/null
+            echo "attested: $f"
+          done
+          for a in netwatch-linux-x86_64 netwatch-linux-x86_64-static; do
+            mkdir "$a.d"
+            tar xzf "$a.tar.gz" -C "$a.d"
+            out=$("$a.d/netwatch-linux-x86_64" --version)
+            echo "$a: $out"
+            grep -qF "${VERSION}" <<< "$out" ||
+              { echo "::error::$a reports '$out', not ${VERSION}"; exit 1; }
+          done
+
+  # The .deb installs, the unit is in place, and removing it works: the
+  # maintainer scripts stop the service on remove.
+  deb:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - run: |
+          set -euo pipefail
+          gh release download "${TAG}" -R "${REPO}" -p "netwatch_*_${{ matrix.arch }}.deb"
+          sudo apt-get install -y ./netwatch_*_${{ matrix.arch }}.deb
+          out=$(netwatch --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            { echo "::error::the .deb installed '$out', not ${VERSION}"; exit 1; }
+          test -f /usr/lib/systemd/system/netwatch.service
+          dpkg -L netwatch | grep -q '/man1/netwatch\.1'
+          sudo apt-get remove -y netwatch
+          test ! -e /usr/bin/netwatch
+
+  rpm:
+    needs: resolve
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - run: |
+          set -euo pipefail
+          rpm_version="${VERSION/-/\~}"
+          curl -fsSLO "https://github.com/${REPO}/releases/download/${TAG}/netwatch-${rpm_version}-1.x86_64.rpm"
+          dnf install -y "./netwatch-${rpm_version}-1.x86_64.rpm"
+          out=$(netwatch --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            { echo "::error::the .rpm installed '$out', not ${VERSION}"; exit 1; }
+          dnf remove -y netwatch
+
+  # The README's apt instructions, word for word.
+  apt-repo:
+    needs: resolve
+    if: needs.resolve.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - run: |
+          set -euo pipefail
+          curl -fsSL https://matthart1983.github.io/netwatch/apt/netwatch.gpg \
+            | sudo tee /usr/share/keyrings/netwatch.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/netwatch.gpg] \
+          https://matthart1983.github.io/netwatch/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/netwatch.list
+          sudo apt-get update && sudo apt-get install -y netwatch
+          out=$(netwatch --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            { echo "::error::apt installed '$out', not ${VERSION}"; exit 1; }
+
+  # COPR builds from source after the release workflow asks it to, which
+  # takes a while, so a version behind is a warning.
+  copr:
+    needs: resolve
+    if: needs.resolve.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - run: |
+          set -euo pipefail
+          dnf install -y dnf-plugins-core
+          dnf copr enable -y matthart1983/netwatch
+          dnf install -y netwatch
+          out=$(netwatch --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            echo "::warning::COPR installed '$out', not ${VERSION} yet"
+
+  # crates.io: `cargo install` builds from source against libpcap. A
+  # pre-release has to be asked for by exact version, as a user would.
+  cargo-install:
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq libpcap-dev
+          cargo install netwatch-tui --version "=${VERSION}" --locked --root "${RUNNER_TEMP}/ci"
+          out=$("${RUNNER_TEMP}/ci/bin/netwatch" --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            { echo "::error::cargo install built '$out', not ${VERSION}"; exit 1; }
+
+  # binstall reads [package.metadata.binstall] from the published crate and
+  # fetches the release tarball, so this checks those URLs resolve.
+  binstall:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-binstall
+      - run: |
+          set -euo pipefail
+          cargo binstall -y --root "${RUNNER_TEMP}/ci" "netwatch-tui@=${VERSION}"
+          out=$("${RUNNER_TEMP}/ci/bin/netwatch" --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            { echo "::error::binstall installed '$out', not ${VERSION}"; exit 1; }
+
+  # The image's own tag, and for a release, that :latest is the same version.
+  container:
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+    steps:
+      - run: |
+          set -euo pipefail
+          tags="${TAG}"
+          [ "${PRERELEASE}" = true ] || tags="${tags} latest"
+          for t in ${tags}; do
+            out=$(docker run --rm "ghcr.io/${REPO}:${t}" --version)
+            echo ":${t}: $out"
+            grep -qF "${VERSION}" <<< "$out" ||
+              { echo "::error::ghcr.io/${REPO}:${t} is '$out', not ${VERSION}"; exit 1; }
+          done
+
+  macos:
+    needs: resolve
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+    steps:
+      - name: Release tarball
+        run: |
+          set -euo pipefail
+          gh release download "${TAG}" -R "${REPO}" -p netwatch-macos-aarch64.tar.gz
+          tar xzf netwatch-macos-aarch64.tar.gz
+          out=$(./netwatch-macos-aarch64 --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            { echo "::error::the macOS tarball is '$out', not ${VERSION}"; exit 1; }
+      - name: Homebrew
+        if: env.PRERELEASE == 'false'
+        run: |
+          set -euo pipefail
+          brew install netwatch
+          out=$(netwatch --version)
+          echo "$out"
+          grep -qF "${VERSION}" <<< "$out" ||
+            echo "::warning::Homebrew installed '$out', not ${VERSION} yet"
+
+  windows:
+    needs: resolve
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+    steps:
+      # No Npcap on the runner, as on a new user's machine: --version still
+      # has to run.
+      - name: Release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download $env:TAG -R $env:REPO -p netwatch-windows-x86_64.exe.zip
+          Expand-Archive netwatch-windows-x86_64.exe.zip -DestinationPath zip
+          $out = & .\zip\netwatch-windows-x86_64.exe --version
+          Write-Output $out
+          if (-not ($out -like "*$env:VERSION*")) {
+            Write-Output "::error::the Windows zip is '$out', not $env:VERSION"
+            exit 1
+          }
+      - name: Scoop
+        if: env.PRERELEASE == 'false'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-RestMethod -Uri https://get.scoop.sh -OutFile install-scoop.ps1
+          .\install-scoop.ps1 -RunAsAdmin
+          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
+          scoop install netwatch
+          $out = & netwatch --version
+          Write-Output $out
+          if (-not ($out -like "*$env:VERSION*")) {
+            Write-Output "::warning::Scoop installed '$out', not $env:VERSION yet"
+          }

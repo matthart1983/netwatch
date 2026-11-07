@@ -2,12 +2,20 @@
 # Make a release commit and its tag, locally.
 #
 #   scripts/release.sh 0.32.4 "what this release is, for the commit subject"
+#   scripts/release.sh 1.0.0-rc.1 "a release candidate"
 #
 # Bumps Cargo.toml and Cargo.lock, the RPM spec's Version and %changelog, and
 # renames CHANGELOG.md's `## [Unreleased]` to `## [X.Y.Z] - <today>`. Then it
 # runs `cargo test`, commits "release: netwatch vX.Y.Z — <summary>" and makes
-# the annotated tag. It pushes nothing; the push commands are printed at the
-# end. The release workflow (scripts/release-guard.sh) refuses a tag that
+# the tag: signed (`git tag -s`) when git has a user.signingkey, annotated
+# otherwise. It pushes nothing; the push commands are printed at the end.
+#
+# A pre-release is X.Y.Z-alpha.N, -beta.N or -rc.N. It may follow anything
+# below X.Y.Z or an earlier pre-release of X.Y.Z, and X.Y.Z may follow it. The
+# RPM spec spells it X.Y.Z~rc.N, which RPM sorts below X.Y.Z, and keeps the
+# hyphenated spelling in `%global upstream` for the tag's source archive. The
+# release workflow marks a hyphenated tag as a GitHub pre-release and skips
+# the apt repository and COPR for it. The release workflow (scripts/release-guard.sh) refuses a tag that
 # disagrees with Cargo.toml or has no CHANGELOG heading, and waits for CI to
 # pass on the tagged commit.
 #
@@ -47,8 +55,36 @@ newer() {
     return 1
 }
 
-[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-    die "${VERSION} is not X.Y.Z (no leading v; pre-releases are tagged by hand)"
+# pre_rank LABEL: alpha < beta < rc.
+pre_rank() {
+    case "$1" in
+        alpha) echo 1 ;;
+        beta) echo 2 ;;
+        rc) echo 3 ;;
+    esac
+}
+
+# follows A B: may version A be released after version B? Either may carry a
+# pre-release suffix (-alpha.N, -beta.N, -rc.N).
+follows() {
+    local a_core="${1%%-*}" b_core="${2%%-*}"
+    local a_pre="${1#"${a_core}"}" b_pre="${2#"${b_core}"}"
+    a_pre="${a_pre#-}" b_pre="${b_pre#-}"
+    newer "${a_core}" "${b_core}" && return 0
+    [ "${a_core}" = "${b_core}" ] || return 1
+    # X.Y.Z itself is out, so nothing with its number follows it.
+    [ -n "${b_pre}" ] || return 1
+    # X.Y.Z follows any of its own pre-releases.
+    [ -n "${a_pre}" ] || return 0
+    local a_rank b_rank
+    a_rank=$(pre_rank "${a_pre%%.*}") b_rank=$(pre_rank "${b_pre%%.*}")
+    [ "${a_rank}" -gt "${b_rank}" ] && return 0
+    [ "${a_rank}" -lt "${b_rank}" ] && return 1
+    [ "${a_pre##*.}" -gt "${b_pre##*.}" ]
+}
+
+[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]] ||
+    die "${VERSION} is not X.Y.Z or X.Y.Z-rc.N (no leading v)"
 
 root=$(git rev-parse --show-toplevel)
 cd "${root}"
@@ -90,11 +126,8 @@ git rev-parse --quiet --verify "refs/tags/${TAG}" > /dev/null && die "${TAG} alr
 
 current=$(awk -F'"' '/^\[/ { pkg = ($0 == "[package]") } pkg && /^version *=/ { print $2; exit }' Cargo.toml)
 [ -n "${current}" ] || die "no version in Cargo.toml's [package]"
-# A pre-release (0.33.0-rc.1) may be followed by its own X.Y.Z.
-core="${current%%-*}"
-if ! newer "${VERSION}" "${core}" && ! { [ "${VERSION}" = "${core}" ] && [ "${current}" != "${core}" ]; }; then
+follows "${VERSION}" "${current}" ||
     die "${VERSION} is not above the current version, ${current}"
-fi
 
 grep -q "^## \[${VERSION}\]" CHANGELOG.md && die "CHANGELOG.md already has a ${VERSION} section"
 unreleased=$(awk '/^## \[Unreleased\][[:space:]]*$/ { on = 1; next }
@@ -112,13 +145,16 @@ echo "==> ${current} -> ${VERSION} on ${branch}"
 # Handed to awk through the environment: `awk -v` would read backslashes in
 # the summary as escapes.
 TODAY=$(date +%F)
-RPM_HEAD="* $(LC_ALL=C date '+%a %b %d %Y') ${name} <${email}> - ${VERSION}-1"
-export V="${VERSION}" SUMMARY TODAY RPM_HEAD
+# RPM allows no hyphen in a Version; a tilde sorts below the release.
+RPM_VERSION="${VERSION/-/\~}"
+RPM_HEAD="* $(LC_ALL=C date '+%a %b %d %Y') ${name} <${email}> - ${RPM_VERSION}-1"
+export V="${VERSION}" RPMV="${RPM_VERSION}" SUMMARY TODAY RPM_HEAD
 
 rewrite Cargo.toml '/^\[/ { pkg = ($0 == "[package]") }
     pkg && !done && /^version *=/ { $0 = "version = \"" ENVIRON["V"] "\""; done = 1 }
     { print }'
-rewrite "${SPEC}" '/^Version:/ { sub(/[^[:space:]]+$/, ENVIRON["V"]) }
+rewrite "${SPEC}" '/^Version:/ { sub(/[^[:space:]]+$/, ENVIRON["RPMV"]) }
+    /^%global upstream / { sub(/[^[:space:]]+$/, ENVIRON["V"]) }
     { print }
     /^%changelog/ { print ENVIRON["RPM_HEAD"]; print "- " ENVIRON["SUMMARY"]; print "" }'
 rewrite CHANGELOG.md '!done && /^## \[Unreleased\][[:space:]]*$/ {
@@ -136,7 +172,12 @@ cargo test ||
 
 git add Cargo.toml Cargo.lock "${SPEC}" CHANGELOG.md
 git commit --quiet -m "release: netwatch ${TAG} — ${SUMMARY}"
-git tag -a "${TAG}" -m "netwatch ${TAG}"
+if [ -n "$(git config user.signingkey)" ]; then
+    git tag -s "${TAG}" -m "netwatch ${TAG}"
+else
+    git tag -a "${TAG}" -m "netwatch ${TAG}"
+    echo "note: ${TAG} is not signed; set git's user.signingkey to sign release tags"
+fi
 
 echo
 echo "Committed and tagged ${TAG} locally. Nothing has been pushed."
