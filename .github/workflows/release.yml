@@ -585,9 +585,13 @@ jobs:
           context: packaging/docker
           platforms: linux/amd64,linux/arm64
           push: true
+          # `cond && x || y` is the expression language's only conditional,
+          # and it yields y whenever x is falsy. The old form put '' in x, so
+          # it always yielded :latest, and 1.0.0-rc.1 took :latest from
+          # 0.40.0. The non-empty value goes in x.
           tags: |
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
-            ${{ contains(env.RELEASE_TAG, '-') && '' || format('ghcr.io/{0}:latest', github.repository) }}
+            ${{ !contains(env.RELEASE_TAG, '-') && format('ghcr.io/{0}:latest', github.repository) || '' }}
 
       # The image's provenance, pushed to GHCR next to it. Verified with:
       #   gh attestation verify oci://ghcr.io/matthart1983/netwatch:vX.Y.Z -R matthart1983/netwatch

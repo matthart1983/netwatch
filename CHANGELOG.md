@@ -10,6 +10,10 @@ All notable changes to NetWatch will be documented in this file.
   while the release served `netwatch_1.0.0.rc.1-1_amd64.deb`, and `sha256sum -c` could not
   find the four packages. The release workflow renames them before the sums are taken.
   1.0.0-rc.1's `SHA256SUMS` was replaced with the corrected names; the hashes are unchanged.
+- **A pre-release no longer takes the container image's `:latest`.** The release workflow's
+  condition always added `:latest`, so 1.0.0-rc.1 replaced 0.40.0 there, and
+  `docker run ghcr.io/matthart1983/netwatch` pulled the candidate. `:latest` was put back on
+  0.40.0 by re-running 0.40.0's own container job.
 
 ## [1.0.0-rc.1] - 2026-11-07
 
