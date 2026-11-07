@@ -15,6 +15,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check documentation and wiki links
+        run: python3 scripts/wiki.py --check
+      - name: Test documentation checks
+        run: python3 -m unittest discover -s tests/docs -v
+      - name: Render release-baseline wiki without publishing
+        run: python3 scripts/wiki.py --output "${{ runner.temp }}/netwatch-wiki" --ref HEAD
+
   test:
     strategy:
       matrix:

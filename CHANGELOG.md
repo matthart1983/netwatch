@@ -39,6 +39,9 @@ All notable changes to NetWatch will be documented in this file.
   capabilities that let it name other users' processes.
 - The `.deb` stops the service when the package is removed, and a purge deletes
   `/var/cache/netwatch` and `/var/lib/netwatch`.
+- Reconcile documentation and the public wiki: correct privilege, sandbox, privacy,
+  attribution and platform guidance; maintain wiki sources in the repository with
+  deterministic rendering and link checks.
 
 ## [0.40.0] - 2026-11-04
 

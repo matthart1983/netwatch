@@ -1,5 +1,8 @@
 # Netwatch implementation progress
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](../index.md).
+
 Release update: PR01–PR05 core and the RTT timeline fixes shipped in **v0.31.0**
 (`805cf71`). CI passed on Linux, macOS and Windows. The dated entries below retain
 their original implementation-stage status; PR05 privileged/interactive acceptance

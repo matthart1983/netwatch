@@ -1,5 +1,8 @@
 **Netwatch Diagnose — implementation plan**
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](../index.md).
+
 Created 20 September 2026. Revised 20 September 2026 after verifying every finding against source. Status: DG00–DG09 implemented locally on 20 September 2026. What remains is listed under Remaining work.
 
 Base revision: `3fff5d9`, version 0.32.0. The originating review examined v0.32.0 at `36832dd`. Every defect below was re-checked against `3fff5d9` and carries a file:line reference; revalidate before editing, since line numbers move.

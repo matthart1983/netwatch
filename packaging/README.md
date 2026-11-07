@@ -95,5 +95,7 @@ installer script. The installer copies netwatch to `/usr/local/bin` and asks
 before it starts a daemon, which runs with the connection log on. Neither the
 binary nor the `.dmg` is signed or notarized.
 
-Full eBPF/PKTAP attribution on macOS requires root; without it the daemon falls
-back to lsof/ss-based attribution.
+macOS uses BPF capture and `lsof` observations; Linux eBPF does not run on macOS.
+PKTAP metadata does not establish verified socket ownership. macOS process
+identity remains unverified even with elevated capture access; see
+[attribution evidence](../docs/attribution.md).

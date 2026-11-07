@@ -1,5 +1,8 @@
 # netwatch 0.30 — screen design
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](index.md).
+
 Derived from the nine renders in `NetWatch btop redesign` (`renders/01-dashboard`
 … `09-egress`, 2026-09-04). Those renders are the authority for anything this
 document leaves ambiguous.

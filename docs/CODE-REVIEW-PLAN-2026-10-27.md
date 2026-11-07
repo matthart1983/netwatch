@@ -1,5 +1,8 @@
 # Netwatch code review remediation plan
 
+> Design/review record: this document can include proposals and revision-specific results.
+> For current user behavior, use the [documentation index](index.md).
+
 Date: 27 October 2026. Status on 31 October: every item is merged to main, not yet released. See [Progress](#progress-31-october-2026).
 
 Reviewed commit: `a268f30d24c9139b000c88bff46168526d3587e3` on `origin/main`, after 0.38.0. The checkout where this plan is saved is the older `feat/uptime` branch. Implement against current main after checking whether the findings have already been fixed.

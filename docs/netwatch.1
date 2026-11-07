@@ -1,4 +1,4 @@
-.TH NETWATCH 1 "2026-09-20" "netwatch" "User Commands"
+.TH NETWATCH 1 "2026-11-01" "netwatch" "User Commands"
 .SH NAME
 netwatch \- real-time network diagnostics in your terminal
 .SH SYNOPSIS
@@ -37,10 +37,9 @@ application-protocol decoding, process attribution where the platform allows
 it, interface and packet views, and a diagnostic engine that learns a baseline
 per network and opens an issue when that baseline breaks.
 .PP
-It runs with no configuration. Packet capture needs elevated access: run it
-with
-.BR sudo ,
-or grant the capabilities once (see
+It runs with no configuration. Packet capture needs platform-specific access. Use
+.B netwatch doctor
+to inspect setup, then configure restricted capture access (see
 .B PERMISSIONS
 below).
 .SH OPTIONS
