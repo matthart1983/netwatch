@@ -5,7 +5,7 @@ Offline training and evaluation for Diagnose. Nothing here ships to users.
 Features come from netwatch, never from this package:
 
 ```sh
-cargo run -- diagnose features --out ml/data/features.csv --schema ml/schema.json <episodes-dir>
+cargo run -- diagnose features --unstable --out ml/data/features.csv --schema ml/schema.json <episodes-dir>
 python3 -m unittest discover -s ml/tests
 ```
 

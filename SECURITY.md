@@ -22,13 +22,17 @@ advisory and release notes (or keep you anonymous, your call).
 
 ## Supported versions
 
-NetWatch is pre-1.0. Security fixes target the **latest release** only —
-please reproduce on the current version before reporting.
+Security fixes go into the **latest release**, so please reproduce on the current
+version before reporting. Upgrading within a major version is safe by
+[promise](STABILITY.md), which is why there are no fixes for older minors.
 
 | Version | Supported |
 |---|---|
 | latest release | ✅ |
+| last minor of the previous major | ✅ for 6 months after the new major ships |
 | anything older | ❌ upgrade first |
+
+There is no previous major yet. Until 1.0.0, only the latest release is supported.
 
 ## Scope — what we care about most
 

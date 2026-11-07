@@ -106,6 +106,7 @@ pub fn command(city: bool) -> Result<()> {
     // A config that does not load could be hiding `sandbox = "strict"`, so
     // this stops the same way a live session does.
     let config = NetwatchConfig::load()?;
+    crate::config::print_warnings(&config.load_warnings);
     let dir = downloaded_dir().context("cannot determine the cache directory")?;
     // A session takes database paths as text, so it could never open a file
     // saved here, and running this again would not help.

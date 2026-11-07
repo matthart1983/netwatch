@@ -1,3 +1,9 @@
+//! netwatch's internals, exposed so that its binary, examples and tests can reach
+//! them. **This is not a public API.** It can change in any release, whatever the
+//! version number suggests, and [STABILITY.md] doesn't cover it.
+//!
+//! [STABILITY.md]: https://github.com/matthart1983/netwatch/blob/main/STABILITY.md
+
 // Clippy lints deliberately allowed crate-wide. Each is a decision, not an
 // oversight — the alternative clippy suggests is worse for this codebase, and
 // leaving them as warnings meant the real signal was buried in noise nobody
@@ -31,6 +37,7 @@
 #![allow(clippy::vec_init_then_push)]
 
 pub mod app;
+pub mod atomic_file;
 pub mod cli;
 pub mod clipboard;
 pub mod collectors;
@@ -49,6 +56,7 @@ pub mod platform;
 pub mod remote;
 pub mod runtime;
 pub mod sandbox;
+pub mod schemas;
 pub mod sort;
 pub mod state;
 pub mod theme;

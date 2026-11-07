@@ -6,7 +6,9 @@ of this implementation.
 
 ## Developer targets
 
-Add targets to netwatch's `config.toml`; reload with **r** in TUI coverage or restart:
+Add targets to netwatch's `config.toml`; reload with **r** in TUI coverage or restart.
+A file from `--generate-config` before 0.40 has a `diagnose_targets = []` line. Delete
+it first: TOML does not allow that and `[[diagnose_targets]]` in one file.
 
 ```toml
 diagnose_record_episodes = true
@@ -95,7 +97,7 @@ CLI equivalents:
 
 ```sh
 netwatch diagnose episodes
-netwatch diagnose replay /path/to/episode.json.gz
+netwatch diagnose replay --unstable /path/to/episode.json.gz
 netwatch diagnose export --since 7d --dry-run
 netwatch diagnose export --since 7d --out /path/to/bundle.json.gz
 ```
@@ -126,7 +128,7 @@ part of the interface:
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | completed, no issue — the rules that could be evaluated did not fire |
+| 0 | completed, and no issue counted; a beta rule's issue can still be listed |
 | 1 | completed, at least one open issue |
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |
@@ -171,6 +173,11 @@ only, `observations` holds the rest, and each finding carries a `kind` of
 or `not_run`, and a `why_not` when it did not run. Schema 1 listed
 observations under `issues` and wrote `passed` (`true`, `false` or `null`) on
 each check; recordings that carry `passed` still load.
+[`schemas/diagnose-run.v2.schema.json`](../schemas/diagnose-run.v2.schema.json)
+describes the output, and [JSON schemas](REFERENCE.md#json-schemas) has the
+rules it follows. `diagnose export` has
+[its own](../schemas/diagnose-export.v1.schema.json), which covers the bundle
+and not the recordings in it.
 
 ## Thresholds
 
@@ -210,9 +217,9 @@ recorded episode keeps the thresholds it ran with, so a replay judges it by the
 same numbers. An episode recorded before a threshold existed replays with that
 threshold's default: one from before 0.34 is judged against the σ and delta
 floors and the 2σ close line it ran without.
-`--generate-config` and the Settings editor's save write the table only once it
-differs from the defaults. Then they write every key, and a key in the file
-keeps its value when a later release retunes that default.
+`--generate-config` leaves the table out, and nothing else in netwatch changes a
+threshold, so a key you did not set follows the default when a later release
+retunes it. A key you set keeps its value.
 
 Every σ is floored before it is used. A resolver that answers from cache in
 1.2 ms, give or take 0.05 ms, is judged as if σ were 0.5 ms, so 3σ is 2.7 ms
@@ -487,8 +494,8 @@ recording. A `lab` row keeps the frames the health lab recorded, and only its
 decisions are derived again.
 
 ```sh
-netwatch diagnose corpus              # regenerate after an intended semantic change
-netwatch diagnose corpus --only ID    # one manifest row
+netwatch diagnose corpus --unstable              # regenerate after an intended semantic change
+netwatch diagnose corpus --unstable --only ID    # one manifest row
 ```
 
 A diff there is a change in what netwatch concludes, and belongs in the same

@@ -53,7 +53,7 @@ fn main() -> Result<()> {
         std::fs::create_dir_all(&p)?;
         std::env::set_var(key, p);
     }
-    let cfg = NetwatchConfig {
+    let mut cfg = NetwatchConfig {
         insights_enabled: false,
         diagnose_record_episodes: true,
         ..Default::default()

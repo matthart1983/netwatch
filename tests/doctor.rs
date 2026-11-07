@@ -115,6 +115,97 @@ fn malformed_config_is_reported_without_echoing_secrets() {
     assert!(detail.contains(&path.display().to_string()), "{detail}");
     assert!(detail.contains("line 1, column 11"), "{detail}");
 }
+/// Doctor is where someone goes to ask what is wrong with their setup. It stays
+/// read-only, names the keys and the files, and leaves out the values.
+#[test]
+fn unknown_keys_degrade_config_and_are_named_without_their_values() {
+    use netwatch::runtime::capabilities::{CapabilitySnapshot, State};
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let config = fixture.0.join("config/netwatch/config.toml");
+    let raw = "sandbox_mode = 'value-sentinel'\n[alerts]\ntypo = 'value-sentinel'\n";
+    fs::write(&config, raw).unwrap();
+    let policy = fixture.0.join("config/netwatch/egress-policy.toml");
+    fs::write(&policy, "stirct = 'value-sentinel'\n").unwrap();
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty(), "the report is where it goes");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("value-sentinel"), "{text}");
+    let snapshot: CapabilitySnapshot = serde_json::from_str(&text).unwrap();
+    let row = snapshot.get("config");
+    assert_eq!(row.state, State::Degraded);
+    assert_eq!(row.reason, "config_unknown_keys");
+    for needle in [
+        config.display().to_string(),
+        policy.display().to_string(),
+        "unknown key sandbox_mode".into(),
+        "unknown key alerts.typo".into(),
+        "unknown key stirct".into(),
+    ] {
+        assert!(row.detail.contains(&needle), "{needle}: {}", row.detail);
+    }
+    assert_eq!(fs::read_to_string(&config).unwrap(), raw);
+    let next = row.next_check.as_deref().unwrap();
+    assert!(
+        next.contains("config.toml") && next.contains("egress-policy.toml"),
+        "{next}"
+    );
+
+    // A key under `[experimental]` is listed, and is no reason to call it degraded.
+    fs::write(&config, "[experimental]\nsomething = 'value-sentinel'\n").unwrap();
+    fs::remove_file(&policy).unwrap();
+    let output = fixture
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
+    let row = snapshot.get("config");
+    assert_eq!(row.state, State::Ready, "{}", row.detail);
+    assert_eq!(row.reason, "config_valid");
+    assert!(
+        row.detail.contains("experimental.something"),
+        "{}",
+        row.detail
+    );
+    assert!(!row.detail.contains("value-sentinel"), "{}", row.detail);
+    fs::write(&policy, "stirct = true\n").unwrap();
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // A policy on its own, with no config.toml, is reported as well.
+    fs::remove_file(&config).unwrap();
+    let output = fixture
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(snapshot.get("config").reason, "config_unknown_keys");
+    // And it names that file. Only that one needs looking at.
+    let next = snapshot.get("config").next_check.clone().unwrap();
+    assert!(next.contains("egress-policy.toml"), "{next}");
+    assert!(!next.contains("config.toml"), "{next}");
+
+    // Only the config, the other way round.
+    fs::remove_file(&policy).unwrap();
+    fs::write(&config, "typo = 1\n").unwrap();
+    let output = fixture
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let snapshot: CapabilitySnapshot = serde_json::from_slice(&output.stdout).unwrap();
+    let next = snapshot.get("config").next_check.clone().unwrap();
+    assert!(next.contains("config.toml"), "{next}");
+    assert!(!next.contains("egress-policy.toml"), "{next}");
+}
 /// A database that does not open used to look the same as no database at all,
 /// and doctor reports it without opening any connection to find out.
 #[test]

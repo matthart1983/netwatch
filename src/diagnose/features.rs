@@ -733,7 +733,8 @@ pub fn schema_json() -> serde_json::Value {
     })
 }
 
-/// `netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...`
+/// `netwatch diagnose features --unstable [--out FILE] [--schema FILE] <FILE|DIR>...`,
+/// with `--unstable` checked and removed by [`super::episode::command`].
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -943,7 +944,7 @@ mod tests {
         assert_eq!(
             committed,
             schema_json(),
-            "run: cargo run -- diagnose features --schema ml/schema.json"
+            "run: cargo run -- diagnose features --unstable --schema ml/schema.json"
         );
     }
 

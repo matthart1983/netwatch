@@ -46,6 +46,14 @@ impl WorkerHandle {
         let handle = self.0.lock().unwrap().take();
         handle.map_or(Ok(()), |h| h.join())
     }
+    /// Leave this worker out of the session's shutdown wait, for one with
+    /// nothing to finish.
+    pub fn not_waited_for(self) {
+        HANDLES
+            .lock()
+            .unwrap()
+            .retain(|slot| !Arc::ptr_eq(slot, &self.0));
+    }
 }
 pub fn stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
@@ -84,12 +92,29 @@ pub fn shutdown(timeout: Duration) -> usize {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+/// The workers [`shutdown`] is still waiting for, by thread name.
+fn unfinished() -> Vec<String> {
+    HANDLES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|slot| {
+            let handle = slot.lock().unwrap();
+            let name = handle.as_ref()?.thread().name()?.to_string();
+            Some(name)
+        })
+        .collect()
+}
 pub struct SessionGuard;
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         let remaining = shutdown(Duration::from_secs(2));
         if remaining != 0 {
-            tracing::warn!(remaining, "workers still unwinding after shutdown deadline");
+            tracing::warn!(
+                remaining,
+                workers = ?unfinished(),
+                "workers still unwinding after shutdown deadline"
+            );
         }
     }
 }

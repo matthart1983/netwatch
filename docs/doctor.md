@@ -29,6 +29,12 @@ On Windows the `capture_library` entry's reason says which of these it found:
 Before 0.38, every Windows host with a `wpcap.dll` reported `not_checked`
 with `npcap_present_unloaded`, including the two `unavailable` cases above.
 
+A key `config.toml` or `egress-policy.toml` sets that netwatch does not read makes
+`config` `degraded`, with reason `config_unknown_keys`. Its detail names each key and
+its file, never a value, and live sessions start as usual. A key under a name it used
+to have still works, so `config` stays `ready`, with reason `config_renamed_keys` and a
+detail giving the new name.
+
 Missing or malformed configuration is reported explicitly; malformed content and
 configured endpoint credentials are not echoed. A configuration file that cannot
 be read or parsed makes `config` `unavailable`, with reason `config_unreadable` or
@@ -169,8 +175,10 @@ this build rather than a session you already have.
 
 ## Output contract
 
-JSON uses `schema_version: 1`, a `scope` (`static` or `capture_check`), `platform`,
-selected `interface`, `capabilities`, `protections` and `network_restricted`.
+[`schemas/doctor.v1.schema.json`](../schemas/doctor.v1.schema.json) describes the JSON, and
+[JSON schemas](REFERENCE.md#json-schemas) has the rules it follows. JSON uses a `metadata` block
+naming that schema, `schema_version: 1`, a `scope` (`static` or `capture_check`), `platform`,
+selected `interface` (null when there is none), `capabilities`, `protections` and `network_restricted`, which is deprecated.
 The additive `attribution_coverage` field is null in doctor reports; only runtime
 snapshots contain observed coverage. See [attribution evidence](attribution.md).
 The additive `landlock` and `tasks_holding_net_raw` fields are described under
@@ -193,7 +201,11 @@ update` saved), is not a MaxMind database, or has a build date out of range. Wit
 (`not_configured`), and `next_check` suggests `netwatch geoip update`. When
 lookups answer with DB-IP's data, judged by each file's own `database_type`, the
 `detail` starts with `IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0`. A
-live session reports what it opened at startup. States are `ready`, `not_checked`,
+live session reports what it opened at startup. `resolver_store` appears on Linux
+only when the kernel refuses this user the root-owned
+[resolver store](resolver-adapter.md#authority-lease-and-recovery). It is `not_checked`
+(`authority_store_unreadable`), since whether the store holds an unresolved change
+is unknown, and `next_check` is `sudo netwatch resolver status`. States are `ready`, `not_checked`,
 `unavailable`, `disabled`, `degraded` and `stale`. Consumers should tolerate new
 capabilities and reason codes. A report is a point-in-time observation.
 

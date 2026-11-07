@@ -1,4 +1,4 @@
-"""Read a features CSV written by `netwatch diagnose features`.
+"""Read a features CSV written by `netwatch diagnose features --unstable`.
 
 The CSV and its schema.json come from the same netwatch build. Nothing here
 computes a feature: if a column is wrong, fix it in src/diagnose/features.rs

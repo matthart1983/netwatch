@@ -4,16 +4,256 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **A flow log for the daemon (experimental).** `netwatch daemon --flow-log file|stdout|both`, or
+  `[experimental] flow_log` in `config.toml`, writes an NDJSON line when a connection appears
+  and when it closes: process, pid, local and remote address, and on close the duration, the
+  SNI or HTTP `Host`, reverse DNS, ASN, country and approximate bytes. Files are daily,
+  0600, under `<cache>/netwatch/flows/`, and kept for `flow_log_keep_days` (14). It is built
+  from the polled connection table, so a connection shorter than one poll is not seen.
+  `schemas/flow.v0.schema.json` describes the lines. `--flow-log-dir` or `flow_log_dir`
+  moves the files, to `/var/log/netwatch` say, with a sandbox write grant of its own.
+  See REFERENCE, Flow log.
+- **eBPF in the flow log.** Where the connect probes load, each `connect()` gets a
+  `connect` line with its pid, process name and destination, including connections shorter
+  than a poll, and a flow polling left ownerless takes the process when one process alone
+  connected to that destination. The file header's `_meta.sources` says whether eBPF is active.
+  A `connect` line waits up to two ticks for the captured stream it started and takes that
+  stream's source port and SNI, so a connection shorter than a poll still says where it went
+  by name. `"ech": true` marks a name Encrypted ClientHello replaced.
+- **DNS in the flow log.** A `dns` line per exchange seen in capture: process, client and
+  resolver, name, type, response code, latency, addresses and CNAMEs. The answers give
+  `connect`, `open` and `close` a `dns_name` for their destination. The DNS decoder now reads
+  answer records (A, AAAA, CNAME, compressed names, bounded).
+- One UDP `connect()` is one `connect` line: the copies the wrapper and inner datagram probes
+  both report are dropped, and `ts` comes from the kernel's clock.
+- `scripts/build-dmg.sh` builds an unsigned Apple Silicon `.dmg`: the binary, and an installer
+  that copies it to `/usr/local/bin` and, if you say yes, runs the daemon at boot with the flow
+  log in `/var/log/netwatch`. Releases do not publish it yet.
+
 ### Fixed
+- **The packaged systemd unit starts under a service user with no home.** It exited with
+  EACCES while preparing `~/.config` and `~/.local/state`; `HOME` and `XDG_*` now point at
+  systemd-managed directories (0700), and `/etc/netwatch/agent.env` is optional. The flow log
+  stays off in the unit; packaging/README.md shows the drop-in that turns it on, and the two
+  capabilities that let it name other users' processes.
+- The `.deb` stops the service when the package is removed, and a purge deletes
+  `/var/cache/netwatch` and `/var/lib/netwatch`.
 - Reconcile documentation and the public wiki: correct privilege, sandbox, privacy,
   attribution and platform guidance; maintain wiki sources in the repository with
   deterministic rendering and link checks.
+
+## [0.40.0] - 2026-11-04
+
+### Migration
+- **Add `--unstable` to `diagnose replay`, `diagnose features` and `diagnose corpus`.**
+  `netwatch diagnose replay FILE` becomes `netwatch diagnose replay --unstable FILE`,
+  and likewise `features` and `corpus`. A script that does not gets exit 3. The flag
+  goes after the subcommand, in any position among its arguments.
+- **Move `--api-key KEY` to `NETWATCH_API_KEY=KEY`.** Nothing stops working, but the
+  flag now warns on stderr, so a wrapper that treats stderr output as failure sees it.
+  The units in `packaging/` already use the variable.
+- **Delete `config.toml` before `--generate-config` if you want to start again.** It used
+  to overwrite the file with the defaults. It now adds the keys the file lacks and keeps
+  what it has, so it no longer resets anything.
+- **Delete `diagnose_targets = []` from a generated file before adding a target.** Older
+  releases wrote that line, and TOML does not allow it and `[[diagnose_targets]]` together.
+- **Fix or remove any key netwatch now warns about.** The setting never did anything. A
+  wrapper that treats stderr output as failure will see the warning.
+- **If you parse the JSON in PCAPNG packet comments, check `schema`.** REFERENCE used to
+  promise this layout as stable, and `netwatch.annotation.v1` is now experimental. Its
+  keys can change in any release, and a key removed, renamed or changing meaning still
+  gets a new schema name.
+- **Egress export consumers: read `sni`, not `proto`, to tell whether a flow has a
+  name.** A cleartext HTTP flow with a `Host` now says `"proto": "other"` where it
+  said `"tls"`, and keeps its name in `sni`.
+- **`doctor --json` consumers: test `interface` for null, not for an empty string.**
+  A capture check that selected no interface wrote `""` and now writes `null`.
+
+### Added
+- **`STABILITY.md` says what 1.0 promises.** Subcommands, long flags, `config.toml`
+  and `egress-policy.toml` keys, the versioned JSON outputs, `diagnose run` exit
+  codes and metric names won't break without a 2.0, and it lists what stays
+  experimental or isn't covered. `tests/stability.rs` fails if a stable key, flag
+  or metric name is removed or renamed. `SECURITY.md` now gives a support window,
+  and the library is declared internal.
+- **Each stable JSON output has a published JSON Schema, and names it in a
+  `metadata` block.** `schemas/` holds one file for `diagnose run --format json`,
+  `doctor --json`, the egress NDJSON export, `diagnose export` and `uptime --json`,
+  and the tests validate what the real code writes against them, including a
+  degraded doctor run and a `diagnose run` with a finding. The five outputs had
+  four ways of saying what they were. Each now also has
+  `metadata.schema`, `schema_version`, `schema_url` and `netwatch_version`, at the
+  top level or on the first line of the NDJSON, and the old markers stay. The
+  schemas leave every object open, because a minor can add fields. They say which
+  value sets are closed and which can grow, and mark the fields a script should not
+  rely on as `deprecated`, such as doctor's `network_restricted`, which is always
+  false. Those stay until a major version. docs/REFERENCE.md has the rules. The
+  egress export stays `netwatch.egress.v1.1`: as with the other outputs, an added
+  field does not change its tag, and only a break does.
+  `uptime --csv` needs no version marker: its header row is the contract, so
+  columns are not renamed or removed, and new ones are added at the end.
+- **A key netwatch does not read now warns, naming the key and the file.** serde
+  ignored them without a word. `sandbox_mode = "strict"` left the sandbox best-effort
+  with nothing to say the setting had no effect, and `allow_snis = [...]` in
+  `egress-policy.toml` left a rule with no restriction by name, because an empty list
+  means unrestricted. Both files now report such keys at any depth, such as
+  `alerts.typo` or `process.curl.allow_snis`, and never the value. netwatch still
+  starts. A session prints `warning: <file>: unknown key <key> is ignored` on stderr
+  before it starts and writes it to the log. A service manager keeps that line, and
+  the terminal shows it again when the TUI quits. The TUI also says so on its bottom
+  row for its first 30 seconds, in every view, and Settings keeps the list. The Egress
+  tab counts the policy's, and stops calling the policy `all precise`. `diagnose run`,
+  `diagnose coverage` and `geoip update` print the same line on stderr. `doctor`
+  reports `config` as `degraded`, reason `config_unknown_keys`, which is additive in
+  its JSON. This adds the serde_ignored crate, which reports what the deserializer
+  skipped. A list of known keys kept by hand would drift from the structs.
+- **A key in `config.toml` or `egress-policy.toml` that gets renamed keeps working,
+  with a warning.** Nothing has been renamed so far, so this changes nothing today.
+  The one key to go, `geoip_online`, was removed, and `auto_close_secs` was a field of
+  recorded episodes and never a config key. After 1.0 a rename is one line in a table.
+  netwatch reads the old name as the new one, warns `<old> was renamed <new> in
+  <release>` wherever an unknown key warns, and a save writes the new name. If a file
+  sets both, the new name wins and the warning says the old one is ignored. `doctor`
+  keeps `config` `ready` for a renamed key, with reason `config_renamed_keys`, because
+  the setting is still in force.
+- **An `[experimental]` table in `config.toml`, for settings that can still change.**
+  A key in it is outside the 1.0 compatibility promise and can change or go away in any
+  release. Nothing is in it yet, so it has no settings and this is only the place for
+  them. A key in it this version does not read does not warn as unknown. It gets a
+  `note:` line on stderr, `doctor` lists it and leaves `config` `ready`, Settings lists
+  it, and the TUI's bottom row says nothing. A save keeps the table, and
+  `--generate-config` does not write an empty one.
+
+### Changed
+- **`diagnose replay`, `diagnose features` and `diagnose corpus` now need
+  `--unstable`.** They read and write the episode, feature and corpus formats, which
+  are experimental and can change in any release, and nothing said so to someone
+  scripting against them. Without the flag each prints an error naming it and exits 3,
+  the status `diagnose run` documents for bad arguments, before reading or writing
+  anything. With it they behave as before, including exit 1 for their other errors.
+  `--unstable` gates only these three. `diagnose run`, `coverage`, `episodes` and
+  `export` are unchanged, as are AI Insights, `--remote` and the resolver commands,
+  which are opt-in already.
+- **`--api-key` prints a deprecation warning.** It has been discouraged because any
+  user on the host can read the key with `ps`. It now says so on stderr and in the log,
+  and points at `NETWATCH_API_KEY`. It stays accepted through 1.x and goes in 2.0, and the
+  warning does not include the key.
+- **AI Insights, `--remote`, `--api-key`, `resolver set` and `recover`, and the JSON in
+  PCAPNG packet comments are labelled experimental.** They can change in any release, and
+  are outside the 1.0 compatibility promise. `--remote`, `--insecure-remote`, `--api-key`
+  and their environment variables stay accepted through 1.x, so a unit file keeps
+  starting, and what they do is experimental. Nothing about how these work changes, and
+  none is gated. `--help`, the man page, docs/REFERENCE.md,
+  docs/CAPABILITIES.md and the README now say so, and Settings says so under the AI
+  rows while one is selected. The running UI has no other new label. REFERENCE used to
+  call the whole export layout stable. PCAP and PCAPNG are still the standard formats,
+  and `netwatch.annotation.v1` still gets a new schema name if a key is removed, renamed
+  or changes meaning, but the comments' keys no longer carry a compatibility promise.
+- **The notice for a resolver change left by 0.30 now names the file and says how
+  to put it back.** Netwatch 0.30 recorded live resolver changes in `applied.json`.
+  Since 0.31.1 nothing has restored an entry left open there, because nothing proves
+  who wrote the file. Diagnose said `automatic rollback disabled` and gave the backup,
+  but not the changed file or the next step, and nothing said that removing the journal
+  is what clears the notice. It now says all three. The steps are in [the recovery document](docs/recovery-store.md#legacy-journal):
+  compare `/etc/resolv.conf` with the text the entry says netwatch wrote, copy the backup
+  back as root only if they match, then remove `applied.json`, which is what clears the
+  notice. A backup file alone proves nothing, since no release removes them, so a session
+  that quit cleanly leaves one too. This only reaches someone whose 0.30
+  session was killed with a change in place. `netwatch resolver recover` restores what an
+  interrupted `netwatch resolver set` left, and tests now hold that to a journal and backup
+  a real 0.31.1 wrote.
+- **`netwatch resolver status` and `recover` no longer read as all clear when a 0.30
+  journal has an entry open.** On that host `recover` said `Recovered 0 resolver
+  operations` and `status` said `No resolver authority journal`, with `/etc/resolv.conf`
+  possibly still changed. Both now print the same notice, naming the file and the
+  backup, on Linux. They restore nothing from the journal. `recover`'s exit status stays
+  as it was and does not depend on the journal: 0 when no unresolved record is left in
+  its own store, 1 otherwise. A file a user can write must not be able to fail a root
+  command, so read the output, not just the exit status.
+- **A 0.30 journal entry marked `abandoned` now gets the notice too.** 0.30 and 0.31.0
+  wrote that state when a rollback gave up, either because the backup was missing, which
+  left the file as netwatch set it, or because the file had been edited since. Those
+  entries said nothing, so the resolver could still hold netwatch's change with `recover`
+  saying `Recovered 0`. The journal does not record which it was, so this notice says that
+  and does not offer the backup as the way back. If you have one, the notice stays until
+  you remove `applied.json`.
+- **The egress export says `"proto": "tls"` only when a ClientHello named the
+  destination.** It said `tls` for anything with a name, and a cleartext HTTP
+  `Host` fills the same field as an SNI, so a plaintext HTTP flow exported as TLS
+  to anyone filtering on `proto`. Such a flow now says `other`, which is what the
+  field was documented to do, and a destination that has seen both stays `other`.
+  A destination in a baseline saved before this keeps saying `tls` until a
+  cleartext flow to it is seen again.
+- **`doctor --json` says `"interface": null` when a capture check selects
+  nothing.** With no `--interface` given and no interface up, or on Windows with no
+  Npcap, it wrote `"interface": ""`, which reads as a name. It now writes the null
+  it writes everywhere else there is no interface.
+
+### Removed
+- **The rollback for the 0.30 resolver journal.** Nothing has called it since 0.31.1,
+  and the code that wrote the journal went in 0.33. That leaves netwatch reading
+  `applied.json` and never writing it or opening a path it names. The notices about
+  an unreadable journal no longer say `host changes blocked`, since no host change
+  was waiting on them. No behaviour changes beyond that wording.
+
+### Fixed
+- **`q` gives your shell back at once.** The screen cleared straight away, but the
+  process stayed for one refresh tick, 1 second by default and up to 2 with a slower
+  `refresh_rate_ms`, with no prompt showing. Keys typed in that time could vanish,
+  because netwatch was still reading them. It now exits in about 50 ms, and a health probe to
+  a network that isn't answering no longer holds the exit either. The warning about
+  workers still running at the shutdown limit now reaches the log and names them.
 - **Graphs are readable on the default theme.** `dark` drew upload from
   `rgb(0, 0, 170)`, which is at best 1.6:1 on a dark terminal, so the lower half of
   every throughput graph all but vanished. A graph's colours now hold at least 4:1
   from its baseline up to the series colour, on every theme that sets its own
   colours. That makes the quiet part of the graph brighter on all of them, and
   download and sparklines too.
+- **A save writes only what the session changed.** Settings and the Diagnose target
+  toggle rewrote the whole file from the session's copy. A key netwatch does not read
+  went, with the warning about it and every comment in the file. So did a hand edit made
+  while netwatch ran, which is how `sandbox = "strict"` could go back to `on` when a
+  session saved a theme. `refresh_rate_ms = 50` became 100 and `view = "future_view"`
+  became `full` on an unrelated save. Every save also wrote every default, growing a
+  one-line file to 49 lines and holding today's defaults there when a release changed
+  one. Now a save compares the session's values with what it loaded and changes those
+  keys in the file, keeping the line's comment. Everything else stays as the file has it.
+  If you and the session changed the same key, the session's value wins for that key
+  alone. A target is found by `name`, so entries reordered by hand keep their own
+  comments and keys, a target added by hand survives, and `d` changes only that target's
+  `enabled`. `d` on a target the file no longer has fails and leaves the file. `--view`
+  is for one run, and a save no longer makes it the default. With nothing to write, the
+  file is not touched. A save that does write drops a byte-order mark and ends every line
+  in LF. Removing `geoip_online` also removes a comment directly above it. If the result
+  would not read back as the file plus those changes, the save fails and the file stays.
+- **A save that cannot finish keeps the old file.** `config.toml` and `egress-policy.toml`
+  were truncated and then written, so a full disk could leave half a file. A config cut
+  off at `view = "ful` then stopped netwatch starting, and a lost policy silences every
+  rule. The new contents now go to a temporary file beside the old one, are synced and are
+  renamed over it. The file keeps its mode, a symlink stays and its target is what changes,
+  and a file you made read-only stays refused. Where a rename cannot work, in a directory
+  you cannot create files in or on a file bind-mounted on its own, netwatch still writes in
+  place, as before. The learned egress baseline is written the same way.
+- **A warning that cannot be printed no longer changes how `diagnose run` ends.** With
+  stderr on a full disk or a closed pipe, printing panicked, so `diagnose run --format json`
+  exited 101 with no report, which is not one of its statuses. A failed write to stderr or
+  to its report on stdout now changes nothing, and it exits 0, 1, 2 or 3. The same goes for
+  the config warnings, `--api-key`'s, and the error from a missing `--unstable`.
+- **A failed save in Settings stays on screen.** Its status was the last row of the
+  popup's list, so a short terminal cut it off, and with eight unknown keys at 120 columns
+  it needed 44 rows. It now has a row of its own above the footer, at any height the popup
+  opens at, and `✗ Save failed` is in the error colour, not the success one.
+- **`--generate-config` adds what a file lacks, and no longer resets it.** It is the one
+  thing that writes defaults. A new file gets every key. A file that exists gains the
+  keys it lacks and keeps what it has, values included. It no longer writes
+  `diagnose_targets = []`, which made the `[[diagnose_targets]]` docs/DIAGNOSE.md says to
+  append a TOML error, so the file then failed to load with `config_invalid`.
+- **Promoting a process in the Egress tab keeps the rest of its rule.** Promotion
+  rebuilt `[process.<name>]` from the four allow lists and `block`, so any other key in the
+  rule was lost, with the comments in it and directly above it, and for the file's first
+  rule, the file's header. They all stay now. A list that gains an entry is rewritten on one
+  line, so a comment inside that list goes, and its line's own comment stays.
 - **`mise use aqua:matthart1983/netwatch` installs on Linux again.** Since 0.31.1
   the plain Linux asset has been the static binary, and the `-static` name went
   away, but aqua's registry, which mise reads, still asked for it. Every release
@@ -34,6 +274,41 @@ All notable changes to NetWatch will be documented in this file.
   across TLS records, or whose segments arrive out of order, is still not
   reassembled. A ClientHello over 4 KiB in one offloaded frame no longer fails
   either.
+- **An ordinary user's Diagnose no longer reports an error for a resolver store only
+  root can read.** One `sudo netwatch resolver set` or `recover` leaves
+  `/var/lib/netwatch` private to root. Every later TUI or daemon session that was not
+  root then showed `resolver authority journal cannot be inspected: Permission denied`
+  on the Diagnose status line and in the log, in place of the status it would have shown.
+  It did this even when every record there was resolved, and that user could do nothing
+  to clear it. Such a session cannot tell resolved from unresolved, so it now leaves the
+  status line alone and logs one line at startup saying the store exists, this user cannot
+  read it, and to run `sudo netwatch resolver status`. `netwatch doctor` reports the same
+  as a new `resolver_store` capability. Root sessions still report unresolved records, and
+  any other failure to read the store is still reported to everyone.
+- **`netwatch resolver set` no longer leaves the resolver changed when its stdout is
+  closed or full.** The line announcing the change was the first write after making it,
+  so `sudo netwatch resolver set ... | head -0` or `> /dev/full` panicked there and exited
+  101 with the change in place and its record `applied`, until someone ran `recover`.
+  Since 0.31.1. Every line `status`, `set` and `recover` print now ignores a failed
+  write: `set` still restores at its deadline, and the exit status and any error on stderr
+  are the same as with a working stdout.
+- **A corrupt resolver store no longer shows a green check in Diagnose.** The status line
+  picks its mark from the words in the text, and `resolver authority journal cannot be
+  inspected: expected value at line 1 column 1` has none it warns on, so a root session
+  drew it with `✓`. Since 0.31.1. Every recovery notice is now drawn with `!`, whatever
+  it says. Some that mentioned an OS error used to get `✕`, and now get `!` too.
+- **A FIFO or a huge file in the cache no longer stops a session starting.** A FIFO at
+  `applied.json` or `baselines.json` blocked the daemon before its first log line and left
+  a TUI on the alternate screen ignoring Ctrl-C and `q`, and a symlink to `/dev/zero` read
+  until memory ran out. Any confined thread but capture can write the cache, so a
+  compromised parser could plant one for the next start. Sessions now read these two only
+  as regular files under a size limit, without following a symlink at that name. A bad
+  `applied.json` gets the usual notice, with `cannot read journal`, and bad baselines start
+  afresh. `applied.json` must also be this user's own, and baselines need not be, since a
+  `sudo` that keeps HOME leaves them root's.
+- **The same goes for `config.toml`, `egress-policy.toml` and `egress-profiles.json`.**
+  Each is now read only as a regular file under a size limit. `config.toml` and the
+  policy can still be symlinks. A policy netwatch can't read logs a warning.
 
 ### Dependencies
 - **`unicode-width` is pinned to 0.2.2.** 0.2.3 counts a halfwidth katakana sound

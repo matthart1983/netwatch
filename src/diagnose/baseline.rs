@@ -40,6 +40,9 @@ pub const DEFAULT_MIN_SAMPLES: u32 = 60;
 /// as observation time.
 pub const MAX_STEP_SECS: f64 = 60.0;
 
+/// Far over what baselines reach: a host's is a few KiB per network.
+const MAX_PERSISTED_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Step assumed when a baseline has no previous timestamp (first update after
 /// migrating a v1 file). Matches the default probe cadence.
 pub const NOMINAL_STEP_SECS: f64 = 5.0;
@@ -557,7 +560,9 @@ impl BaselineStore {
 
     pub fn load(path: &Path, current: NetworkFingerprint) -> Self {
         let mut store = Self::new(current);
-        let Ok(text) = std::fs::read_to_string(path) else {
+        // No ownership check: a sudo that keeps HOME leaves this file root's, and
+        // the same user's next session should not lose what was learned.
+        let Ok(text) = crate::owner_only::read_saved(path, MAX_PERSISTED_BYTES) else {
             return store;
         };
         match serde_json::from_str::<Persisted>(&text) {
@@ -1125,5 +1130,40 @@ mod tests {
         let back = BaselineStore::from_snapshot(&serde_json::from_str(&json).unwrap());
         assert!(s.get("r", "m").is_some());
         assert_eq!(back.get("r", "m"), s.get("r", "m"));
+    }
+
+    /// A confined thread can write the cache, and this read comes before the
+    /// session can do anything else. Whatever is at the path, it starts afresh.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_oversize_file_of_baselines_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("netwatch-baselines-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = dir.join("fifo.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sent.send(BaselineStore::load(&fifo, office()).networks.len()));
+        assert_eq!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("reading the baselines blocked"),
+            0
+        );
+
+        // A valid store that only a read with no limit would get to the end of.
+        let mut store = BaselineStore::new(office());
+        store.seed("r", "m", 5.0, 1.0, 500);
+        let saved = dir.join("saved.json");
+        store.save(&saved).unwrap();
+        let text = std::fs::read_to_string(&saved).unwrap();
+        assert_eq!(BaselineStore::load(&saved, office()).networks.len(), 1);
+        let padded = " ".repeat(MAX_PERSISTED_BYTES as usize) + &text;
+        std::fs::write(&saved, padded).unwrap();
+        assert_eq!(BaselineStore::load(&saved, office()).networks.len(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

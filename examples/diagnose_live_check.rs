@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         expect_status: Some(200),
         interval_secs: 10,
     };
-    let config = NetwatchConfig {
+    let mut config = NetwatchConfig {
         refresh_rate_ms: 1000,
         insights_enabled: false,
         diagnose_record_episodes: true,

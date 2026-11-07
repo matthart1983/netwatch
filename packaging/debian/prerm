@@ -1,0 +1,11 @@
+#!/bin/sh
+# Stops and disables netwatch.service when the package is removed, so the
+# service does not outlive its binary. An upgrade leaves it running.
+set -e
+
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl stop netwatch.service || true
+    systemctl disable netwatch.service >/dev/null 2>&1 || true
+fi
+
+exit 0

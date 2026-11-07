@@ -14,7 +14,7 @@ _netwatch() {
 
     local subcommands="daemon doctor diagnose uptime geoip resolver"
     local options="--remote --api-key --insecure-remote --view --lite --demo \
-        --no-sandbox --sandbox-strict --metrics --metrics-addr --daemon \
+        --no-sandbox --sandbox-strict --metrics --metrics-addr --flow-log --flow-log-dir --daemon \
         --headless --generate-config --help -h --version -V"
 
     # Options that take a value: complete the value, not another flag.
@@ -23,10 +23,18 @@ _netwatch() {
             COMPREPLY=( $(compgen -W "full lite dense" -- "${cur}") )
             return 0
             ;;
+        --flow-log)
+            COMPREPLY=( $(compgen -W "file stdout both" -- "${cur}") )
+            return 0
+            ;;
         --interface)
             local ifaces
             ifaces=$(ls /sys/class/net 2>/dev/null)
             COMPREPLY=( $(compgen -W "${ifaces}" -- "${cur}") )
+            return 0
+            ;;
+        --flow-log-dir)
+            COMPREPLY=( $(compgen -d -- "${cur}") )
             return 0
             ;;
         --remote|--api-key|--metrics-addr|--seconds|--out|--schema|--since)
@@ -44,7 +52,7 @@ _netwatch() {
             if [[ ${COMP_CWORD} -eq 2 ]]; then
                 COMPREPLY=( $(compgen -W "run coverage episodes replay features export corpus" -- "${cur}") )
             else
-                COMPREPLY=( $(compgen -W "--json --seconds --test --out --schema --since --dry-run --target --budget --format --only --include-beta" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "--json --seconds --test --out --schema --since --dry-run --target --budget --format --only --include-beta --unstable" -- "${cur}") )
             fi
             return 0
             ;;

@@ -1,0 +1,4 @@
+# set by the administrator
+search lan
+nameserver 192.0.2.1
+options edns0

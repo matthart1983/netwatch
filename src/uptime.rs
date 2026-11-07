@@ -20,8 +20,10 @@
 //! - Time is monitored only while records keep arriving. A gap of more than
 //!   [`GAP_SECS`], or a stop, is "not monitored", never up.
 //!
-//! The JSON and CSV outputs are versioned (`schema`) and part of the 1.0
-//! compatibility promise.
+//! The JSON and CSV outputs are part of the 1.0 compatibility promise. The JSON
+//! is versioned (`schema`). The CSV has no version marker and is covered by its
+//! header row: columns are not renamed or removed, and new ones are added at the
+//! end.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
@@ -40,7 +42,7 @@ pub const HEARTBEAT_SECS: u64 = 60;
 pub const GAP_SECS: u64 = 3 * HEARTBEAT_SECS;
 /// Log files older than this are deleted when a monitor starts.
 pub const RETAIN_DAYS: i64 = 90;
-/// Version of the `--json` and `--csv` output.
+/// Version of the `--json` output. The CSV has none: see the module docs.
 pub const SCHEMA: u32 = 1;
 /// Longest line [`load`] reads. A record is under a hundred bytes, so a
 /// longer line is not one netwatch wrote, and reading it whole would let a
@@ -859,6 +861,7 @@ fn text(r: &Report, dir: &Path) -> String {
 fn json(r: &Report) -> serde_json::Value {
     let ts = |t: u64| local(t).to_rfc3339();
     serde_json::json!({
+        "metadata": crate::schemas::UPTIME.metadata(),
         "schema": SCHEMA,
         "since": ts(r.since),
         "until": ts(r.until),

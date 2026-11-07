@@ -55,7 +55,7 @@ pub fn role_for(name: &str) -> Role {
         "capture" => Role::Capture,
         "proc-broker" => Role::Broker,
         // keylog, metrics-listener, metrics-client, ebpf, connections,
-        // tcp-info, traffic, process-cpu, terminal, logging, capture-export,
+        // tcp-info, traffic, process-cpu, terminal, logging, flow-log, capture-export,
         // policy-preflight, geoip-update and pktap, and any name added
         // without a row here.
         // shutdown-deadline never enters; as a parser it relinquishes every
@@ -111,6 +111,7 @@ mod tests {
         ("process-cpu", Role::Parser, false),
         ("terminal", Role::Parser, false),
         ("logging", Role::Parser, false),
+        ("flow-log", Role::Parser, false),
         ("capture-export", Role::Parser, false),
         ("policy-preflight", Role::Parser, false),
         ("geoip-update", Role::Parser, false),

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "2026-0908-01-1",
+    "issue_id": "2026-0908-01",
+    "action": {
+      "action": "set_resolver",
+      "addr": "192.0.2.53"
+    },
+    "target": "/etc/resolv.conf",
+    "backup": "/etc/resolv.conf.netwatch-48213.bak",
+    "installed": "# set by the administrator\nsearch lan\nnameserver 192.0.2.53\noptions edns0\n",
+    "state": "reverted",
+    "applied_at": "2026-09-08 14:02:11",
+    "pid": 48213,
+    "permanent": false
+  },
+  {
+    "id": "2026-0908-02-2",
+    "issue_id": "2026-0908-02",
+    "action": {
+      "action": "set_resolver",
+      "addr": "192.0.2.53"
+    },
+    "target": "/etc/resolv.conf",
+    "backup": "/etc/resolv.conf.netwatch-48977.bak",
+    "installed": "# set by the administrator\nsearch lan\nnameserver 192.0.2.53\noptions edns0\n",
+    "state": "applied",
+    "applied_at": "2026-09-08 16:40:37",
+    "pid": 48977,
+    "permanent": false
+  }
+]

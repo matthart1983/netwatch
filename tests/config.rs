@@ -151,6 +151,222 @@ mod cli {
         }
     }
 
+    /// `sandbox_mode = "strict"` does nothing, so it has to say so. A session
+    /// says it before anything else, and `--remote` to an http:// URL is a
+    /// session that stops right after, so this needs no terminal or capture.
+    #[test]
+    fn an_unknown_key_warns_on_stderr_and_does_not_stop_anything() {
+        let fixture = Fixture::new();
+        let config = fixture.config();
+        fs::write(
+            &config,
+            "sandbox_mode = 'strict'\n[alerts]\nbandwidth_thresold = 'secret-value'\n",
+        )
+        .unwrap();
+        let policy = config.with_file_name("egress-policy.toml");
+        fs::write(&policy, "[process.curl]\nallow_snis = ['a.example']\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut session = fixture.command();
+        session
+            .args(["--remote", "http://192.0.2.1"])
+            .env("NETWATCH_API_KEY", "k");
+        let (status, stderr) = {
+            let output = session.output().unwrap();
+            (output.status, String::from_utf8(output.stderr).unwrap())
+        };
+        assert_eq!(status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("cleartext"), "{stderr}");
+        for line in [
+            format!(
+                "warning: {}: unknown key sandbox_mode is ignored\n",
+                config.display()
+            ),
+            format!(
+                "warning: {}: unknown key alerts.bandwidth_thresold is ignored\n",
+                config.display()
+            ),
+            format!(
+                "warning: {}: unknown key process.curl.allow_snis is ignored\n",
+                policy.display()
+            ),
+        ] {
+            assert_eq!(stderr.matches(&line).count(), 1, "{line}in\n{stderr}");
+        }
+        assert!(!stderr.contains("secret-value"), "{stderr}");
+
+        // A command with no session reports it too, with its stdout untouched.
+        // No such target, so this is exit 3 without a run.
+        let (status, stdout, stderr) =
+            fixture.run(&["diagnose", "run", "--format", "json", "--target", "none"]);
+        assert_eq!(status.code(), Some(3), "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("unknown key sandbox_mode"), "{stderr}");
+        assert!(stderr.contains("no configured target"), "{stderr}");
+    }
+
+    /// `[experimental]` is a note, not a warning, and nothing else in the file
+    /// is affected by it.
+    #[test]
+    fn an_unread_experimental_key_is_a_note() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.config(),
+            "[experimental]\nsomething = 'value-sentinel'\n",
+        )
+        .unwrap();
+        let (status, _, stderr) =
+            fixture.run(&["diagnose", "run", "--format", "json", "--target", "none"]);
+        assert_eq!(status.code(), Some(3), "{stderr}");
+        assert!(stderr.contains("note: "), "{stderr}");
+        assert!(stderr.contains("experimental.something"), "{stderr}");
+        assert!(!stderr.contains("warning:"), "{stderr}");
+        assert!(!stderr.contains("value-sentinel"), "{stderr}");
+    }
+
+    /// Nothing a command prints can change how it ends. `eprintln!` panics when
+    /// the write fails, so with stderr on a full disk `diagnose run --format json`
+    /// exited 101, which is not one of its statuses, and printed no report.
+    #[cfg(target_os = "linux")]
+    mod unwritable_output {
+        use super::super::Fixture;
+        use std::{
+            fs::{self, File},
+            process::{Command, Output, Stdio},
+        };
+
+        fn full() -> Stdio {
+            Stdio::from(File::options().write(true).open("/dev/full").unwrap())
+        }
+
+        /// Run with both stdout and stderr on a disk with no room.
+        fn run(fixture: &Fixture, args: &[&str]) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_netwatch"))
+                .args(args)
+                .env("HOME", &fixture.0)
+                .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+                .env("XDG_CACHE_HOME", fixture.0.join("cache"))
+                .env("XDG_STATE_HOME", fixture.0.join("state"))
+                .stdin(Stdio::null())
+                .stdout(full())
+                .stderr(full())
+                .output()
+                .unwrap()
+        }
+
+        fn with_warnings() -> Fixture {
+            let fixture = Fixture::new();
+            fs::write(
+                fixture.config(),
+                "sandbox_mode = 'strict'\n[experimental]\nx = 1\n[diagnose_thresholds]\nsigma_k = -1.0\n",
+            )
+            .unwrap();
+            fixture
+        }
+
+        #[test]
+        fn the_warnings_and_errors_keep_their_statuses() {
+            let fixture = with_warnings();
+            for (args, status) in [
+                // A config warning, an invalid threshold and its error line.
+                (
+                    &["diagnose", "run", "--format", "json", "--target", "none"][..],
+                    3,
+                ),
+                (&["diagnose", "run", "--budget", "1s"][..], 3),
+                // `--unstable`'s error.
+                (&["diagnose", "replay", "episode.json.gz"][..], 3),
+                // The config warnings and `--api-key`'s, then main's own error.
+                (&["--remote", "http://192.0.2.1", "--api-key", "k"][..], 1),
+            ] {
+                let output = run(&fixture, args);
+                assert_eq!(output.status.code(), Some(status), "{args:?}");
+            }
+        }
+
+        #[test]
+        fn a_whole_run_keeps_a_status_it_documents() {
+            let fixture = with_warnings();
+            for format in ["json", "text"] {
+                let output = run(
+                    &fixture,
+                    &["diagnose", "run", "--format", format, "--budget", "5s"],
+                );
+                let status = output.status.code();
+                assert!(matches!(status, Some(0..=3)), "{format}: exited {status:?}");
+            }
+        }
+
+        #[test]
+        fn coverage_is_not_taken_down_by_its_output() {
+            let fixture = with_warnings();
+            let output = run(&fixture, &["diagnose", "coverage", "--seconds", "1"]);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+        }
+    }
+
+    /// The review's reproduction: a write limit standing in for a full disk left
+    /// a config that ended mid-line, and netwatch then refused to start. Through
+    /// `--generate-config`, which shares its writer with a Settings save.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_that_cannot_finish_keeps_the_old_file() {
+        let fixture = Fixture::new();
+        let old = "# mine\ntheme = 'nord'\nsandbox = 'strict'\n";
+        fs::write(fixture.config(), old).unwrap();
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                "trap '' XFSZ; ulimit -f 1; exec \"$0\" --generate-config",
+            ])
+            .arg(env!("CARGO_BIN_EXE_netwatch"))
+            .env("HOME", &fixture.0)
+            .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert_eq!(fs::read_to_string(fixture.config()).unwrap(), old);
+        let names: Vec<_> = fs::read_dir(fixture.config().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"], "a temporary file was left behind");
+        // And it still starts on it.
+        let (status, _, stderr) = fixture.run(&["doctor"]);
+        assert!(status.success(), "{stderr}");
+    }
+
+    /// The mode and the link are the user's, through the real path.
+    #[test]
+    fn a_save_keeps_the_mode_and_follows_a_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let fixture = Fixture::new();
+        let elsewhere = fixture.0.join("dotfiles.toml");
+        fs::write(&elsewhere, "theme = 'nord'\n").unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::remove_file(fixture.config()).unwrap();
+        symlink(&elsewhere, fixture.config()).unwrap();
+
+        let (status, _, stderr) = fixture.run(&["--generate-config"]);
+        assert!(status.success(), "{stderr}");
+        assert!(fs::symlink_metadata(fixture.config())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let saved = fs::read_to_string(&elsewhere).unwrap();
+        assert!(saved.starts_with("theme = 'nord'\n"), "{saved}");
+        assert!(saved.contains("default_tab"), "{saved}");
+        assert_eq!(
+            fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
     #[test]
     fn generate_config_does_not_overwrite_it() {
         let fixture = Fixture::new();

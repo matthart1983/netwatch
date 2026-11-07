@@ -16,6 +16,7 @@ maintenance notes, see [ARCHITECTURE.md](ARCHITECTURE.md).
   - [Flight Recorder](#flight-recorder)
   - [Landlock sandbox (Linux)](#landlock-sandbox-linux)
 - [Command line](#command-line)
+- [JSON schemas](#json-schemas)
 - [Keyboard controls](#keyboard-controls)
 - [Permissions](#permissions)
   - [Running without sudo (Linux)](#running-without-sudo-linux)
@@ -139,8 +140,10 @@ share evidence with someone else, `netwatch diagnose export` writes a pseudonymi
 
 #### Export file format, version 1
 
-This layout is stable. Later versions may add options and comment keys; a change that removes
-or renames one, or changes its meaning, gets a new schema name.
+Classic PCAP and the PCAPNG blocks below are the standard formats, so any reader of them can open
+these files. The JSON in packet comments, `netwatch.annotation.v1`, is experimental and outside
+the 1.0 compatibility promise. Its keys can change in any release. A change that removes or
+renames one, or changes its meaning, gets a new schema name, so a parser can tell.
 
 **Classic PCAP**: little-endian, magic `0xa1b2c3d4` (microsecond timestamps), version 2.4,
 snaplen 65535, and one link type for the whole file. A selection that mixes link types can
@@ -157,7 +160,7 @@ one little-endian section, with only these blocks:
 
 A block with options ends them with `opt_endofopt`; a block without has no options list.
 
-**Packet comments.** Each comment is one JSON object in UTF-8, schema
+**Packet comments.** Experimental. Each comment is one JSON object in UTF-8, schema
 `netwatch.annotation.v1`. Wireshark shows it under *Packet comments*, and
 `tshark -r FILE -T fields -e frame.comment` prints one per line.
 
@@ -362,18 +365,25 @@ Sharp edges handled for you:
 - **Policy file trust**: a group- or world-writable `egress-policy.toml` is refused
   with a loud log warning. If anyone but the owner can edit the policy, "warn on
   drift" could be silenced by the very thing drifting. `chmod 644` or stricter.
+- **Unknown keys**: a key the policy does not read is ignored and reported, naming the
+  key and the file, on stderr when a session starts, in the log, in Settings, in the
+  Egress tab and in `netwatch doctor`, as for [`config.toml`](#configuration). It
+  matters more here. An empty list means unrestricted, so `allow_snis` for `allow_sni`
+  is a rule that restricts no name. The tab stops calling such a policy `all precise`.
+  Promoting a rule keeps such a key, as it keeps the rule's `block` table.
 
 **Structured export.** Press `e` on the Egress tab to write the attributed
-records as **NDJSON** (`netwatch.egress.v1`) — one JSON object per line, preceded
-by a `_meta` line naming the schema. Each record is metadata only (process, SNI,
+records as **NDJSON** (`netwatch.egress.v1.1`) — one JSON object per line, preceded
+by a header line naming the schema. Each record is metadata only (process, SNI,
 ASN org, IP, port, coarse proto, ECH flag, first/last-seen, count, policy
-verdict) — never any payload. This is the ingest contract the managed layer consumes; the
+verdict, what admitted it, approximate bytes) — never any payload. This is the ingest contract the managed layer consumes; the
 same `policy.toml` the TUI lints with is the file a managed layer would
-distribute.
+distribute. [`schemas/egress.v1.1.schema.json`](../schemas/egress.v1.1.schema.json)
+describes both kinds of line.
 
 ```json
-{"_meta":{"schema":"netwatch.egress.v1","records":2}}
-{"process":"chrome","sni":"mail.google.com","asn_org":"Google LLC","ip":"142.250.66.101","port":443,"proto":"tls","ech":false,"first_seen":1751600000,"last_seen":1751603600,"count":42,"verdict":"ok"}
+{"_meta":{"records":1,"schema":"netwatch.egress.v1.1"},"metadata":{"netwatch_version":"0.40.0","schema":"netwatch.egress.v1.1","schema_url":"https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/egress.v1.1.schema.json","schema_version":"1.1"}}
+{"process":"chrome","sni":"mail.google.com","asn_org":"Google LLC","ip":"142.250.66.101","port":443,"proto":"tls","ech":false,"first_seen":1751600000,"last_seen":1751603600,"count":42,"verdict":"ok","matched_by":"sni","bytes_out":18200,"bytes_in":940000}
 ```
 
 ```toml
@@ -440,7 +450,7 @@ netwatch --no-sandbox         # explicitly disable Netwatch policy
   | Threads | TCP bind and connect | socket(2) |
   | --- | --- | --- |
   | Main and the network workers (reverse DNS, WHOIS, GeoIP, health, traceroute, Insights, remote, Diagnose probes, blocking pool) | Allowed | Allowed |
-  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink, and the others have not been audited for the filter |
+  | Other parser workers (connections, tcp-info, traffic, process CPU, eBPF, terminal, logging, flow log, export) | Denied from Linux 6.7 | Allowed: `ss`, `ip` and `iw` need netlink, and the others have not been audited for the filter |
   | Capture, keylog, metrics listener and client | Denied from Linux 6.7 | EPERM |
 
   `netwatch doctor --json` reports the kernel's ABI and what a parser thread enforces
@@ -471,19 +481,24 @@ The [man page](netwatch.1) carries the same list.
 | Command | What it does |
 |---------|--------------|
 | `netwatch` | The TUI. Flags below. |
-| `netwatch daemon` (also `--daemon`, `--headless`) | The collectors with no screen. With `--metrics` or `--metrics-addr`, serves [Prometheus metrics](observability-export.md). |
+| `netwatch daemon` (also `--daemon`, `--headless`) | The collectors with no screen. With `--metrics` or `--metrics-addr`, serves [Prometheus metrics](observability-export.md). With `--flow-log`, writes a [flow log](#flow-log). |
 | `netwatch doctor [--json] [--check-capture] [--interface NAME]` | Read-only setup report: what this host lets netwatch see. `--check-capture` tries a real capture. See [doctor.md](doctor.md). |
-| `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue. 1: at least one open issue. 2: no usable observation in the budget. 3: bad arguments or no session. |
+| `netwatch diagnose run [--budget 30s] [--target NAME] [--format text\|json]` | One bounded diagnosis. Exit 0: completed, no issue counted. 1: at least one open issue counted. 2: no usable observation in the budget. 3: bad arguments or no session. |
 | `netwatch diagnose coverage [--json] [--seconds N] [--test ID]` | Which checks have their inputs on this host, and why the others do not. |
 | `netwatch diagnose episodes [DIR]` | List recorded incident episodes. |
-| `netwatch diagnose replay [--json] FILE\|DIR...` | Replay episodes through the engine and report any divergence. |
-| `netwatch diagnose features [--out FILE] [--schema FILE] FILE\|DIR...` | Write the feature table of recorded episodes. |
+| `netwatch diagnose replay --unstable [--json] FILE\|DIR...` | Experimental. Replay episodes through the engine and report any divergence. |
+| `netwatch diagnose features --unstable [--out FILE] [--schema FILE] FILE\|DIR...` | Experimental. Write the feature table of recorded episodes. |
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
+| `netwatch diagnose corpus --unstable [--only ID] [DIR]` | Experimental, for netwatch's developers. Regenerate the pinned test corpus. |
 | `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
-| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. |
-| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. Refuses to replace a `config.toml` that does not load. |
+| `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. `set` and `recover` are experimental. `recover` undoes an interrupted `set`, and exits 0 when none is left unresolved, 1 otherwise. A change from 0.30 is [restored by hand](recovery-store.md#legacy-journal): `status` and `recover` print a notice naming it, and it does not affect the exit status. |
+| `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. To a file that exists it adds only the keys the file lacks, and keeps what is there; delete the file first for a clean one. Refuses to touch a `config.toml` that does not load. |
 | `netwatch --version`, `--help` | |
+
+`diagnose replay`, `features` and `corpus` read and write episode, feature and corpus formats
+that can change in any release, so each needs `--unstable`. Without it, the command prints an
+error naming the flag and exits 3, the status `diagnose run` documents for bad arguments.
 
 TUI flags:
 
@@ -492,10 +507,106 @@ TUI flags:
 | `--view full\|lite\|dense`, `--lite` | Start in that view. |
 | `--demo` | Replay a recorded Diagnose incident instead of watching this host. |
 | `--no-sandbox`, `--sandbox-strict` | Turn the Linux sandbox off, or refuse to start unless it is enforced. |
-| `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Experimental. |
-| `--insecure-remote` | Allow an `http://` remote URL. |
-| `--api-key KEY` | Discouraged: the key shows in the process list. Use `NETWATCH_API_KEY`. |
+| `--remote URL` | Stream snapshots to a backend. Needs `NETWATCH_API_KEY`. Accepted through 1.x; what it does is experimental. |
+| `--insecure-remote` | Allow an `http://` remote URL. Accepted through 1.x; experimental, with `--remote`. |
+| `--api-key KEY` | Deprecated: the key shows in the process list. Use `NETWATCH_API_KEY`. Accepted through 1.x, with a warning that does not include the key, and goes in 2.0. What it does is experimental, with `--remote`. |
 | `--metrics`, `--metrics-addr ADDR` | With `daemon`: serve metrics on `127.0.0.1:9464`, or on `ADDR`. |
+| `--flow-log file\|stdout\|both` | With `daemon`: write the [flow log](#flow-log). Overrides `[experimental] flow_log`. Experimental. |
+| `--flow-log-dir DIR` | With `daemon`: the flow log's files go to `DIR`, for example `/var/log/netwatch`. Overrides `[experimental] flow_log_dir`. Experimental. |
+
+### Flow log
+
+Experimental. `netwatch daemon --flow-log file` (or `stdout`, or `both`) writes one line when a
+connection appears and one when it closes: which process, to where, for how long. Set it in
+`config.toml` instead with `[experimental] flow_log = "file"`; the flag wins.
+
+```bash
+netwatch daemon --flow-log both
+tail -f ~/.cache/netwatch/flows/flows.$(date -u +%F).ndjson | jq -c 'select(.event=="close") | {process, remote, host, duration_ms}'
+```
+
+```json
+{"ts":"2026-11-05T10:00:01.120Z","event":"open","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","local":"10.0.0.5:51234","remote":"93.184.215.14:443","state":"ESTABLISHED","observed_by":"poll"}
+{"ts":"2026-11-05T10:00:02.121Z","event":"close","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","local":"10.0.0.5:51234","remote":"93.184.215.14:443","state":"TIME-WAIT","reason":"closed","duration_ms":1001,"host":"example.com","host_source":"sni","asn_org":"Edgecast Inc.","country":"US","app_protocol":"tls","bytes_out":812,"bytes_in":3417,"retransmits":0,"observed_by":"poll"}
+```
+
+- **Where.** `file` writes `flows.YYYY-MM-DD.ndjson`, one per UTC day, in the `flows` directory
+  of netwatch's cache (`~/.cache/netwatch/flows` on Linux; under the packaged systemd unit,
+  `/var/cache/netwatch/netwatch/flows`). Files are 0600 in a 0700 directory, and those older
+  than `flow_log_keep_days` (default 14) are deleted when the day changes; netwatch rotates
+  them itself, so no logrotate rule is needed. `flow_log_dir` (or `--flow-log-dir`) puts them
+  elsewhere, such as `/var/log/netwatch`. That directory gets a sandbox write grant of its
+  own, and must belong to the user netwatch runs as, with mode 0700: systemd's
+  `LogsDirectory=netwatch` with `LogsDirectoryMode=0700` makes one. `stdout` writes the same
+  lines to standard output, which a systemd unit sends to the journal.
+- **What.** Each file, and stdout, starts with a header naming the schema,
+  [`schemas/flow.v0.schema.json`](../schemas/flow.v0.schema.json). Then `open` and `close`
+  events. `close` has a `reason`: `closed` when the socket reached a closing TCP state,
+  `gone` when it left the table without one, `shutdown` when the daemon stopped. It also has
+  the names learned while the flow was open (`host` from a TLS or QUIC SNI or an HTTP `Host`,
+  `rdns`, `asn_org`, `country`) and approximate byte counts. Names and bytes need packet
+  capture; `asn_org` and `country` need the [GeoIP databases](#geoip-databases). Metadata
+  only, never payload.
+- **eBPF.** Where the connect probes load (Linux, `CAP_BPF` and `CAP_PERFMON`; the header's
+  `_meta.sources.ebpf` says `active` or `unavailable` with `ebpf_error`), every `connect()` of a
+  TCP or connected UDP socket also gets a line, as it happens, even for a connection shorter than
+  a poll:
+
+  ```json
+  {"ts":"2026-11-05T10:00:01.012Z","event":"connect","proto":"TCP","process":"curl","pid":4242,"attribution":"ebpf","remote":"93.184.215.14:443","observed_by":"ebpf"}
+  ```
+
+  `process` is the kernel's 15-character `comm`. The probes fire before the kernel picks the
+  source port, so the line waits up to two ticks for packet capture to see the stream the connect
+  started (same transport and destination, begun after the connect, started from this side, not
+  taken by an earlier connect) and takes its `local` and, from the ClientHello, `host`:
+
+  ```json
+  {"ts":"…","event":"connect","proto":"TCP","process":"curl","pid":942955,"attribution":"ebpf","local":"10.210.6.92:59694","remote":"5.255.255.242:443","host":"ya.ru","host_source":"sni","app_protocol":"tls","observed_by":"ebpf"}
+  ```
+
+  Without capture, or with no ClientHello in time, the line has no `local` or `host`. The UDP
+  probes sit on both `ip{4,6}_datagram_connect` and the inner function they call, so one
+  `connect()` fires two or three of them; copies from one thread to one destination within
+  20 µs of each other are written once. `ts` is the kernel's time for the probe. A burst of UDP
+  connects from one process to every address a name resolved to, with no traffic after, is
+  glibc's `getaddrinfo` choosing between them (RFC 6724), not traffic. TLS 1.3
+  and QUIC send the SNI in the clear like TLS 1.2; only Encrypted ClientHello hides it, and then
+  the line says `"ech": true` and `host` is the outer, public name. The table cannot say which
+  socket a connect is either, for the same missing source port. So a flow polling left without an owner takes the connect's process only when one
+  process alone connected to that destination within five seconds, with `attribution: "ebpf"`;
+  a verified owner on a later poll replaces it. With two processes on one destination, the flow
+  keeps a null `process`.
+- **DNS.** With capture, every DNS exchange over UDP port 53 gets a line: the query and its
+  response, paired by client, server and transaction id, named by the owner of the client
+  socket (the connection table's verified owner, else the socket's `connect` line):
+
+  ```json
+  {"ts":"…","event":"dns","proto":"UDP","process":"python3","pid":1002265,"attribution":"ebpf","local":"10.210.6.92:60281","server":"10.200.6.2:53","qname":"pypi.org","qtype":"A","rcode":"NOERROR","latency_ms":4.1,"answers":["151.101.0.223"],"cnames":["dualstack.python.map.fastly.net"],"observed_by":"capture"}
+  ```
+
+  No response within three ticks is `"rcode":"timeout"`; a response whose query capture missed
+  is written alone with `"query_seen":false`. The answers also feed `dns_name` on `connect`,
+  `open` and `close`: the name asked for an address, through any CNAME, for the answer's TTL
+  (kept at least a minute, at most a day). It works where SNI cannot, without TLS and under ECH,
+  and is missing where capture sees no DNS: encrypted DNS (DoT, DoH), a resolver's cached
+  answer from before netwatch started, or an interface capture does not listen on. An
+  application asking `systemd-resolved` on `127.0.0.53` talks over loopback; the line capture
+  sees is the resolver's own query upstream, named `systemd-resolve`.
+- **What it skips.** Listening and unconnected sockets, and loopback unless
+  `flow_log_loopback = true`.
+- **Limits.** The log is built from the connection table, polled every `refresh_rate_ms`.
+  A connection that opens and closes between two polls is not logged, and `ts` is the poll that
+  saw the event, not the `connect()` (`observed_by: "poll"`). One caught already closing, in
+  TIME-WAIT say, gets its `open` and `close` together, often with a null `process`: the kernel
+  no longer ties a closing socket to its owner. Its `connect` line, with eBPF, names it.
+  Reading other users' sockets takes `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` for the
+  proc-broker thread. The packaged unit leaves them out;
+  [packaging/README.md](../packaging/README.md) shows how to add them. Without them, eBPF
+  or root, sockets of other users' processes can have a null `process`. If the writer falls behind by 8192 lines,
+  later events are dropped and a `{"event":"dropped","count":N}` line says how many.
+
+The format is experimental: it can change in any release.
 
 ### Uptime report
 
@@ -536,9 +647,13 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   measured, the text leaves the figure out and `--json` gives `"uptime_pct": null`, outages or
   not.
 
-`--json` and `--csv` carry the same outages for an ISP ticket or a chart. Both are versioned
-(`"schema": 1` in JSON) and covered by the 1.0 compatibility promise. Each outage's `ended` is
-`recovered`, `monitoring_stopped` (netwatch stopped while it was still down) or `ongoing`.
+`--json` and `--csv` carry the same outages for an ISP ticket or a chart, and the 1.0 compatibility
+promise covers both. The JSON is versioned (`"schema": 1`), and
+[`schemas/uptime.v1.schema.json`](../schemas/uptime.v1.schema.json) describes it. The CSV has no
+version marker and is covered by its header row, `start,end,duration_secs,hop,ended`: columns are
+not renamed or removed, and new ones are added at the end, so read columns by header name. Each
+outage's `ended` is `recovered`, `monitoring_stopped` (netwatch stopped while it was still down)
+or `ongoing`.
 
 The log is `~/.local/state/netwatch/uptime/`, one small file per day (about 80 KB), kept 90
 days, readable only by you. Nothing is uploaded. `record_uptime = false` turns it off.
@@ -576,6 +691,114 @@ IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0. Settings and `netwatch d
 line whenever a loaded database says it is DB-IP's, wherever the file came from.
 
 ---
+
+## JSON schemas
+
+Five outputs are part of the 1.0 compatibility promise. Each has a JSON Schema (draft 2020-12)
+under [`schemas/`](../schemas), which ships in the repository and the published crate. The tests
+run the real code behind each output and validate what it writes against these files, so a schema
+that stops describing its output fails CI.
+
+| Output | Schema file | `metadata.schema` | Older marker, still written |
+|---|---|---|---|
+| `netwatch diagnose run --format json` | `diagnose-run.v2.schema.json` | `netwatch.diagnose-run.v2` | `"schema": 2` |
+| `netwatch doctor --json` | `doctor.v1.schema.json` | `netwatch.doctor.v1` | `"schema_version": 1` |
+| The Egress tab's NDJSON export | `egress.v1.1.schema.json` | `netwatch.egress.v1.1` | `_meta.schema` |
+| `netwatch diagnose export`, once gunzipped | `diagnose-export.v1.schema.json` | `netwatch.diagnose-export.v1` | `"format": "netwatch-episode-export"`, `"version": 1` |
+| `netwatch uptime --json` | `uptime.v1.schema.json` | `netwatch.uptime.v1` | `"schema": 1` |
+
+The [flow log](#flow-log) has a schema too, `flow.v0.schema.json` (`netwatch.flow.v0`), checked
+the same way, but it is experimental and outside the promise.
+
+**Finding the schema from the output.** Each output has the same `metadata` object at its top
+level. In the egress export it is on the first line, and that file's schema validates one line at a
+time.
+
+```json
+"metadata": {
+  "schema": "netwatch.uptime.v1",
+  "schema_version": "1",
+  "schema_url": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/uptime.v1.schema.json",
+  "netwatch_version": "0.40.0"
+}
+```
+
+`schema_version` is a string because the egress export's is `1.1`. Use this block in new code.
+The older markers stay, with their meanings unchanged. Mind `version`: in `diagnose run` it is the
+netwatch version, and in `diagnose export` it is the version of the bundle format.
+
+**What can change in a 1.x minor.** A minor can add a field anywhere, so ignore fields you do not
+know. No schema here closes an object, so a validator using one of these files keeps passing when
+that happens. A break needs netwatch 2.0 and a new schema file, and a published file is never
+removed or renamed. The files describe what 0.40 and later write. A field added after that is not
+made `required` in an existing file, so older documents stay valid. An added field changes no
+output's name or version, so `netwatch.egress.v1.1` stays that until a break, like the others.
+
+**Required and null.** A field is `required` only where netwatch always writes it. Some can be
+absent and some can be null, and the two are not interchangeable. An egress record leaves `sni`
+out when there is no name but writes `"matched_by": null`. The schema says which is which.
+
+**Value sets.** A set that a script has to branch on to read the document correctly is closed. A new
+value needs 2.0, the schema lists it as an `enum`, and its description says `Closed set`. These are:
+
+- `diagnose run`: `outcome`, `exit`, a finding's `kind` and `severity`, a check's `state`, and
+  `verify.predicate`
+- `doctor`: a capability's `state`
+- `uptime`: an outage's `ended`
+
+Every other listed set is open, including rule ids, capability ids, doctor's `reason` codes,
+`why_not`, an egress `verdict` and an outage's `hop`. A minor can add to these, so a
+validator must not refuse a new value. The schema lists the values known today under `examples`, its
+description says `Open set`, and it says what to do with a value you do not know. An existing value
+keeps its meaning.
+
+**Deprecated fields.** A field marked `deprecated` in a schema tells a consumer nothing useful, so do
+not rely on it. netwatch keeps writing it, and it goes only in a major version. The schema leaves it
+out of `required`. In `doctor` that is `network_restricted`, which is always false. In `diagnose run`
+it is a finding's `artifacts`, `suppressed_by`, `tests` and `verification`, which a run leaves empty,
+and a remediation step's `key`, `action`, `reversible`, `requires` and `applied`, which belong to the
+TUI.
+
+**What is outside the promise.**
+
+- Text in words, such as `detail`, `title`, `completeness` and `redaction`, can be reworded. Each
+  such field says so. `reason` is a stable code in `doctor` and free text in `diagnose run`'s
+  `coverage`.
+- A `diagnose run` finding with `"beta": true` follows the schema, but its rule can change thresholds
+  or disappear.
+- Each entry in `diagnose export`'s `episodes` is a recording in the episode format, which is
+  experimental. The schema covers the bundle around them and each one's `schema_version`.
+
+**Names that stay as they are.** These read oddly and are frozen anyway, so read them as described.
+
+- A `diagnose run` finding's `state` is an object, `{"state": "open"}`, so the value is at
+  `.state.state`. A check's `state` is a plain string.
+- An egress record's `sni` holds the destination's name, which can be a cleartext HTTP `Host`. `proto`
+  says `tls` only when a ClientHello supplied it and no flow to that destination carried a `Host`.
+- An egress record's `"matched_by": "sni"` also covers a rule that declares no name restriction at
+  all, so it does not always mean one named endpoint. `matched_by` is an open set, so a minor can add
+  a broader value for such a rule.
+- `ruleset` in `diagnose run` is how many rules the build's catalogue holds. It grows between releases
+  and is not a version.
+- `window_seconds` at the top level of `diagnose run` is how long the run sampled, and can have a
+  fraction. `window_secs` on a finding's evidence is an integer, the seconds of data that value
+  summarises.
+
+**Times.** Four formats are in use, and one name can differ between outputs: `since` is RFC 3339 in
+`uptime` and local time in a `diagnose run` finding.
+
+| Format | Fields |
+|---|---|
+| Local wall-clock time with no UTC offset, such as `2026-11-01 08:58:52`. This is not UTC, so do not parse it as UTC. | `diagnose run`: a finding's `since`, `last_seen` and `stale_since`. `diagnose export`: `created`. The deprecated `tests` and `verification` use it too, but a run leaves them empty. |
+| RFC 3339 with the host's UTC offset | `diagnose run`: `started_at`. `uptime`: `since`, `until`, and an outage's `start` and `end`. |
+| Unix seconds | Egress record: `first_seen` and `last_seen`. |
+| Unix milliseconds | `doctor`: `attribution_coverage.completed_at_utc_ms`. |
+
+In `diagnose run`, `started_at` gives the host's offset for the rest of the document. `diagnose export`
+gives none. A minor can add fields that carry an offset, and the fields above keep their format.
+
+`diagnose run` prints no JSON for exit 3, which means bad arguments or a session that could not
+start, so there is nothing to validate.
 
 ## Keyboard controls
 
@@ -892,8 +1115,8 @@ The selection, highlighted rows and filled bars show in reverse video instead.
 | Variable | Effect |
 |----------|--------|
 | `NO_COLOR` | Any non-empty value: draw the TUI without colour ([no-color.org](https://no-color.org)). |
-| `NETWATCH_API_KEY` | API key for `--remote`. Preferred over `--api-key`, which leaves the key in the process list and shell history. |
-| `NETWATCH_REMOTE_URL` | Remote backend URL, when `--remote` is not given. |
+| `NETWATCH_API_KEY` | API key for `--remote`. Preferred over `--api-key`, which leaves the key in the process list and shell history. Accepted through 1.x; what it does is experimental. |
+| `NETWATCH_REMOTE_URL` | Remote backend URL, when `--remote` is not given. Accepted through 1.x; what it does is experimental. |
 | `NETWATCH_METRICS_ADDR` | Address for the daemon's metrics endpoint, when `--metrics-addr` is not given. |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase) | Diagnose records whether a proxy applies to each configured target, and weighs it as evidence: an untrusted certificate behind a proxy points at interception. |
 
@@ -940,7 +1163,8 @@ exist until you write one.
 Two ways to write it. From the shell:
 
 ```bash
-netwatch --generate-config    # writes every key at its default value, then exits
+netwatch --generate-config    # writes every key at its default value, then exits. To a
+                              # file that exists, adds only the keys it lacks
 ```
 
 Or live in the TUI: `,` opens Settings, `↑`/`↓` moves, `←`/`→` cycles the enum-valued rows
@@ -949,12 +1173,52 @@ the free-text ones, `S` saves. Most changes apply the moment you make them — `
 exception, because Landlock and dropped capabilities can't be undone inside a running
 process, so it takes effect on the next launch.
 
-Both leave out the `[diagnose_thresholds]` table while it holds its defaults, so a later
-release can retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
+Neither writes the `[diagnose_thresholds]` table unless you changed it, so a later release can
+retune them; [DIAGNOSE.md](DIAGNOSE.md#thresholds) lists its keys.
 
 A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
 out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
 to start.
+
+A key netwatch does not read is ignored and reported, because otherwise a typo such as
+`sandbox_mode = "strict"` would do nothing without a word. netwatch still starts. `netwatch`
+and `netwatch daemon` print `warning: <file>: unknown key <key> is ignored` on stderr before
+they start, at any depth (`alerts.typo`, `diagnose_targets.0.typo`), and write it to the log.
+The TUI hides stderr until it quits, so it also shows the warning on its bottom row for its
+first 30 seconds, in every view, and Settings keeps the list. `diagnose run`,
+`diagnose coverage` and `geoip update` print the same line on stderr. `netwatch doctor` reports
+`config` as `degraded`, reason `config_unknown_keys`. None of these prints the key's value.
+
+A key that gets renamed keeps working until 2.0. netwatch reads the old name as the new one and
+warns `<old> was renamed <new> in <release>` in the same places. `netwatch doctor` leaves `config`
+`ready`, with reason `config_renamed_keys`. If the file sets both names, the new one wins. A save
+writes the new name. No key has been renamed so far. `geoip_online` below was removed.
+
+The `[experimental]` table is for settings that can still change, and is outside the 1.0
+compatibility promise. A key in it can change meaning or go away in any release. It holds the
+[flow log](#flow-log)'s `flow_log` (`off`, `file`, `stdout` or `both`), `flow_log_dir`
+(empty: the cache directory's `flows`), `flow_log_keep_days` (14) and `flow_log_loopback`
+(false). A key in it this version does not read is expected rather than a mistake, so it does not
+warn as unknown. stderr gets a `note:` line, `netwatch doctor` lists it and leaves `config`
+`ready`, Settings lists it, and the TUI's bottom row says nothing. A save keeps the table.
+
+A save writes only what the session changed, compared with what it loaded. Settings' `S` and the
+Diagnose tab's `d` change those keys in the file, and a target is found by its `name`, wherever
+it now sits. Everything else stays as the file has it: a key you edited by hand while netwatch
+ran, a value the session clamped or fell back from, a key netwatch does not read, a table at its
+defaults, comments, and any default you never set, which a later release can still change. If you
+and the session changed the same key, the session's value wins for that key alone. `d` on a target
+the file no longer has fails and leaves the file; press `r` to reload. `--view` is for one run, and
+a save does not write it. With nothing to write, the file is not touched.
+
+A save that does write keeps the old file until the new one is complete and synced, so a full
+disk leaves the settings you had, and keeps the file's mode and any symlink to it. It drops a
+byte-order mark and ends every line in LF. Removing `geoip_online` also removes a comment directly
+above it.
+
+`--generate-config` is the one thing that writes defaults. A new file gets every key. A file that
+exists gains the keys it lacks, and keeps every value and comment it has. It leaves out
+`diagnose_targets` while there are none, so you can append `[[diagnose_targets]]` to the file.
 
 A file netwatch cannot read or parse is different. If the TOML is broken, or a key has a value
 of the wrong type (`refresh_rate_ms = "fast"`), `netwatch` and `netwatch daemon` print the
@@ -1065,6 +1329,8 @@ port_scan_window_secs = 30          # detection window
 
 ### AI Insights
 
+Experimental, like the feature. These three can change in any release.
+
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
 | `insights_enabled` | `false` | `true` `false` | Adds an AI narrative block to the Diagnose tab. Opt-in — see [AI Insights](#ai-insights). |
@@ -1074,6 +1340,9 @@ port_scan_window_secs = 30          # detection window
 ---
 
 ## AI Insights
+
+Experimental. This can change or go away in any release, and is outside the 1.0 compatibility
+promise.
 
 Insights is opt-in commentary inside **Diagnose (`9`)**, below the findings.
 It sends a network snapshot to the configured Ollama-compatible `/api/chat`

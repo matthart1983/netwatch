@@ -12,13 +12,16 @@ The v2 directory is `netwatch/recovery-v2` under `dirs::state_dir()`, falling ba
 to local application data. On Linux this normally means
 `~/.local/state/netwatch/recovery-v2`. It contains `journal.json`, `store.lock`,
 UUID-named `.backup` files, and possibly temporary/orphan evidence after failures.
-The legacy cache `netwatch/applied.json` remains in place, inspection-only. Neither
+The [legacy cache](#legacy-journal) `netwatch/applied.json` remains in place, inspection-only. Neither
 format is silently migrated or overwritten by application startup/shutdown.
 
 Ordinary observation does not create the v2 directory. The Unix `Store` API creates
 its final private directory when explicitly opened for a transaction; its parent
 must already exist. An existing directory without a readable journal is reported
-by inspection, rather than silently treated as no recovery data.
+by inspection, rather than silently treated as no recovery data. Only the Linux
+resolver command opens a store, at its own fixed location, so no release has written
+this per-user directory. Startup inspects it anyway, and `netwatch resolver recover`
+does not read it.
 
 The persistence backend is implemented for Unix and tested on Linux. Windows
 writes are unavailable; an existing v2 directory reports an unsupported-backend
@@ -55,7 +58,54 @@ preserved; automatic cleanup is intentionally not implemented.
 States are `Prepared`, `Applied`, `RecoveryRequired`, `Reverted`, and `Committed`.
 Terminal states cannot transition again. A second unresolved operation for the same
 path or file identity is rejected. Permanent operations retain their original
-backup; a later operation receives a different UUID backup.
+backup; a later operation receives a different UUID backup. No command writes
+`Committed` today; the format keeps it.
+
+## Legacy journal
+
+Netwatch 0.30.0 to 0.30.4 recorded live resolver changes in `netwatch/applied.json`,
+in the cache directory of whichever home the session used. For a change that reached
+`/etc/resolv.conf` that means a root session, and under `sudo` usually root's home.
+0.31.0 was the last release to roll an entry back. Netwatch now only reads this
+file: it has no writer and no rollback.
+
+An entry still marked pending, applied or abandoned puts `recovery required` on the
+Diagnose status line and in the report's timeline, and in the log at startup and shutdown.
+Abandoned means 0.30 or 0.31.0 tried to restore the file and gave up. Either its backup
+was missing, which left the file as netwatch set it, or the file had been edited since.
+The journal does not say which, so the notice does not offer the backup as the way back.
+`netwatch resolver status` and `recover` print the same notice on Linux, naming the
+file. Nothing restores the entry. The journal cannot authorize a
+write: nothing proves who wrote it, and every confined thread but capture can write
+the cache. So `recover` can print `Recovered 0 resolver operations` and exit 0 with
+`/etc/resolv.conf` still holding netwatch's change. The notice is what says so.
+
+To deal with an entry by hand:
+
+1. Open `applied.json` and find the entry. Its `installed` field is the exact text
+   netwatch wrote, and `backup` is where it said it kept the original.
+2. Compare `/etc/resolv.conf` with `installed`. If they differ, what is there now is not
+   netwatch's change: something else wrote the file later, or a pending entry's write
+   never landed, usually because the sandbox refused it. Leave the file alone, and only
+   check it reads as you expect.
+3. If they match and the backup exists, copy the backup over the file as root. If they
+   match and it does not exist, the original is gone, so set the resolver yourself.
+4. Remove `applied.json`, and the backup if there is one. The notice goes with the next
+   start.
+
+A backup file does not mean an entry is open. No release removes
+`/etc/resolv.conf.netwatch-<pid>.bak`, so a session that quit cleanly and restored the
+file leaves one too, and copying an old one back would undo every edit since. Only the
+journal says what is open. A session in another home does not see that journal, so run
+`netwatch resolver status` as the account that ran 0.30, usually with `sudo`. When the
+notice says the journal is invalid or cannot be read it cannot name an entry. Read the
+file yourself if you can, and do not restore from a backup on the strength of the notice.
+
+A confined thread can write the cache, and under a `sudo` that keeps HOME the journal
+is in someone else's home. So every session and command reads it only as a regular,
+single-link file the current user owns, up to 64 KiB, without following a symlink, and
+only prints from it, with control characters replaced on the command line. Anything else
+gets `cannot read journal` in place of the entry.
 
 ## Lock and trust scope
 
@@ -81,6 +131,12 @@ every referenced backup must pass digest verification. Additional tests cover
 competing processes, invalid transitions/session identity, backup reuse prevention,
 corruption/version rejection, digest tampering, symlinks/hardlinks and directory
 replacement. Live discovery tests preserve both v2 and legacy bytes.
+
+Fixtures in `tests/fixtures/recovery` hold what older releases wrote: the journal
+from 0.30.4's own writer, and the journal and backup a real 0.31.1 `resolver set`
+left when SIGKILLed. Tests read the first and restore from the second.
+`tests/recovery.rs` runs a real daemon on the first and, where a user namespace is
+available, the real `resolver recover` on the second.
 
 These tests demonstrate process-crash behavior on the test filesystem. They do not
 simulate hardware power loss, disk-controller caches, or establish durability on

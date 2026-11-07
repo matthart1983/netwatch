@@ -246,6 +246,8 @@ pub struct AppUiState {
     // ── Transient status messages ──
     pub export_status: Option<String>,
     pub export_status_tick: u32,
+    /// Until when the row saying the config has keys it ignored shows.
+    pub config_notice_until: Option<std::time::Instant>,
 }
 
 impl AppUiState {
@@ -321,6 +323,7 @@ impl AppUiState {
 
             export_status: None,
             export_status_tick: 0,
+            config_notice_until: None,
         }
     }
 }

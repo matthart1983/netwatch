@@ -26,7 +26,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         netwatch::cli::Command::GenerateConfig => {
-            NetwatchConfig::default().save()?;
+            NetwatchConfig::generate()?;
             println!(
                 "Config written to {}",
                 NetwatchConfig::path()
@@ -59,7 +59,19 @@ fn main() -> Result<()> {
     // not load stops the TUI and the daemon here, naming the file and the
     // cause: the defaults would drop every setting in it, the sandbox mode
     // and `record_uptime` included.
-    let config = NetwatchConfig::load()?;
+    let api_key_flag = options.api_key.is_some();
+    if api_key_flag {
+        netwatch::logging::stderr_line(&format!("warning: {}", netwatch::cli::API_KEY_DEPRECATION));
+    }
+    let mut config = NetwatchConfig::load()?;
+    // The daemon's flow-log flags override the file before the sandbox paths
+    // are taken from it, so a `--flow-log-dir` gets its write grant.
+    netwatch::collectors::flow_log::apply_cli(&mut config, options.flow_log, options.flow_log_dir);
+    // The TUI is about to hide stderr, and these are back in view when it
+    // quits. A daemon's go to the journal. Nothing else here reports them twice:
+    // `load` says nothing, however many times a session calls it.
+    netwatch::config::print_warnings(&config.load_warnings);
+    netwatch::config::print_warnings(&netwatch::collectors::egress::default_policy_warnings());
     let remote_url = options
         .remote
         .or_else(|| std::env::var("NETWATCH_REMOTE_URL").ok());
@@ -97,6 +109,9 @@ fn main() -> Result<()> {
         netwatch::owner_only::create_dir_all(exports)?;
     }
     netwatch::sandbox::worker::install(sandbox_mode, sandbox_paths).map_err(anyhow::Error::msg)?;
+    // Declared before the session guard so it drops after it: the guard's warning
+    // about workers still running has to reach the log.
+    let _log_guard;
     let _worker_session = netwatch::sandbox::worker::SessionGuard;
     netwatch::sandbox::worker::preflight().map_err(anyhow::Error::msg)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -127,8 +142,15 @@ fn main() -> Result<()> {
     // non-blocking writer's worker flushes queued records on shutdown.
     // Installed after CLI flag handling so `--version` / `--help` don't
     // touch the cache dir.
-    let _log_guard = netwatch::logging::init();
+    _log_guard = netwatch::logging::init();
     config.warn_removed_keys();
+    config
+        .load_warnings
+        .iter()
+        .for_each(netwatch::config::ConfigWarning::log);
+    if api_key_flag {
+        tracing::warn!(target: "netwatch::remote", "{}", netwatch::cli::API_KEY_DEPRECATION);
+    }
 
     // Headless daemon mode: `netwatch daemon` (or `--daemon`/`--headless`).
     // Runs the same collectors as the TUI with no rendering, streams to the
@@ -148,9 +170,12 @@ fn main() -> Result<()> {
             exporter
         });
 
+        let flow_log = netwatch::collectors::flow_log::FlowLogConfig::resolve(&config);
+
         return runtime.block_on(app::run_headless(
             remote_publisher.as_ref(),
             metrics.as_ref(),
+            flow_log,
             sandbox_mode,
         ));
     }

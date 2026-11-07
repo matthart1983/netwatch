@@ -3,7 +3,7 @@
 use crate::{
     app::{App, AttributionStatus},
     collectors::geo::{DbFile, DbStatus},
-    config::NetwatchConfig,
+    config::{ConfigWarning, ConfigWarningKind, NetwatchConfig},
     sandbox::{self, Mode},
 };
 use serde::{Deserialize, Serialize};
@@ -160,6 +160,9 @@ pub struct NetRawTask {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
+    /// Read back as empty from a document older than the block.
+    #[serde(default)]
+    pub metadata: crate::schemas::Metadata,
     pub schema_version: u32,
     pub scope: String,
     pub platform: String,
@@ -189,6 +192,7 @@ impl CapabilitySnapshot {
     }
     fn configured_with(config: &NetwatchConfig, geoip: &DbStatus) -> Self {
         let mut snapshot = Self {
+            metadata: crate::schemas::DOCTOR.metadata(),
             schema_version: 1,
             scope: "static".into(),
             platform: std::env::consts::OS.into(),
@@ -1237,6 +1241,39 @@ fn live_connection_table(coverage: &crate::collectors::attribution::Coverage) ->
     }
 }
 
+/// Add what config files got wrong to the `config` row: key names and files,
+/// never a value, as with a file that does not parse. A key that is ignored means
+/// a setting is not in force, which is `degraded`. A renamed key still works, so
+/// the row stays `ready` with a reason of its own.
+fn report_config_warnings(
+    files: [&Vec<ConfigWarning>; 2],
+    state: &mut State,
+    code: &mut &'static str,
+    detail: &mut String,
+) {
+    for warnings in files {
+        let Some(first) = warnings.first() else {
+            continue;
+        };
+        let messages: Vec<_> = warnings.iter().map(|w| w.kind.message()).collect();
+        detail.push_str(&format!(
+            "; {}: {}",
+            first.file.display(),
+            messages.join(", ")
+        ));
+    }
+    if *state != State::Ready {
+        return;
+    }
+    let kinds = || files.into_iter().flatten().map(|w| &w.kind);
+    if kinds().any(|kind| matches!(kind, ConfigWarningKind::UnknownKey(_))) {
+        *state = State::Degraded;
+        *code = "config_unknown_keys";
+    } else if kinds().any(|kind| matches!(kind, ConfigWarningKind::RenamedKey { .. })) {
+        *code = "config_renamed_keys";
+    }
+}
+
 pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
     use crate::config::ConfigError;
     // The loader live sessions use, so doctor fails a file exactly when they
@@ -1245,7 +1282,7 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
     const REFUSED: &str = "defaults shown. Live sessions refuse to start until it is fixed";
     let path = NetwatchConfig::path();
     let loaded = path.as_deref().map(NetwatchConfig::load_from);
-    let (config, config_state, code, detail) = match loaded {
+    let (config, mut config_state, mut code, mut detail) = match loaded {
         Some(Ok(config)) if path.as_deref().is_some_and(std::path::Path::exists) => (
             config,
             State::Ready,
@@ -1277,14 +1314,24 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
             "No saved configuration; defaults shown".to_string(),
         ),
     };
-    let mut snapshot = CapabilitySnapshot::configured(&config);
-    snapshot.put(
-        "config",
-        config_state,
-        code,
-        &detail,
-        Some("Review config.toml; doctor never writes it"),
+    let policy = crate::collectors::egress::default_policy_warnings();
+    // The file to look at: the config, unless only the policy has something to say.
+    let review = match (
+        config_state == State::Ready && config.load_warnings.is_empty(),
+        policy.is_empty(),
+    ) {
+        (true, false) => "Review egress-policy.toml; doctor never writes it",
+        (false, false) => "Review config.toml and egress-policy.toml; doctor never writes them",
+        (_, true) => "Review config.toml; doctor never writes it",
+    };
+    report_config_warnings(
+        [&config.load_warnings, &policy],
+        &mut config_state,
+        &mut code,
+        &mut detail,
     );
+    let mut snapshot = CapabilitySnapshot::configured(&config);
+    snapshot.put("config", config_state, code, &detail, Some(review));
     #[cfg(target_os = "linux")]
     {
         snapshot.landlock = Some(landlock_self_test());
@@ -1401,6 +1448,15 @@ pub fn inspect_static(interface: Option<String>) -> CapabilitySnapshot {
             Some("netwatch resolver status; no recovery attempted by doctor"),
         );
     }
+    if let Some(refusal) = crate::diagnose::remediation::resolver::authority_refusal() {
+        snapshot.put(
+            "resolver_store",
+            State::NotChecked,
+            "authority_store_unreadable",
+            &refusal,
+            Some("sudo netwatch resolver status"),
+        );
+    }
     snapshot
 }
 
@@ -1500,7 +1556,7 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
             let result = bounded_check(&interface, mode);
             match result {
                 Ok(result) => {
-                    snapshot.interface = Some(result.interface.clone());
+                    snapshot.interface = checked_interface(&result);
                     if result.opened {
                         snapshot.put(
                             "interface",
@@ -1563,6 +1619,11 @@ pub fn doctor(json: bool, check_capture: bool, interface: Option<String>) -> any
     }
     Ok(())
 }
+/// The interface a capture check names in the report. A check that selected
+/// nothing sends back an empty name, and the JSON has null for that.
+fn checked_interface(result: &CaptureResult) -> Option<String> {
+    (!result.interface.is_empty()).then(|| result.interface.clone())
+}
 fn bounded_check(interface: &str, mode: Mode) -> anyhow::Result<CaptureResult> {
     use std::process::{Command, Stdio};
     let mode = match mode {
@@ -1608,7 +1669,64 @@ fn wait_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_renamed_key_leaves_config_ready_and_an_ignored_one_does_not() {
+        use crate::config::{ConfigWarning, ConfigWarningKind};
+        let warning = |kind| ConfigWarning {
+            file: "/etc/netwatch/config.toml".into(),
+            kind,
+        };
+        let renamed = warning(ConfigWarningKind::RenamedKey {
+            old: "colour_theme",
+            new: "theme",
+            since: "1.1",
+            both_set: false,
+        });
+        let unknown = warning(ConfigWarningKind::UnknownKey("typo".into()));
+        let report = |warnings: Vec<ConfigWarning>, state: State| {
+            let (mut state, mut code, mut detail) = (state, "config_valid", "Parsed".to_string());
+            report_config_warnings([&warnings, &Vec::new()], &mut state, &mut code, &mut detail);
+            (state, code, detail)
+        };
+
+        let (state, code, detail) = report(vec![], State::Ready);
+        assert_eq!(
+            (state, code, detail.as_str()),
+            (State::Ready, "config_valid", "Parsed")
+        );
+
+        let (state, code, detail) = report(vec![renamed.clone()], State::Ready);
+        assert_eq!((state, code), (State::Ready, "config_renamed_keys"));
+        assert!(
+            detail.contains("colour_theme was renamed theme in 1.1"),
+            "{detail}"
+        );
+        assert!(detail.contains("/etc/netwatch/config.toml"), "{detail}");
+
+        let (state, code, detail) = report(vec![renamed, unknown.clone()], State::Ready);
+        assert_eq!((state, code), (State::Degraded, "config_unknown_keys"));
+        assert!(
+            detail.contains("colour_theme") && detail.contains("typo"),
+            "{detail}"
+        );
+
+        // A file that did not load stays what it is.
+        let (state, code, _) = report(vec![unknown], State::Unavailable);
+        assert_eq!((state, code), (State::Unavailable, "config_valid"));
+    }
+
     use super::*;
+    #[test]
+    fn a_capture_check_that_selected_nothing_names_no_interface() {
+        let result = |interface: &str| CaptureResult {
+            interface: interface.into(),
+            opened: false,
+            error: Some("No up interface found".into()),
+            protection: None,
+        };
+        assert_eq!(checked_interface(&result("")), None);
+        assert_eq!(checked_interface(&result("eth0")).as_deref(), Some("eth0"));
+    }
     #[test]
     fn blocked_capture_child_is_terminated_at_deadline() {
         let child = std::process::Command::new(std::env::current_exe().unwrap())

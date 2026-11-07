@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "revision": 2,
+  "operations": [
+    {
+      "id": "bd204382-3ba1-46a0-a521-79de298b097e",
+      "issue_id": "resolver-command",
+      "owner": {
+        "session": "808003af-1ba2-4ecf-af1b-e2d1675d9f27",
+        "pid": 1687795,
+        "uid": 0,
+        "boot_id": "00000000-0000-4000-8000-000000000031",
+        "process_start": "8596747",
+        "pid_namespace": "pid:[4026531836]"
+      },
+      "resource": {
+        "adapter": "unmanaged_file",
+        "target": "/etc/resolv.conf",
+        "device": 53,
+        "inode": 11037260
+      },
+      "original_sha256": "6a59e79ae67fea765d1962ffa796b08f71c73bba991fff06a7350206cfb146f9",
+      "installed_sha256": "91d85906fd222540cd9d3fffc390b47af7b787ae43a9e17d9eec60daf57b1721",
+      "state": "applied",
+      "created_at": "2026-10-31T21:58:27.705899710+00:00",
+      "updated_at": "2026-10-31T21:58:27.707704729+00:00",
+      "detail": null
+    }
+  ]
+}

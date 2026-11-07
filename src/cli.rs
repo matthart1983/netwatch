@@ -33,12 +33,24 @@ pub struct Run {
     pub insecure_remote: bool,
     pub metrics: bool,
     pub metrics_addr: Option<String>,
+    /// `--flow-log`: where the daemon writes its connection log. Experimental.
+    pub flow_log: Option<crate::collectors::flow_log::FlowLogMode>,
+    /// `--flow-log-dir`: where `--flow-log file` writes. Experimental.
+    pub flow_log_dir: Option<String>,
 }
 // One option catalogue supplies both accepted spellings and help text.
 const OPTIONS: &[(&str, bool, &str)] = &[
-    ("--remote", true, "Remote https:// URL (requires API key)"),
-    ("--api-key", true, "Discouraged: use NETWATCH_API_KEY"),
-    ("--insecure-remote", false, "Allow an http:// remote URL"),
+    (
+        "--remote",
+        true,
+        "Experimental: remote https:// URL (requires API key)",
+    ),
+    ("--api-key", true, "Deprecated: use NETWATCH_API_KEY"),
+    (
+        "--insecure-remote",
+        false,
+        "Experimental: allow an http:// remote URL",
+    ),
     ("--view", true, "full, lite, or dense"),
     ("--lite", false, "Start in Lite view"),
     ("--demo", false, "Replay the Diagnose demo"),
@@ -46,17 +58,27 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--sandbox-strict", false, "Require sandbox enforcement"),
     ("--metrics", false, "Daemon metrics on 127.0.0.1:9464"),
     ("--metrics-addr", true, "Daemon metrics address"),
+    ("--flow-log", true, "Experimental: daemon connection log"),
+    (
+        "--flow-log-dir",
+        true,
+        "Experimental: directory for the connection log",
+    ),
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
+/// What `--api-key` prints on stderr. Names the replacement and why, and it is a
+/// constant so that it cannot pick up the key. The flag stays accepted through 1.x,
+/// because units and scripts use it, and goes in 2.0.
+pub const API_KEY_DEPRECATION: &str = "--api-key is deprecated and will go in 2.0, because any user on this host can read the key with ps. Set NETWATCH_API_KEY instead.";
 pub fn help() -> String {
-    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus [--only ID] [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch geoip update [--city]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
+    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose run [--target NAME] [--budget 30s] [--format json]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK] [--doc [PATH]]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose corpus --unstable [--only ID] [DIR]\n       netwatch diagnose replay --unstable [--json] <FILE|DIR>...\n       netwatch diagnose features --unstable [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch uptime [--since 7d] [--json | --csv] [DIR]\n       netwatch geoip update [--city]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]  (experimental)\n       netwatch resolver recover --unmanaged  (experimental)\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
     for (name, value, description) in OPTIONS {
         text.push_str(&format!(
             "  {name:<19} {}{description}\n",
             if *value { "<value> " } else { "" }
         ));
     }
-    text.push_str("  --generate-config    Write default config and exit\n  --help, -h           Show help\n  --version, -V        Show version\n\nKeys: 1–9,0 tabs; V view; L Lite; q quit; Shift+R/F/E recorder\n");
+    text.push_str("  --unstable           Required by diagnose corpus, replay and features, whose\n                       formats can change in any release\n  --generate-config    Write default config and exit\n  --help, -h           Show help\n  --version, -V        Show version\n\nKeys: 1–9,0 tabs; V view; L Lite; q quit; Shift+R/F/E recorder\n\nExperimental, and can change in any release: what --remote, --insecure-remote and\n--api-key do, resolver set and recover, AI Insights, and the JSON in PCAPNG packet\ncomments. Those three flags stay accepted through 1.x; --api-key goes in 2.0.\n");
     text
 }
 pub fn parse(args: &[String]) -> anyhow::Result<Command> {
@@ -158,6 +180,17 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
             }
             "--metrics" => run.metrics = true,
             "--metrics-addr" => run.metrics_addr = Some(value(&mut rest, arg)?),
+            "--flow-log" => {
+                let name = value(&mut rest, arg)?;
+                run.flow_log = Some(
+                    crate::collectors::flow_log::FlowLogMode::by_name(&name)
+                        .filter(|m| m.enabled())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--flow-log expects file, stdout, or both")
+                        })?,
+                );
+            }
+            "--flow-log-dir" => run.flow_log_dir = Some(value(&mut rest, arg)?),
             _ => unreachable!(),
         }
     }
@@ -166,6 +199,9 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
     }
     if !run.daemon && (run.metrics || run.metrics_addr.is_some()) {
         anyhow::bail!("metrics options require daemon mode");
+    }
+    if !run.daemon && (run.flow_log.is_some() || run.flow_log_dir.is_some()) {
+        anyhow::bail!("flow log options require daemon mode");
     }
     if run.metrics && run.metrics_addr.is_some() {
         anyhow::bail!("choose --metrics or --metrics-addr");
@@ -206,6 +242,34 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn flow_log_is_a_daemon_option_with_a_mode() {
+        use crate::collectors::flow_log::FlowLogMode;
+        for (s, mode) in [
+            ("daemon --flow-log file", FlowLogMode::File),
+            ("daemon --flow-log stdout", FlowLogMode::Stdout),
+            ("--flow-log both daemon", FlowLogMode::Both),
+        ] {
+            match command(s).unwrap() {
+                Command::Run(run) => assert_eq!(run.flow_log, Some(mode), "{s}"),
+                _ => panic!("{s}"),
+            }
+        }
+        match command("daemon --flow-log file --flow-log-dir /var/log/netwatch").unwrap() {
+            Command::Run(run) => assert_eq!(run.flow_log_dir.as_deref(), Some("/var/log/netwatch")),
+            _ => panic!(),
+        }
+        for s in [
+            "--flow-log file",
+            "--flow-log-dir /var/log/netwatch",
+            "daemon --flow-log-dir",
+            "daemon --flow-log",
+            "daemon --flow-log off",
+            "daemon --flow-log typo",
+        ] {
+            assert!(command(s).is_err(), "{s}");
+        }
     }
     #[test]
     fn ambiguous_or_missing_values_fail_before_startup() {
@@ -259,8 +323,10 @@ mod tests {
             .lines()
             .find(|l| l.trim_start().starts_with("--api-key"))
             .unwrap();
+        assert!(line.contains("Deprecated"), "{line}");
         assert!(line.contains("NETWATCH_API_KEY"), "{line}");
-        // Discouraged, not removed: existing units keep working.
+        assert!(API_KEY_DEPRECATION.contains("NETWATCH_API_KEY"));
+        // Deprecated, not removed: existing units keep starting through 1.x.
         assert!(matches!(
             command("--remote https://cloud.example.com --api-key k").unwrap(),
             Command::Run(Run {
@@ -268,6 +334,42 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Where a user meets them, the things that can change in any release say so.
+    #[test]
+    fn help_labels_what_is_experimental() {
+        let help = help();
+        for option in ["--remote", "--insecure-remote"] {
+            let line = help
+                .lines()
+                .find(|l| l.trim_start().starts_with(option))
+                .unwrap();
+            assert!(line.contains("Experimental"), "{line}");
+        }
+        for usage in ["netwatch resolver set", "netwatch resolver recover"] {
+            let line = help.lines().find(|l| l.contains(usage)).unwrap();
+            assert!(line.contains("(experimental)"), "{line}");
+        }
+        assert!(!help
+            .lines()
+            .find(|l| l.contains("netwatch resolver status"))
+            .unwrap()
+            .contains("experimental"));
+        let footer = help
+            .split("Experimental, and")
+            .nth(1)
+            .unwrap()
+            .replace('\n', " ");
+        for word in [
+            "AI Insights",
+            "PCAPNG packet comments",
+            "what --remote, --insecure-remote and --api-key do",
+            "stay accepted through 1.x",
+            "--api-key goes in 2.0",
+        ] {
+            assert!(footer.contains(word), "{word}: {footer}");
+        }
     }
 
     #[test]
@@ -304,11 +406,18 @@ mod tests {
         const FISH: &str = include_str!("../completions/netwatch.fish");
         const MAN: &str = include_str!("../docs/netwatch.1");
 
-        for (name, _, _) in OPTIONS {
+        for (name, _, description) in OPTIONS {
             for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
                 assert!(
                     text.contains(name) || text.contains(name.trim_start_matches("--")),
                     "{what} completion is missing {name}"
+                );
+            }
+            // The two that show a description show the one help does.
+            for (what, text) in [("zsh", ZSH), ("fish", FISH)] {
+                assert!(
+                    text.contains(description),
+                    "{what} completion does not say {description:?} for {name}"
                 );
             }
             // roff escapes every hyphen: `--api-key` is written `\-\-api\-key`.
@@ -346,6 +455,37 @@ mod tests {
             MAN.contains("\\-\\-city"),
             "man page is missing geoip update --city"
         );
+
+        // `--unstable` is not in OPTIONS either: the run parser refuses it, and only
+        // the subcommands it gates take it.
+        for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+            assert!(
+                text.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|w| w == "unstable"),
+                "{what} completion is missing --unstable"
+            );
+        }
+        assert!(
+            help().contains("\n  --unstable "),
+            "help does not list --unstable"
+        );
+        assert!(command("--unstable").is_err(), "gates nothing on a session");
+        for sub in crate::diagnose::episode::UNSTABLE_SUBCOMMANDS {
+            let usage = format!("netwatch diagnose {sub} --unstable ");
+            assert!(help().contains(&usage), "help is missing {usage}");
+            // The man page's entry for it, up to the next one.
+            let heading = format!(".B diagnose {sub}");
+            let entry: Vec<_> = MAN
+                .lines()
+                .skip_while(|l| l.trim_end() != heading)
+                .skip(1)
+                .take_while(|l| l.trim_end() != ".TP")
+                .collect();
+            assert!(
+                entry.iter().any(|l| l.contains("\\-\\-unstable")),
+                "man page's diagnose {sub} does not name --unstable: {entry:?}"
+            );
+        }
 
         for sub in crate::diagnose::episode::SUBCOMMANDS {
             for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {

@@ -1,6 +1,6 @@
 """Offline tooling for netwatch Diagnose models.
 
-Features are computed by netwatch itself (`netwatch diagnose features`); this
+Features are computed by netwatch itself (`netwatch diagnose features --unstable`); this
 package only reads them. See load.py.
 """
 

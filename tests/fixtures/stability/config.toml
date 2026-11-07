@@ -1,0 +1,76 @@
+# Every stable config.toml key. tests/stability.rs loads this and requires no
+# unknown-key warning, so removing or renaming one fails. See STABILITY.md.
+default_tab = "dashboard"
+refresh_rate_ms = 1000
+capture_interface = ""
+show_geo = true
+timeline_window = "5m"
+packet_follow = true
+bpf_filter = ""
+geoip_db = ""
+geoip_asn_db = ""
+insights_enabled = false
+insights_model = "llama3.2"
+insights_endpoint = "local"
+theme = "dark"
+view = "full"
+graph_style = "dots"
+graph_fade = true
+sandbox = "on"
+tls_keylog_path = ""
+egress_violation_cooldown_secs = 300
+groups_start_collapsed = true
+confirm_quit = false
+diagnose_record_episodes = true
+record_uptime = true
+third_party_probes = true
+
+[alerts]
+bandwidth_threshold = 100000000
+port_scan_threshold = 20
+port_scan_window_secs = 30
+
+[diagnose_probes]
+pmtu_url = "https://example.com/"
+trace_target = "1.1.1.1"
+trace_refresh_secs = 300
+
+[[diagnose_probes.ipv6_pairs]]
+v4 = "1.1.1.1:443"
+v6 = "[2606:4700:4700::1111]:443"
+
+[[diagnose_probes.portal_endpoints]]
+url = "http://connectivitycheck.gstatic.com/generate_204"
+expect_status = 204
+
+[[diagnose_targets]]
+enabled = true
+name = "api"
+host = "example.com"
+port = 443
+tls = true
+http = true
+path = "/"
+expect_status = 200
+interval_secs = 60
+
+[diagnose_thresholds]
+sigma_k = 3.0
+sigma_close_k = 2.0
+sigma_floor_ms = 2.0
+sigma_floor_pct = 0.2
+gateway_delta_floor_ms = 5.0
+dns_delta_floor_ms = 20.0
+dns_delta_multiple = 2.0
+consecutive_n = 3
+verdict_hold_secs = 30
+dns_ceiling_ms = 200.0
+socket_rtt_ms = 200.0
+loaded_rtt_delta_ms = 100.0
+saturation_pct = 90.0
+iface_error_floor = 1.0
+iface_drop_floor = 1.0
+dns_tc_pct = 5.0
+dns_mismatch_pct = 5.0
+wifi_rssi_dbm = -70.0
+wifi_retry_pct = 20.0
