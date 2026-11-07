@@ -439,6 +439,17 @@ jobs:
             scripts/static-asset-names.sh
           fi
 
+      # GitHub replaces a `~` in an asset's name with `.`, so a pre-release's
+      # packages (netwatch_1.0.0~rc.1-1_amd64.deb) were served under names
+      # SHA256SUMS did not list, and `sha256sum -c` could not find them
+      # (1.0.0-rc.1). Renamed first, the sums, the attestations and the
+      # release all use the name GitHub serves. The version inside each
+      # package keeps its tilde.
+      - name: Name pre-release packages as GitHub serves them
+        run: |
+          shopt -s nullglob
+          for f in *~*; do mv -v "$f" "${f//\~/.}"; done
+
       # Every shipped binary must carry the dependency list `cargo auditable`
       # embeds. A build step that lost the wrapper still links fine, so
       # check the artifacts rather than trust the build.
