@@ -35,7 +35,9 @@ Cycle 2 peaked 15.3 MiB above cycle 1 on the reference machine and 14.3 MiB abov
 | `57b496f` (0.40.0 and the flow log) | +20.4, +17.8 |
 | `main` (rc.1's code, apart from docs) | +16.3, +23.6, +20.4 |
 
-The four runs dispatched together read +17.8 to +20.4, v0.40.0 among them. One commit varies by more than 7 MiB between runs, so a 16 MiB limit on cycle 2 against cycle 1 sits inside the noise, and it still can't tell a leak from the allocator warming up in cycle 1. Every other gate passed on every run: the highest VmHWM was 403 MiB against the 512 MiB ceiling, and the stream and ring budgets held. Before 1.0.0 the soak is to compare a third cycle with the second, and a 24-hour run is to show whether memory keeps climbing. A climb blocks 1.0.0.
+The four runs dispatched together read +17.8 to +20.4, v0.40.0 among them. One commit varies by more than 7 MiB between runs, so a 16 MiB limit on cycle 2 against cycle 1 sits inside the noise, and it still can't tell a leak from the allocator warming up in cycle 1. Every other gate passed on every run: the highest VmHWM was 403 MiB against the 512 MiB ceiling, and the stream and ring budgets held.
+
+One local run of `main` with a third cycle points the wrong way. Its peaks, all in the `mtu-tcp` phase, were 375.7 MiB in cycle 2 and 393.7 MiB in cycle 3, 18 MiB higher. Every other scenario except `bulk` also peaked about 8 to 20 MiB higher in cycle 3. Cycle 1 doesn't count: the machine suspended in the middle of it. That is one run, and runs vary by 7 MiB, but it reads as growth that continues after warm-up. Before 1.0.0, the soak is to compare a third cycle with the second, a 24-hour run is to show whether memory keeps climbing, and the growth is to be found or ruled out. A climb blocks 1.0.0.
 
 ## Flood soak
 
