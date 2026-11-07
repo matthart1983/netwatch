@@ -2,6 +2,15 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **The Nix build passes its tests on Linux 7.2.** A sandbox test expected a TCP Fast Open
+  send from a parser thread to get past the Landlock network deny. Linux 7.2 closes that gap,
+  and kernels with the stable backport may too, so the test failed and the build stopped
+  (#192). The test now accepts a denied send, as long as nothing reaches the listener, and
+  the threat model scopes the Fast Open gap to kernels without the fix.
+
 ## [1.0.0-rc.1] - 2026-11-07
 
 ### Added

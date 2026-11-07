@@ -1429,11 +1429,16 @@ mod tests {
     }
 
     #[test]
-    fn parser_layer_leaves_fast_open_and_autobind_open() {
-        // Landlock checks connect(2) and bind(2). A TCP Fast Open sendto
-        // connects without the first, and listen(2) on an unbound socket
-        // takes an ephemeral port on every address without the second. The
-        // threat model says so; this fails if that changes under it.
+    fn parser_layer_leaves_autobind_open_and_fast_open_to_the_kernel() {
+        // Landlock checks connect(2) and bind(2). listen(2) on an unbound
+        // socket takes an ephemeral port on every address without the second;
+        // the threat model says so, and this fails if that changes under it.
+        // A TCP Fast Open sendto connects without the first on kernels before
+        // Linux 7.2, which checks it against the connect rules (33cb713db016,
+        // "landlock: Fix TCP Fast Open connection bypass", also marked for
+        // stable). Either the send is denied and nothing arrives, or it goes
+        // out. Landlock has no erratum for the fix, so nothing can tell which
+        // ahead of time (#192).
         use nix::sys::socket::{
             listen, sendto, socket, AddressFamily, Backlog, MsgFlags, SockFlag, SockType,
             SockaddrIn,
@@ -1489,9 +1494,15 @@ mod tests {
         .join()
         .unwrap();
 
-        if let Some(sent) = sent {
+        outside.set_nonblocking(true).unwrap();
+        if sent == Some(Err(nix::errno::Errno::EACCES)) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            match outside.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("a denied Fast Open send reached the listener: {other:?}"),
+            }
+        } else if let Some(sent) = sent {
             assert_eq!(sent, Ok(9));
-            outside.set_nonblocking(true).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut accepted = loop {
                 match outside.accept() {

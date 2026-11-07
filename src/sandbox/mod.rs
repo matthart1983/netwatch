@@ -203,10 +203,10 @@ pub struct PlatformReport {
     /// when the layer could not be built to ask.
     pub landlock_availability: Option<&'static str>,
     /// Linux: connect(2) and bind(2) on TCP sockets denied on this thread by
-    /// its parser or capture layer. The network stays reachable: UDP, MPTCP,
-    /// a TCP Fast Open send and listen(2) on an unbound socket all get past
-    /// it (docs/THREAT-MODEL.md, item 4). Main and the network workers leave
-    /// this false.
+    /// its parser or capture layer. The network stays reachable: UDP, MPTCP
+    /// and listen(2) on an unbound socket get past it, and so does a TCP Fast
+    /// Open send on kernels without the Linux 7.2 fix (docs/THREAT-MODEL.md,
+    /// item 4). Main and the network workers leave this false.
     pub landlock_network_blocked: bool,
     /// Linux: the layer this thread's role stacks on the filesystem one,
     /// "parser" or "capture", whether or not the kernel enforced it. `None`
