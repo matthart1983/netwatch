@@ -148,9 +148,11 @@ jobs:
     steps:
       - run: |
           set -euo pipefail
-          rpm_version=$(tr - '~' <<< "${VERSION}")
-          curl -fsSLO "https://github.com/${REPO}/releases/download/${TAG}/netwatch-${rpm_version}-1.x86_64.rpm"
-          dnf install -y "./netwatch-${rpm_version}-1.x86_64.rpm"
+          # The package's version is 1.0.0~rc.1, but GitHub serves a `~` in an
+          # asset's name as `.`.
+          rpm_file="netwatch-$(tr - . <<< "${VERSION}")-1.x86_64.rpm"
+          curl -fsSLO "https://github.com/${REPO}/releases/download/${TAG}/${rpm_file}"
+          dnf install -y "./${rpm_file}"
           out=$(netwatch --version)
           echo "$out"
           grep -qF "${VERSION}" <<< "$out" ||

@@ -103,7 +103,7 @@ What each channel does with a hyphenated tag:
 | GitHub release | published, marked pre-release; `/releases/latest` stays on the last release |
 | crates.io | published; `cargo install` and `cargo binstall` take it only when asked for by version |
 | GHCR | `:v1.0.0-rc.1`, never `:latest` |
-| `.deb` / `.rpm` assets | `1.0.0~rc.1-1`, which both sort below `1.0.0` |
+| `.deb` / `.rpm` assets | version `1.0.0~rc.1-1`, which both sort below `1.0.0`; the file names say `1.0.0.rc.1`, since GitHub serves no `~` in an asset's name |
 | apt repository, COPR | skipped: each has one channel that users upgrade from |
 | Homebrew, Scoop, conda-forge | not picked up; they follow releases |
 

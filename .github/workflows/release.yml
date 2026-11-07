@@ -439,6 +439,17 @@ jobs:
             scripts/static-asset-names.sh
           fi
 
+      # GitHub replaces a `~` in an asset's name with `.`, so a pre-release's
+      # packages (netwatch_1.0.0~rc.1-1_amd64.deb) were served under names
+      # SHA256SUMS did not list, and `sha256sum -c` could not find them
+      # (1.0.0-rc.1). Renamed first, the sums, the attestations and the
+      # release all use the name GitHub serves. The version inside each
+      # package keeps its tilde.
+      - name: Name pre-release packages as GitHub serves them
+        run: |
+          shopt -s nullglob
+          for f in *~*; do mv -v "$f" "${f//\~/.}"; done
+
       # Every shipped binary must carry the dependency list `cargo auditable`
       # embeds. A build step that lost the wrapper still links fine, so
       # check the artifacts rather than trust the build.
@@ -574,9 +585,13 @@ jobs:
           context: packaging/docker
           platforms: linux/amd64,linux/arm64
           push: true
+          # `cond && x || y` is the expression language's only conditional,
+          # and it yields y whenever x is falsy. The old form put '' in x, so
+          # it always yielded :latest, and 1.0.0-rc.1 took :latest from
+          # 0.40.0. The non-empty value goes in x.
           tags: |
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
-            ${{ contains(env.RELEASE_TAG, '-') && '' || format('ghcr.io/{0}:latest', github.repository) }}
+            ${{ !contains(env.RELEASE_TAG, '-') && format('ghcr.io/{0}:latest', github.repository) || '' }}
 
       # The image's provenance, pushed to GHCR next to it. Verified with:
       #   gh attestation verify oci://ghcr.io/matthart1983/netwatch:vX.Y.Z -R matthart1983/netwatch
