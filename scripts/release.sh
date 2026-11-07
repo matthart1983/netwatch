@@ -145,8 +145,10 @@ echo "==> ${current} -> ${VERSION} on ${branch}"
 # Handed to awk through the environment: `awk -v` would read backslashes in
 # the summary as escapes.
 TODAY=$(date +%F)
-# RPM allows no hyphen in a Version; a tilde sorts below the release.
-RPM_VERSION="${VERSION/-/\~}"
+# RPM allows no hyphen in a Version; a tilde sorts below the release. Not
+# ${VERSION/-/\~}: macOS's bash 3.2 keeps the backslash.
+RPM_VERSION="${VERSION%%-*}"
+[ "${RPM_VERSION}" = "${VERSION}" ] || RPM_VERSION="${RPM_VERSION}~${VERSION#*-}"
 RPM_HEAD="* $(LC_ALL=C date '+%a %b %d %Y') ${name} <${email}> - ${RPM_VERSION}-1"
 export V="${VERSION}" RPMV="${RPM_VERSION}" SUMMARY TODAY RPM_HEAD
 

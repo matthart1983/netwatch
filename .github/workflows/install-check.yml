@@ -97,10 +97,11 @@ jobs:
             gh attestation verify "$f" -R "${REPO}" > /dev/null
             echo "attested: $f"
           done
+          # Each tarball holds one binary named after the tarball.
           for a in netwatch-linux-x86_64 netwatch-linux-x86_64-static; do
             mkdir "$a.d"
             tar xzf "$a.tar.gz" -C "$a.d"
-            out=$("$a.d/netwatch-linux-x86_64" --version)
+            out=$("$a.d/$a" --version)
             echo "$a: $out"
             grep -qF "${VERSION}" <<< "$out" ||
               { echo "::error::$a reports '$out', not ${VERSION}"; exit 1; }
@@ -147,7 +148,7 @@ jobs:
     steps:
       - run: |
           set -euo pipefail
-          rpm_version="${VERSION/-/\~}"
+          rpm_version=$(tr - '~' <<< "${VERSION}")
           curl -fsSLO "https://github.com/${REPO}/releases/download/${TAG}/netwatch-${rpm_version}-1.x86_64.rpm"
           dnf install -y "./netwatch-${rpm_version}-1.x86_64.rpm"
           out=$(netwatch --version)
@@ -178,7 +179,9 @@ jobs:
             { echo "::error::apt installed '$out', not ${VERSION}"; exit 1; }
 
   # COPR builds from source after the release workflow asks it to, which
-  # takes a while, so a version behind is a warning.
+  # takes a while, so a version behind is a warning. fedora:latest is the
+  # newest Fedora, so this also fails when the project lacks its chroot, as
+  # it did for Fedora 45: scripts/copr-setup.sh lists the chroots.
   copr:
     needs: resolve
     if: needs.resolve.outputs.prerelease == 'false'

@@ -312,9 +312,9 @@ jobs:
           # Cargo.toml's as it is, so a pre-release (1.0.0-rc.1) is given as
           # 1.0.0~rc.1, which RPM sorts below 1.0.0. cargo-deb makes the same
           # change on its own.
-          version="${RELEASE_TAG#v}"
+          version=$(tr - '~' <<< "${RELEASE_TAG#v}")
           cargo generate-rpm --target ${{ matrix.target }} --arch "${rpm_arch}" --output . \
-            --set-metadata "version = \"${version/-/\~}\""
+            --set-metadata "version = \"${version}\""
           ls -l *.deb *.rpm
 
       # A package that installs but does not run is worse than no package.
