@@ -15,7 +15,11 @@ CFG="${COPR_CONFIG:-$HOME/.config/copr}"
 PROJECT="${COPR_PROJECT:-netwatch}"
 REPO_URL="https://github.com/matthart1983/netwatch"
 SPEC="packaging/rpm/netwatch.spec"
-CHROOTS=(fedora-43-x86_64 fedora-43-aarch64 fedora-44-x86_64 fedora-44-aarch64 fedora-rawhide-x86_64)
+# A new Fedora needs its chroots added here and in the project's settings
+# (re-running this script does not change an existing project's chroots).
+# install-check.yml fails on the newest Fedora until it has them.
+CHROOTS=(fedora-43-x86_64 fedora-43-aarch64 fedora-44-x86_64 fedora-44-aarch64
+    fedora-45-x86_64 fedora-45-aarch64 fedora-rawhide-x86_64)
 
 [ -r "${CFG}" ] || { echo "No COPR config at ${CFG} — see the header of this script." >&2; exit 1; }
 

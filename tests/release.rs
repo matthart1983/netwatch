@@ -672,6 +672,139 @@ mod script {
         );
     }
 
+    /// A release candidate: the crate, the lockfile and the CHANGELOG take
+    /// the hyphenated version, the RPM spec a tilde in `Version` (RPM allows
+    /// no hyphen there) and the hyphen in `upstream`, the tag's spelling.
+    #[test]
+    fn release_script_makes_a_release_candidate() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let spec = fixture
+            .read("packaging/rpm/netwatch.spec")
+            .replace("Name:", "%global upstream 0.32.3\nName:");
+        fs::write(fixture.repo().join("packaging/rpm/netwatch.spec"), spec).unwrap();
+        fixture.git(&["commit", "-q", "-am", "spec with upstream"]);
+
+        let out = fixture.release(&["1.0.0-rc.1", "the first release candidate"]);
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(fixture
+            .read("Cargo.toml")
+            .contains("\nversion = \"1.0.0-rc.1\"\n"));
+        assert!(fixture
+            .read("Cargo.lock")
+            .contains("name = \"netwatch-tui\"\nversion = \"1.0.0-rc.1\"\n"));
+        let spec = fixture.read("packaging/rpm/netwatch.spec");
+        assert!(
+            spec.lines().any(|l| l == "%global upstream 1.0.0-rc.1"),
+            "{spec}"
+        );
+        assert!(
+            spec.lines().any(|l| l == "Version:        1.0.0~rc.1"),
+            "{spec}"
+        );
+        assert!(
+            spec.split("%changelog\n")
+                .nth(1)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with(" - 1.0.0~rc.1-1"),
+            "{spec}"
+        );
+        assert!(fixture
+            .read("CHANGELOG.md")
+            .contains("\n## [1.0.0-rc.1] - "));
+        assert_eq!(
+            fixture.git(&["rev-parse", "v1.0.0-rc.1^{commit}"]),
+            fixture.git(&["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            fixture.git(&["cat-file", "-t", "v1.0.0-rc.1"]).trim(),
+            "tag"
+        );
+    }
+
+    /// Pre-releases go up within a version (alpha < beta < rc, then by
+    /// number), and never come after the version they lead to.
+    #[test]
+    fn release_script_orders_pre_releases() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        fixture.refuses(&["0.32.4-rc", "summary"], "is not X.Y.Z or X.Y.Z-rc.N");
+        fixture.refuses(&["0.32.4-pre.1", "summary"], "is not X.Y.Z or X.Y.Z-rc.N");
+        fixture.refuses(
+            &["0.32.3-rc.1", "summary"],
+            "0.32.3-rc.1 is not above the current version, 0.32.3",
+        );
+        let rc2 = fixture
+            .read("Cargo.toml")
+            .replace("version = \"0.32.3\"", "version = \"0.32.4-rc.2\"");
+        fs::write(fixture.repo().join("Cargo.toml"), rc2).unwrap();
+        fixture.git(&["commit", "-q", "-am", "0.32.4-rc.2"]);
+        for earlier in ["0.32.4-rc.1", "0.32.4-rc.2", "0.32.4-beta.5"] {
+            fixture.refuses(
+                &[earlier, "summary"],
+                &format!("{earlier} is not above the current version, 0.32.4-rc.2"),
+            );
+        }
+        let out = fixture.release(&["0.32.4-rc.10", "summary"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// With a signing key configured the tag is signed; the key here is a
+    /// throwaway SSH key, so the test needs ssh-keygen.
+    #[test]
+    fn release_script_signs_the_tag_when_git_has_a_key() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        if !has_ssh_keygen() {
+            return;
+        }
+        let key = fixture.0.join("signing");
+        let made = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "release-test", "-f"])
+            .arg(&key)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        fixture.git(&["config", "gpg.format", "ssh"]);
+        fixture.git(&["config", "user.signingkey", key.to_str().unwrap()]);
+        let out = fixture.release(&["0.32.4", "signed"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tag = fixture.git(&["cat-file", "-p", "v0.32.4"]);
+        assert!(tag.contains("-----BEGIN SSH SIGNATURE-----"), "{tag}");
+    }
+
+    fn has_ssh_keygen() -> bool {
+        // ssh-keygen has no --version; any answer means it is there.
+        let found = Command::new("ssh-keygen").arg("-?").output().is_ok();
+        if !found {
+            eprintln!("skipping: no ssh-keygen to make a signing key with");
+        }
+        found
+    }
+
     /// The RPM %changelog entry is signed with git's identity; without one the
     /// script used to stop with no message.
     #[test]
