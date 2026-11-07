@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Network diagnostics in your terminal.</strong><br>
-  Linux, macOS and Windows. FreeBSD best-effort.
+  Linux, macOS, Windows and FreeBSD.
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/demo-dense.gif" alt="netwatch's dense view: a mirrored braille throughput graph with download above the axis and upload below, per-interface rates with sparklines, four-hop latency budgets, and a connection table with the selected socket's kernel TCP state" width="900">
+  <img src="docs/media/demo-dense-light.gif" alt="netwatch's dense view on a light terminal: a mirrored braille throughput graph with download above the axis and upload below, per-interface rates with sparklines, four-hop latency budgets, and a connection table with the selected socket's kernel TCP state" width="900">
 </p>
 
 <p align="center">
@@ -61,7 +61,7 @@ Windows are on the
 `.deb`, `.rpm`, checksums and signed provenance. The Linux builds are static and
 need nothing installed; Windows needs [Npcap](https://npcap.com/#download).
 
-**FreeBSD** is best-effort. `netwatch-freebsd-x86_64` is built on FreeBSD 13.5 and
+**FreeBSD:** `netwatch-freebsd-x86_64` is built on FreeBSD 13.5 and
 dynamically links the base system's libc and libpcap, so it needs FreeBSD 13 or
 newer (it cannot be static). On anything older, build from source with
 `cargo install netwatch-tui`.

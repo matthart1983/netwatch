@@ -54,6 +54,9 @@ All notable changes to NetWatch will be documented in this file.
 - `scripts/release.sh` signs the tag (`git tag -s`) when git has a `user.signingkey`.
 - README: the header keeps the CI, release and Terminal Trove badges and states platform
   support in text. Related adds kernwatch and drops NetWatch Cloud.
+- README: the demo at the top is a light-terminal recording of the dense view
+  (`docs/media/demo-dense-light.gif`, from `demo-dense-light.tape`). The dark
+  `demo-dense.gif` is re-recorded on 0.40.0. FreeBSD is listed with the other platforms.
 
 ### Fixed
 - **`paper`'s graph peaks are readable.** The top of every graph was lightened toward white,
