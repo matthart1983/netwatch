@@ -13,6 +13,12 @@
 //!   resolver as DNS failing. A probe that could not be sent at all
 //!   (ICMP blocked and no TCP answer) measures nothing, so the hop is
 //!   unknown, never down.
+//! - The internet hop is two targets. A cycle in which
+//!   [`INTERNET_TARGET`](crate::collectors::health::INTERNET_TARGET) gets no
+//!   reply counts as answered if
+//!   [`INTERNET_FALLBACK_TARGET`](crate::collectors::health::INTERNET_FALLBACK_TARGET)
+//!   replies in the same cycle, so one provider's outage, or a network that
+//!   blocks it, is not an internet outage.
 //! - The connection is down while any hop is down, and the outage is blamed
 //!   on the nearest hop that was down: the gateway means the LAN or router,
 //!   the internet hop means the ISP or beyond, DNS means name resolution
@@ -23,7 +29,8 @@
 //! The JSON and CSV outputs are part of the 1.0 compatibility promise. The JSON
 //! is versioned (`schema`). The CSV has no version marker and is covered by its
 //! header row: columns are not renamed or removed, and new ones are added at the
-//! end.
+//! end. The text and Markdown (`--md`) reports are for people, and their wording
+//! may change.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
@@ -374,7 +381,7 @@ impl Monitor {
         for hop in Hop::ALL {
             let (completed, loss, configured) = match hop {
                 Hop::Gateway => (status.completed.gateway, status.gateway_loss, gateway),
-                Hop::Internet => (status.completed.internet, status.internet_loss, true),
+                Hop::Internet => (status.completed.internet, internet_loss(status), true),
                 Hop::Dns => (status.completed.dns, status.dns_loss, dns),
             };
             let sample = if !configured {
@@ -413,6 +420,19 @@ impl Monitor {
                 return;
             }
         }
+    }
+}
+
+/// The internet hop's loss for one cycle: the first target's, unless it got
+/// no reply and the fallback target, asked in the same cycle, did.
+fn internet_loss(status: &HealthStatus) -> Loss {
+    match (status.internet_loss, status.internet_fallback_loss) {
+        (Loss::Measured(first), Some(fallback @ Loss::Measured(second)))
+            if first >= 100.0 && second < 100.0 =>
+        {
+            fallback
+        }
+        (first, _) => first,
     }
 }
 
@@ -701,9 +721,10 @@ enum Format {
     Text,
     Json,
     Csv,
+    Markdown,
 }
 
-/// `netwatch uptime [--since 7d] [--json | --csv] [DIR]`
+/// `netwatch uptime [--since 7d] [--json | --csv | --md] [DIR]`
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     let mut since_secs = 7 * 86_400;
     let mut format = Format::Text;
@@ -719,10 +740,11 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
             }
             "--json" if format == Format::Text => format = Format::Json,
             "--csv" if format == Format::Text => format = Format::Csv,
-            "--json" | "--csv" => anyhow::bail!("pick one of --json and --csv"),
+            "--md" if format == Format::Text => format = Format::Markdown,
+            "--json" | "--csv" | "--md" => anyhow::bail!("pick one of --json, --csv and --md"),
             flag if flag.starts_with("--") => anyhow::bail!("unknown uptime option: {flag}"),
             _ if dir.is_none() => dir = Some(PathBuf::from(arg)),
-            _ => anyhow::bail!("usage: netwatch uptime [--since 7d] [--json | --csv] [DIR]"),
+            _ => anyhow::bail!("usage: netwatch uptime [--since 7d] [--json | --csv | --md] [DIR]"),
         }
     }
     let dir = match dir {
@@ -743,6 +765,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         Format::Text => text(&report, &dir),
         Format::Json => serde_json::to_string_pretty(&json(&report))? + "\n",
         Format::Csv => csv(&report),
+        Format::Markdown => markdown(&report, &dir),
     };
     print!("{out}");
     Ok(())
@@ -854,6 +877,156 @@ fn text(r: &Report, dir: &Path) -> String {
     out.push_str(&format!(
         "; {} not monitored\n",
         duration(s.unmonitored_secs)
+    ));
+    out
+}
+
+/// Where an outage was, in words for someone outside the house.
+fn place(hop: Hop) -> &'static str {
+    match hop {
+        Hop::Gateway => "The router or local network",
+        Hop::Internet => "Beyond the router (the ISP or further)",
+        Hop::Dns => "Name resolution (DNS) only",
+    }
+}
+
+fn note(e: Ended) -> &'static str {
+    match e {
+        Ended::Recovered => "",
+        Ended::MonitoringStopped => "netwatch stopped during it, so it ended later",
+        Ended::Ongoing => "still down when this report was made",
+    }
+}
+
+/// `--md`: a report to attach to a ticket with an ISP. It says what one
+/// computer saw and how, and claims nothing it could not measure.
+fn markdown(r: &Report, dir: &Path) -> String {
+    use crate::collectors::health::{INTERNET_FALLBACK_TARGET, INTERNET_TARGET};
+    let at = |t: u64| local(t).format("%Y-%m-%d %H:%M:%S").to_string();
+    let s = &r.summary;
+    let monitored = s.up_secs + s.down_secs + s.unknown_secs;
+    let mut out = String::from("# Internet outages observed from this host\n\n");
+    out.push_str(&format!(
+        "{} to {}, in this computer's local time (UTC{}). Recorded by netwatch {}.\n\n",
+        local(r.since).format("%Y-%m-%d %H:%M"),
+        local(r.until).format("%Y-%m-%d %H:%M"),
+        local(r.until).format("%:z"),
+        env!("CARGO_PKG_VERSION"),
+    ));
+    if monitored == 0 {
+        out.push_str(&format!(
+            "Nothing was monitored in this period. netwatch records uptime while the TUI \
+             or `netwatch daemon` runs, under `{}`.\n",
+            dir.display()
+        ));
+        return out;
+    }
+
+    out.push_str("## Summary\n\n");
+    out.push_str("| Where it failed | Outages | Time down | Longest |\n|---|---:|---:|---:|\n");
+    for hop in [Hop::Internet, Hop::Gateway, Hop::Dns] {
+        let mine: Vec<&Outage> = r.outages.iter().filter(|o| o.hop == hop).collect();
+        let total: u64 = mine.iter().map(|o| o.secs()).sum();
+        let longest = mine.iter().map(|o| o.secs()).max();
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            place(hop),
+            mine.len(),
+            if mine.is_empty() {
+                "-".into()
+            } else {
+                duration(total)
+            },
+            longest.map_or("-".into(), duration),
+        ));
+    }
+    out.push('\n');
+    match s.uptime_pct {
+        Some(pct) => out.push_str(&format!(
+            "The connection was up {pct:.2}% of the time netwatch could measure it. "
+        )),
+        None => out.push_str(
+            "The internet probe got no measurement in this period, so there is no uptime \
+             figure, and an outage past the router cannot be told from one at it. ",
+        ),
+    }
+    out.push_str(&format!(
+        "{} was monitored, and {} was not, because netwatch was not running.",
+        duration(monitored),
+        duration(s.unmonitored_secs),
+    ));
+    if s.unknown_secs >= 60 {
+        out.push_str(&format!(
+            " For {} of the monitored time the probes could not be sent, so it counts as \
+             neither up nor down.",
+            duration(s.unknown_secs)
+        ));
+    }
+    out.push_str("\n\n");
+
+    let table = |out: &mut String, outages: &[&Outage], with_place: bool| {
+        if with_place {
+            out.push_str("| Start | End | Duration | Where | Note |\n|---|---|---:|---|---|\n");
+        } else {
+            out.push_str("| Start | End | Duration | Note |\n|---|---|---:|---|\n");
+        }
+        for o in outages {
+            let place = if with_place {
+                format!(" {} |", place(o.hop))
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} |{} {} |\n",
+                at(o.start),
+                at(o.end),
+                duration(o.secs()),
+                place,
+                note(o.ended),
+            ));
+        }
+        out.push('\n');
+    };
+    let beyond: Vec<&Outage> = r
+        .outages
+        .iter()
+        .filter(|o| o.hop == Hop::Internet)
+        .collect();
+    let other: Vec<&Outage> = r
+        .outages
+        .iter()
+        .filter(|o| o.hop != Hop::Internet)
+        .collect();
+    out.push_str("## Outages beyond the router\n\n");
+    if beyond.is_empty() {
+        out.push_str("None.\n\n");
+    } else {
+        out.push_str(&format!(
+            "In each of these neither {INTERNET_TARGET} nor {INTERNET_FALLBACK_TARGET} answered, \
+             while the router had not failed.\n\n"
+        ));
+        table(&mut out, &beyond, false);
+    }
+    if !other.is_empty() {
+        out.push_str("## Other outages\n\n");
+        table(&mut out, &other, true);
+    }
+
+    out.push_str(&format!(
+        "## How this was measured\n\n\
+         - Every few seconds netwatch probed the default gateway (the router), \
+         {INTERNET_TARGET} (Cloudflare), the configured DNS resolver, and, whenever \
+         {INTERNET_TARGET} gave no reply, {INTERNET_FALLBACK_TARGET} (Google). The gateway and \
+         the public addresses were probed with ICMP echo, or TCP where ICMP is blocked, and \
+         the resolver with a DNS query.\n\
+         - An outage starts when three probe cycles in a row get no reply, and is timed from \
+         the first of them. It ends at the first reply. Slow replies are not outages.\n\
+         - Each outage is put down to the nearest part that failed: the router, then the \
+         internet, then DNS.\n\
+         - Time when netwatch was not running is left out, and not counted as up.\n\
+         - This is what one computer saw. A fault on this computer or its own link to the \
+         router, such as Wi-Fi, is not ruled out, though a router that kept answering \
+         through an outage points past it.\n"
     ));
     out
 }
@@ -1360,6 +1533,196 @@ mod tests {
         assert_eq!(r.summary.up_secs, 300);
         assert_eq!(r.summary.unknown_secs, 300);
         assert_eq!(r.summary.uptime_pct, Some(100.0));
+    }
+
+    /// One provider not answering is not the internet going down: a reply
+    /// from the fallback target in the same cycle keeps the hop up. Both
+    /// silent is an outage, and a fallback that could not be sent leaves the
+    /// first target's verdict standing.
+    #[test]
+    fn the_internet_is_down_only_when_both_targets_are_silent() {
+        let mut status = (*crate::collectors::health::HealthProber::new().status()).clone();
+        status.gateway_loss = Loss::Measured(0.0);
+        status.dns_loss = Loss::Measured(0.0);
+        let t0 = std::time::Instant::now();
+        let mut cycle = 0u64;
+        let mut run = |m: &mut Monitor, status: &mut HealthStatus, first: f64, fallback| {
+            for _ in 0..4 {
+                let at = t0 + std::time::Duration::from_secs(cycle * 5);
+                status.completed.internet = Some(at);
+                status.completed.gateway = Some(at);
+                status.completed.dns = Some(at);
+                status.internet_loss = Loss::Measured(first);
+                status.internet_fallback_loss = fallback;
+                m.observe_at(status, true, true, 1000 + cycle * 5);
+                cycle += 1;
+            }
+        };
+
+        let mut m = Monitor::new(None);
+        run(&mut m, &mut status, 0.0, None);
+        assert!(matches!(m.connection(), Connection::Up { .. }));
+        run(&mut m, &mut status, 100.0, Some(Loss::Measured(0.0)));
+        assert!(
+            matches!(m.connection(), Connection::Up { .. }),
+            "{:?}",
+            m.connection()
+        );
+        run(&mut m, &mut status, 100.0, Some(Loss::Measured(100.0)));
+        assert!(
+            matches!(
+                m.connection(),
+                Connection::Down {
+                    hop: Hop::Internet,
+                    ..
+                }
+            ),
+            "{:?}",
+            m.connection()
+        );
+
+        let mut m = Monitor::new(None);
+        run(
+            &mut m,
+            &mut status,
+            100.0,
+            Some(Loss::Unmeasured("blocked")),
+        );
+        assert!(
+            matches!(
+                m.connection(),
+                Connection::Down {
+                    hop: Hop::Internet,
+                    ..
+                }
+            ),
+            "{:?}",
+            m.connection()
+        );
+    }
+
+    /// A week with one internet outage, one gateway outage and an hour off.
+    fn a_week() -> Report {
+        const WEEK: u64 = 7 * 86_400;
+        let mut recs = vec![
+            start(0),
+            hop(0, Hop::Gateway, HopState::Up),
+            hop(0, Hop::Dns, HopState::Up),
+            hop(0, Hop::Internet, HopState::Up),
+            hop(86_400, Hop::Internet, HopState::Down),
+            hop(86_400 + 3_725, Hop::Internet, HopState::Up),
+            hop(3 * 86_400, Hop::Gateway, HopState::Down),
+            hop(3 * 86_400 + 45, Hop::Gateway, HopState::Up),
+            Record::Stop { t: 5 * 86_400 },
+            start(5 * 86_400 + 3_600),
+            hop(5 * 86_400 + 3_600, Hop::Gateway, HopState::Up),
+            hop(5 * 86_400 + 3_600, Hop::Dns, HopState::Up),
+            hop(5 * 86_400 + 3_600, Hop::Internet, HopState::Up),
+            Record::Stop { t: WEEK },
+        ];
+        recs.extend(beats(60, 5 * 86_400));
+        recs.extend(beats(5 * 86_400 + 3_600 + 60, WEEK));
+        report(recs, 0, WEEK)
+    }
+
+    #[test]
+    fn the_markdown_report_puts_isp_outages_first_and_says_how() {
+        let r = a_week();
+        assert_eq!(r.summary.outages, 2);
+        let md = markdown(&r, Path::new("/nowhere"));
+        assert!(
+            md.starts_with("# Internet outages observed from this host\n\n"),
+            "{md}"
+        );
+        let row = |place: &str| {
+            md.lines()
+                .find(|l| l.starts_with(&format!("| {place} |")))
+                .unwrap_or_else(|| panic!("no {place} row in {md}"))
+                .to_string()
+        };
+        assert_eq!(
+            row("Beyond the router (the ISP or further)"),
+            "| Beyond the router (the ISP or further) | 1 | 1h 02m | 1h 02m |"
+        );
+        assert_eq!(
+            row("The router or local network"),
+            "| The router or local network | 1 | 45s | 45s |"
+        );
+        assert_eq!(
+            row("Name resolution (DNS) only"),
+            "| Name resolution (DNS) only | 0 | - | - |"
+        );
+        assert!(
+            md.contains("% of the time netwatch could measure it"),
+            "{md}"
+        );
+        assert!(
+            md.contains("and 1h 00m was not, because netwatch was not running"),
+            "{md}"
+        );
+
+        // The ISP's section lists only its own outage, and no Where column.
+        let beyond = md
+            .split("## Outages beyond the router\n\n")
+            .nth(1)
+            .unwrap()
+            .split("\n## ")
+            .next()
+            .unwrap();
+        assert!(
+            beyond.contains("neither 1.1.1.1 nor 8.8.8.8 answered"),
+            "{beyond}"
+        );
+        let rows = beyond
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.starts_with("| Start"));
+        assert_eq!(rows.count(), 1, "{beyond}");
+        assert!(beyond.contains("| 1h 02m |"), "{beyond}");
+        let other = md.split("## Other outages\n\n").nth(1).unwrap();
+        assert!(
+            other.contains("| 45s | The router or local network |"),
+            "{other}"
+        );
+        assert!(md.contains("## How this was measured"), "{md}");
+        assert!(md.contains("This is what one computer saw."), "{md}");
+    }
+
+    #[test]
+    fn the_markdown_report_claims_nothing_it_could_not_measure() {
+        let empty = report(vec![], 0, 600);
+        let md = markdown(&empty, Path::new("/nowhere"));
+        assert!(md.contains("Nothing was monitored in this period."), "{md}");
+        assert!(!md.contains("## Summary"), "{md}");
+
+        // The internet probe never measured: no figure, and it says why.
+        let recs = vec![
+            start(0),
+            hop(0, Hop::Gateway, HopState::Up),
+            hop(0, Hop::Internet, HopState::Unknown),
+            Record::Stop { t: 600 },
+        ];
+        let mut recs = recs;
+        recs.extend(beats(60, 600));
+        let md = markdown(&report(recs, 0, 600), Path::new("/nowhere"));
+        assert!(!md.contains("% of the time"), "{md}");
+        assert!(md.contains("there is no uptime figure"), "{md}");
+        assert!(md.contains("## Outages beyond the router\n\nNone."), "{md}");
+    }
+
+    #[test]
+    fn uptime_takes_one_output_format() {
+        let dir = std::env::temp_dir().join(format!("netwatch-uptime-{}", uuid::Uuid::new_v4()));
+        let args = |a: &[&str]| -> Vec<String> {
+            a.iter()
+                .map(|s| s.to_string())
+                .chain([dir.display().to_string()])
+                .collect()
+        };
+        for pair in [["--json", "--md"], ["--md", "--csv"]] {
+            let err = command(&args(&pair)).unwrap_err().to_string();
+            assert!(err.contains("pick one of --json, --csv and --md"), "{err}");
+        }
+        command(&args(&["--md"])).unwrap();
     }
 
     #[test]

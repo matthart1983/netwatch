@@ -107,6 +107,10 @@ fn threat_model_lists_every_outbound_endpoint() {
         ("Reference DNS", health::REFERENCE_RESOLVER.to_owned()),
         ("Reference DNS", health::CROSS_CHECK_NAME.to_owned()),
         ("Internet reachability", health::INTERNET_TARGET.to_owned()),
+        (
+            "Internet reachability",
+            health::INTERNET_FALLBACK_TARGET.to_owned(),
+        ),
         ("Startup trace", traceroute::STARTUP_TARGET.to_owned()),
         ("WHOIS on W", whois::RDAP_URL.to_owned()),
         (
