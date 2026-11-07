@@ -212,12 +212,15 @@ write: /dev/null
    opened earlier, the filtered ones included, because threads share descriptors
    (item 1); a test holds a UDP socket opened before the filter to that
    ([filter tests](../src/sandbox/seccomp.rs#L1)). On a thread with socket(2) open,
-   two TCP calls get past the deny. A TCP Fast Open send (`sendto` or
-   `sendmsg` with `MSG_FASTOPEN`) opens a connection and delivers its data
-   without connect(2), and listen(2) on an unbound socket takes an ephemeral port
-   on every address without bind(2). Both work from a parser thread on Linux 7.1,
-   and a test fails if that changes
-   ([gap tests](../src/sandbox/linux.rs#L1122)). Accepting on a listener bound
+   two TCP calls get past the deny. listen(2) on an unbound socket takes an
+   ephemeral port on every address without bind(2); that works from a parser
+   thread on Linux 7.1, and a test fails if it changes. A TCP Fast Open send
+   (`sendto` or `sendmsg` with `MSG_FASTOPEN`) opens a connection and delivers
+   its data without connect(2) on kernels before 7.2. Linux 7.2 checks it
+   against the connect rules, and the fix is marked for stable kernels, so an
+   older kernel may have it too. Landlock has no erratum for it, so netwatch
+   cannot tell which kernels do, and the report does not claim it; the test
+   accepts either result ([gap tests](../src/sandbox/linux.rs#L1122)). Accepting on a listener bound
    before entry is not mediated either, which is how the metrics threads serve.
    Main, the network workers and the proc broker have no network restriction,
    and a parser running injected code can reach them through shared memory
