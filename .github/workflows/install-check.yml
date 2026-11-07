@@ -286,6 +286,10 @@ jobs:
         if: env.PRERELEASE == 'false'
         run: |
           set -euo pipefail
+          # The runner image sets HOMEBREW_NO_AUTO_UPDATE and ships the formula
+          # list from when it was built, which was serving 0.39.0 three days
+          # after homebrew-core took 0.40.0. A user's brew updates first.
+          brew update --quiet
           brew install netwatch
           out=$(netwatch --version)
           echo "$out"
