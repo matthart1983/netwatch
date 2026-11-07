@@ -53,6 +53,9 @@ All notable changes to NetWatch will be documented in this file.
 - `scripts/release.sh` signs the tag (`git tag -s`) when git has a `user.signingkey`.
 
 ### Fixed
+- **`paper`'s graph peaks are readable.** The top of every graph was lightened toward white,
+  which on `paper`'s off-white background faded the peaks to 1.4:1. On a light background
+  they now darken instead, to 13:1, and the contrast test covers the whole ramp.
 - A pre-release tag would have failed the release build: `cargo generate-rpm` rejects a
   hyphen in the version. It now gets `1.0.0~rc.1`. The tag also no longer reaches the apt
   repository or COPR, where `1.0.0~rc.1` would have been offered as an upgrade.

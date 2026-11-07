@@ -527,7 +527,8 @@ pub fn bright_token(c: Color) -> Color {
 }
 
 /// The magnitude gradient: dim at the baseline, the series color in the
-/// middle, lightened at the peak.
+/// middle, and at the peak moved further from the background: lighter on a
+/// dark one, darker on a light one.
 ///
 /// This is btop's move, and the reason its graphs read as depth rather than as
 /// a solid block: a cell's color comes from *how high it sits*, so the shape of
@@ -553,12 +554,21 @@ pub fn magnitude_ramp(base: Color, bg: Color) -> Ramp {
         .map(|step| MIN_FADE_ALPHA + step as f32 / 100.0)
         .find(|&alpha| contrast(fade_color(base, bg, alpha, false), behind) >= MIN_RAMP_CONTRAST)
         .unwrap_or(1.0);
+    // The peak moves away from the background as the floor moves toward it.
+    // Lightened toward white on `paper`'s off-white, the top stops used to
+    // fade to 1.4:1. On a light background they darken instead, and less far,
+    // so they keep the hue rather than going to black.
+    let (away, near, far) = if luminance(behind) < 0.18 {
+        (Color::Rgb(255, 255, 255), 0.42, 0.76)
+    } else {
+        (Color::Rgb(0, 0, 0), 0.25, 0.5)
+    };
     Ramp::new(vec![
         fade_color(base, bg, floor, false),
         fade_color(base, bg, floor + (1.0 - floor) * 0.46, false),
         base,
-        lighten(base, 0.42),
-        lighten(base, 0.76),
+        lerp(base, away, near),
+        lerp(base, away, far),
     ])
 }
 
@@ -2061,10 +2071,12 @@ mod tests {
     }
 
     /// `dark` resolved its upload series to (0, 0, 170), so the graph's lower half
-    /// all but vanished on a dark terminal. Nothing below the series colour may
-    /// fall under the floor, and the floor must not flatten the gradient.
+    /// all but vanished on a dark terminal, and `paper`'s peaks lightened toward
+    /// its off-white background until they were 1.4:1. No stop from the baseline
+    /// to the peak may fall under the floor, and contrast has to climb the whole
+    /// way up.
     #[test]
-    fn every_theme_keeps_a_graph_readable_up_to_its_series_colour() {
+    fn every_theme_keeps_a_graph_readable_from_baseline_to_peak() {
         for name in crate::theme::THEME_NAMES {
             let theme = crate::theme::by_name(name);
             if theme.defers_to_terminal() {
@@ -2074,7 +2086,7 @@ mod tests {
             for base in [theme.rx_rate, theme.tx_rate] {
                 let ramp = magnitude_ramp(base, theme.bg);
                 let mut previous = 0.0;
-                for step in 0..=10 {
+                for step in 0..=20 {
                     let c = contrast(ramp.at(step as f32 / 20.0), behind);
                     assert!(
                         c >= MIN_RAMP_CONTRAST,
