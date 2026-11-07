@@ -647,6 +647,7 @@ mod tests {
             dns_loss: crate::collectors::health::Loss::Measured(0.0),
             internet_rtt_ms: Some(12.0),
             internet_loss: crate::collectors::health::Loss::Measured(0.0),
+            internet_fallback_loss: None,
             gateway_rtt_history: VecDeque::new(),
             dns_rtt_history: VecDeque::new(),
             internet_rtt_history: VecDeque::new(),

@@ -87,8 +87,9 @@ _netwatch() {
                 uptime)
                     _arguments \
                         '--since=[Period, e.g. 7d, 24h, 90m]:period:' \
-                        '(--csv)--json[JSON output]' \
-                        '(--json)--csv[CSV output]' \
+                        '(--csv --md)--json[JSON output]' \
+                        '(--json --md)--csv[CSV output]' \
+                        '(--json --csv)--md[Markdown report for an ISP ticket]' \
                         '1:log directory:_files -/'
                     ;;
                 resolver)

@@ -36,7 +36,7 @@ This takes effect at 1.0.0. Until then 0.40 and its release candidates hold to i
 - The daemon's flow log: `--flow-log` and its NDJSON format (`netwatch.flow.v0`)
 - Anything under `[experimental]` in `config.toml`
 
-**Not covered at all.** The TUI's layout and keybindings, all human-readable text including warnings and `report.md`, log messages, and file locations. Keybinding changes are noted in the CHANGELOG.
+**Not covered at all.** The TUI's layout and keybindings, all human-readable text including warnings, `report.md` and the `netwatch uptime` text and `--md` reports, log messages, and file locations. Keybinding changes are noted in the CHANGELOG.
 
 **The library.** The crate exposes a library so that its examples and tests can reach it. It is internal, and its API can change in any release, whatever its version number suggests.
 

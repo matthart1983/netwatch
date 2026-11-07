@@ -25,6 +25,11 @@ pub struct HealthStatus {
     /// working LAN with a dead uplink looks perfectly healthy on both.
     pub internet_rtt_ms: Option<f64>,
     pub internet_loss: Loss,
+    /// What [`INTERNET_FALLBACK_TARGET`] said in the same cycle, asked only
+    /// when [`INTERNET_TARGET`] got no reply at all; `None` when it was not
+    /// asked. Only the uptime log reads it. The internet tile, its history and
+    /// Diagnose stay on the primary target.
+    pub internet_fallback_loss: Option<Loss>,
     pub gateway_rtt_history: VecDeque<Option<f64>>,
     pub dns_rtt_history: VecDeque<Option<f64>>,
     pub internet_rtt_history: VecDeque<Option<f64>>,
@@ -192,6 +197,13 @@ pub const STUN_EVERY: u32 = 12;
 /// probe applies — plenty of networks drop echo but pass TCP.
 pub const INTERNET_TARGET: &str = "1.1.1.1";
 
+/// Second internet target, asked only in a cycle where [`INTERNET_TARGET`]
+/// got no reply at all, with the same ICMP-then-TCP/443 probe. Google's
+/// resolver, on another operator's network from Cloudflare's, so the uptime
+/// log calls the internet down only when two unrelated networks stopped
+/// answering, not when one of them had an outage or this network blocks it.
+pub const INTERNET_FALLBACK_TARGET: &str = "8.8.8.8";
+
 /// Why a reading that needs a public server is empty: the config said not to
 /// ask one. It starts every reason the Diagnose coverage table gives for it.
 pub const PROBES_OFF: &str = "third_party_probes is off";
@@ -244,6 +256,7 @@ impl HealthProber {
                 dns_loss: Loss::Pending,
                 internet_rtt_ms: None,
                 internet_loss: Loss::Pending,
+                internet_fallback_loss: None,
                 gateway_rtt_history: VecDeque::new(),
                 dns_rtt_history: VecDeque::new(),
                 internet_rtt_history: VecDeque::new(),
@@ -470,9 +483,16 @@ fn run_cycle(
         } else {
             (None, Loss::Unmeasured(PROBES_OFF))
         };
+        // A second opinion before the uptime log counts this cycle as lost,
+        // published in the same snapshot so the two always belong together.
+        let fallback = (cycle.third_party
+            && matches!(loss, Loss::Measured(pct) if pct >= 100.0)
+            && !cancel.cancelled())
+        .then(|| probes.internet(INTERNET_FALLBACK_TARGET).1);
         let mut next = (**safe_read(snapshot, "health::probe::read_inet")).clone();
         next.internet_rtt_ms = rtt;
         next.internet_loss = loss;
+        next.internet_fallback_loss = fallback;
         let completed = std::time::Instant::now();
         if loss.is_measured() {
             next.completed.internet_history.push_back(completed);
@@ -1285,10 +1305,12 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
-    /// Answers every probe at once, and writes down who was asked.
+    /// Answers every probe at once, and writes down who was asked. The
+    /// internet targets answer as `internet` says, 0% loss for any not in it.
     #[derive(Default)]
     struct FakeProbes {
         asked: std::cell::RefCell<Vec<String>>,
+        internet: Vec<(&'static str, Loss)>,
     }
 
     impl FakeProbes {
@@ -1327,13 +1349,20 @@ mod tests {
         }
         fn internet(&self, target: &str) -> (Option<f64>, Loss) {
             self.saw(format!("internet {target}"));
-            (Some(3.0), Loss::Measured(0.0))
+            match self.internet.iter().find(|(t, _)| *t == target) {
+                Some(&(_, loss)) if loss.pct() == Some(100.0) => (None, loss),
+                Some(&(_, loss)) => (Some(3.0), loss),
+                None => (Some(3.0), Loss::Measured(0.0)),
+            }
         }
     }
 
     /// What one cycle asked for and what it left behind.
     fn one_cycle(third_party: bool) -> (Vec<String>, HealthProber) {
-        let probes = FakeProbes::default();
+        one_cycle_with(third_party, FakeProbes::default())
+    }
+
+    fn one_cycle_with(third_party: bool, probes: FakeProbes) -> (Vec<String>, HealthProber) {
         let prober = HealthProber::with_third_party_probes(third_party);
         run_cycle(
             &probes,
@@ -1392,8 +1421,52 @@ mod tests {
         );
         let status = prober.status();
         assert_eq!(status.internet_loss, Loss::Measured(0.0));
+        assert_eq!(status.internet_fallback_loss, None);
         assert!(status.dns_cross.is_some());
         assert!(status.nat.is_some());
+    }
+
+    /// The second internet target is asked only when the first got no reply
+    /// at all, and what it said goes beside the first's, which stays as it
+    /// was for the tile and Diagnose.
+    #[test]
+    fn the_fallback_target_is_asked_only_when_the_first_is_silent() {
+        let lost = |internet| FakeProbes {
+            internet,
+            ..Default::default()
+        };
+        let (asked, prober) =
+            one_cycle_with(true, lost(vec![(INTERNET_TARGET, Loss::Measured(100.0))]));
+        assert_eq!(
+            asked.last().map(String::as_str),
+            Some("internet 8.8.8.8"),
+            "{asked:?}"
+        );
+        let status = prober.status();
+        assert_eq!(status.internet_loss, Loss::Measured(100.0));
+        assert_eq!(status.internet_fallback_loss, Some(Loss::Measured(0.0)));
+
+        // Partial loss is a reply: no second opinion.
+        let (asked, prober) =
+            one_cycle_with(true, lost(vec![(INTERNET_TARGET, Loss::Measured(66.7))]));
+        assert!(
+            !asked.iter().any(|a| a.contains(INTERNET_FALLBACK_TARGET)),
+            "{asked:?}"
+        );
+        assert_eq!(prober.status().internet_fallback_loss, None);
+
+        // Nor when the probe could not be sent, or third-party probes are off.
+        let (asked, _) = one_cycle_with(
+            true,
+            lost(vec![(INTERNET_TARGET, Loss::Unmeasured("blocked"))]),
+        );
+        assert!(
+            !asked.iter().any(|a| a.contains(INTERNET_FALLBACK_TARGET)),
+            "{asked:?}"
+        );
+        let (asked, _) =
+            one_cycle_with(false, lost(vec![(INTERNET_TARGET, Loss::Measured(100.0))]));
+        assert!(!asked.iter().any(|a| a.contains("internet")), "{asked:?}");
     }
 
     // ── loss model ─────────────────────────────────────────────────────

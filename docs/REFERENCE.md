@@ -476,7 +476,7 @@ The [man page](netwatch.1) carries the same list.
 | `netwatch diagnose features --unstable [--out FILE] [--schema FILE] FILE\|DIR...` | Experimental. Write the feature table of recorded episodes. |
 | `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]` | A pseudonymised bundle of recent incidents. Nothing is uploaded. |
 | `netwatch diagnose corpus --unstable [--only ID] [DIR]` | Experimental, for netwatch's developers. Regenerate the pinned test corpus. |
-| `netwatch uptime [--since 7d] [--json\|--csv] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
+| `netwatch uptime [--since 7d] [--json\|--csv\|--md] [DIR]` | Outage history: start, end, duration and the hop that failed, with totals. See [Uptime report](#uptime-report). |
 | `netwatch geoip update [--city]` | Download DB-IP Lite databases for offline GeoIP. Exit 0 when every file is up to date, 1 otherwise. See [GeoIP databases](#geoip-databases). |
 | `netwatch resolver status\|set\|recover` | Inspect, temporarily change (Linux, root, `--unmanaged` files only) or restore the DNS resolver. `set` and `recover` are experimental. `recover` undoes an interrupted `set`, and exits 0 when none is left unresolved, 1 otherwise. A change from 0.30 is [restored by hand](recovery-store.md#legacy-journal): `status` and `recover` print a notice naming it, and it does not affect the exit status. |
 | `netwatch --generate-config` | Write `config.toml` with every key at its default, then exit. To a file that exists it adds only the keys the file lacks, and keeps what is there; delete the file first for a clean one. Refuses to touch a `config.toml` that does not load. |
@@ -623,6 +623,9 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   failing. Latency spikes are not outages.
 - **The hop** is the nearest one that failed: the gateway (your router or LAN), the internet
   probe (your ISP or beyond) or DNS alone.
+- **The internet probe** asks 1.1.1.1, and in a cycle where that gets no reply, 8.8.8.8 as
+  well. The internet counts as down only when neither answers, so an outage at one provider, or
+  a network that blocks it, is not reported as your ISP's.
 - **Not monitored** is time when no netwatch was running, or a gap of more than three minutes in
   the log. It is never counted as up. Time when the internet probe could not be sent at all
   (ICMP blocked and TCP/443 unanswered) is *unmeasured*, and is neither up nor down. With
@@ -632,6 +635,14 @@ gateway: your router or LAN · internet: your ISP or beyond · dns: name resolut
   the only hop that can say the connection is up: over a period in which that probe was never
   measured, the text leaves the figure out and `--json` gives `"uptime_pct": null`, outages or
   not.
+
+`--md` writes the same report as Markdown to attach to a ticket with your ISP: a summary by
+where each outage was, the outages past your router in a table of their own, and how it was
+measured, worded as what this computer saw. It is for people, so its wording may change.
+
+```
+$ netwatch uptime --since 30d --md > outages.md
+```
 
 `--json` and `--csv` carry the same outages for an ISP ticket or a chart, and the 1.0 compatibility
 promise covers both. The JSON is versioned (`"schema": 1`), and
@@ -1109,7 +1120,7 @@ its default endpoints to the code.
 | What | When | Where it goes | What it carries |
 |------|------|---------------|-----------------|
 | Reference DNS query | Automatically | 1.1.1.1 | A query for `dns.google` |
-| Internet reachability | Automatically | 1.1.1.1, with a TCP fallback on port 443 | A probe, no data |
+| Internet reachability | Automatically | 1.1.1.1, with a TCP fallback on port 443; 8.8.8.8 the same way, only when 1.1.1.1 did not answer | A probe, no data |
 | STUN | Automatically, about once a minute | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | A binding request, which reveals your public address to them |
 | Health probes | Automatically | Your gateway and the configured resolver | ICMP echoes, with TCP connects where those are dropped, and DNS queries |
 | Reverse DNS | Automatically, for addresses in this host's own connections | The system resolver | The addresses it looks up |
@@ -1267,7 +1278,7 @@ full resolution.
 
 `third_party_probes = false` stops four things: STUN to `stun.l.google.com` and
 `stun.cloudflare.com`, the `dns.google` cross-check against 1.1.1.1, the internet probe (ICMP,
-then TCP 443) to 1.1.1.1, and the trace each TUI start runs to 1.1.1.1. What they measured reads
+then TCP 443) to 1.1.1.1 and its fallback to 8.8.8.8, and the trace each TUI start runs to 1.1.1.1. What they measured reads
 as not measured, never as failed:
 
 - The internet RTT reads `—`, and Dense shows its target as `off`. Topology's ISP box stays
