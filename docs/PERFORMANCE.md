@@ -25,6 +25,20 @@ The ceiling doesn't cover an armed flight recorder or a City database (127 MiB).
 
 Cycle 2 peaked 15.3 MiB above cycle 1 on the reference machine and 14.3 MiB above it on the runner. That is inside the 16 MiB the soak allows, but only just, and these runs can't tell a slow leak from run-to-run variation. Five-minute smokes have gone the other way (cycle 2 peaked 11 MiB lower on a runner). A longer soak would settle it.
 
+### The plateau gate at 1.0.0-rc.1
+
+1.0.0-rc.1 was cut with this gate failing, as a recorded exception. On 7 November the same gate failed v0.40.0, the code that passed it at release, so the failure says nothing about the changes since. These are cycle 2's peak minus cycle 1's on GitHub runners, every run that day:
+
+| Code | Cycle 2 − cycle 1, MiB |
+| --- | --- |
+| v0.40.0 | +11.8, +19.2 |
+| `57b496f` (0.40.0 and the flow log) | +20.4, +17.8 |
+| `main` (rc.1's code, apart from docs) | +16.3, +23.6, +20.4 |
+
+The four runs dispatched together read +17.8 to +20.4, v0.40.0 among them. One commit varies by more than 7 MiB between runs, so a 16 MiB limit on cycle 2 against cycle 1 sits inside the noise, and it still can't tell a leak from the allocator warming up in cycle 1. Every other gate passed on every run: the highest VmHWM was 403 MiB against the 512 MiB ceiling, and the stream and ring budgets held.
+
+One local run of `main` with a third cycle points the wrong way. Its peaks, all in the `mtu-tcp` phase, were 375.7 MiB in cycle 2 and 393.7 MiB in cycle 3, 18 MiB higher. Every other scenario except `bulk` also peaked about 8 to 20 MiB higher in cycle 3. Cycle 1 doesn't count: the machine suspended in the middle of it. That is one run, and runs vary by 7 MiB, but it reads as growth that continues after warm-up. Before 1.0.0, the soak is to compare a third cycle with the second, a 24-hour run is to show whether memory keeps climbing, and the growth is to be found or ruled out. A climb blocks 1.0.0.
+
 ## Flood soak
 
 Each run floods a veth pair in a private network namespace for an hour: two cycles of six scenarios, then paced rates, then ten minutes of the real daemon. A Python AF_PACKET generator sends the traffic, so the soak needs no extra packages. It offers up to about 1.5 million packets a second on the reference machine and about 350,000 on the runner. The harness can use tcpreplay for the replay scenario if asked.
