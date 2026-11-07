@@ -1,25 +1,21 @@
+<h1 align="center">netwatch</h1>
+
 <p align="center">
-  <h1 align="center">NetWatch</h1>
-  <p align="center">
-    <strong>Network diagnostics in your terminal.</strong>
-  </p>
-  <p align="center">
-    <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
-    <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/d/netwatch-tui.svg" alt="downloads"></a>
-    <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/v/release/matthart1983/netwatch" alt="Release"></a>
-    <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/downloads/matthart1983/netwatch/total?label=GitHub%20downloads" alt="GitHub release downloads"></a>
-    <a href="https://anaconda.org/conda-forge/netwatch"><img src="https://img.shields.io/conda/dn/conda-forge/netwatch?label=conda%20downloads" alt="conda-forge downloads"></a>
-    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue" alt="Platform">
-    <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-  </p>
-  <p align="center">
-    <a title="Tool of The Week on Terminal Trove" href="https://terminaltrove.com/netwatch/"><img src="docs/media/terminal_trove_totw_badge.svg" alt="Terminal Trove Tool of The Week" height="54" /></a>
-    <a href="https://trendshift.io/repositories/22467?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-22467" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/22467/daily?language=Rust" alt="matthart1983%2Fnetwatch | Trendshift" width="250" height="55"/></a>
-  </p>
+  <strong>Network diagnostics in your terminal.</strong><br>
+  Linux, macOS and Windows. FreeBSD best-effort.
 </p>
 
 <p align="center">
-  <img src="docs/media/demo-dense.gif" alt="NetWatch's dense view: a mirrored braille throughput graph with download above the axis and upload below, per-interface rates with sparklines, four-hop latency budgets, and a connection table with the selected socket's kernel TCP state" width="900">
+  <a href="https://github.com/matthart1983/netwatch/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/matthart1983/netwatch/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status on main"></a>
+  <a href="https://github.com/matthart1983/netwatch/releases/latest"><img src="https://img.shields.io/github/v/release/matthart1983/netwatch" alt="Latest release"></a>
+</p>
+
+<p align="center">
+  <a title="Tool of The Week on Terminal Trove" href="https://terminaltrove.com/netwatch/"><img src="docs/media/terminal_trove_totw_badge.svg" alt="Terminal Trove Tool of The Week" height="54" /></a>
+</p>
+
+<p align="center">
+  <img src="docs/media/demo-dense.gif" alt="netwatch's dense view: a mirrored braille throughput graph with download above the axis and upload below, per-interface rates with sparklines, four-hop latency budgets, and a connection table with the selected socket's kernel TCP state" width="900">
 </p>
 
 <p align="center">
@@ -152,7 +148,7 @@ Diagnose misread your network? [Open an issue](https://github.com/matthart1983/n
 
 ## Related
 
-[SysWatch](https://github.com/matthart1983/syswatch) and [DiskWatch](https://github.com/matthart1983/diskwatch) share the chrome. [ESSH](https://github.com/matthart1983/essh) is a Rust SSH client with the same look. [NetWatch Cloud](https://www.netwatchlabs.com) is hosted fleet monitoring built on the MIT [agent](https://github.com/matthart1983/netwatch-agent), [SDK](https://github.com/matthart1983/netwatch-sdk) and [dashboard](https://github.com/matthart1983/netwatch-dashboard).
+[syswatch](https://github.com/matthart1983/syswatch) and [diskwatch](https://github.com/matthart1983/diskwatch) share the layout and palette. [kernwatch](https://github.com/matthart1983/kernwatch) covers Linux scheduling, memory pressure and block I/O. [essh](https://github.com/matthart1983/essh) keeps remote shells alive across connection drops, with the same look.
 
 ## Thanks
 

@@ -43,6 +43,10 @@ All notable changes to NetWatch will be documented in this file.
   it set up, and with the stored token otherwise.
 - `scripts/release.sh` signs the tag (`git tag -s`) when git has a `user.signingkey`.
 
+### Changed
+- README: the header keeps the CI, release and Terminal Trove badges and states platform
+  support in text. Related adds kernwatch and drops NetWatch Cloud.
+
 ### Fixed
 - A pre-release tag would have failed the release build: `cargo generate-rpm` rejects a
   hyphen in the version. It now gets `1.0.0~rc.1`. The tag also no longer reaches the apt
