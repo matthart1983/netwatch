@@ -59,7 +59,7 @@ const USAGE: &[&str] = &[
     "diagnose coverage [--json]",
     "diagnose episodes",
     "diagnose export [--since DAYS] [--out FILE] [--dry-run]",
-    "uptime [--since 7d] [--json | --csv]",
+    "uptime [--since 7d] [--json | --csv | --md]",
     "geoip update [--city]",
     "resolver status",
 ];

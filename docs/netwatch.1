@@ -21,7 +21,7 @@ netwatch \- real-time network diagnostics in your terminal
 .B netwatch uptime
 .RB [ \-\-since
 .IR PERIOD ]
-.RB [ \-\-json " | " \-\-csv ]
+.RB [ \-\-json " | " \-\-csv " | " \-\-md ]
 .RI [ DIR ]
 .br
 .B netwatch geoip update
@@ -193,6 +193,8 @@ Outage history from the uptime log the TUI and
 keep: one row per outage with its start, end, duration and the hop that
 failed (gateway, internet or DNS), then the outage count, total downtime,
 uptime and the time nothing was monitored.
+.B \-\-md
+writes it as Markdown for a ticket with an ISP.
 .B \-\-since
 takes a period such as 7d (the default), 24h or 90m;
 .B \-\-json

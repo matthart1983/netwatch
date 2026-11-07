@@ -26,6 +26,7 @@ complete -c netwatch -n '__fish_seen_subcommand_from geoip' -l city -d 'Also dow
 complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l since -x -d 'Period, e.g. 7d, 24h, 90m'
 complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l json -d 'JSON output'
 complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l csv -d 'CSV output'
+complete -c netwatch -n '__fish_seen_subcommand_from uptime' -l md -d 'Markdown report for an ISP ticket'
 
 # ── options ───────────────────────────────────────────────────────────
 complete -c netwatch -l remote -r -d 'Experimental: remote https:// URL (requires API key)'

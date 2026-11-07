@@ -5,6 +5,10 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`netwatch uptime --md`, a report for your ISP.** The same outages as Markdown to attach to
+  a support ticket: a summary by where each outage was (beyond the router, at the router, DNS
+  only), the outages past the router in a table of their own, and how they were measured,
+  worded as what this computer saw. `netwatch uptime --since 30d --md > outages.md`.
 - **A flow log for the daemon (experimental).** `netwatch daemon --flow-log file|stdout|both`, or
   `[experimental] flow_log` in `config.toml`, writes an NDJSON line when a connection appears
   and when it closes: process, pid, local and remote address, and on close the duration, the
@@ -30,6 +34,13 @@ All notable changes to NetWatch will be documented in this file.
 - `scripts/build-dmg.sh` builds an unsigned Apple Silicon `.dmg`: the binary, and an installer
   that copies it to `/usr/local/bin` and, if you say yes, runs the daemon at boot with the flow
   log in `/var/log/netwatch`. Releases do not publish it yet.
+
+### Changed
+- **An internet outage now needs two providers to stop answering.** In a probe cycle where
+  1.1.1.1 gets no reply, the uptime log also asks 8.8.8.8, with the same ICMP-then-TCP/443
+  probe, and counts the internet as down only if neither answers. An outage at Cloudflare, or a
+  network that blocks 1.1.1.1, was reported as your ISP's. The dashboard's internet tile and
+  Diagnose still read 1.1.1.1 alone, and `third_party_probes = false` stops both.
 
 ### Fixed
 - **The packaged systemd unit starts under a service user with no home.** It exited with

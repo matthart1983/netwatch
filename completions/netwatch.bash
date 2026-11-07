@@ -57,7 +57,7 @@ _netwatch() {
             return 0
             ;;
         uptime)
-            COMPREPLY=( $(compgen -W "--since --json --csv" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "--since --json --csv --md" -- "${cur}") )
             return 0
             ;;
         geoip)
