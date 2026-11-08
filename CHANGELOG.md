@@ -19,6 +19,13 @@ All notable changes to NetWatch will be documented in this file.
   and kernels with the stable backport may too, so the test failed and the build stopped
   (#192). The test now accepts a denied send, as long as nothing reaches the listener, and
   the threat model scopes the Fast Open gap to kernels without the fix.
+- **Memory no longer creeps up after capture bursts on Linux.** mimalloc asks for transparent
+  huge pages on its arenas, so after a burst the kernel kept whole 2 MiB pages resident and
+  khugepaged collapsed released ranges back into them. RSS sat 80 to 100 MiB above the bytes
+  live on the heap and rose a little with each burst, which is what failed the flood soak's
+  plateau gate. netwatch now turns transparent huge pages off for itself at startup
+  (`PR_SET_THP_DISABLE`). In a three-cycle soak with two-minute steps, RSS after the cycles
+  fell from 115 to 41 MiB, and the peak under a full stream budget from 360 to 336 MiB.
 
 ## [1.0.0-rc.1] - 2026-11-07
 

@@ -205,6 +205,9 @@ nix = { version = "0.31", features = ["term", "signal"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 caps = "0.5"
+# prctl(PR_SET_THP_DISABLE) at startup (platform::disable_transparent_huge_pages).
+# The same nix as above, so nothing new is compiled.
+nix = { version = "0.31", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

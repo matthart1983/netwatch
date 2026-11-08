@@ -142,6 +142,8 @@ fn parse() -> Result<Options> {
 }
 
 fn main() -> Result<()> {
+    // As `main` does, so RSS reads as the binary's.
+    netwatch::platform::disable_transparent_huge_pages();
     let opts = parse()?;
     match &opts.replay {
         Some(dir) => replay(dir, opts.seconds),

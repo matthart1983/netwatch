@@ -28,6 +28,24 @@ pub mod socket_table;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// Turns transparent huge pages off for this process on Linux, and does
+/// nothing elsewhere. `main` calls it first, and the flood soak's driver does
+/// the same so its RSS reads as the binary's.
+///
+/// mimalloc asks for huge pages on its arenas (`madvise(MADV_HUGEPAGE)`). With
+/// THP set to `madvise` or `always`, the kernel backs every 2 MiB of an arena
+/// netwatch has touched, and khugepaged collapses ranges mimalloc had released
+/// back into huge pages. After a capture burst that left RSS 80 to 100 MiB
+/// above the bytes live on the heap, and a little higher each time the burst
+/// came back: the flood soak's cycle-to-cycle growth. Without huge pages RSS
+/// stays about 23 MiB above the live heap. The flag also covers the children
+/// netwatch starts, which is harmless for `ss` and `ip`. A kernel without the
+/// prctl (before 3.15) keeps huge pages.
+pub fn disable_transparent_huge_pages() {
+    #[cfg(target_os = "linux")]
+    let _ = nix::sys::prctl::set_thp_disable(true);
+}
+
 /// The command the capture error and the Dashboard banner give for capture
 /// without root on Linux. CAP_BPF and CAP_PERFMON are for eBPF attribution
 /// (`sandbox/mod.rs`). It restricts the binary to a group before granting it,
@@ -788,6 +806,21 @@ stat() { case ${3#"$PWD"/} in usr/* | local/* | store/* | profile/*) echo root ;
             std::fs::remove_file(root.join("profile/netwatch")).unwrap();
             std::fs::remove_file(root.join("store/netwatch")).unwrap();
             std::fs::remove_file(root.join("local/netwatch")).unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod huge_page_tests {
+    /// The kernel reports the flag back, and `THP_enabled` in
+    /// `/proc/self/status` reads 0, as it would for the binary.
+    #[test]
+    fn transparent_huge_pages_are_off_after_the_call() {
+        super::disable_transparent_huge_pages();
+        assert_eq!(nix::sys::prctl::get_thp_disable(), Ok(true));
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        if let Some(line) = status.lines().find(|l| l.starts_with("THP_enabled:")) {
+            assert_eq!(line.split_whitespace().nth(1), Some("0"), "{line}");
         }
     }
 }
