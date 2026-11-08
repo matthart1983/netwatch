@@ -15,6 +15,8 @@ use std::mem::ManuallyDrop;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
+    // Before the collectors allocate: see the function for the RSS it saves.
+    netwatch::platform::disable_transparent_huge_pages();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match netwatch::cli::parse(&args)? {
         netwatch::cli::Command::Help => {
