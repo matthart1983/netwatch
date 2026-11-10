@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [1.0.0-rc.2] - 2026-11-10
 
 ### Fixed
 - **A pre-release's `SHA256SUMS` names its packages as GitHub serves them.** GitHub turns
