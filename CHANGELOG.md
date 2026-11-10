@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [1.0.0-rc.3] - 2026-11-10
 
 ### Fixed
 - **The capture fix line no longer changes your working directory when netwatch isn't on

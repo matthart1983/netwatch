@@ -12,9 +12,9 @@
 # below 1.0.0 and allows, where it allows no hyphen). scripts/release.sh writes
 # both. `spec_version_matches_the_crate` in tests/packaging.rs fails the build
 # if they drift.
-%global upstream 1.0.0-rc.2
+%global upstream 1.0.0-rc.3
 Name:           netwatch
-Version:        1.0.0~rc.2
+Version:        1.0.0~rc.3
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -100,6 +100,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Tue Nov 10 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 1.0.0~rc.3-1
+- the third 1.0 release candidate: the capture fix line stops when netwatch isn't on PATH instead of changing the working directory on Ubuntu 26.04, with rc.2's fixes, as rc.2 was never released
+
 * Tue Nov 10 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 1.0.0~rc.2-1
 - the second 1.0 release candidate: memory that holds flat under a flood with transparent huge pages off, the Nix build passing on Linux 7.2, and pre-release packages named as GitHub serves them
 
