@@ -55,16 +55,21 @@ pub fn disable_transparent_huge_pages() {
 /// It finds the binary once, first. Once `chmod` has taken it away from an
 /// account not yet in the group, another `which netwatch` finds a different
 /// netwatch further down `PATH`, or none, and `setcap` would grant that one.
+/// `[ -f "$b" ]` stops the chain when `which` found none. GNU `readlink -f ""`
+/// fails, but uutils coreutils (Ubuntu 26.04) prints the working directory and
+/// succeeds, so without it the chain went on to `chown` and `chmod` that
+/// directory, the home directory when pasted there.
 /// Each `&&` stops the chain before a binary is granted anything unrestricted,
 /// such as where a Nix store refuses the `chown`. REFERENCE.md has the longer
 /// recipe that copies a binary like that one.
 ///
 /// `usermod` does not change the groups of a session already running, and
 /// `chmod` has just taken execute away from it. Until a new login the next
-/// `netwatch` gets permission denied, and pasting this again stops at `which`,
-/// so the last step says so. It is a step and not a note after the command, so
-/// the two cannot be separated, and it fits one row of 80 columns.
-pub const LINUX_CAPTURE_FIX: &str = r#"b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b" && echo 'Log in again to join the group: netwatch cannot start until you do'"#;
+/// `netwatch` gets permission denied, and pasting this again stops before
+/// `sudo`, as `which` finds nothing, so the last step says so. It is a step
+/// and not a note after the command, so the two cannot be separated, and it
+/// fits one row of 80 columns.
+pub const LINUX_CAPTURE_FIX: &str = r#"b=$(readlink -f "$(which netwatch)") && [ -f "$b" ] && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b" && echo 'Log in again to join the group: netwatch cannot start until you do'"#;
 
 /// A message ending in a chain of commands, as the refused-capture error does
 /// on Linux: what comes before the chain, and each command with its `&&`. A
@@ -565,6 +570,11 @@ mod capture_fix_tests {
         let root = scratch.0.as_path();
         let tools = root.join("tools");
         std::fs::create_dir_all(&tools).unwrap();
+        // The chain runs from here. The `sudo` shim's chmod is real, so a chain
+        // that takes its working directory for the binary locks this one, not
+        // the checkout the tests run in.
+        let cwd = root.join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
         let dirs: Vec<_> = std::env::var_os("PATH")
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default();
@@ -604,6 +614,7 @@ sudo() {
             let out = std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(format!("{SHIMS}{LINUX_CAPTURE_FIX}"))
+                .current_dir(&cwd)
                 .env_clear()
                 .env("PATH", format!("{path}:{}", tools.display()))
                 .env("USER", "user")
@@ -636,6 +647,24 @@ sudo() {
         // away from this session, so pasting the line again finds nothing,
         // and running it would be permission denied.
         std::fs::remove_file(root.join("second").join("netwatch")).unwrap();
+        assert_eq!(run(), "");
+
+        // uutils coreutils 0.10 (Ubuntu 26.04) answers `readlink -f ""` with
+        // the working directory and exit 0, where GNU fails. Finding no
+        // netwatch must still change nothing, so the command's directory
+        // doesn't become root's.
+        let readlink = tools.join("readlink");
+        let real = std::fs::read_link(&readlink).unwrap();
+        std::fs::remove_file(&readlink).unwrap();
+        std::fs::write(
+            &readlink,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = -f ] && [ -z \"$2\" ] && {{ pwd; exit 0; }}\nexec {} \"$@\"\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&readlink, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(run(), "");
     }
 
