@@ -2,6 +2,19 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **The capture fix line no longer changes your working directory when netwatch isn't on
+  `PATH`.** The line the capture error, the Dashboard banner and `netwatch doctor` give on Linux
+  starts `b=$(readlink -f "$(which netwatch)")`. GNU `readlink -f ""` fails and stopped the
+  chain there, but uutils coreutils, which Ubuntu 26.04 ships, prints the working directory
+  and succeeds. The line then ran `sudo chown root:netwatch`, `chmod 0750` and `setcap` on
+  that directory, so pasted from your home directory it handed your home to root. A new
+  `[ -f "$b" ]` step stops the chain unless it found a file. CI caught it when GitHub's
+  `ubuntu-latest` moved to 26.04, which stopped the 1.0.0-rc.2 release before anything was
+  published.
+
 ## [1.0.0-rc.2] - 2026-11-10
 
 ### Fixed

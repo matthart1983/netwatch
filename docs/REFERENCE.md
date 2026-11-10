@@ -1050,12 +1050,13 @@ draw it whole, or, when the terminal has too few rows or columns, point to docto
 section instead:
 
 ```bash
-b=$(readlink -f "$(which netwatch)") && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b" && echo 'Log in again to join the group: netwatch cannot start until you do'
+b=$(readlink -f "$(which netwatch)") && [ -f "$b" ] && sudo groupadd -f netwatch && sudo usermod -aG netwatch "$USER" && sudo chown root:netwatch "$b" && sudo chmod 0750 "$b" && sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$b" && echo 'Log in again to join the group: netwatch cannot start until you do'
 ```
 
 As it says, log in again before the next `netwatch`. `usermod` does not change a session already
 running, so until then the group restriction keeps this session out too: `netwatch` gets
-permission denied, and pasting the line again stops at `which`, which no longer finds it.
+permission denied, and pasting the line again stops before `sudo`, because `which` no longer
+finds it.
 
 The [systemd unit](../packaging/systemd/netwatch.service) needs none of this: it grants the
 capabilities to its own service user.
