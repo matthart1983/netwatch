@@ -26,7 +26,17 @@
   Featured in <a href="https://www.youtube.com/watch?v=TBOtZ3mBktM&amp;t=112s">35 Self-Hosted Projects on GitHub</a> by Github Awesome.
 </p>
 
-One binary, no config. `netwatch` with capture permissions gives you live capture with L7 decode, process attribution where available, and a diagnostic engine that opens an issue when a learned baseline breaks and closes it when the fix holds.
+netwatch shows what your machine is doing on the network: every connection and the process behind it where the OS exposes that, the latency of each hop on the way out, and, with capture permissions, the packets decoded up to the application layer. It is one binary and needs no configuration.
+
+The Diagnose tab is the part most network tools leave to you. It learns what normal looks like on your network, opens an issue when that breaks, ranks the likely causes by the checks each one passed, and closes the issue itself once the fix has held.
+
+<p align="center">
+  <img src="docs/media/demo-diagnose-light.gif" alt="netwatch's Diagnose tab replaying a recorded incident: a slow DNS resolver is flagged at many times its baseline, three causes are ranked with the checks each one passed, a fix is staged and confirmed, and the issue closes once its verify condition has held" width="900">
+</p>
+
+<p align="center">
+  <em><code>netwatch --demo</code> replays this recorded incident through the real engine at 6×. It touches nothing on your machine, and the DEMO banner stays on screen.</em>
+</p>
 
 ## Install
 
@@ -40,7 +50,10 @@ nix-shell -p netwatch                 # NixOS / Nix
 conda install -c conda-forge netwatch # conda / mamba (Linux, macOS)
 ```
 
-**Debian / Ubuntu** ([apt repository](https://matthart1983.github.io/netwatch/)):
+<details>
+<summary><strong>Debian / Ubuntu</strong> (apt repository)</summary>
+
+The [apt repository](https://matthart1983.github.io/netwatch/) is signed:
 
 ```bash
 curl -fsSL https://matthart1983.github.io/netwatch/apt/netwatch.gpg \
@@ -50,6 +63,8 @@ https://matthart1983.github.io/netwatch/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/netwatch.list
 sudo apt update && sudo apt install netwatch
 ```
+
+</details>
 
 **Fedora:** `sudo dnf copr enable matthart1983/netwatch && sudo dnf install netwatch`
 
@@ -61,10 +76,8 @@ Windows are on the
 `.deb`, `.rpm`, checksums and signed provenance. The Linux builds are static and
 need nothing installed; Windows needs [Npcap](https://npcap.com/#download).
 
-**FreeBSD:** `netwatch-freebsd-x86_64` is built on FreeBSD 13.5 and
-dynamically links the base system's libc and libpcap, so it needs FreeBSD 13 or
-newer (it cannot be static). On anything older, build from source with
-`cargo install netwatch-tui`.
+The FreeBSD binary needs FreeBSD 13 or newer; on anything older, build from
+source with `cargo install netwatch-tui`.
 [Verifying a download](docs/REFERENCE.md#verifying-a-download) ·
 [every channel](docs/PACKAGING.md).
 
@@ -77,6 +90,7 @@ netwatch              # interfaces, connections, config. No privileges.
 sudo netwatch         # works; root containment is limited
 netwatch --lite       # one 80x24 screen
 netwatch --view dense # four boxes, 130x44 or larger
+netwatch --demo       # replay a recorded Diagnose incident, no capture needed
 ```
 
 `1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key.
@@ -90,7 +104,6 @@ netwatch diagnose run --format json      # the same, for scripts
 netwatch daemon --metrics                # headless; Prometheus /metrics on 127.0.0.1:9464
 netwatch uptime --since 7d               # outages this week: when, how long, and which hop failed
 netwatch geoip update                    # download the offline GeoIP databases
-netwatch --demo                          # replay a recorded Diagnose incident, no capture needed
 ```
 
 `daemon` runs the same collectors with no screen; a [systemd unit](packaging/systemd/netwatch.service) and a [launchd agent](packaging/launchd/com.netwatch.agent.plist) ship with it, and [Prometheus export](docs/observability-export.md) lists the metrics. `--remote URL` with `NETWATCH_API_KEY` streams snapshots to a backend you run. Both stay accepted through 1.x, and what they do is experimental: the wire format may change. So are AI Insights, `netwatch resolver set` and `recover`, and the JSON in PCAPNG packet comments: [what that covers](docs/CAPABILITIES.md#experimental). [Every command and flag](docs/REFERENCE.md#command-line).
@@ -102,7 +115,7 @@ netwatch --demo                          # replay a recorded Diagnose incident, 
 | 1 | Dashboard | Latency tiles, mirrored throughput, the link carrying it, connections rolled up per process |
 | 2 | Connections | Every socket with process, PID, state, GeoIP, RTT, retransmits |
 | 3 | Interfaces | Addresses, MTU, rates, errors, drops |
-| 4 | Packets | Live decode, TLS 1.3 decryption, JA4, stream tracking, display filters, PCAPNG and PCAP export |
+| 4 | Packets | Live decode, TLS 1.3 and 1.2 decryption, JA4, stream tracking, display filters, PCAPNG and PCAP export |
 | 5 | Stats | Protocol breakdown and handshake-timing histogram |
 | 6 | Topology | Machine, gateway, DNS, top hosts, traceroute, how long the connection has been up |
 | 7 | Timeline | Connections by TCP state, with alerts |
