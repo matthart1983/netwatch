@@ -408,6 +408,9 @@ pub struct Recorder {
     ring: VecDeque<Frame>,
     active: Option<Active>,
     next_quiet_at: f64,
+    /// Record every quiet stretch instead of one sample a day. See
+    /// [`Recorder::continuous`].
+    continuous: bool,
 }
 
 impl Recorder {
@@ -417,7 +420,22 @@ impl Recorder {
             ring: VecDeque::new(),
             active: None,
             next_quiet_at: now_unix + random_offset(86_400.0),
+            continuous: false,
         }
+    }
+
+    /// Record all the time: quiet samples back to back, each
+    /// [`QUIET_SAMPLE_SECS`] long, with an incident's recording taking over
+    /// when something opens. This is what a false-alert soak needs: every
+    /// monitored second is on disk, so the time a rule stayed quiet can be
+    /// counted, and replayed against a later version of the rule.
+    ///
+    /// Not for ordinary use. A day of it is about a hundred files, and
+    /// [`prune`] would start deleting them within the week.
+    pub fn continuous(mut self, now_unix: f64) -> Self {
+        self.continuous = true;
+        self.next_quiet_at = now_unix;
+        self
     }
 
     /// Move the next quiet sample to `at` (unix seconds).
@@ -453,7 +471,11 @@ impl Recorder {
                 self.start(EpisodeSource::Live, &tick, true, None);
                 self.track(&tick, &open);
             } else if tick.at >= self.next_quiet_at {
-                self.next_quiet_at = tick.at + 86_400.0 + random_offset(3_600.0) - 1_800.0;
+                self.next_quiet_at = if self.continuous {
+                    tick.at
+                } else {
+                    tick.at + 86_400.0 + random_offset(3_600.0) - 1_800.0
+                };
                 self.start(EpisodeSource::QuietSample, &tick, false, None);
             }
             return None;
@@ -467,11 +489,17 @@ impl Recorder {
             // Something broke during the quiet sample. Its last ten minutes
             // become the incident's pre-roll, taken from the ring because the
             // ring's frames still carry their own baseline snapshots.
+            //
+            // A continuous recording keeps every frame it has instead: the
+            // minutes before the pre-roll were monitored time, and dropping
+            // them would undercount it.
             active.episode.source = EpisodeSource::Live;
-            active.network = None;
-            active.episode.frames = self.ring.iter().cloned().collect();
-            for f in &mut active.episode.frames {
-                strip_repeat_snapshot(&mut active.network, f);
+            if !self.continuous {
+                active.network = None;
+                active.episode.frames = self.ring.iter().cloned().collect();
+                for f in &mut active.episode.frames {
+                    strip_repeat_snapshot(&mut active.network, f);
+                }
             }
             active.started_at = active.episode.frames.first().map_or(tick.at, |f| f.at);
             active.episode.started = active
@@ -2737,6 +2765,51 @@ mod tests {
         assert!(ep.issue_keys().is_empty());
         assert!(ep.duration_secs() >= QUIET_SAMPLE_SECS - 5.0);
         assert!(replay(ep).matches());
+    }
+
+    /// A soak counts quiet time, so none of it may go unrecorded: samples
+    /// run back to back, an incident keeps the quiet minutes before it, and
+    /// every file replays to what was recorded.
+    #[test]
+    fn a_continuous_recorder_leaves_no_time_unrecorded() {
+        let mut s = Session::new();
+        s.recorder = Recorder::new(EnvProfile::detect("no privileges", 1000), T0).continuous(T0);
+        s.run(healthy, 2.0 * 3_600.0, 5.0);
+        s.run(|_| 80.0, 300.0, 5.0);
+        s.run(healthy, 3_600.0, 5.0);
+        let quiet = s
+            .finished
+            .iter()
+            .filter(|e| e.source == EpisodeSource::QuietSample)
+            .count();
+        let live: Vec<&Episode> = s
+            .finished
+            .iter()
+            .filter(|e| e.source == EpisodeSource::Live)
+            .collect();
+        assert!(quiet >= 9, "{quiet} quiet samples in three hours");
+        assert_eq!(live.len(), 1);
+        // The incident began partway through a sample, and kept all of it.
+        let before = live[0].issues[0].ts.as_str();
+        let lead = live[0]
+            .frames
+            .iter()
+            .take_while(|f| f.ts.as_str() < before)
+            .count();
+        assert!(lead > 1, "the incident kept {lead} frames from before it");
+        let recorded: f64 = s.finished.iter().map(Episode::duration_secs).sum();
+        let elapsed = s.at - T0;
+        assert!(
+            recorded > elapsed * 0.97,
+            "{recorded:.0}s recorded of {elapsed:.0}s"
+        );
+        for ep in &s.finished {
+            assert!(
+                replay(ep).matches(),
+                "{:#?}",
+                replay(ep).divergences.first()
+            );
+        }
     }
 
     #[test]

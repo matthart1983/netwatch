@@ -115,6 +115,11 @@ alert accounting, historical baseline inputs, and an explicit DNS/target family
 mapping. Current QuietSample recordings alone do not establish false alerts per
 device-week or supply a week of baseline history.
 
+The [false-alert soak](../tests/soak/README.md#diagnose-false-alert-soak) is the
+tool for that: it records every tick on an ordinary host beside an independent
+witness, and reports monitored host-weeks and opens per rule, replayed against
+the current rules. No soak result has been published yet.
+
 
 ## One bounded diagnosis
 

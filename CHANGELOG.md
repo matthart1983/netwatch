@@ -31,6 +31,10 @@ All notable changes to NetWatch will be documented in this file.
   `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change
   in a minor release.
 - **Issue forms for a Diagnose false positive, a missed detection and a rule idea.**
+- **A false-alert soak for Diagnose.** `examples/diagnose_quiet_soak.rs` records every
+  tick on an ordinary host and reports monitored host-weeks and opens per rule, replayed
+  against the current rules and judged against `tests/soak/witness.py`, an independent
+  log of pings and lookups. See `tests/soak/README.md`. No result is published yet.
 
 ## [1.0.0-rc.3] - 2026-11-10
 
