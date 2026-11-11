@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/matthart1983/netwatch/main/schemas/diagnose-run.v2.schema.json",
   "title": "netwatch diagnose run --format json, schema 2",
-  "description": "One bounded diagnosis. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated tells you nothing useful, so do not rely on it. It goes only in a major version. A finding with beta true comes from a rule with no reviewed contract: its shape follows this schema, but the rule can change thresholds or disappear. Exit 3, for bad arguments or a session that could not start, prints no JSON at all. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
+  "description": "One bounded diagnosis. Later minors may add fields, so ignore any you do not know. A break needs netwatch 2.0 and a new schema file. A field marked deprecated tells you nothing useful, so do not rely on it. It goes only in a major version. A finding with beta true comes from a rule netwatch does not yet stand behind: its shape follows this schema, but the rule can change thresholds or disappear. Exit 3, for bad arguments or a session that could not start, prints no JSON at all. This file describes what netwatch 0.40 and later write; 0.39 has no metadata block.",
   "type": "object",
   "required": ["metadata", "schema", "version", "ruleset", "outcome", "exit", "include_beta", "target", "started_at", "window_seconds", "samples", "evidence", "completeness", "coverage", "issues", "observations"],
   "properties": {
@@ -56,7 +56,7 @@
     },
     "issues": {
       "type": "array",
-      "description": "Faults. Only an Issue from a contracted rule, or any Issue with --include-beta, sets the exit status.",
+      "description": "Faults. Only an Issue from a stable rule, or any Issue with --include-beta, sets the exit status.",
       "items": {
         "$ref": "#/$defs/finding",
         "properties": {
@@ -125,7 +125,8 @@
         "since": { "$ref": "#/$defs/local_time" },
         "last_seen": { "$ref": "#/$defs/local_time" },
         "stale_since": { "$ref": "#/$defs/local_time", "description": "From when this finding's evidence stopped arriving. Absent, not null, while it is arriving." },
-        "beta": { "type": "boolean", "description": "Opened by a rule with no reviewed contract." },
+        "beta": { "type": "boolean", "description": "Opened by a rule that was not stable when the finding opened. Always the same statement as maturity." },
+        "maturity": { "type": "string", "description": "The rule's maturity when the finding opened. stable counts towards the exit status; beta counts only with --include-beta. Open set: a minor may add a value, and experimental is reserved. Treat any value other than stable as not counted by default. Absent before netwatch 1.0.0-rc.4; read beta there.", "examples": ["beta", "stable"] },
         "state": {
           "type": "object",
           "description": "An object, so the value is at state.state. A check's state is a plain string. Schema 2 keeps this shape.",

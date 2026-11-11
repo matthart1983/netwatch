@@ -148,7 +148,9 @@ impl DemoDriver {
         if self.finished() {
             s.push_str(" · ended");
         } else if let Some(at) = self.fixed_at {
-            s.push_str(&format!(" · resolver switched at {at}s, waiting on verify"));
+            s.push_str(&format!(
+                " · resolver switch simulated at {at}s, waiting on verify"
+            ));
         }
         s
     }

@@ -2,6 +2,36 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Three Diagnose rules go back to beta, so five set `diagnose run`'s exit status.**
+  `path.high_loss`, `tcp.bufferbloat_remote` and `dns.hijack_suspect` keep their written
+  contracts and are shown as before, tagged beta, but count toward exit 1 only with
+  `--include-beta`. The first judges loss per hop from three probes, the second opens
+  without a test that proves the socket was under load, and the third opens when two
+  resolvers disagree, which CDNs and split-horizon DNS do by design. The stable rules are
+  `gateway.unreachable` and the four `target.*` failure rules. A script that relied on
+  exit 1 from one of the three needs `--include-beta` or a match on `rule`.
+- **A rule's maturity is set by hand instead of derived from its documentation.** Having
+  the four contract fields filled in used to make a rule count. Now each rule is marked
+  beta or stable in the catalogue, a test pins the stable list, and a stable rule may not
+  have a trigger text that is known to misdescribe its detector.
+- **The trigger texts of four rules describe what their detectors do.** `iface.saturated`
+  holds for three interface samples, not 30 seconds. `path.high_loss` also opens when
+  every hop after the lossy one is silent. `path.rtt_spike` falls back to the internet
+  probe's baseline. `tcp.bufferbloat_remote` opens whether or not the link test has run.
+  `gateway.unreachable` no longer lists an ARP probe as evidence, since none exists.
+- **The demo banner says the resolver switch is simulated.** `docs/DIAGNOSE.md` gains a
+  "Rule maturity" section that says what stable does and does not mean, and the README
+  caption says the demo's rules are beta.
+
+### Added
+- **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
+  `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change
+  in a minor release.
+- **Issue forms for a Diagnose false positive, a missed detection and a rule idea.**
+
 ## [1.0.0-rc.3] - 2026-11-10
 
 ### Fixed

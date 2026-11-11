@@ -1,0 +1,37 @@
+name: Diagnose rule idea
+description: Propose a new rule, or a change to what an existing one fires on
+labels: ["diagnose", "rule-idea"]
+body:
+  - type: textarea
+    id: fault
+    attributes:
+      label: The fault
+      description: What goes wrong for the user, in a sentence.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: What would be measured
+      description: The reading or readings, where they come from on each OS, and the line that counts as a fault.
+    validations:
+      required: true
+  - type: textarea
+    id: lookalikes
+    attributes:
+      label: Healthy lookalikes
+      description: Situations where the same reading appears and nothing is wrong. A rule with none listed is not ready.
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Recovery
+      description: What netwatch would have to measure to close the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: Sources
+      description: RFCs, vendor documentation or measurements behind the threshold, if any.

@@ -66,10 +66,11 @@ every tier is best-effort.
 ## Diagnose and remediation
 
 The [rule coverage document](diagnostic-coverage.md), generated from the
-catalogue, lists 30 active rules, eight of which carry a reviewed contract
-stating their evidence, lookalikes, recovery and platform limits. An active
-rule can still be learning, unmeasured or stale on a given host. Local bufferbloat lacks a live loaded/idle test;
-interface saturation lacks link capacity in the live adapter. Empty findings do
+catalogue, lists 30 active rules. Five are stable and set `diagnose run`'s exit
+status; the other 25 are beta ([rule maturity](DIAGNOSE.md#rule-maturity)). An active
+rule can still be learning, unmeasured or stale on a given host. Local bufferbloat is
+judged only after you run the loaded-versus-idle test by hand; interface saturation
+needs a link rate from the OS, which only Linux reports. Empty findings do
 not establish host health. Baseline readiness is sample-based, not a guaranteed
 30-minute elapsed window.
 
@@ -132,7 +133,7 @@ This audit checked [tab/config mapping](../src/config.rs),
 [Linux policy](../src/sandbox/linux.rs), and
 [Insights snapshot/worker](../src/collectors/insights.rs).
 
-PR05 implements worker entry policy and Settings reporting. A broader runtime
-capability snapshot and a `doctor` command remain planned. See the [implementation progress](research/implementation-progress.md).
+PR05 implements worker entry policy and Settings reporting. The [doctor command](doctor.md)
+reports setup capabilities; a broader runtime capability snapshot remains planned. See the [implementation progress](research/implementation-progress.md).
 
 The [threat model](THREAT-MODEL.md) details containment and privilege limits.

@@ -35,7 +35,7 @@ The Diagnose tab is the part most network tools leave to you. It learns what nor
 </p>
 
 <p align="center">
-  <em><code>netwatch --demo</code> replays this recorded incident through the real engine at 6×. It touches nothing on your machine, and the DEMO banner stays on screen.</em>
+  <em><code>netwatch --demo</code> replays this recorded incident through the real engine at 6×. The resolver switch is simulated and touches nothing on your machine; live, netwatch gives you the step to run and closes the issue once its verify condition holds. The rules shown are <a href="docs/DIAGNOSE.md#rule-maturity">beta</a>.</em>
 </p>
 
 ## Install

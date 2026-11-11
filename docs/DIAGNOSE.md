@@ -133,9 +133,9 @@ part of the interface:
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |
 
-An issue from a beta rule (one whose contract is not yet reviewed; see
-[diagnostic-coverage.md](diagnostic-coverage.md#not-yet-contracted)) is reported, tagged
-`beta`, but sets exit 1 only with `--include-beta`.
+An issue from a beta rule (see [Rule maturity](#rule-maturity)) is reported, tagged
+`beta`, but sets exit 1 only with `--include-beta`. Each finding in the JSON says
+which it is in `maturity`.
 
 Exit 0 and exit 2 are deliberately different. A run that gathered nothing has
 established nothing, and a script that treats silence as health will report a
@@ -465,6 +465,48 @@ reset the sampler's histories. Cancellation stops new requests and discards
 late results; an operation already in progress may take its bounded timeout to
 return. STUN now reports resolution, send, receive and malformed-response errors,
 and only a complete two-server mapping comparison is usable.
+
+## Rule maturity
+
+Every rule is `beta` or `stable`, set by hand in `rules.rs` and pinned by a test.
+
+| Maturity | In the tab | In `diagnose run` |
+| --- | --- | --- |
+| stable | shown | sets exit 1 |
+| beta | shown, tagged `beta` | listed; sets exit 1 only with `--include-beta` |
+
+Five rules are stable: `gateway.unreachable`, `target.resolve_failed`,
+`target.connect_failed`, `target.tls_failed` and `target.http_error`. Each is a
+yes-or-no condition that has to hold for three probes, has a written contract,
+and has a trigger text that describes its detector as it is.
+
+That is all stable means today. No rule has been through repeated
+fault-injection runs with measured impairments, and no false-alert rate has been
+measured on real networks. The 25 beta rules include the ones most people meet
+first (`dns.slow_resolver`, `dns.failing`, `link.down`, `gateway.rtt_spike`), so
+`netwatch diagnose run` exits 0 while DNS is failing unless you pass
+`--include-beta`.
+
+Three rules have a written contract and are beta anyway:
+
+- `path.high_loss` judges loss per hop, and three probes a hop make one lost
+  probe read as 33%. It is also evaluated only when a trace runs, which by
+  default is when you press `t`.
+- `tcp.bufferbloat_remote` opens without the loaded-versus-idle test that would
+  place the queue, so it cannot prove the socket was under load.
+- `dns.hijack_suspect` opens on two resolvers disagreeing, which CDNs and
+  split-horizon DNS do by design. Its private-address branch is sound; the
+  disagreement branch is not yet.
+
+### What `netwatch --demo` shows
+
+The demo replays a recorded incident through the real engine. The three rules it
+opens (`dns.slow_resolver`, `path.changed`, `tcp.bufferbloat_remote`) are all
+beta and are tagged so on screen. The resolver switch you confirm in the demo is
+simulated: the status line and the banner say so, and nothing on your machine
+changes. Live netwatch does not offer that step. It shows remediation as
+instructions for you to run, and closes an issue itself only when its verify
+condition holds on what it measures afterwards.
 
 ## Rule coverage document
 

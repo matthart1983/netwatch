@@ -1381,7 +1381,7 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
     )));
     if issue.beta {
         lines.push(Line::from(Span::styled(
-            "beta rule: contract not yet reviewed; not counted in `diagnose run`'s exit status",
+            "beta rule: not yet validated; not counted in `diagnose run`'s exit status",
             Style::default().fg(t.text_muted),
         )));
     }
@@ -1899,7 +1899,7 @@ mod tests {
             .join("\n")
     }
 
-    /// The fixture's issues come from rules without a reviewed contract, so
+    /// The fixture's issues come from beta rules, so
     /// they are beta: tagged in the list and explained in the detail pane.
     #[test]
     fn beta_issue_is_tagged() {
@@ -1911,10 +1911,7 @@ mod tests {
             screen.contains(&format!("{} beta", first.title)),
             "{screen}"
         );
-        assert!(
-            screen.contains("beta rule: contract not yet reviewed"),
-            "{screen}"
-        );
+        assert!(screen.contains("beta rule: not yet validated"), "{screen}");
     }
 
     fn draw_coverage_text(width: u16, selected: usize) -> String {
