@@ -45,6 +45,14 @@ All notable changes to NetWatch will be documented in this file.
   instruction and never applied, and it says your lookups would go to that provider. No
   new traffic: same query, same destination, same cadence.
 
+- **Diagnose can say it checked and found nothing.** The verdict never reached its green
+  state: ready baselines and an empty list always read "no visible issues" in grey. It now
+  turns green, as `no issues · link, gateway and dns checked against their baselines`,
+  once the five core rules (`link.down`, `gateway.unreachable`, `gateway.rtt_spike`,
+  `dns.failing`, `dns.slow_resolver`) all had their inputs. Until then the grey line names
+  the core rule that is waiting and why. Behind a local stub resolver the line adds that
+  DNS speed was not judged. `diagnose run`'s outcomes and exit codes are unchanged.
+
 ### Added
 - **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
   `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change

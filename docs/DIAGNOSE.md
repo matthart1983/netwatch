@@ -472,6 +472,31 @@ late results; an operation already in progress may take its bounded timeout to
 return. STUN now reports resolution, send, receive and malformed-response errors,
 and only a complete two-server mapping comparison is usable.
 
+## When the tab says "no issues"
+
+An empty issue list is one of three things, and the verdict line says which:
+
+| Line begins | Marker | Meaning |
+| --- | --- | --- |
+| `no issues · link, gateway and dns checked against their baselines` | green ● | Baselines are ready and all five core rules had their inputs, so each could have opened and did not. |
+| `no visible issues · not yet checked: …` | grey ◌ | A core rule has no input yet. The line names it and why. |
+| `no visible issues · baselines learning …` | grey ◌ | Baselines are still being learned. |
+
+The core rules are `link.down`, `gateway.unreachable`, `gateway.rtt_spike`,
+`dns.failing` and `dns.slow_resolver`: is the link up, does the gateway answer
+at its usual speed, does the resolver. Every other rule needs a test you run, a
+target you configure, or traffic that may not exist, so none of them holds the
+green marker back and none of them is covered by it.
+
+Behind a local stub resolver such as 127.0.0.53 the probe times the stub's
+cache, so resolver speed leaves the core set and the line ends `dns speed not
+judged: the local stub answers from cache`.
+
+The green line is a statement about those five rules on this network since the
+baselines became ready. It is not a claim that the host is healthy, and
+`netwatch diagnose run`'s exit 0 still means only that no counted issue was
+found.
+
 ## Rule maturity
 
 Every rule is `beta` or `stable`, set by hand in `rules.rs` and pinned by a test.

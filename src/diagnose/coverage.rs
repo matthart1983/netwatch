@@ -11,6 +11,46 @@ use serde::{Deserialize, Serialize};
 /// still needs nothing but serde and fmt.
 pub use super::issue::Availability;
 
+/// The rules that must have been evaluated before an empty issue list is
+/// reported as checked rather than as incomplete: is the link up, does the
+/// gateway answer and at its usual speed, does the resolver answer and at
+/// its usual speed. Everything else in the catalogue needs a test someone
+/// runs, a target someone configures, or traffic that may not exist.
+pub const CORE_RULES: [&str; 5] = [
+    "link.down",
+    "gateway.unreachable",
+    "gateway.rtt_spike",
+    "dns.failing",
+    "dns.slow_resolver",
+];
+
+/// How a stub resolver's `dns.slow_resolver` row begins its reason.
+const STUB_REASON: &str = "limited:";
+
+/// What stands between an empty issue list and saying the core was checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Core {
+    /// Core rules without their inputs, and why.
+    pub waiting: Vec<(&'static str, Availability)>,
+    /// The resolver is a local stub, so its speed was not judged.
+    pub dns_speed_unjudged: bool,
+}
+
+impl Core {
+    pub fn checked(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    /// "gateway.rtt_spike learning, dns.failing not_measured".
+    pub fn waiting_label(&self) -> String {
+        self.waiting
+            .iter()
+            .map(|(rule, why)| format!("{rule} {}", why.label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleCoverage {
     pub rule: String,
@@ -99,6 +139,32 @@ impl Coverage {
             let area = row.rule.split('.').next().unwrap_or("");
             areas.iter().position(|a| a == area)
         });
+    }
+
+    /// Which of the [`CORE_RULES`] have not been evaluated, and whether
+    /// resolver speed was left out because the resolver is a local stub.
+    pub fn core(&self) -> Core {
+        let mut core = Core::default();
+        for id in CORE_RULES {
+            let row = self.rules.iter().find(|r| r.rule == id);
+            // Decision M5: behind a local stub the probe times the stub's
+            // cache, which says nothing about the upstream. The rule stays
+            // available for what it does measure, and leaves the core set.
+            if id == "dns.slow_resolver"
+                && row.is_some_and(|r| {
+                    r.status == Availability::Available && r.reason.starts_with(STUB_REASON)
+                })
+            {
+                core.dns_speed_unjudged = true;
+                continue;
+            }
+            match row {
+                Some(r) if r.status == Availability::Available => {}
+                Some(r) => core.waiting.push((id, r.status.clone())),
+                None => core.waiting.push((id, Availability::Unknown)),
+            }
+        }
+        core
     }
 
     pub fn label(&self) -> String {
@@ -192,7 +258,7 @@ impl Coverage {
             .filter(|d| d.rtt_p50_ms.is_some() && d.is_local_stub())
             .map(|d| {
                 format!(
-                    "limited: measures the local stub at {}, not the upstream",
+                    "{STUB_REASON} measures the local stub at {}, not the upstream",
                     d.resolver
                 )
             });
@@ -435,6 +501,62 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows(rows: &[(&str, Availability, &str)]) -> Coverage {
+        Coverage {
+            rules: rows
+                .iter()
+                .map(|(rule, status, reason)| RuleCoverage {
+                    rule: rule.to_string(),
+                    status: status.clone(),
+                    reason: reason.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_core_is_checked_only_when_every_core_rule_is_available() {
+        let all: Vec<(&str, Availability, &str)> = CORE_RULES
+            .iter()
+            .map(|r| (*r, Availability::Available, "inputs present"))
+            .collect();
+        assert!(rows(&all).core().checked());
+
+        let mut learning = all.clone();
+        learning[2].1 = Availability::Learning;
+        let core = rows(&learning).core();
+        assert!(!core.checked());
+        assert_eq!(core.waiting_label(), "gateway.rtt_spike learning");
+
+        // A rule with no row at all was not evaluated either.
+        let core = rows(&all[..4]).core();
+        assert_eq!(core.waiting_label(), "dns.slow_resolver unknown");
+
+        // Rules outside the core never hold it up.
+        let mut extra = all.clone();
+        extra.push((
+            "path.changed",
+            Availability::AwaitingTest,
+            "run a traceroute",
+        ));
+        assert!(rows(&extra).core().checked());
+    }
+
+    #[test]
+    fn a_stub_resolver_takes_dns_speed_out_of_the_core() {
+        let mut all: Vec<(&str, Availability, &str)> = CORE_RULES
+            .iter()
+            .map(|r| (*r, Availability::Available, "inputs present"))
+            .collect();
+        all[4].2 = "limited: measures the local stub at 127.0.0.53, not the upstream";
+        let core = rows(&all).core();
+        assert!(core.checked());
+        assert!(core.dns_speed_unjudged);
+        // A stub whose speed is not even measured is still waiting.
+        all[4].1 = Availability::NotMeasured;
+        assert!(!rows(&all).core().checked());
+    }
     use crate::diagnose::{baseline::NetworkFingerprint, fixture};
 
     #[test]

@@ -584,12 +584,12 @@ pub fn build_verdict_line(app: &App) -> Line<'static> {
     // Nothing open: a status, not a coverage breakdown. The counts live on
     // the Diagnose tab, one keypress away, and are noise on every other tab.
     match &verdict {
-        crate::diagnose::Verdict::Clear => with_demo(vec![
+        crate::diagnose::Verdict::Clear { .. } => with_demo(vec![
             Span::styled(" ● ", Style::default().fg(t.status_good)),
             Span::styled("no issues", Style::default().fg(t.text_muted)),
         ]),
-        // What the engine returns with ready baselines and nothing open until
-        // green is earned (C14). Not green, on every tab.
+        // What the engine returns with ready baselines and nothing open while
+        // a core rule still lacks its input. Not green, on every tab.
         crate::diagnose::Verdict::Incomplete { .. } => with_demo(vec![Span::styled(
             " ◌ no issues",
             Style::default().fg(t.text_muted),

@@ -1357,8 +1357,20 @@ impl Engine {
                     ),
                 };
             }
+            // Green is earned: ready baselines and an empty list say nothing
+            // unless the core rules had their inputs and could have opened.
+            let core = self.coverage.core();
+            if core.checked() {
+                return Verdict::Clear {
+                    dns_speed_unjudged: core.dns_speed_unjudged,
+                };
+            }
             return Verdict::Incomplete {
-                detail: self.coverage.label(),
+                detail: format!(
+                    "not yet checked: {} · {}",
+                    core.waiting_label(),
+                    self.coverage.label()
+                ),
             };
         }
 
@@ -1393,11 +1405,20 @@ fn merge_remediation(existing: &mut Vec<super::issue::Step>, fresh: Vec<super::i
         .collect();
 }
 
+/// What a clear verdict says was checked.
+pub const CLEAR_CHECKED: &str = "link, gateway and dns checked against their baselines";
+
 /// What the verdict line says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    /// Baselines are ready and no Issue is open.
-    Clear,
+    /// No Issue is open, baselines are ready, and every core rule
+    /// ([`super::coverage::CORE_RULES`]) had its inputs, so each could have
+    /// opened and did not. A statement about those rules, not about health.
+    Clear {
+        /// The resolver is a local stub: its speed was left out, and the
+        /// line says so.
+        dns_speed_unjudged: bool,
+    },
     /// No Issue is open, but netwatch doesn't yet have the baselines to say so
     /// with confidence.
     Learning {
@@ -1420,7 +1441,10 @@ impl Verdict {
     /// The exact text of the line, so the TUI, the toast and `y` copy agree.
     pub fn line(&self) -> String {
         match self {
-            Verdict::Clear => "no issues · baselines ready".to_string(),
+            Verdict::Clear { .. } => match self.clear_note() {
+                Some(note) => format!("no issues · {CLEAR_CHECKED} · {note}"),
+                None => format!("no issues · {CLEAR_CHECKED}"),
+            },
             Verdict::Learning { detail } | Verdict::Incomplete { detail } => {
                 format!("no visible issues · {detail}")
             }
@@ -1441,6 +1465,16 @@ impl Verdict {
         !matches!(self, Verdict::Issues { .. })
     }
 
+    /// What a clear verdict has to add about what it left out.
+    pub fn clear_note(&self) -> Option<&'static str> {
+        match self {
+            Verdict::Clear {
+                dns_speed_unjudged: true,
+            } => Some("dns speed not judged: the local stub answers from cache"),
+            _ => None,
+        }
+    }
+
     /// Short form for tight chrome — a box title, a Lite status cell, a Dense
     /// subtitle.
     ///
@@ -1451,7 +1485,7 @@ impl Verdict {
     /// specific claim the design review objected to.
     pub fn chip(&self) -> &'static str {
         match self {
-            Verdict::Clear => "nominal",
+            Verdict::Clear { .. } => "nominal",
             Verdict::Learning { .. } => "learning",
             Verdict::Incomplete { .. } => "limited",
             Verdict::Issues { count, .. } => {
@@ -1488,7 +1522,7 @@ impl Verdict {
             // A clear verdict is green; a learning one is not — it is an
             // absence of information, and green would misreport it as health.
             None => match self {
-                Verdict::Clear => t.status_good,
+                Verdict::Clear { .. } => t.status_good,
                 _ => t.text_muted,
             },
         }
@@ -3847,12 +3881,89 @@ mod tests {
         assert!(!engine.get(&id).unwrap().state.is_open());
     }
 
+    /// An engine that has seen nothing has checked nothing, however ready
+    /// its baselines are.
     #[test]
-    fn a_clear_verdict_is_one_quiet_line() {
+    fn an_empty_list_with_nothing_evaluated_is_not_clear() {
         let (e, _clock) = engine_at("2026-09-03 06:48:10");
+        let verdict = e.verdict(&base());
+        assert!(matches!(verdict, Verdict::Incomplete { .. }), "{verdict:?}");
+        let line = verdict.line();
+        assert!(
+            line.starts_with("no visible issues · not yet checked: "),
+            "{line}"
+        );
+        for rule in crate::diagnose::coverage::CORE_RULES {
+            assert!(line.contains(rule), "{rule}: {line}");
+        }
+    }
+
+    /// Green is earned: the fixture's healthy minutes carry a link, a
+    /// gateway that answers, and a resolver, all against ready baselines.
+    #[test]
+    fn a_clear_verdict_needs_every_core_rule_evaluated() {
+        use crate::diagnose::fixture;
+        let (mut e, _clock) = engine_at("2026-09-03 06:44:10");
+        let b = fixture::baselines();
+        // Without the scenario's reroute, which is already under way.
+        let mut healthy = fixture::observations_with(10, false);
+        healthy.paths.clear();
+        e.observe(&healthy, &b);
+        assert!(
+            e.primary_issues().is_empty(),
+            "the fixture starts healthy: {:?}",
+            e.primary_issues()
+                .iter()
+                .map(|i| &i.rule)
+                .collect::<Vec<_>>()
+        );
+        let verdict = e.verdict(&b);
         assert_eq!(
-            e.verdict(&base()).line(),
-            "no visible issues · coverage not recorded"
+            verdict,
+            Verdict::Clear {
+                dns_speed_unjudged: false
+            },
+            "{:?}",
+            e.coverage().core()
+        );
+        assert_eq!(
+            verdict.line(),
+            "no issues · link, gateway and dns checked against their baselines"
+        );
+        assert_eq!(verdict.chip(), "nominal");
+
+        // Take the gateway away and the same empty list is no longer a check.
+        let mut blind = healthy.clone();
+        blind.gateway = None;
+        e.observe(&blind, &b);
+        let verdict = e.verdict(&b);
+        assert!(matches!(verdict, Verdict::Incomplete { .. }), "{verdict:?}");
+        assert!(
+            verdict.line().contains("gateway.unreachable not measured"),
+            "{}",
+            verdict.line()
+        );
+
+        // Behind a local stub, resolver speed leaves the core set and the
+        // line says it was not judged (decision M5).
+        let mut stub = healthy;
+        if let Some(dns) = stub.dns.as_mut() {
+            dns.resolver = "127.0.0.53".into();
+        }
+        e.observe(&stub, &b);
+        let verdict = e.verdict(&b);
+        assert_eq!(
+            verdict,
+            Verdict::Clear {
+                dns_speed_unjudged: true
+            }
+        );
+        assert!(
+            verdict
+                .line()
+                .ends_with("dns speed not judged: the local stub answers from cache"),
+            "{}",
+            verdict.line()
         );
     }
 
