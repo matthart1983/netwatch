@@ -510,9 +510,13 @@ The demo replays a recorded incident through the real engine. The three rules it
 opens (`dns.slow_resolver`, `path.changed`, `tcp.bufferbloat_remote`) are all
 beta and are tagged so on screen. The resolver switch you confirm in the demo is
 simulated: the status line and the banner say so, and nothing on your machine
-changes. Live netwatch does not offer that step. It shows remediation as
-instructions for you to run, and closes an issue itself only when its verify
-condition holds on what it measures afterwards.
+changes. Live netwatch never applies a step. For a slow or silent resolver it
+times the public reference resolver (1.1.1.1) over the same uplink every probe
+cycle, and when that answers in under a quarter of your resolver's time it says
+so, with the command to switch and a note that your lookups would then go to
+that provider. It closes an issue itself only when its verify condition holds on
+what it measures afterwards. With `third_party_probes = false` the reference is
+not asked and no such step appears.
 
 ## Rule coverage document
 

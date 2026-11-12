@@ -41,6 +41,11 @@ pub struct HealthStatus {
     /// answer disagreed with the validating reference.
     pub dns_cross: Option<DnsCrossCheck>,
     pub dns_cross_history: VecDeque<bool>,
+    /// How long [`REFERENCE_RESOLVER`] took to answer the cross-check's
+    /// question, one entry per cycle that asked it; `None` where it did not
+    /// answer. Asked whether or not the configured resolver answered, so
+    /// there is something to compare a slow or silent resolver with.
+    pub dns_reference_rtt_history: VecDeque<Option<f64>>,
     /// The latest STUN mapping probe. Runs every [`STUN_EVERY`] cycles.
     pub nat: Option<NatProbe>,
 }
@@ -264,6 +269,7 @@ impl HealthProber {
                 dns_probe_history: VecDeque::new(),
                 dns_cross: None,
                 dns_cross_history: VecDeque::new(),
+                dns_reference_rtt_history: VecDeque::new(),
                 nat: None,
             }))),
             busy: Arc::new(AtomicBool::new(false)),
@@ -333,7 +339,9 @@ impl HealthProber {
 trait Probes {
     fn gateway(&self, target: &str) -> (Option<f64>, Loss);
     fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe);
-    fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck>;
+    /// The cross-check, when the configured resolver answered it, and how
+    /// long the reference took to answer its half, when it did.
+    fn dns_cross_check(&self, server: &str) -> (Option<DnsCrossCheck>, Option<f64>);
     fn stun(&self, cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String>;
     fn internet(&self, target: &str) -> (Option<f64>, Loss);
 }
@@ -347,7 +355,7 @@ impl Probes for Network {
     fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe) {
         run_dns_query(server)
     }
-    fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck> {
+    fn dns_cross_check(&self, server: &str) -> (Option<DnsCrossCheck>, Option<f64>) {
         run_dns_cross_check(server)
     }
     fn stun(&self, cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String> {
@@ -425,10 +433,11 @@ fn run_cycle(
         let completed = std::time::Instant::now();
         // Same cycle, same resolver: what does it say a public name
         // resolves to, against a reference that validates?
-        let cross = if cycle.third_party {
-            probes.dns_cross_check(dns)
+        let (cross, reference_rtt) = if cycle.third_party {
+            let (cross, rtt) = probes.dns_cross_check(dns);
+            (cross, Some(rtt))
         } else {
-            None
+            (None, None)
         };
         let mut next = (**safe_read(snapshot, "health::probe::read_dns")).clone();
         if next.completed.dns_target.as_deref() != Some(dns) {
@@ -436,6 +445,17 @@ fn run_cycle(
             next.completed.dns_history.clear();
             next.dns_probe_history.clear();
             next.dns_cross_history.clear();
+        }
+        match reference_rtt {
+            Some(rtt) => {
+                next.dns_reference_rtt_history.push_back(rtt);
+                if next.dns_reference_rtt_history.len() > RTT_HISTORY_MAX {
+                    next.dns_reference_rtt_history.pop_front();
+                }
+            }
+            // Third-party probes are off: what was measured while they were
+            // on is not a current reading.
+            None => next.dns_reference_rtt_history.clear(),
         }
         next.dns_rtt_ms = rtt;
         next.dns_loss = loss;
@@ -827,24 +847,36 @@ pub fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 
 /// Ask the configured resolver and a validating reference the same public
 /// name, and compare.
-fn run_dns_cross_check(server: &str) -> Option<DnsCrossCheck> {
+///
+/// The reference is asked first and whatever the configured resolver does,
+/// and its round trip is returned beside the comparison: when the configured
+/// resolver is slow or silent, how the reference fared over the same uplink
+/// is the measurement that tells a resolver problem from a network one.
+fn run_dns_cross_check(server: &str) -> (Option<DnsCrossCheck>, Option<f64>) {
     use std::net::{IpAddr, SocketAddr};
 
-    let local_addr: IpAddr = server.parse().ok()?;
-    let sock = dns_socket(local_addr)?;
-    let local_q = build_dns_query(0x5a11, CROSS_CHECK_NAME, 1, false);
-    let (local_reply, _) = dns_exchange(&sock, SocketAddr::new(local_addr, 53), &local_q, 0x5a11)?;
+    let reference = REFERENCE_RESOLVER
+        .parse::<IpAddr>()
+        .ok()
+        .and_then(|addr| Some((addr, dns_socket(addr)?)))
+        .and_then(|(addr, sock)| {
+            let q = build_dns_query(0x5a12, CROSS_CHECK_NAME, 1, true);
+            dns_exchange(&sock, SocketAddr::new(addr, 53), &q, 0x5a12)
+        });
+    let reference_rtt = reference.as_ref().map(|(_, rtt)| *rtt);
+    let reference = reference.map(|(r, _)| r);
 
-    let reference_addr: IpAddr = REFERENCE_RESOLVER.parse().ok()?;
-    let ref_sock = dns_socket(reference_addr)?;
-    let ref_q = build_dns_query(0x5a12, CROSS_CHECK_NAME, 1, true);
-    let reference = dns_exchange(
-        &ref_sock,
-        SocketAddr::new(reference_addr, 53),
-        &ref_q,
-        0x5a12,
-    )
-    .map(|(r, _)| r);
+    let local = server
+        .parse::<IpAddr>()
+        .ok()
+        .and_then(|addr| Some((addr, dns_socket(addr)?)))
+        .and_then(|(addr, sock)| {
+            let q = build_dns_query(0x5a11, CROSS_CHECK_NAME, 1, false);
+            dns_exchange(&sock, SocketAddr::new(addr, 53), &q, 0x5a11)
+        });
+    let Some((local_reply, _)) = local else {
+        return (None, reference_rtt);
+    };
 
     let private_answer = local_reply.answers.iter().any(|ip| is_private_v4(*ip));
     let (reference_answers, validated) = match &reference {
@@ -861,15 +893,18 @@ fn run_dns_cross_check(server: &str) -> Option<DnsCrossCheck> {
             .iter()
             .any(|ip| reference_answers.contains(ip));
 
-    Some(DnsCrossCheck {
-        name: CROSS_CHECK_NAME.to_string(),
-        local: local_reply.answers,
-        reference_resolver: REFERENCE_RESOLVER.to_string(),
-        reference: reference_answers,
-        validated,
-        private_answer,
-        mismatch,
-    })
+    (
+        Some(DnsCrossCheck {
+            name: CROSS_CHECK_NAME.to_string(),
+            local: local_reply.answers,
+            reference_resolver: REFERENCE_RESOLVER.to_string(),
+            reference: reference_answers,
+            validated,
+            private_answer,
+            mismatch,
+        }),
+        reference_rtt,
+    )
 }
 
 /// A standard recursive query for `name`/`qtype`. With `dnssec`, an EDNS OPT
@@ -1349,9 +1384,9 @@ mod tests {
             self.saw(format!("dns {server}"));
             (Some(2.0), Loss::Measured(0.0), DnsProbe::default())
         }
-        fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck> {
+        fn dns_cross_check(&self, server: &str) -> (Option<DnsCrossCheck>, Option<f64>) {
             self.saw(format!("cross {server} and {REFERENCE_RESOLVER}"));
-            Some(DnsCrossCheck {
+            let cross = Some(DnsCrossCheck {
                 name: CROSS_CHECK_NAME.into(),
                 local: vec![],
                 reference_resolver: REFERENCE_RESOLVER.into(),
@@ -1359,7 +1394,8 @@ mod tests {
                 validated: false,
                 private_answer: false,
                 mismatch: false,
-            })
+            });
+            (cross, Some(9.0))
         }
         fn stun(&self, _: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String> {
             self.saw("stun".into());

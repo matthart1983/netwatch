@@ -35,6 +35,16 @@ All notable changes to NetWatch will be documented in this file.
   seconds of cycles with nothing lost. `diagnose_thresholds` gains `dns_failure_pct`
   (default 5). The rule stays beta.
 
+- **A slow or silent resolver is compared with the public reference resolver.** The
+  cross-check's query to 1.1.1.1 was already sent every probe cycle and its timing thrown
+  away. It is now kept, and sent whether or not your resolver answers. When the reference
+  answers in under a quarter of your resolver's median, `dns.slow_resolver`'s "alt
+  resolver is fast" check passes on a measurement instead of reading "not run", and the
+  issue carries a step naming 1.1.1.1 with its time and the command to switch. For
+  `dns.failing` the step says the reference answered while yours did not. It is an
+  instruction and never applied, and it says your lookups would go to that provider. No
+  new traffic: same query, same destination, same cadence.
+
 ### Added
 - **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
   `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change

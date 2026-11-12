@@ -2533,16 +2533,35 @@ fn dns_close_line(baseline: Option<&Baseline>, t: &Thresholds) -> f64 {
 /// Steps for a failing or slow resolver. A switch is proposed only to an
 /// alternate that was measured: for a slow resolver, one that answered in
 /// under a quarter of `slow_p50`, the line `alt_resolver_is_fast` passes on;
-/// for a failing one (`None`), answering at all is the case for it. Live, no
-/// alternate is timed until A11 keeps the reference resolver's RTT, so today
-/// the step appears only in the demo, which simulates it.
+/// for a failing one (`None`), answering at all is the case for it.
+///
+/// Live, the alternate that is timed is the public reference resolver. That
+/// is an instruction and never an Apply step: moving someone's lookups to a
+/// third party is their decision, so the step gives the measurement and the
+/// command and says where the lookups would go. The Apply step is for an
+/// alternate the host already has configured, which today only the demo
+/// supplies, and the demo simulates it.
 fn dns_remediation(dns: &DnsObs, slow_p50: Option<f64>) -> Vec<Step> {
     let mut steps = Vec::new();
     let measured = match (&dns.alt_resolver, dns.alt_rtt_ms) {
         (Some(alt), Some(rtt)) if slow_p50.is_none_or(|p50| rtt < p50 / 4.0) => Some((alt, rtt)),
         _ => None,
     };
-    if let Some((alt, rtt)) = measured {
+    let reference = crate::collectors::health::REFERENCE_RESOLVER;
+    if let Some((alt, rtt)) = measured.filter(|(alt, _)| alt.as_str() == reference) {
+        let against = match slow_p50 {
+            Some(p50) => format!("while {} took {p50:.0}ms", dns.resolver),
+            None => format!("while {} did not answer", dns.resolver),
+        };
+        steps.push(Step::instruct(
+            format!("try the public resolver {alt}"),
+            format!(
+                "{alt} answered in {rtt:.1}ms over the same uplink {against}. To use it: \
+                 resolvectl dns <iface> {alt}, or set it in your network settings. Your \
+                 lookups then go to that provider; netwatch changes nothing itself"
+            ),
+        ));
+    } else if let Some((alt, rtt)) = measured {
         // The live `↵` writes nothing, so the text says what to run instead
         // of promising an edit netwatch will not make.
         steps.push(Step::apply(
@@ -5540,6 +5559,72 @@ mod tests {
             .find(|k| k.id == "resolver_itself_is_reachable")
             .unwrap();
         assert_eq!(icmp.passed, Some(true));
+    }
+
+    /// Decision OD-2: the public reference resolver is named with its
+    /// measurement and the command, and is never something netwatch applies.
+    #[test]
+    fn the_reference_resolver_is_an_instruction_never_an_apply_step() {
+        use super::super::issue::StepKind;
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let reference = DnsObs {
+            alt_resolver: Some(crate::collectors::health::REFERENCE_RESOLVER.into()),
+            alt_rtt_ms: Some(8.0),
+            ..slow_dns()
+        };
+        let found = detect(
+            &obs_with_dns(reference.clone()),
+            &base,
+            &Thresholds::default(),
+        );
+        let slow = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("slow");
+        assert!(slow.remediation.iter().all(|s| s.kind != StepKind::Apply));
+        let step = &slow.remediation[0];
+        assert_eq!(step.text, "try the public resolver 1.1.1.1");
+        for want in [
+            "1.1.1.1 answered in 8.0ms over the same uplink while 169.254.1.1 took 40ms",
+            "resolvectl dns <iface> 1.1.1.1",
+            "Your lookups then go to that provider",
+            "netwatch changes nothing itself",
+        ] {
+            assert!(step.detail.contains(want), "{want}: {}", step.detail);
+        }
+        // And the cause ranking gets its strongest check, measured.
+        let check = slow.causes[0]
+            .checks
+            .iter()
+            .find(|c| c.id == "alt_resolver_is_fast")
+            .expect("the check");
+        assert_eq!(check.passed, Some(true), "{check:?}");
+
+        // A resolver that answers nothing, beside a reference that does.
+        let mut silent = reference;
+        silent.window = DnsWindow {
+            queries: 12,
+            unanswered: 12,
+            recent_unanswered: 12,
+            all_lost_secs: Some(20.0),
+        };
+        let found = detect(&obs_with_dns(silent), &base, &Thresholds::default());
+        let failing = found
+            .iter()
+            .find(|d| d.rule == "dns.failing")
+            .expect("failing");
+        assert!(failing
+            .remediation
+            .iter()
+            .all(|s| s.kind != StepKind::Apply));
+        assert!(
+            failing.remediation[0]
+                .detail
+                .contains("while 169.254.1.1 did not answer"),
+            "{}",
+            failing.remediation[0].detail
+        );
     }
 
     /// REVIEW §2.4: propose a resolver only after measuring it. Live, the

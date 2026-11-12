@@ -863,6 +863,13 @@ fn dns(app: &App) -> Option<DnsObs> {
         }
     });
 
+    // The reference resolver is the alternate that gets timed: it is asked
+    // every cycle over the same uplink, whatever the configured resolver
+    // does. It is no alternate to itself.
+    let reference_rtt = (resolver != crate::collectors::health::REFERENCE_RESOLVER)
+        .then(|| reference_rtt(&health.dns_reference_rtt_history))
+        .flatten();
+
     Some(DnsObs {
         window: dns_window(&health.dns_probe_history, &health.completed.dns_history),
         resolver,
@@ -877,11 +884,11 @@ fn dns(app: &App) -> Option<DnsObs> {
             .filter(|s| s.is_none())
             .count() as u32,
         truncated,
-        // netwatch probes one resolver today. The alternate-resolver check is
-        // the strongest discriminator the DNS rule has, so this is the first
-        // thing the pipeline should add; until then it reports "not run".
-        alt_resolver: cfg.dns_servers.get(1).cloned(),
-        alt_rtt_ms: None,
+        alt_resolver: match reference_rtt {
+            Some(_) => Some(crate::collectors::health::REFERENCE_RESOLVER.to_string()),
+            None => cfg.dns_servers.get(1).cloned(),
+        },
+        alt_rtt_ms: reference_rtt,
         icmp_rtt_ms: None,
         cached_rtt_ms: None,
         window_secs,
@@ -921,6 +928,27 @@ fn observed_config(app: &App) -> ObservedConfig {
         trace_refresh_secs: probes.periodic_trace_secs(),
         interfaces: known(app.interface_info.iter().map(|i| i.name.clone()).collect()),
     }
+}
+
+/// Cycles the reference resolver's round trip is taken over, and how many
+/// of them must have answered for there to be one.
+const REFERENCE_RTT_CYCLES: usize = 6;
+const REFERENCE_RTT_MIN_ANSWERS: usize = 3;
+
+/// The reference resolver's median round trip over its newest cycles, or
+/// `None` when it answered fewer than half of them. One fast answer is not a
+/// resolver worth pointing someone at.
+fn reference_rtt(history: &std::collections::VecDeque<Option<f64>>) -> Option<f64> {
+    let answers: Vec<f64> = history
+        .iter()
+        .rev()
+        .take(REFERENCE_RTT_CYCLES)
+        .flatten()
+        .copied()
+        .collect();
+    (answers.len() >= REFERENCE_RTT_MIN_ANSWERS)
+        .then(|| percentile(&answers, 0.5))
+        .flatten()
 }
 
 /// The probe's newest cycles as `dns.failing` judges them: up to
@@ -1113,6 +1141,30 @@ mod tests {
         app.health_prober.publish_for_test(status);
         let observations = LiveSampler::new().sample(&app, &Thresholds::default());
         assert!(observations.gateway.is_some());
+    }
+
+    #[test]
+    fn the_reference_rtt_needs_three_answers_in_the_newest_six_cycles() {
+        let h = |v: &[Option<f64>]| v.iter().copied().collect::<std::collections::VecDeque<_>>();
+        assert_eq!(reference_rtt(&h(&[])), None);
+        assert_eq!(reference_rtt(&h(&[Some(9.0), Some(11.0)])), None);
+        assert_eq!(
+            reference_rtt(&h(&[Some(9.0), None, Some(11.0), None, Some(40.0)])),
+            Some(11.0)
+        );
+        // Old answers do not stand in for new silence.
+        let stale = [
+            Some(9.0),
+            Some(9.0),
+            Some(9.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(9.0),
+        ];
+        assert_eq!(reference_rtt(&h(&stale)), None);
     }
 
     #[test]

@@ -1041,6 +1041,7 @@ mod tests {
             dns_probe_history: VecDeque::new(),
             dns_cross: None,
             dns_cross_history: VecDeque::new(),
+            dns_reference_rtt_history: VecDeque::new(),
             nat: None,
         }
     }
