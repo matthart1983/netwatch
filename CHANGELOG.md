@@ -26,6 +26,15 @@ All notable changes to NetWatch will be documented in this file.
   "Rule maturity" section that says what stable does and does not mean, and the README
   caption says the demo's rules are beta.
 
+- **`dns.failing` judges the last 60 probe queries instead of the latest three.** One
+  lost query in a cycle of three read as 33% and opened the issue. The rule now needs at
+  least 5 unanswered queries in the last 60, one of them among the newest 12, and a 95%
+  lower confidence bound on that share above 5%, which seven of sixty meets and six do not. A resolver that answers nothing
+  for 15 seconds still opens it without waiting. It opens on the first sample that
+  qualifies, is Medium below 50% unanswered and High from there, and closes after 120
+  seconds of cycles with nothing lost. `diagnose_thresholds` gains `dns_failure_pct`
+  (default 5). The rule stays beta.
+
 ### Added
 - **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
   `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change

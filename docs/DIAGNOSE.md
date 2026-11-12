@@ -207,6 +207,7 @@ saturation_pct = 90.0
 iface_error_floor = 1.0    # interface errors per minute
 iface_drop_floor = 60.0    # interface drops per minute
 dns_tc_pct = 10.0
+dns_failure_pct = 5.0      # unanswered share of DNS queries that counts as failing
 dns_mismatch_pct = 50.0
 wifi_rssi_dbm = -70.0
 wifi_retry_pct = 20.0

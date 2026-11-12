@@ -84,6 +84,10 @@ pub struct Thresholds {
     /// Share of DNS replies carrying the TC bit before truncation is a
     /// finding. Some truncation is normal for large answers over UDP.
     pub dns_tc_pct: f64,
+    /// Share of DNS queries going unanswered that `dns.failing` treats as a
+    /// fault. The rule opens when the lower confidence bound on the share,
+    /// over the last [`DNS_FAIL_WINDOW`] queries, is above this.
+    pub dns_failure_pct: f64,
     /// Share of cross-check cycles whose local answer disagreed with the
     /// validating reference before the resolver is suspected.
     pub dns_mismatch_pct: f64,
@@ -112,6 +116,7 @@ impl Default for Thresholds {
             iface_error_floor: 1.0,
             iface_drop_floor: 60.0,
             dns_tc_pct: 10.0,
+            dns_failure_pct: 5.0,
             dns_mismatch_pct: 50.0,
             wifi_rssi_dbm: -70.0,
             wifi_retry_pct: 20.0,
@@ -119,7 +124,51 @@ impl Default for Thresholds {
     }
 }
 
+/// Queries `dns.failing` judges over: the last 20 probe cycles of three.
+pub const DNS_FAIL_WINDOW: u32 = 60;
+/// Unanswered queries in the window below which `dns.failing` stays shut,
+/// whatever the share: two lost of six is 33% and is also two packets.
+pub const DNS_FAIL_MIN: u32 = 5;
+/// The newest queries at least one of the unanswered must be among. Without
+/// it the window keeps saying "failing" for a minute and a half after the
+/// resolver recovers, and the close's hold only starts after that.
+pub const DNS_FAIL_RECENT: u32 = 12;
+/// How long every query must go unanswered for `dns.failing` to open
+/// without waiting for the window to fill.
+pub const DNS_ALL_LOST_SECS: f64 = 15.0;
+/// The unanswered share at which `dns.failing` is High rather than Medium.
+pub const DNS_FAIL_HIGH_PCT: f64 = 50.0;
+
+/// The lower end of the 95% Wilson score interval for `failed` of `n`, as a
+/// percentage. Where the plain share calls one lost query of three 33%, this
+/// calls it "at least 6%", and seven of sixty "at least 5.8%": it says how
+/// little loss the count is still consistent with.
+pub fn wilson_lower_pct(failed: u32, n: u32) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let (n, z) = (n as f64, 1.959_964_f64);
+    let p = failed as f64 / n;
+    let centre = p + z * z / (2.0 * n);
+    let spread = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt();
+    ((centre - spread) / (1.0 + z * z / n)).max(0.0) * 100.0
+}
+
 impl Thresholds {
+    /// Distinct samples a rule's condition must hold for before it opens.
+    ///
+    /// `consecutive_n` for most rules, where one sample is one probe and a
+    /// single slow one is not a finding. `dns.failing` judges a window of
+    /// sixty queries, so its first qualifying sample already rests on more
+    /// evidence than three probes would; making it wait for more only delays
+    /// it.
+    pub fn confirmations(&self, rule: &str) -> u32 {
+        match rule {
+            "dns.failing" => 1,
+            _ => self.consecutive_n.max(1),
+        }
+    }
+
     /// The floor under every baseline's σ, for scoring and for learning.
     pub fn sigma_floor(&self) -> SigmaFloor {
         SigmaFloor {
@@ -193,6 +242,7 @@ impl Thresholds {
         check("iface_error_floor", |t| &mut t.iface_error_floor, number);
         check("iface_drop_floor", |t| &mut t.iface_drop_floor, number);
         check("dns_tc_pct", |t| &mut t.dns_tc_pct, share);
+        check("dns_failure_pct", |t| &mut t.dns_failure_pct, share);
         check("dns_mismatch_pct", |t| &mut t.dns_mismatch_pct, share);
         check("wifi_rssi_dbm", |t| &mut t.wifi_rssi_dbm, number);
         check("wifi_retry_pct", |t| &mut t.wifi_retry_pct, share);
@@ -444,9 +494,77 @@ pub struct DnsObs {
     pub window_secs: u64,
     /// The latest answer cross-check against a validating reference.
     pub cross: Option<DnsCross>,
+    /// Answered and unanswered queries over the last probe cycles, which is
+    /// what `dns.failing` judges. Empty in recordings made before it
+    /// existed, and then the rule falls back to `failure_rate_pct`.
+    #[serde(default)]
+    pub window: DnsWindow,
+}
+
+/// The DNS probe's last [`DNS_FAIL_WINDOW`] queries, or fewer when the probe
+/// has not sent that many to this resolver yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct DnsWindow {
+    pub queries: u32,
+    pub unanswered: u32,
+    /// Unanswered among the newest [`DNS_FAIL_RECENT`] queries.
+    #[serde(default)]
+    pub recent_unanswered: u32,
+    /// How long the newest run of cycles with no answer at all has lasted,
+    /// from the first such cycle's completion to the last's. `None` when the
+    /// latest cycle got an answer, or only one cycle has failed so far.
+    #[serde(default)]
+    pub all_lost_secs: Option<f64>,
+}
+
+impl DnsWindow {
+    pub fn unanswered_pct(&self) -> f64 {
+        if self.queries == 0 {
+            0.0
+        } else {
+            self.unanswered as f64 / self.queries as f64 * 100.0
+        }
+    }
+}
+
+/// Why `dns.failing` is open on these observations, if it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DnsFailing {
+    /// Enough of the window went unanswered that the share's lower bound is
+    /// over the line.
+    Window,
+    /// Nothing has been answered for [`DNS_ALL_LOST_SECS`].
+    AllLost,
+    /// A recording from before the window existed: the latest cycle's share.
+    Cycle,
 }
 
 impl DnsObs {
+    /// Whether the resolver is failing, and on which evidence.
+    pub fn failing(&self, t: &Thresholds) -> Option<DnsFailing> {
+        let w = &self.window;
+        if w.queries == 0 {
+            return (self.failure_rate_pct > t.dns_failure_pct).then_some(DnsFailing::Cycle);
+        }
+        if w.all_lost_secs.is_some_and(|s| s >= DNS_ALL_LOST_SECS) {
+            return Some(DnsFailing::AllLost);
+        }
+        (w.unanswered >= DNS_FAIL_MIN
+            && w.recent_unanswered > 0
+            && wilson_lower_pct(w.unanswered, w.queries) > t.dns_failure_pct)
+            .then_some(DnsFailing::Window)
+    }
+
+    /// The unanswered share `dns.failing` reports: over the window when there
+    /// is one, otherwise the latest cycle's.
+    pub fn unanswered_pct(&self) -> f64 {
+        if self.window.queries == 0 {
+            self.failure_rate_pct
+        } else {
+            self.window.unanswered_pct()
+        }
+    }
+
     /// The configured resolver is a stub on this host, such as
     /// systemd-resolved's 127.0.0.53. The probe asks root NS, which the stub
     /// answers from its cache, so what it times is the stub's round trip,
@@ -1822,17 +1940,41 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     };
     let mut out = Vec::new();
 
-    if dns.failure_rate_pct > 5.0 {
+    if let Some(why) = dns.failing(t) {
         let mut d = Detection::new(
             "dns.failing",
             Subject::Resolver {
                 addr: dns.resolver.clone(),
             },
         );
-        d.evidence.push(
-            Evidence::new("dns.failure_rate", dns.failure_rate_pct, "%")
-                .with_window(dns.window_secs, dns.queries),
-        );
+        let share = dns.unanswered_pct();
+        // Losing one query in eight is a fault and is not an outage.
+        d.severity = if share >= DNS_FAIL_HIGH_PCT {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+        let (secs, queries) = if dns.window.queries == 0 {
+            (dns.window_secs, dns.queries)
+        } else {
+            (
+                dns.window.queries as u64 / crate::collectors::health::DNS_PROBES_PER_CYCLE as u64
+                    * crate::app::HEALTH_PROBE_TICKS as u64,
+                dns.window.queries,
+            )
+        };
+        d.evidence
+            .push(Evidence::new("dns.failure_rate", share, "%").with_window(secs, queries));
+        if why == DnsFailing::Window {
+            d.evidence.push(
+                Evidence::new(
+                    "dns.failure_rate_lower",
+                    wilson_lower_pct(dns.window.unanswered, dns.window.queries),
+                    "%",
+                )
+                .with_window(secs, queries),
+            );
+        }
         d.causes = vec![
             Cause::new(
                 "resolver_down",
@@ -3212,6 +3354,7 @@ mod tests {
 
     fn slow_dns() -> DnsObs {
         DnsObs {
+            window: Default::default(),
             resolver: "169.254.1.1".into(),
             rtt_p50_ms: Some(40.0),
             rtt_p95_ms: Some(48.0),
@@ -3771,6 +3914,133 @@ mod tests {
         assert_eq!(d.evidence[0].value, 120.0);
         assert_eq!(d.evidence[0].baseline, Some(80.0));
         assert_eq!(d.severity, Severity::Medium, "1.5 times the mean");
+    }
+
+    /// `dns.failing` on a window of `queries`, `unanswered` of them, with the
+    /// resolver otherwise healthy.
+    fn failing(queries: u32, unanswered: u32, all_lost_secs: Option<f64>) -> Option<Detection> {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.window = DnsWindow {
+            queries,
+            unanswered,
+            recent_unanswered: unanswered.min(1),
+            all_lost_secs,
+        };
+        detect(&obs_with_dns(dns), &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "dns.failing")
+    }
+
+    /// The old rule read one lost query in a cycle of three as 33% and
+    /// opened. One packet is not a failing resolver.
+    #[test]
+    fn dns_failing_needs_five_lost_and_a_lower_bound_over_the_line() {
+        assert!(failing(3, 1, None).is_none(), "one lost of three");
+        assert!(
+            failing(9, 3, None).is_none(),
+            "under five lost, whatever the share"
+        );
+        assert!(
+            failing(60, 5, None).is_none(),
+            "5 of 60 is consistent with 3.6%"
+        );
+        assert!(
+            failing(60, 6, None).is_none(),
+            "6 of 60 is consistent with 4.7%"
+        );
+        let d = failing(60, 7, None).expect("7 of 60 is at least 5.8%");
+        assert_eq!(d.severity, Severity::Medium);
+        assert_eq!(d.evidence[0].metric, "dns.failure_rate");
+        assert!((d.evidence[0].value - 11.666).abs() < 0.01);
+        assert_eq!(d.evidence[0].samples, 60);
+        assert_eq!(d.evidence[1].metric, "dns.failure_rate_lower");
+        assert!(d.evidence[1].value > 5.0 && d.evidence[1].value < 6.0);
+        // A short window can open too, when what it holds is bad enough.
+        assert!(failing(15, 6, None).is_some(), "6 of 15 is at least 20%");
+    }
+
+    /// After an outage the window still holds its losses for a hundred
+    /// seconds. The rule stops on the newest queries being clean, so the
+    /// close's hold starts at the recovery and not after the window drains.
+    #[test]
+    fn dns_failing_stops_once_the_newest_queries_are_all_answered() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.window = DnsWindow {
+            queries: 60,
+            unanswered: 18,
+            recent_unanswered: 0,
+            all_lost_secs: None,
+        };
+        let t = Thresholds::default();
+        assert_eq!(dns.failing(&t), None);
+        dns.window.recent_unanswered = 1;
+        assert_eq!(dns.failing(&t), Some(DnsFailing::Window));
+    }
+
+    #[test]
+    fn dns_failing_is_high_once_half_the_queries_go_unanswered() {
+        assert_eq!(failing(60, 29, None).unwrap().severity, Severity::Medium);
+        assert_eq!(failing(60, 30, None).unwrap().severity, Severity::High);
+    }
+
+    /// A dead resolver should not have to fail five queries' worth of
+    /// timeouts before anyone is told.
+    #[test]
+    fn dns_failing_opens_on_fifteen_seconds_of_silence() {
+        assert!(failing(6, 3, Some(14.0)).is_none());
+        let d = failing(6, 3, Some(15.0)).expect("nothing answered for 15s");
+        assert_eq!(
+            d.evidence.len(),
+            1,
+            "no lower bound is quoted for the fast path"
+        );
+        // A run of silence that has ended is not one.
+        assert!(failing(6, 3, None).is_none());
+    }
+
+    /// Recordings from before the window existed carry only the latest
+    /// cycle's share, and are judged on it as they were.
+    #[test]
+    fn dns_failing_reads_an_old_recording_by_its_cycle_share() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        assert_eq!(dns.window, DnsWindow::default());
+        dns.failure_rate_pct = 5.0;
+        assert!(dns.failing(&Thresholds::default()).is_none());
+        dns.failure_rate_pct = 33.3;
+        assert_eq!(dns.failing(&Thresholds::default()), Some(DnsFailing::Cycle));
+    }
+
+    #[test]
+    fn the_wilson_lower_bound_matches_worked_values() {
+        assert_eq!(wilson_lower_pct(0, 0), 0.0);
+        assert_eq!(wilson_lower_pct(0, 60), 0.0);
+        assert!(
+            (wilson_lower_pct(7, 60) - 5.77).abs() < 0.05,
+            "{}",
+            wilson_lower_pct(7, 60)
+        );
+        assert!(
+            (wilson_lower_pct(6, 60) - 4.66).abs() < 0.05,
+            "{}",
+            wilson_lower_pct(6, 60)
+        );
+        assert!(
+            (wilson_lower_pct(1, 3) - 6.15).abs() < 0.05,
+            "{}",
+            wilson_lower_pct(1, 3)
+        );
+        assert!(wilson_lower_pct(60, 60) > 93.0);
+    }
+
+    #[test]
+    fn only_dns_failing_confirms_on_its_first_sample() {
+        let t = Thresholds::default();
+        assert_eq!(t.confirmations("dns.failing"), 1);
+        assert_eq!(t.confirmations("dns.slow_resolver"), t.consecutive_n);
+        assert_eq!(t.confirmations("gateway.rtt_spike"), t.consecutive_n);
     }
 
     #[test]

@@ -917,6 +917,7 @@ mod tests {
     fn a_40ms_resolver_opens_an_issue(app: &mut App) -> bool {
         let obs = Observations {
             dns: Some(DnsObs {
+                window: Default::default(),
                 resolver: "192.0.2.53".into(),
                 rtt_p50_ms: Some(40.0),
                 rtt_p95_ms: Some(48.0),

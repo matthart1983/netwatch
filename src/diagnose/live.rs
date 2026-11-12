@@ -864,6 +864,7 @@ fn dns(app: &App) -> Option<DnsObs> {
     });
 
     Some(DnsObs {
+        window: dns_window(&health.dns_probe_history, &health.completed.dns_history),
         resolver,
         rtt_p50_ms: percentile(&samples, 0.5).or(health.dns_rtt_ms),
         rtt_p95_ms: percentile(&samples, 0.95),
@@ -919,6 +920,55 @@ fn observed_config(app: &App) -> ObservedConfig {
         trace_target: probes.trace_target.clone(),
         trace_refresh_secs: probes.periodic_trace_secs(),
         interfaces: known(app.interface_info.iter().map(|i| i.name.clone()).collect()),
+    }
+}
+
+/// The probe's newest cycles as `dns.failing` judges them: up to
+/// [`DNS_FAIL_WINDOW`] queries, how many went unanswered, and how long the
+/// resolver has answered nothing at all.
+///
+/// `probes` and `completed` are the prober's per-cycle histories, pushed
+/// together, oldest first. A SERVFAIL is a reply here, as it is to the
+/// probe.
+fn dns_window(
+    probes: &std::collections::VecDeque<crate::collectors::health::DnsProbe>,
+    completed: &std::collections::VecDeque<Instant>,
+) -> super::detectors::DnsWindow {
+    use super::detectors::{DNS_FAIL_RECENT, DNS_FAIL_WINDOW};
+    let per_cycle = crate::collectors::health::DNS_PROBES_PER_CYCLE as u32;
+    let cycles = (DNS_FAIL_WINDOW / per_cycle) as usize;
+    let recent = probes.iter().rev().take(cycles);
+    let (mut queries, mut answered, mut recent_unanswered) = (0, 0, 0);
+    for p in recent {
+        let lost = per_cycle - (p.replies as u32).min(per_cycle);
+        if queries < DNS_FAIL_RECENT {
+            recent_unanswered += lost;
+        }
+        queries += per_cycle;
+        answered += per_cycle - lost;
+    }
+    // The two histories are the same length unless a reader caught the
+    // prober between pushes; pair them from the newest end.
+    let silent = probes
+        .iter()
+        .rev()
+        .zip(completed.iter().rev())
+        .take_while(|(p, _)| p.replies == 0)
+        .map(|(_, at)| *at);
+    let (newest, oldest) = silent.fold((None, None), |(newest, _), at| {
+        (newest.or(Some(at)), Some(at))
+    });
+    let all_lost_secs = match (newest, oldest) {
+        (Some(newest), Some(oldest)) if newest > oldest => {
+            Some(newest.duration_since(oldest).as_secs_f64())
+        }
+        _ => None,
+    };
+    super::detectors::DnsWindow {
+        queries,
+        unanswered: queries - answered,
+        recent_unanswered,
+        all_lost_secs,
     }
 }
 
@@ -1063,6 +1113,49 @@ mod tests {
         app.health_prober.publish_for_test(status);
         let observations = LiveSampler::new().sample(&app, &Thresholds::default());
         assert!(observations.gateway.is_some());
+    }
+
+    #[test]
+    fn the_dns_window_counts_the_newest_twenty_cycles_and_times_the_silence() {
+        use crate::collectors::health::DnsProbe;
+        let t0 = Instant::now();
+        let cycle = |replies: u8| DnsProbe {
+            replies,
+            ..Default::default()
+        };
+        let at = |n: usize| -> std::collections::VecDeque<Instant> {
+            (0..n)
+                .map(|i| t0 + std::time::Duration::from_secs(i as u64 * 5))
+                .collect()
+        };
+        // 25 cycles: the oldest five lost everything and have left the window.
+        let mut probes: std::collections::VecDeque<DnsProbe> =
+            (0..25).map(|i| cycle(if i < 5 { 0 } else { 3 })).collect();
+        let w = dns_window(&probes, &at(25));
+        assert_eq!((w.queries, w.unanswered, w.all_lost_secs), (60, 0, None));
+        // A loss five cycles back is in the window and no longer recent.
+        probes[20].replies = 1;
+        let w = dns_window(&probes, &at(25));
+        assert_eq!((w.unanswered, w.recent_unanswered), (2, 0));
+        probes[20].replies = 3;
+        // One query lost in the newest cycle: counted, and not a silence.
+        probes.back_mut().unwrap().replies = 2;
+        let w = dns_window(&probes, &at(25));
+        assert_eq!(
+            (w.unanswered, w.recent_unanswered, w.all_lost_secs),
+            (1, 1, None)
+        );
+        // One silent cycle has no duration yet; four span fifteen seconds.
+        probes.back_mut().unwrap().replies = 0;
+        assert_eq!(dns_window(&probes, &at(25)).all_lost_secs, None);
+        for p in probes.iter_mut().rev().take(4) {
+            p.replies = 0;
+        }
+        let w = dns_window(&probes, &at(25));
+        assert_eq!((w.unanswered, w.all_lost_secs), (12, Some(15.0)));
+        // A probe that has barely started reports what it has.
+        let few: std::collections::VecDeque<DnsProbe> = (0..2).map(|_| cycle(3)).collect();
+        assert_eq!(dns_window(&few, &at(2)).queries, 6);
     }
 
     #[test]

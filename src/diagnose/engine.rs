@@ -708,7 +708,7 @@ impl Engine {
         times: Option<&ObservationTimes>,
         now: DateTime<Local>,
     ) -> Option<DateTime<Local>> {
-        let need = self.settings.thresholds.consecutive_n.max(1);
+        let need = self.settings.thresholds.confirmations(d.rule);
         let sample = times
             .and_then(|t| sample_time(d.rule, &d.subject, t))
             .flatten();
@@ -1594,7 +1594,11 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
         if let Some(p95) = dns.rtt_p95_ms {
             m.insert("dns.rtt_p95".to_string(), p95);
         }
+        // The latest cycle's share, under both names: `dns.failing` closes on
+        // the cycle rate, and issues opened before the rule judged a window
+        // still name the older metric in their verify.
         m.insert("dns.failure_rate".to_string(), dns.failure_rate_pct);
+        m.insert("dns.cycle_failure_rate".to_string(), dns.failure_rate_pct);
         m.insert("dns.tc_rate".to_string(), dns.truncation_rate_pct);
         if let Some(c) = &dns.cross {
             // A private answer is a total mismatch, whatever the history
@@ -1721,6 +1725,7 @@ mod tests {
 
     fn dns(p50: f64) -> DnsObs {
         DnsObs {
+            window: Default::default(),
             resolver: "169.254.1.1".into(),
             rtt_p50_ms: Some(p50),
             rtt_p95_ms: Some(p50 * 1.2),

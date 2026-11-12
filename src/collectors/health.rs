@@ -751,6 +751,10 @@ pub(crate) fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> 
     Some(sock)
 }
 
+/// Queries the DNS probe sends each cycle. Diagnose counts unanswered
+/// queries over a window of cycles, and needs to know how many were asked.
+pub const DNS_PROBES_PER_CYCLE: usize = 3;
+
 /// The reachability probe: three root-NS queries, timed.
 ///
 /// Returns the mean rtt, the loss, and the reply flags — a SERVFAIL or a
@@ -759,7 +763,7 @@ pub(crate) fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> 
 fn run_dns_query(server: &str) -> (Option<f64>, Loss, DnsProbe) {
     use std::net::{IpAddr, SocketAddr};
 
-    const PROBES: usize = 3;
+    const PROBES: usize = DNS_PROBES_PER_CYCLE;
     let lost = |n: usize| (PROBES - n) as f64 / PROBES as f64 * 100.0;
 
     // `IpAddr::parse` rejects IPv6 zone identifiers (e.g. `fe80::1%en0`),

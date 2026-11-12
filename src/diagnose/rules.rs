@@ -134,7 +134,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "dns resolution failing",
         category: "dns",
         severity: Severity::High,
-        trigger: "servfail/timeout rate > 5%, or the pipeline dns stage fails",
+        trigger: "at least 5 of the last 60 probe queries unanswered, one of them among the newest 12, with the lower confidence bound on that share above 5%; or every query unanswered for 15s",
         suppresses: &["dns.slow_resolver", "target.resolve_failed"],
         status: RuleStatus::Active,
         maturity: Maturity::Beta,
@@ -906,7 +906,7 @@ pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
 pub fn default_verify(id: &str) -> Option<Verify> {
     Some(match id {
         "dns.slow_resolver" => Verify::below("dns.rtt_p50", 80.0, "ms").holding_for(60),
-        "dns.failing" => Verify::below("dns.failure_rate", 1.0, "%").holding_for(120),
+        "dns.failing" => Verify::below("dns.cycle_failure_rate", 1.0, "%").holding_for(120),
         "dns.truncation_retry" => Verify::below("dns.tc_rate", 1.0, "%").holding_for(120),
         "dns.hijack_suspect" => Verify::below("dns.answer_mismatch", 1.0, "%").holding_for(300),
         "gateway.unreachable" => Verify::below("gateway.loss", 1.0, "%").holding_for(60),
@@ -1000,18 +1000,11 @@ mod tests {
     /// stands, and the item with what the text gets wrong. The guard below
     /// skips them. The item rewrites the text and removes its row; a row
     /// whose text has already changed fails, so none outlives its reason.
-    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[
-        (
-            "dns.failing",
-            "servfail/timeout rate > 5%, or the pipeline dns stage fails",
-            "B15, then A14: servfail counts as a reply, and no pipeline branch exists",
-        ),
-        (
-            "iface.errors",
-            "rx/tx error, drop, overrun or fifo counters increment",
-            "B19: fires on the per-minute error and drop floors, not on any increment",
-        ),
-    ];
+    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[(
+        "iface.errors",
+        "rx/tx error, drop, overrun or fifo counters increment",
+        "B19: fires on the per-minute error and drop floors, not on any increment",
+    )];
 
     /// The quantities a trigger quotes. Digits glued to a word name
     /// something (p50, v6, 5xx) and are not quantities; a unit glued to a
@@ -1092,6 +1085,7 @@ mod tests {
         // both 3) need the number twice.
         const QUOTED_THRESHOLDS: &[(&str, &[&str])] = &[
             ("dns.truncation_retry", &["dns_tc_pct"]),
+            ("dns.failing", &["dns_failure_pct"]),
             (
                 "dns.slow_resolver",
                 &[
@@ -1124,6 +1118,12 @@ mod tests {
         // detectors, pinned by their own firing tests, and a protocol
         // constant.
         const QUOTED_LITERALS: &[(&str, f64)] = &[
+            // detectors::DNS_FAIL_MIN, _WINDOW, _RECENT and DNS_ALL_LOST_SECS,
+            // checked against the constants below.
+            ("dns.failing", 5.0),
+            ("dns.failing", 60.0),
+            ("dns.failing", 12.0),
+            ("dns.failing", 15.0),
             // retrans_burst_fires_at_five_a_minute
             ("tcp.retrans_burst", 5.0),
             // kernel::tests::matched_positive_negative_and_unknown
@@ -1135,6 +1135,19 @@ mod tests {
             ("captive.portal", 204.0),
         ];
 
+        use crate::diagnose::detectors::{
+            DNS_ALL_LOST_SECS, DNS_FAIL_MIN, DNS_FAIL_RECENT, DNS_FAIL_WINDOW,
+        };
+        assert_eq!(
+            (
+                DNS_FAIL_MIN as f64,
+                DNS_FAIL_WINDOW as f64,
+                DNS_FAIL_RECENT as f64,
+                DNS_ALL_LOST_SECS,
+            ),
+            (5.0, 60.0, 12.0, 15.0),
+            "dns.failing's trigger quotes these"
+        );
         let defaults = serde_json::to_value(Thresholds::default()).expect("thresholds serialise");
         let default_of = |field: &str| {
             defaults

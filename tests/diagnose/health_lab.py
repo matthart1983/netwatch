@@ -109,17 +109,20 @@ SCENARIOS = [
                 'link.down']},
     {'name': 'L-DNS-DOWN',
      'fault': [('dns', 'gw', 'drop:100')], 'fault_secs': 60, 'clear': [('dns', 'gw', 'ok')],
-     # 3 samples about 10 s apart, the first landing mid-cycle.
+     # Two silent cycles are 6 unanswered queries of the 15 or so sent, which
+     # opens it; cycles run about 10 s apart while nothing answers.
      'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 40, 'open_expect_s': 20,
      # dns.failing holds its verify for 120 s.
      'expect_close': [{'rule': 'dns.failing'}], 'close_within_s': 250, 'close_expect_s': 125,
      'forbid': ['dns.slow_resolver', 'gateway.unreachable', 'gateway.rtt_spike',
                 'path.rtt_spike', 'link.down']},
-    # Reported, not asserted, until B15; the windows are the ones B15 will be
-    # held to. A 60 s open bound would fail about 40% of runs, because B15
-    # needs 7 failures of 60 and 36 faulted queries give that only about 60%
-    # of the time. Today's rule reads one lost query in a cycle of 3 as 33%.
-    {'name': 'L-DNS-LOSSY', 'asserted': False,
+    # dns.failing judges the last 60 queries: it opens once 5 are unanswered
+    # and the share's lower confidence bound is over 5%. At 20% loss and 3
+    # queries every 5 s the fifth loss comes about 25 queries in, 40 s or so,
+    # but runs have taken 37 s and 79 s; by 120 s fewer than one in 500 has
+    # not seen five. The close is the rule's 120 s hold, starting within four
+    # clean cycles of the clear.
+    {'name': 'L-DNS-LOSSY',
      'fault': [('dns', 'gw', 'drop:20')], 'fault_secs': 180, 'clear': [('dns', 'gw', 'ok')],
      'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 120, 'open_expect_s': 60,
      'expect_close': [{'rule': 'dns.failing'}], 'close_within_s': 250, 'close_expect_s': 125,
