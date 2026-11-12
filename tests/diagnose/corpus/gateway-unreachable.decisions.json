@@ -1,0 +1,13 @@
+{
+  "episode": "gateway-unreachable",
+  "frames": 481,
+  "issues": [
+    {
+      "key": "gateway.unreachable|host",
+      "opened": "2026-09-03 06:46:10",
+      "closed": "2026-09-03 06:50:00",
+      "top_cause": "gateway.unreachable/wrong_vlan_or_address_conflict",
+      "close_reason": "auto-closed"
+    }
+  ]
+}

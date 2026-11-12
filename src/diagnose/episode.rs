@@ -2003,6 +2003,31 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// A stable rule sets `diagnose run`'s exit status, so the least it owes
+    /// is a pinned episode in which it opens and then closes on its own
+    /// verify. No exemptions: a stable rule that cannot close is not stable.
+    #[test]
+    fn every_stable_rule_opens_and_closes_in_a_pinned_episode() {
+        let failures: Vec<String> = crate::diagnose::rules::CATALOGUE
+            .iter()
+            .filter(|rule| !rule.beta())
+            .filter_map(|rule| {
+                let episodes = pinned_spans_of(rule.id);
+                let closes = episodes
+                    .iter()
+                    .any(|(_, spans)| spans.iter().any(|span| closed_by(span, VERIFY)));
+                (!closes).then(|| {
+                    format!(
+                        "{}: stable, and no episode in {MANIFEST} that lists it shows it \
+                         opening and auto-closing",
+                        rule.id
+                    )
+                })
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     fn pending_close_entries_are_still_needed() {
         for (rule, why) in PENDING_CLOSE {

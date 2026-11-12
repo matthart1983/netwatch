@@ -87,3 +87,33 @@ id = "iface-errors-wifi-drops"
 kind = "synthetic"
 rules = ["iface.errors"]
 note = "A Wi-Fi driver drops 70 unwanted frames a minute throughout, and the link takes 30 errors a minute from 120 s to 300 s. The drops alone open iface.errors at 2 s, and it never closes: it closes only under 1/min errors and drops combined. Pinned open until B19."
+
+[[episode]]
+id = "target-resolve-failed"
+kind = "synthetic"
+rules = ["target.resolve_failed"]
+note = "The api target, probed every 60 s. From the probe at 180 s to the one at 420 s the system resolver does not answer for its name, so no later stage runs. The issue opens on the third failed probe and closes once resolution has held."
+
+[[episode]]
+id = "target-connect-failed"
+kind = "synthetic"
+rules = ["target.connect_failed"]
+note = "The same target resolves and its connection times out from 180 s to 420 s: a firewall or a route, where a stopped service would refuse."
+
+[[episode]]
+id = "target-tls-failed"
+kind = "synthetic"
+rules = ["target.tls_failed"]
+note = "The handshake reaches the server and its certificate has expired, from 180 s to 420 s."
+
+[[episode]]
+id = "target-http-error"
+kind = "synthetic"
+rules = ["target.http_error"]
+note = "Everything up to the request works and the service answers 503 from 180 s to 420 s. The rule files it as an Observation: the service, not the network."
+
+[[episode]]
+id = "gateway-unreachable"
+kind = "synthetic"
+rules = ["gateway.unreachable"]
+note = "The router stops answering pings and the TCP fallback from 120 s, and the internet probe fails with it. From 300 s both answer. The issue opens on the third failed probe and closes once the gateway has answered for its hold."

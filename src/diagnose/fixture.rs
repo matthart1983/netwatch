@@ -675,7 +675,6 @@ fn target_baselines() -> BaselineStore {
 /// is back at 41 ms, and the issue closes once that has held 180 s. The
 /// other stages stay at their baselines.
 fn target_slow_stage(t: u64) -> Observations {
-    use super::targets::{ConnectAttempt, Lookup, LookupOutcome, Stage, TargetContext, TargetObs};
     // A frame carries the last probe to complete, on the cadence's grid.
     let probed = t - t % 60;
     let first_byte = match probed {
@@ -683,15 +682,28 @@ fn target_slow_stage(t: u64) -> Observations {
         360..=479 => 50.0,
         _ => 41.0,
     };
-    let took = |ms| Stage {
-        ms: Some(ms),
-        error: None,
-    };
+    target_frame(api_target(probed, first_byte))
+}
+
+/// A quiet frame whose config and target list hold `target`.
+fn target_frame(target: super::targets::TargetObs) -> Observations {
     let mut obs = quiet_frame();
     if let Some(config) = &mut obs.config {
         config.targets = vec![("api".into(), API_REVISION.into())];
     }
-    obs.targets = vec![TargetObs {
+    obs.targets = vec![target];
+    obs
+}
+
+/// The `api` target as its probe at `probed` seconds found it, healthy but
+/// for `first_byte` ms to the first byte.
+fn api_target(probed: u64, first_byte: f64) -> super::targets::TargetObs {
+    use super::targets::{ConnectAttempt, Lookup, LookupOutcome, Stage, TargetContext, TargetObs};
+    let took = |ms| Stage {
+        ms: Some(ms),
+        error: None,
+    };
+    TargetObs {
         baseline_key: Some(API_REVISION.into()),
         name: "api".into(),
         host: "api.example.com".into(),
@@ -723,7 +735,106 @@ fn target_slow_stage(t: u64) -> Observations {
         // Three missed probes at the default interval.
         stale_after_secs: Some(180),
         context: TargetContext::default(),
-    }];
+    }
+}
+
+/// The `api` target probed every 60 s, with `fault` applied to the probes
+/// from 180 s to 420 s: five failing probes, then healthy ones. A target
+/// rule opens on the third and closes once its stage has held for its
+/// verify.
+fn target_fault(t: u64, fault: fn(&mut super::targets::TargetObs)) -> Observations {
+    let probed = t - t % 60;
+    let mut target = api_target(probed, 41.0);
+    if (180..=420).contains(&probed) {
+        fault(&mut target);
+    }
+    target_frame(target)
+}
+
+fn failed(error: super::targets::StageError) -> Option<super::targets::Stage> {
+    Some(super::targets::Stage {
+        ms: None,
+        error: Some(error),
+    })
+}
+
+/// The system resolver stops answering for the name: no address, so no
+/// later stage runs.
+fn target_resolve_failed(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::{LookupOutcome, StageError};
+        target.resolve = failed(StageError::ResolverFailed).expect("a stage");
+        target.addresses.clear();
+        for lookup in &mut target.lookups {
+            lookup.outcome = LookupOutcome::NoReply;
+        }
+        target.connect = None;
+        target.connect_v4 = None;
+        target.tls_stage = None;
+        target.http_stage = None;
+        target.status = None;
+        target.attempts.clear();
+        target.effective_endpoint = None;
+    })
+}
+
+/// The name resolves and the connection times out: a firewall or a route,
+/// not a stopped service, which would refuse.
+fn target_connect_failed(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::StageError;
+        target.connect = failed(StageError::Timeout);
+        target.connect_v4 = failed(StageError::Timeout);
+        for attempt in &mut target.attempts {
+            attempt.stage = failed(StageError::Timeout).expect("a stage");
+        }
+        target.tls_stage = None;
+        target.http_stage = None;
+        target.status = None;
+    })
+}
+
+/// The handshake reaches the server and its certificate has expired.
+fn target_tls_failed(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::StageError;
+        target.tls_stage = failed(StageError::CertExpired);
+        target.http_stage = None;
+        target.status = None;
+    })
+}
+
+/// Everything up to the request works and the service answers 503. The
+/// rule files that as an Observation: the service, not the network.
+fn target_http_error(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::{Stage, StageError};
+        target.http_stage = Some(Stage {
+            ms: Some(41.0),
+            error: Some(StageError::HttpStatus { status: 503 }),
+        });
+        target.status = Some(503);
+    })
+}
+
+/// The router stops answering from 120 s, pings and the TCP fallback both,
+/// and nothing beyond it answers either; from 300 s both are back. The
+/// internet probe failing too is what makes it the gateway and not a
+/// router that ignores pings.
+fn gateway_unreachable(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    if phase(t, &STORY) == Phase::Fault {
+        obs.gateway = Some(GatewayObs {
+            rtt_ms: None,
+            loss_pct: 100.0,
+            arp_ok: None,
+            icmp_ok: false,
+            internet_reachable: Some(false),
+            ..healthy_gateway()
+        });
+        // With the gateway gone the resolver behind it is silent too.
+        obs.dns = None;
+    }
     obs
 }
 
@@ -1008,6 +1119,23 @@ pub fn scenarios() -> Vec<Scenario> {
             baselines: target_baselines,
             ..Scenario::live("target-slow-stage", 720, target_slow_stage)
         },
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-resolve-failed", 780, target_resolve_failed)
+        },
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-connect-failed", 780, target_connect_failed)
+        },
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-tls-failed", 780, target_tls_failed)
+        },
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-http-error", 780, target_http_error)
+        },
+        Scenario::live("gateway-unreachable", 480, gateway_unreachable),
         Scenario {
             baselines: router_baselines,
             ..Scenario::live("dns-slow-router", 420, dns_slow_router)

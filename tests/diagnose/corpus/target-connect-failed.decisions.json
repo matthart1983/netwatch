@@ -1,0 +1,13 @@
+{
+  "episode": "target-connect-failed",
+  "frames": 781,
+  "issues": [
+    {
+      "key": "target.connect_failed|api|target-config:synthetic-api",
+      "opened": "2026-09-03 06:49:00",
+      "closed": "2026-09-03 06:54:00",
+      "top_cause": "target.connect_failed/firewall_or_route",
+      "close_reason": "auto-closed"
+    }
+  ]
+}
