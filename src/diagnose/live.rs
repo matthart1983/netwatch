@@ -228,14 +228,16 @@ impl LiveSampler {
         let mut out = Vec::new();
 
         // Learn the statistic the rule judges. `dns.slow_resolver` compares
-        // the rolling p50 of the probe history against this baseline, so the
-        // baseline has to be fed that p50 — feeding it the latest single probe
-        // taught it a noisier, lower number than the one it was later asked
-        // to judge, and the 3σ test drifted with the difference.
-        let dns_p50 = dns_p50_to_learn(health.dns_rtt_ms, &health.dns_rtt_history);
+        // the median of a closed window of probe cycles against this
+        // baseline, so the baseline is fed that median, once per window.
+        // Feeding it a single probe taught it a noisier, lower number than
+        // the one it was later asked to judge, and the 3σ test drifted with
+        // the difference. A window where the resolver mostly did not answer
+        // has no median and teaches nothing.
+        let dns_p50 = dns_p50_to_learn(health.dns_rtt_window.as_ref());
         if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), dns_p50) {
             if health.completed.dns_target.as_ref() == Some(&resolver) {
-                if let Some(at) = self.fresh_reading("dns", health.completed.dns) {
+                if let Some(at) = self.fresh_reading("dns.window", health.completed.dns_window) {
                     out.push(Reading::new(resolver, "dns.rtt_p50", rtt, at));
                 }
             }
@@ -821,7 +823,6 @@ fn dns(app: &App) -> Option<DnsObs> {
     // socket) is not a resolver failing 100% of queries; it is no observation.
     let failure_rate_pct = health.dns_loss.pct()?;
 
-    let samples: Vec<f64> = health.dns_rtt_history.iter().flatten().copied().collect();
     // One sample per probe, so the window is samples × the probe interval —
     // not × a bare 5, which silently became wrong the moment the cadence
     // constant moved.
@@ -871,10 +872,18 @@ fn dns(app: &App) -> Option<DnsObs> {
         .flatten();
 
     Some(DnsObs {
-        window: dns_window(&health.dns_probe_history, &health.completed.dns_history),
+        window: super::detectors::DnsWindow {
+            rtt_secs: health.dns_rtt_window.map_or(0, |w| w.secs),
+            rtt_cycles: health.dns_rtt_window.map_or(0, |w| w.answered),
+            ..dns_window(&health.dns_probe_history, &health.completed.dns_history)
+        },
         resolver,
-        rtt_p50_ms: percentile(&samples, 0.5).or(health.dns_rtt_ms),
-        rtt_p95_ms: percentile(&samples, 0.95),
+        // The newest closed window, held until the next one closes. Nothing
+        // is judged before the first: a median of the cycles so far would be
+        // a different statistic from the one the baseline learns.
+        rtt_p50_ms: dns_p50_to_learn(health.dns_rtt_window.as_ref()),
+        // A handful of cycles has no tail worth quoting.
+        rtt_p95_ms: None,
         failure_rate_pct,
         truncation_rate_pct,
         queries: replies.max(health.dns_rtt_history.len() as u32),
@@ -997,23 +1006,18 @@ fn dns_window(
         unanswered: queries - answered,
         recent_unanswered,
         all_lost_secs,
+        ..Default::default()
     }
 }
 
 /// Nearest-rank percentile. `None` on an empty sample set rather than 0.0 —
 /// "no measurement" and "zero milliseconds" are different claims.
-/// The DNS p50 the baseline may learn from this cycle, or `None` when the
-/// cycle got no reply. The p50 comes from the history, which still holds the
-/// replies from before an outage; learning it while the resolver is silent
-/// would advance the baseline on timings that did not happen again, and
-/// narrow its spread with every failed probe.
-fn dns_p50_to_learn(
-    latest: Option<f64>,
-    history: &std::collections::VecDeque<Option<f64>>,
-) -> Option<f64> {
-    let latest = latest?;
-    let samples: Vec<f64> = history.iter().flatten().copied().collect();
-    percentile(&samples, 0.5).or(Some(latest))
+/// The DNS p50 the rule judges and the baseline learns: the median of the
+/// newest closed window, or `None` when there is no window yet or the
+/// resolver went unanswered for most of it. One function serves both, so the
+/// two cannot come apart.
+fn dns_p50_to_learn(window: Option<&crate::collectors::health::DnsRttWindow>) -> Option<f64> {
+    window?.p50_ms
 }
 
 fn percentile(values: &[f64], p: f64) -> Option<f64> {
@@ -1862,20 +1866,49 @@ mod tests {
         }
     }
 
+    /// What `dns.slow_resolver` judges and what its baseline learns are one
+    /// number: the median of the newest closed window. Before a window has
+    /// closed there is neither, whatever the cycles so far measured.
     #[test]
-    fn a_dns_cycle_without_a_reply_teaches_the_baseline_nothing() {
-        let history: std::collections::VecDeque<Option<f64>> =
-            [Some(12.0), Some(14.0), Some(13.0), None].into();
-        // The resolver stopped answering: the history still has old replies,
-        // but this cycle measured nothing.
-        assert_eq!(dns_p50_to_learn(None, &history), None);
-        // A reply this cycle learns the p50 the rule judges.
-        assert_eq!(dns_p50_to_learn(Some(13.0), &history), Some(13.0));
-        // A first reply with no history yet learns that reply.
-        assert_eq!(
-            dns_p50_to_learn(Some(9.0), &std::collections::VecDeque::new()),
-            Some(9.0)
-        );
+    fn the_judged_and_learned_dns_statistic_are_the_same() {
+        let judged_and_learned = |app: &App| {
+            let mut sampler = LiveSampler::new();
+            let obs = sampler.sample(app, &app.diagnose.engine.settings().thresholds);
+            let learned: Vec<f64> = sampler
+                .readings(app)
+                .into_iter()
+                .filter(|r| r.metric == "dns.rtt_p50")
+                .map(|r| r.value)
+                .collect();
+            (
+                obs.dns.expect("the resolver was probed").rtt_p50_ms,
+                learned,
+            )
+        };
+
+        let app = probes_off_app((Some(1.0), 0.0));
+        assert_eq!(judged_and_learned(&app), (None, vec![]));
+
+        let mut status = (*app.health_prober.status()).clone();
+        status.dns_rtt_window = Some(crate::collectors::health::DnsRttWindow {
+            p50_ms: Some(7.0),
+            cycles: 6,
+            answered: 6,
+            secs: 30,
+        });
+        status.completed.dns_window = status.completed.dns;
+        app.health_prober.publish_for_test(status.clone());
+        assert_eq!(judged_and_learned(&app), (Some(7.0), vec![7.0]));
+
+        // The resolver went mostly unanswered: no speed to judge or learn.
+        status.dns_rtt_window = Some(crate::collectors::health::DnsRttWindow {
+            p50_ms: None,
+            cycles: 6,
+            answered: 2,
+            secs: 30,
+        });
+        app.health_prober.publish_for_test(status);
+        assert_eq!(judged_and_learned(&app), (None, vec![]));
     }
 
     #[test]

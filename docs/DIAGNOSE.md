@@ -250,6 +250,21 @@ line for both, a gateway hovering at 3σ closed each time it dipped under for
 two minutes and reopened each time it rose. A noisy link now takes longer to
 close.
 
+`dns.slow_resolver` judges the median of a window of six probe cycles, and
+its baseline learns that same median, once per window. In the TUI a cycle runs
+every five seconds, so a window is 30 seconds; `diagnose run` probes every
+second, so its windows are six seconds, and a refresh slower than five seconds
+closes a window at 30 seconds with the cycles it has. The windows do not
+overlap, and the rule opens when two in a row are over its line, so in the TUI
+a resolver that turns slow is reported 45 to 75 seconds later. With an even
+number of cycles the median is the lower of the middle two, so a window counts
+as slow only when more than half of it was. Nothing is judged before the first
+window closes. A window in which fewer than half the cycles got an answer has
+no median: that is `dns.failing`'s case. The rule used to judge a median over
+the whole ten-minute probe history, which took five minutes to move, in either
+direction. A baseline learned before this change holds that slower statistic;
+its mean carries over and its spread relearns.
+
 `dns.slow_resolver` closes once the resolver's median has stayed under one
 line for 60 s, set when the issue opens: 0.8 of the line it opened on, or 2σ
 above the resolver's mean if that is higher. The line it opened on is the

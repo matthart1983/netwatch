@@ -99,11 +99,13 @@ DEVICES = {'nw0': None, 'gw0': 'gw', 'gw1': 'gw', 'inet0': 'inet'}
 #   asserted       False: measured and reported, never failed on
 SCENARIOS = [
     {'name': 'L-DNS-SLOW',
-     'fault': [('dns', 'gw', 'delay:300')], 'fault_secs': 60, 'clear': [('dns', 'gw', 'ok')],
-     # 3 healthy samples, so the 4th slow one moves the median; 3 to confirm.
-     'expect_open': [{'rule': 'dns.slow_resolver'}], 'open_within_s': 60, 'open_expect_s': 30,
-     # 12 slow samples need 10 healthy ones to lose the median (50 s), then
-     # the 60 s hold.
+     'fault': [('dns', 'gw', 'delay:300')], 'fault_secs': 150, 'clear': [('dns', 'gw', 'ok')],
+     # The rule judges windows of six cycles (30 s) and wants two slow ones in
+     # a row. A window counts once more than half its cycles are slow, so the
+     # first can be the one the fault started in: 45 s at best, 75 s at worst.
+     'expect_open': [{'rule': 'dns.slow_resolver'}], 'open_within_s': 120, 'open_expect_s': 60,
+     # The first clean window closes within 45 s of the clear, and the 60 s
+     # hold is two more.
      'expect_close': [{'rule': 'dns.slow_resolver'}], 'close_within_s': 220, 'close_expect_s': 110,
      'forbid': ['dns.failing', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
                 'link.down']},

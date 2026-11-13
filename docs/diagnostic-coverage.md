@@ -187,7 +187,7 @@ These rules have detectors and can open issues. What they have not had is a writ
 
 | Rule | Category | Fires when | Status |
 |---|---|---|---|
-| `dns.slow_resolver` | dns | resolver p50 > 3σ above baseline, at least 5ms above it and at least 2× it, or p50 > 100ms with or without a baseline, for 3 samples | active |
+| `dns.slow_resolver` | dns | resolver median over 6 probe cycles (30s in the TUI) > 3σ above baseline, at least 5ms above it and at least 2× it, or > 100ms with or without a baseline, for 2 such windows in a row | active |
 | `dns.failing` | dns | at least 5 of the last 60 probe queries unanswered, one of them among the newest 12, with the lower confidence bound on that share above 5%; or every query unanswered for 15s | active |
 | `dns.truncation_retry` | dns | more than 10% of probe replies carry the TC bit | active |
 | `link.down` | link | the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says "Media disconnected" | active |

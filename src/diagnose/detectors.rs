@@ -165,6 +165,11 @@ impl Thresholds {
     pub fn confirmations(&self, rule: &str) -> u32 {
         match rule {
             "dns.failing" => 1,
+            // One sample is the median of a 30 s window that shares no probe
+            // with the last; two of them are a minute of slow answers, and
+            // a third would only add half a minute. A `consecutive_n` under
+            // two still lowers it.
+            "dns.slow_resolver" => self.consecutive_n.clamp(1, 2),
             _ => self.consecutive_n.max(1),
         }
     }
@@ -515,6 +520,13 @@ pub struct DnsWindow {
     /// latest cycle got an answer, or only one cycle has failed so far.
     #[serde(default)]
     pub all_lost_secs: Option<f64>,
+    /// The span of the closed window `rtt_p50_ms` is the median of, and how
+    /// many of its probe cycles answered. Zero where the p50 did not come
+    /// from one: a fixture, or a recording made before the windows.
+    #[serde(default)]
+    pub rtt_secs: u64,
+    #[serde(default)]
+    pub rtt_cycles: u32,
 }
 
 impl DnsWindow {
@@ -2228,7 +2240,11 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         return out;
     }
 
-    let mut ev = Evidence::new("dns.rtt_p50", p50, "ms").with_window(dns.window_secs, dns.queries);
+    let (secs, samples) = match dns.window.rtt_cycles {
+        0 => (dns.window_secs, dns.queries),
+        cycles => (dns.window.rtt_secs, cycles),
+    };
+    let mut ev = Evidence::new("dns.rtt_p50", p50, "ms").with_window(secs, samples);
     if let Some(b) = baseline {
         ev = ev.with_baseline(b.mean, b.sigma_floored(t.sigma_floor()));
     }
@@ -3945,6 +3961,7 @@ mod tests {
             unanswered,
             recent_unanswered: unanswered.min(1),
             all_lost_secs,
+            ..Default::default()
         };
         detect(&obs_with_dns(dns), &store(), &Thresholds::default())
             .into_iter()
@@ -3991,6 +4008,7 @@ mod tests {
             unanswered: 18,
             recent_unanswered: 0,
             all_lost_secs: None,
+            ..Default::default()
         };
         let t = Thresholds::default();
         assert_eq!(dns.failing(&t), None);
@@ -4056,9 +4074,15 @@ mod tests {
 
     #[test]
     fn only_dns_failing_confirms_on_its_first_sample() {
-        let t = Thresholds::default();
+        let mut t = Thresholds::default();
         assert_eq!(t.confirmations("dns.failing"), 1);
-        assert_eq!(t.confirmations("dns.slow_resolver"), t.consecutive_n);
+        // Two windows, unless the user asked for fewer samples than that.
+        assert_eq!(t.confirmations("dns.slow_resolver"), 2);
+        t.consecutive_n = 1;
+        assert_eq!(t.confirmations("dns.slow_resolver"), 1);
+        t.consecutive_n = 8;
+        assert_eq!(t.confirmations("dns.slow_resolver"), 2);
+        let t = Thresholds::default();
         assert_eq!(t.confirmations("gateway.rtt_spike"), t.consecutive_n);
     }
 
@@ -5608,6 +5632,7 @@ mod tests {
             unanswered: 12,
             recent_unanswered: 12,
             all_lost_secs: Some(20.0),
+            ..Default::default()
         };
         let found = detect(&obs_with_dns(silent), &base, &Thresholds::default());
         let failing = found

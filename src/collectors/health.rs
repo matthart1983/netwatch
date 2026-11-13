@@ -33,6 +33,11 @@ pub struct HealthStatus {
     pub gateway_rtt_history: VecDeque<Option<f64>>,
     pub dns_rtt_history: VecDeque<Option<f64>>,
     pub internet_rtt_history: VecDeque<Option<f64>>,
+    /// The newest closed [`DNS_WINDOW_SECS`] window of DNS probe cycles;
+    /// `completed.dns_window` is when it closed. `None` until one has.
+    pub dns_rtt_window: Option<DnsRttWindow>,
+    /// The window still filling.
+    pub dns_window_fill: DnsWindowFill,
     /// Per-cycle reply flags from the DNS probe, one entry per probe cycle.
     /// The RTT series says whether the resolver answered; this says *what*
     /// it answered — a truncated reply or a SERVFAIL is a reply.
@@ -48,6 +53,84 @@ pub struct HealthStatus {
     pub dns_reference_rtt_history: VecDeque<Option<f64>>,
     /// The latest STUN mapping probe. Runs every [`STUN_EVERY`] cycles.
     pub nat: Option<NatProbe>,
+}
+
+/// How many probe cycles make one DNS RTT window. `dns.slow_resolver` judges
+/// the median of a window and its baseline learns that same median.
+///
+/// Six cycles are [`DNS_WINDOW_SECS`] at the TUI's five-second cadence. A
+/// window is counted in cycles so that `diagnose run`, which probes every
+/// second inside a 30 s budget, still closes several; it is capped in time so
+/// that a slow refresh does not stretch one window over minutes.
+///
+/// The windows are fixed and do not overlap. A median over the whole rolling
+/// history took half the history to move: with ten minutes kept, a resolver
+/// that turned slow was reported five minutes later and cleared five minutes
+/// after it recovered, and consecutive readings shared all but one sample, so
+/// confirming over three of them confirmed nothing.
+pub const DNS_WINDOW_CYCLES: usize = 6;
+
+/// The longest a DNS RTT window stays open, however few cycles it has.
+pub const DNS_WINDOW_SECS: u64 = 30;
+
+/// One closed window of DNS probe cycles.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DnsRttWindow {
+    /// The median of the cycles that got a reply, the lower of the middle two
+    /// when their count is even; `None` when fewer than half
+    /// did, which is `dns.failing`'s case and no reading of the resolver's
+    /// speed.
+    pub p50_ms: Option<f64>,
+    pub cycles: u32,
+    pub answered: u32,
+    /// From the last window's close, or the first cycle of all, to this
+    /// window's.
+    pub secs: u64,
+}
+
+impl DnsRttWindow {
+    fn close(cycles: &[Option<f64>], secs: u64) -> Self {
+        let mut replies: Vec<f64> = cycles.iter().flatten().copied().collect();
+        replies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let answered = replies.len();
+        // The lower median: a window half slow and half not reads as not, so
+        // the level has to hold for more than half a window to count.
+        let median = answered.checked_sub(1).map(|last| replies[last / 2]);
+        Self {
+            p50_ms: median.filter(|_| answered * 2 >= cycles.len()),
+            cycles: cycles.len() as u32,
+            answered: answered as u32,
+            secs,
+        }
+    }
+}
+
+/// The cycles of a window that has not closed yet, and when it started: the
+/// last window's close, or the first cycle of all.
+#[derive(Clone, Debug, Default)]
+pub struct DnsWindowFill {
+    cycles: Vec<Option<f64>>,
+    started: Option<std::time::Instant>,
+}
+
+impl HealthStatus {
+    /// Add one DNS cycle to the window that is filling, and close the window
+    /// with it once it holds [`DNS_WINDOW_CYCLES`] or has been open for
+    /// [`DNS_WINDOW_SECS`]. The next window starts empty.
+    pub(crate) fn roll_dns_window(&mut self, rtt: Option<f64>, completed: std::time::Instant) {
+        let fill = &mut self.dns_window_fill;
+        let started = *fill.started.get_or_insert(completed);
+        fill.cycles.push(rtt);
+        let secs = completed.saturating_duration_since(started).as_secs();
+        if fill.cycles.len() >= DNS_WINDOW_CYCLES || secs >= DNS_WINDOW_SECS {
+            self.dns_rtt_window = Some(DnsRttWindow::close(&fill.cycles, secs));
+            self.completed.dns_window = Some(completed);
+            *fill = DnsWindowFill {
+                cycles: Vec::new(),
+                started: Some(completed),
+            };
+        }
+    }
 }
 
 /// What a probe's loss figure means.
@@ -119,6 +202,10 @@ pub struct ProbeTimes {
     pub dns: Option<std::time::Instant>,
     pub internet: Option<std::time::Instant>,
     pub nat: Option<std::time::Instant>,
+    /// When the newest DNS RTT window closed. `dns.slow_resolver` is sampled
+    /// on this clock: one window is one sample, however many cycles or ticks
+    /// it spans.
+    pub dns_window: Option<std::time::Instant>,
     pub gateway_target: Option<String>,
     pub dns_target: Option<String>,
 }
@@ -266,6 +353,8 @@ impl HealthProber {
                 gateway_rtt_history: VecDeque::new(),
                 dns_rtt_history: VecDeque::new(),
                 internet_rtt_history: VecDeque::new(),
+                dns_rtt_window: None,
+                dns_window_fill: Default::default(),
                 dns_probe_history: VecDeque::new(),
                 dns_cross: None,
                 dns_cross_history: VecDeque::new(),
@@ -445,6 +534,9 @@ fn run_cycle(
             next.completed.dns_history.clear();
             next.dns_probe_history.clear();
             next.dns_cross_history.clear();
+            next.dns_rtt_window = None;
+            next.dns_window_fill = Default::default();
+            next.completed.dns_window = None;
         }
         match reference_rtt {
             Some(rtt) => {
@@ -467,6 +559,7 @@ fn run_cycle(
                 next.completed.dns_history.pop_front();
             }
             next.dns_rtt_history.make_contiguous();
+            next.roll_dns_window(rtt, completed);
             next.dns_probe_history.push_back(flags);
             if next.dns_probe_history.len() > RTT_HISTORY_MAX {
                 next.dns_probe_history.pop_front();
@@ -1354,6 +1447,80 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rolled(cycles: &[(Option<f64>, u64)]) -> (HealthStatus, std::time::Instant) {
+        use std::time::Duration;
+        let mut status = (*HealthProber::new().status()).clone();
+        let t0 = std::time::Instant::now();
+        for &(rtt, at) in cycles {
+            status.roll_dns_window(rtt, t0 + Duration::from_secs(at));
+        }
+        (status, t0)
+    }
+
+    #[test]
+    fn a_dns_window_is_six_cycles_and_shares_none_with_the_next() {
+        let first: Vec<(Option<f64>, u64)> =
+            (0..5).map(|i| (Some(10.0 + i as f64), i * 5)).collect();
+        let (status, _) = rolled(&first);
+        assert_eq!(
+            status.dns_rtt_window, None,
+            "five cycles in, nothing is closed"
+        );
+
+        // The sixth cycle closes the window it is in.
+        let mut cycles = first.clone();
+        cycles.push((Some(15.0), 25));
+        let (status, t0) = rolled(&cycles);
+        let closed = DnsRttWindow {
+            p50_ms: Some(12.0),
+            cycles: 6,
+            answered: 6,
+            secs: 25,
+        };
+        assert_eq!(status.dns_rtt_window, Some(closed));
+        assert_eq!(
+            status.completed.dns_window,
+            Some(t0 + std::time::Duration::from_secs(25))
+        );
+
+        // The next window shares no cycle with the last: its median is the
+        // new level in full, and the old window stands until it closes.
+        cycles.extend((6..11).map(|i| (Some(99.0), i * 5)));
+        let (status, _) = rolled(&cycles);
+        assert_eq!(status.dns_rtt_window, Some(closed));
+        cycles.push((Some(99.0), 55));
+        let (status, _) = rolled(&cycles);
+        let next = status.dns_rtt_window.unwrap();
+        assert_eq!((next.p50_ms, next.cycles, next.secs), (Some(99.0), 6, 30));
+    }
+
+    /// `diagnose run` probes every second: six cycles are six seconds. A
+    /// refresh so slow that six cycles would take minutes closes on time.
+    #[test]
+    fn a_dns_window_follows_the_cadence_but_never_runs_past_thirty_seconds() {
+        let fast: Vec<(Option<f64>, u64)> = (0..6).map(|i| (Some(8.0), i)).collect();
+        let w = rolled(&fast).0.dns_rtt_window.unwrap();
+        assert_eq!((w.cycles, w.secs), (6, 5));
+
+        let slow: Vec<(Option<f64>, u64)> = (0..3).map(|i| (Some(8.0), i * 25)).collect();
+        assert_eq!(rolled(&slow[..2]).0.dns_rtt_window, None);
+        let w = rolled(&slow).0.dns_rtt_window.unwrap();
+        assert_eq!((w.cycles, w.secs), (3, 50));
+    }
+
+    #[test]
+    fn a_window_the_resolver_mostly_missed_has_no_median() {
+        let window = |answered: u64| {
+            let cycles: Vec<(Option<f64>, u64)> = (0..6)
+                .map(|i| ((i < answered).then_some(20.0), i * 5))
+                .collect();
+            rolled(&cycles).0.dns_rtt_window.unwrap()
+        };
+        assert_eq!(window(2).p50_ms, None);
+        assert_eq!((window(2).cycles, window(2).answered), (6, 2));
+        assert_eq!(window(3).p50_ms, Some(20.0));
+    }
 
     /// Answers every probe at once, and writes down who was asked. The
     /// internet targets answer as `internet` says, 0% loss for any not in it.

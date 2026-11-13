@@ -280,7 +280,7 @@ impl Coverage {
                 "gateway.unreachable" => present(obs.gateway.as_ref().is_some_and(|g| g.addr.is_some() && g.internet_reachable.is_some()), "gateway and corroborating internet probe required"),
                 "gateway.rtt_spike" => baseline(obs.gateway.as_ref().and_then(|g| g.rtt_ms), obs.gateway.as_ref().and_then(|g| g.addr.as_deref()), "gateway.rtt"),
                 "dns.slow_resolver" if stub.is_some() => (Available, stub.as_deref().unwrap_or_default()),
-                "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "resolver RTT not measured; absolute threshold remains usable without a baseline"),
+                "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "no window of resolver timings has closed yet; the first takes six probe cycles"),
                 "dns.failing" | "dns.truncation_retry" => present(obs.dns.as_ref().is_some_and(|d| d.queries > 0), "no DNS query outcomes measured"),
                 "dns.hijack_suspect" => present(obs.dns.as_ref().and_then(|d| d.cross.as_ref()).is_some(), "resolver cross-check not measured"),
                 id if id.starts_with("path.") && obs.paths.is_empty() => (AwaitingTest, "run a traceroute; results remain usable for 120 seconds"),

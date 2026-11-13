@@ -120,6 +120,9 @@ pub struct ProbeAges {
     pub path: Option<f64>,
     pub gateway: Option<f64>,
     pub dns: Option<f64>,
+    /// Since the newest DNS RTT window closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_window: Option<f64>,
     pub internet: Option<f64>,
     pub nat: Option<f64>,
     /// Newest target completion, kept for recordings written before probe
@@ -149,6 +152,7 @@ impl ProbeAges {
             path: age(times.path),
             gateway: age(times.health.gateway),
             dns: age(times.health.dns),
+            dns_window: age(times.health.dns_window),
             internet: age(times.health.internet),
             nat: age(times.health.nat),
             targets: times
@@ -211,6 +215,9 @@ impl ProbeAges {
         };
         times.health.gateway = at(self.gateway);
         times.health.dns = at(self.dns);
+        // A recording from before DNS windows sampled the slow-resolver rule
+        // on every cycle; it replays that way.
+        times.health.dns_window = at(self.dns_window.or(self.dns));
         times.health.internet = at(self.internet);
         times.health.nat = at(self.nat);
         times.health.gateway_target = self.gateway_target.clone();

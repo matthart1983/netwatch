@@ -37,6 +37,7 @@ use super::detectors::{
 use super::engine::{format_ts, Clock, Engine, FixedClock, ObservationTimes, Settings};
 use super::episode::{EnvProfile, Episode, Recorder, Tick};
 use super::report::{Environment, Report, TimelineEvent};
+use crate::collectors::health::DNS_WINDOW_SECS;
 
 /// When the demo window ends. Every timestamp in the fixture is relative to
 /// this, so the whole scenario is reproducible to the second.
@@ -1209,6 +1210,10 @@ pub fn record(scenario: &Scenario) -> Episode {
         // either.
         let probed = Cadence::stamp(cadence.health, start, t);
         times.health.dns = probed;
+        // The slow-resolver rule is sampled once per closed window, as live.
+        times.health.dns_window = cadence
+            .health
+            .and_then(|_| Cadence::stamp(Some(DNS_WINDOW_SECS), start, t));
         times.health.gateway = probed;
         times.health.internet = probed;
         times.health.dns_target = obs.dns.as_ref().map(|d| d.resolver.clone());
@@ -1605,16 +1610,16 @@ mod tests {
     }
 
     /// B13 closes a slow-resolver issue relative to the line it opened on.
-    /// The router's 150 ms p50 opens the issue on the third slow probe, at
-    /// 130 s, over the ceiling and over its baseline's 21 ms line, and 11 ms
-    /// from 300 s holds under 0.8 of the lower line for 60 s. The flat 5 ms
-    /// line B13 replaced never closed it.
+    /// The router's 150 ms p50 from 120 s opens the issue on the second slow
+    /// 30 s window, at 150 s, over the ceiling and over its baseline's 21 ms
+    /// line, and 11 ms from 300 s holds under 0.8 of the lower line for 60 s,
+    /// two more windows. The flat 5 ms line B13 replaced never closed it.
     #[test]
     fn a_router_resolver_issue_closes_under_the_line_it_opened_on() {
         assert_eq!(
             pinned_spans("dns-slow-router"),
             vec![span(
-                "2026-09-03 06:46:10",
+                "2026-09-03 06:46:30",
                 "2026-09-03 06:50:00",
                 "auto-closed"
             )]

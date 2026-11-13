@@ -102,6 +102,9 @@ fn sample_time(
         Some(times.kernel)
     } else if rule.starts_with("egress.") {
         Some(times.egress)
+    } else if rule == "dns.slow_resolver" {
+        // Judged on a closed window of probe cycles, not on each cycle.
+        Some(times.health.dns_window)
     } else if rule.starts_with("dns.") {
         Some(times.health.dns)
     } else if rule.starts_with("gateway.") {
@@ -978,6 +981,10 @@ impl Engine {
                         || issue.rule.starts_with("wifi.")
                     {
                         15
+                    } else if issue.rule == "dns.slow_resolver" {
+                        // One sample per window; a window that ran a cycle
+                        // long is still the next one.
+                        crate::collectors::health::DNS_WINDOW_SECS * 5 / 2
                     } else {
                         30
                     };
@@ -1810,8 +1817,6 @@ mod tests {
         e.observe(&obs(1.0), &b);
         clock.advance_secs(1);
         e.observe(&obs(40.0), &b);
-        clock.advance_secs(1);
-        e.observe(&obs(40.0), &b);
         assert_eq!(e.open_count(), 0, "the streak was broken by a good sample");
         clock.advance_secs(1);
         e.observe(&obs(40.0), &b);
@@ -1829,8 +1834,8 @@ mod tests {
         let b = base();
         let start = std::time::Instant::now();
         let mut times = ObservationTimes::default();
-        times.health.dns = Some(start);
-        // One slow probe result, visible for ten ticks until the next probe.
+        times.health.dns_window = Some(start);
+        // One slow window, visible on every tick until the next one closes.
         for tick in 0..10 {
             e.observe_live_at(
                 &obs(40.0),
@@ -1839,17 +1844,24 @@ mod tests {
                 start + std::time::Duration::from_millis(tick * 500),
             );
         }
-        assert_eq!(e.open_count(), 0, "one probe result is one sample");
-        for probe in 1..=2u64 {
-            times.health.dns = Some(start + std::time::Duration::from_secs(5 * probe));
-            e.observe_live_at(
-                &obs(40.0),
-                &b,
-                &times,
-                start + std::time::Duration::from_secs(5 * probe),
-            );
-        }
-        assert_eq!(e.open_count(), 1, "three distinct probes confirm it");
+        assert_eq!(e.open_count(), 0, "one window is one sample");
+        // A newer probe cycle is not a newer window.
+        times.health.dns = Some(start + std::time::Duration::from_secs(5));
+        e.observe_live_at(
+            &obs(40.0),
+            &b,
+            &times,
+            start + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(e.open_count(), 0, "a probe cycle is not a sample");
+        times.health.dns_window = Some(start + std::time::Duration::from_secs(30));
+        e.observe_live_at(
+            &obs(40.0),
+            &b,
+            &times,
+            start + std::time::Duration::from_secs(30),
+        );
+        assert_eq!(e.open_count(), 1, "two distinct windows confirm it");
     }
 
     struct ClockRef(std::sync::Arc<FixedClock>);
@@ -3815,9 +3827,11 @@ mod tests {
         let base = base();
         engine.observe(&obs(40.0), &base);
         let id = engine.primary()[0].id.clone();
+        let at = std::time::Instant::now();
         let mut times = ObservationTimes {
             health: crate::collectors::health::ProbeTimes {
-                dns: Some(std::time::Instant::now()),
+                dns: Some(at),
+                dns_window: Some(at),
                 ..Default::default()
             },
             ..Default::default()
@@ -3826,14 +3840,18 @@ mod tests {
         clock.advance_secs(90);
         engine.observe_live(&obs(1.0), &base, &times);
         assert!(engine.get(&id).unwrap().state.is_open());
-        times.health.dns = Some(times.health.dns.unwrap() + std::time::Duration::from_nanos(1));
+        times.health.dns_window =
+            Some(times.health.dns_window.unwrap() + std::time::Duration::from_nanos(1));
+        times.health.dns = times.health.dns_window;
         engine.observe_live(&obs(1.0), &base, &times);
         assert!(
             engine.get(&id).unwrap().state.is_open(),
             "wall clock jumps cannot satisfy a hold"
         );
         for _ in 0..3 {
-            times.health.dns = Some(times.health.dns.unwrap() + std::time::Duration::from_secs(20));
+            times.health.dns_window =
+                Some(times.health.dns_window.unwrap() + std::time::Duration::from_secs(20));
+            times.health.dns = times.health.dns_window;
             engine.observe_live(&obs(1.0), &base, &times);
         }
         assert!(!engine.get(&id).unwrap().state.is_open());
@@ -3871,12 +3889,15 @@ mod tests {
         let id = engine.primary()[0].id.clone();
         let mut times = ObservationTimes::default();
         let start = std::time::Instant::now();
-        for seconds in [0, 20, 80, 100, 120] {
-            times.health.dns = Some(start + std::time::Duration::from_secs(seconds));
+        // Windows 80 s apart are not consecutive: the hold starts over.
+        for seconds in [0, 30, 110, 140] {
+            times.health.dns_window = Some(start + std::time::Duration::from_secs(seconds));
+            times.health.dns = times.health.dns_window;
             engine.observe_live(&obs(1.0), &base, &times);
             assert!(engine.get(&id).unwrap().state.is_open());
         }
-        times.health.dns = Some(start + std::time::Duration::from_secs(140));
+        times.health.dns_window = Some(start + std::time::Duration::from_secs(170));
+        times.health.dns = times.health.dns_window;
         engine.observe_live(&obs(1.0), &base, &times);
         assert!(!engine.get(&id).unwrap().state.is_open());
     }

@@ -127,9 +127,8 @@ RULES = {
         'reference': lambda: dns_ms(hl.GATEWAY),
         'fault': lambda ms: ('dns', 'gw', f'delay:{ms:.1f}'),
         'clear': ('dns', 'gw', 'ok'),
-        # The p50 is a median over the probe history, so the slow samples
-        # have to outnumber the warm-up's before it moves.
-        'fault_secs': 90, 'close_within_s': 300,
+        # Two 30 s windows in a row, and the fault can start mid-window.
+        'fault_secs': 150, 'close_within_s': 220,
     },
     'path.rtt_spike': {
         'metric': 'path.rtt', 'line': path_line,

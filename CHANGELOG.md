@@ -35,6 +35,16 @@ All notable changes to NetWatch will be documented in this file.
   seconds of cycles with nothing lost. `diagnose_thresholds` gains `dns_failure_pct`
   (default 5). The rule stays beta.
 
+- **`dns.slow_resolver` judges windows of six probe cycles instead of the whole probe
+  history.** The rule compared a median over ten minutes of probes with its baseline, so
+  a resolver that turned slow was reported about five minutes later and cleared about five
+  minutes after it recovered. It now judges the median of each six-cycle window, 30
+  seconds in the TUI and six seconds in `diagnose run`, and opens when two windows in a
+  row are over its line: 45 to 75 seconds in the TUI. Its baseline learns the same
+  median, once per window. A window where fewer than half the cycles were answered is not
+  judged. The issue no longer quotes a p95. A `consecutive_n` of 1 still opens it on one
+  window; values above 2 no longer make it wait longer. The rule stays beta.
+
 - **A slow or silent resolver is compared with the public reference resolver.** The
   cross-check's query to 1.1.1.1 was already sent every probe cycle and its timing thrown
   away. It is now kept, and sent whether or not your resolver answers. When the reference

@@ -120,7 +120,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "slow dns resolver",
         category: "dns",
         severity: Severity::Medium,
-        trigger: "resolver p50 > 3σ above baseline, at least 5ms above it and at least 2× it, or p50 > 100ms with or without a baseline, for 3 samples",
+        trigger: "resolver median over 6 probe cycles (30s in the TUI) > 3σ above baseline, at least 5ms above it and at least 2× it, or > 100ms with or without a baseline, for 2 such windows in a row",
         suppresses: &[],
         status: RuleStatus::Active,
         maturity: Maturity::Beta,
@@ -1093,7 +1093,6 @@ mod tests {
                     "dns_delta_floor_ms",
                     "dns_delta_multiple",
                     "dns_ceiling_ms",
-                    "consecutive_n",
                 ],
             ),
             (
@@ -1124,6 +1123,11 @@ mod tests {
             ("dns.failing", 60.0),
             ("dns.failing", 12.0),
             ("dns.failing", 15.0),
+            // health::DNS_WINDOW_CYCLES, DNS_WINDOW_SECS and the rule's own
+            // confirmation count, checked below.
+            ("dns.slow_resolver", 6.0),
+            ("dns.slow_resolver", 30.0),
+            ("dns.slow_resolver", 2.0),
             // retrans_burst_fires_at_five_a_minute
             ("tcp.retrans_burst", 5.0),
             // kernel::tests::matched_positive_negative_and_unknown
@@ -1147,6 +1151,15 @@ mod tests {
             ),
             (5.0, 60.0, 12.0, 15.0),
             "dns.failing's trigger quotes these"
+        );
+        assert_eq!(
+            (
+                crate::collectors::health::DNS_WINDOW_CYCLES,
+                crate::collectors::health::DNS_WINDOW_SECS,
+                Thresholds::default().confirmations("dns.slow_resolver"),
+            ),
+            (6, 30, 2),
+            "dns.slow_resolver's trigger quotes these"
         );
         let defaults = serde_json::to_value(Thresholds::default()).expect("thresholds serialise");
         let default_of = |field: &str| {
