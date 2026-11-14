@@ -29,10 +29,10 @@ pub fn compile(schema: &Value) -> Validator {
 }
 
 pub fn errors(validator: &Validator, doc: &Value) -> Vec<String> {
-    match validator.validate(doc) {
-        Ok(()) => vec![],
-        Err(found) => found.map(|e| format!("{}: {e}", e.instance_path)).collect(),
-    }
+    validator
+        .iter_errors(doc)
+        .map(|e| format!("{}: {e}", e.instance_path()))
+        .collect()
 }
 
 /// `schema` with its open parts closed, which is how a test notices a field or
