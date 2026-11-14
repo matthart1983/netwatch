@@ -4,6 +4,7 @@
 
 use super::format::{canonical_ip, parse_ip};
 use super::{CapturedPacket, IndexSpace};
+use std::net::IpAddr;
 
 // ── Display filters ─────────────────────────────────────────
 
@@ -73,8 +74,17 @@ fn tokenize(input: &str) -> Vec<String> {
             continue;
         }
         if ch == '!' {
-            tokens.push("!".to_string());
             chars.next();
+            // `!=` is one operator; a lone `!` negates what follows.
+            if chars.peek() == Some(&'=') {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                }
+                tokens.push("!=".to_string());
+            } else {
+                tokens.push("!".to_string());
+            }
             continue;
         }
         if ch == '=' {
@@ -157,25 +167,29 @@ fn parse_atom(tokens: &[String]) -> Option<(FilterExpr, &[String])> {
         return None;
     }
 
-    // ip.src == x
-    if tokens[0].eq_ignore_ascii_case("ip.src") && tokens.len() >= 3 && tokens[1] == "==" {
-        return Some((FilterExpr::SrcIp(address_value(&tokens[2])), &tokens[3..]));
-    }
-    // ip.dst == x
-    if tokens[0].eq_ignore_ascii_case("ip.dst") && tokens.len() >= 3 && tokens[1] == "==" {
-        return Some((FilterExpr::DstIp(address_value(&tokens[2])), &tokens[3..]));
-    }
-    // ip.addr == x: either end, as Wireshark spells it
-    if tokens[0].eq_ignore_ascii_case("ip.addr") && tokens.len() >= 3 && tokens[1] == "==" {
-        return Some((FilterExpr::Ip(address_value(&tokens[2])), &tokens[3..]));
-    }
-    // port [==] N
-    if tokens[0].eq_ignore_ascii_case("port") && tokens.len() >= 2 {
-        if tokens[1] == "==" && tokens.len() >= 3 {
-            if let Ok(p) = tokens[2].parse::<u16>() {
-                return Some((FilterExpr::Port(p), &tokens[3..]));
-            }
+    // ip.src, ip.dst, ip.addr and port, compared with `==` or `!=`. `!=`
+    // is the negation of `==`, so `ip.addr != x` keeps the packets where
+    // neither end is `x`, as Wireshark reads it since 3.6.
+    if tokens.len() >= 3 && (tokens[1] == "==" || tokens[1] == "!=") {
+        let field = tokens[0].to_ascii_lowercase();
+        let equals = match field.as_str() {
+            "ip.src" => Some(FilterExpr::SrcIp(address_value(&tokens[2])?)),
+            "ip.dst" => Some(FilterExpr::DstIp(address_value(&tokens[2])?)),
+            "ip.addr" => Some(FilterExpr::Ip(address_value(&tokens[2])?)),
+            "port" => Some(FilterExpr::Port(tokens[2].parse::<u16>().ok()?)),
+            _ => None,
+        };
+        if let Some(equals) = equals {
+            let expr = if tokens[1] == "!=" {
+                FilterExpr::Not(Box::new(equals))
+            } else {
+                equals
+            };
+            return Some((expr, &tokens[3..]));
         }
+    }
+    // port N
+    if tokens[0].eq_ignore_ascii_case("port") && tokens.len() >= 2 {
         if let Ok(p) = tokens[1].parse::<u16>() {
             return Some((FilterExpr::Port(p), &tokens[2..]));
         }
@@ -248,6 +262,16 @@ fn parse_atom(tokens: &[String]) -> Option<(FilterExpr, &[String])> {
     if let Some(ip) = canonical_ip(word) {
         return Some((FilterExpr::Ip(ip), &tokens[1..]));
     }
+    // A bare range, `10.0.0.0/8`. Only a word whose first part is an
+    // address is read as one, so `GET /index` stays a text search, and a
+    // range with a prefix length no address has is rejected, not searched
+    // for as text.
+    if word
+        .split_once('/')
+        .is_some_and(|(addr, _)| parse_ip(addr).is_some())
+    {
+        return Some((FilterExpr::Ip(canonical_cidr(word)?), &tokens[1..]));
+    }
     if word.contains('.') && word.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return Some((FilterExpr::Ip(word.to_string()), &tokens[1..]));
     }
@@ -269,19 +293,64 @@ fn parse_atom(tokens: &[String]) -> Option<(FilterExpr, &[String])> {
 /// The value of an address filter as typed. A whole address is stored in
 /// the spelling packet decoding uses, so `2001:DB8:0:0:0:0:0:1`,
 /// `[2001:db8::1]`, `fe80::1%eth0` and `::ffff:192.0.2.1` (as `ss` shows a
-/// dual-stack socket's IPv4 peer) each find their packets. Anything else is
-/// kept as text to match against.
-fn address_value(token: &str) -> String {
+/// dual-stack socket's IPv4 peer) each find their packets. A range in CIDR
+/// notation is stored as its network and prefix length. Anything else is
+/// kept as text to match against, except something written as a range that
+/// is not one, which is `None`: `10.0.0.0/33` matching nothing, silently,
+/// reads as "no such traffic".
+fn address_value(token: &str) -> Option<String> {
     let token = token.trim_matches('"');
-    canonical_ip(token).unwrap_or_else(|| token.to_lowercase())
+    if token.contains('/') {
+        return canonical_cidr(token);
+    }
+    Some(canonical_ip(token).unwrap_or_else(|| token.to_lowercase()))
+}
+
+/// `addr/len` as a network and a prefix length, or `None` when the address
+/// does not parse or the length is longer than the address.
+fn parse_cidr(text: &str) -> Option<(IpAddr, u8)> {
+    let (addr, len) = text.split_once('/')?;
+    let addr = parse_ip(addr)?;
+    let len: u8 = len.parse().ok()?;
+    let bits = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    (len <= bits).then(|| (network_of(addr, len), len))
+}
+
+/// `192.168.0.77/24` as `192.168.0.0/24`: the range, whichever of its
+/// addresses was typed.
+fn canonical_cidr(text: &str) -> Option<String> {
+    parse_cidr(text).map(|(network, len)| format!("{network}/{len}"))
+}
+
+/// `addr` with every bit after the first `len` cleared.
+fn network_of(addr: IpAddr, len: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            IpAddr::V4((u32::from(v4) & mask).into())
+        }
+        IpAddr::V6(v6) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            IpAddr::V6((u128::from(v6) & mask).into())
+        }
+    }
 }
 
 /// Whether a packet address matches an address filter's value. A whole
 /// address matches the same address, compared as addresses: as text,
 /// compressed IPv6 matches far too much, since `::1` is inside `2001:db8::1`
 /// and `fe80::1` inside `fe80::1c2:3`, and `10.0.0.1` inside `10.0.0.10`
-/// never meant that either. A fragment such as `192.168.` matches as text.
+/// never meant that either. A range matches the addresses of its own family
+/// inside it. A fragment such as `192.168.` matches as text.
 fn address_matches(addr: &str, wanted: &str) -> bool {
+    if let Some((network, len)) = parse_cidr(wanted) {
+        return parse_ip(addr).is_some_and(|addr| {
+            addr.is_ipv4() == network.is_ipv4() && network_of(addr, len) == network
+        });
+    }
     match parse_ip(wanted) {
         Some(wanted) => parse_ip(addr) == Some(wanted),
         None => addr.contains(wanted),
