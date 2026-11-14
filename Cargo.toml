@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 edition = "2021"
 # Minimum supported Rust version, checked by CI's msrv job. Raised only in a
 # minor release, and named in the changelog when it is. Today's floor is

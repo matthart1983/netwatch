@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [1.0.0-rc.4] - 2026-11-14
 
 ### Added
 - **Packet filters take CIDR ranges and `!=`** (#202). `ip.src == 192.168.0.0/24`,
