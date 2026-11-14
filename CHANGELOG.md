@@ -76,6 +76,12 @@ All notable changes to NetWatch will be documented in this file.
   a gateway that answers echo no longer can. IPv6 gateways and other platforms still
   read "not measured".
 
+- **macOS: `link.down` sees an unplugged cable.** The interface's UP flag is the admin
+  state and stays set when the cable is pulled or the radio has no network. netwatch now
+  also reads ifconfig's `status: inactive` line. Interfaces that report no media status,
+  such as `lo0` and `utun`, still stand on the flag. This was written and tested on Linux
+  against sample ifconfig output and has not been run on a Mac.
+
 - **A slow or silent resolver is compared with the public reference resolver.** The
   cross-check's query to 1.1.1.1 was already sent every probe cycle and its timing thrown
   away. It is now kept, and sent whether or not your resolver answers. When the reference

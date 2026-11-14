@@ -190,7 +190,7 @@ These rules have detectors and can open issues. What they have not had is a writ
 | `dns.slow_resolver` | dns | resolver median over 6 probe cycles (30s in the TUI) > 3σ above baseline, at least 5ms above it and at least 2× it, or > 100ms with or without a baseline, for 2 such windows in a row | active |
 | `dns.failing` | dns | at least 5 of the last 60 probe queries unanswered or answered SERVFAIL, one of them among the newest 12, with the lower confidence bound on that share above 5%; or every query failing that way for 15s | active |
 | `dns.truncation_retry` | dns | more than 10% of probe replies carry the TC bit | active |
-| `link.down` | link | the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says "Media disconnected" | active |
+| `link.down` | link | the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag or reports "status: inactive"; on windows ipconfig says "Media disconnected" | active |
 | `gateway.rtt_spike` | link | gateway rtt > 3σ and at least 10ms above baseline for 3 samples | active |
 | `iface.errors` | link | over the last minute, at least 5 interface errors, or errors over 1% of packets, or drops over 2% of packets on a wired link and 10% on wi-fi; shares are judged only above 1000 packets a minute | active |
 | `iface.saturated` | link | throughput at or above 90% of the link rate the os reports, for 3 interface samples | active |

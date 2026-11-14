@@ -219,10 +219,9 @@ pub const CATALOGUE: &[Rule] = &[
         title: "link down",
         category: "link",
         severity: Severity::Critical,
-        // Each OS reports "up" differently, and macOS reports the admin flag
-        // rather than carrier. A09 moves macOS to the `status:` line and
-        // rewrites that clause.
-        trigger: "the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says \"Media disconnected\"",
+        // Each OS reports "up" differently. On macOS the UP flag is the
+        // admin state, so the media status line is read as well.
+        trigger: "the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag or reports \"status: inactive\"; on windows ipconfig says \"Media disconnected\"",
         suppresses: &["gateway.unreachable"],
         status: RuleStatus::Active,
         maturity: Maturity::Beta,

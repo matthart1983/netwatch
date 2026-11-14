@@ -109,6 +109,13 @@ fn parse_ifconfig_output(text: &str) -> Vec<InterfaceInfo> {
                 }
             } else if trimmed.starts_with("ether ") {
                 iface.mac = trimmed.split_whitespace().nth(1).map(|s| s.to_string());
+            } else if trimmed == "status: inactive" {
+                // The UP flag is the admin state: an interface with its cable
+                // pulled, or a radio with no network, keeps it. The media
+                // status is what says the link is gone. Interfaces with no
+                // media to report (lo0, utun) print no status line and stand
+                // on the flag.
+                iface.is_up = false;
             }
         }
     }
@@ -192,6 +199,40 @@ fn parse_route_get_interface(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IFCONFIG_OUTPUT: &str = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether aa:bb:cc:dd:ee:ff
+\tinet 10.0.0.50 netmask 0xffffff00 broadcast 10.0.0.255
+\tmedia: autoselect
+\tstatus: active
+en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether aa:bb:cc:dd:ee:00
+\tmedia: autoselect (none)
+\tstatus: inactive
+en6: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500
+\tether aa:bb:cc:dd:ee:01
+\tstatus: active
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+\tinet6 fe80::1%utun0 prefixlen 64 scopeid 0x10
+";
+
+    /// An unplugged cable leaves the UP flag set; `status: inactive` is what
+    /// says the link is down.
+    #[test]
+    fn an_inactive_interface_is_down_whatever_its_up_flag_says() {
+        let up: HashMap<String, bool> = parse_ifconfig_output(IFCONFIG_OUTPUT)
+            .into_iter()
+            .map(|i| (i.name, i.is_up))
+            .collect();
+        assert!(up["en0"]);
+        assert!(!up["en5"], "UP flag set, media inactive");
+        assert!(!up["en6"], "admin down, whatever the media says");
+        assert!(up["lo0"], "no status line: the flag stands");
+        assert!(up["utun0"]);
+    }
 
     const NETSTAT_OUTPUT: &str = "\
 Name       Mtu   Network       Address             Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
