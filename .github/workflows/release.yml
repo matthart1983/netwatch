@@ -135,7 +135,7 @@ jobs:
       # check an installed netwatch without the SBOM beside it.
       - name: Install cargo-auditable
         if: matrix.target != 'armv5te-unknown-linux-gnueabi'
-        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-auditable@0.7.7
 
@@ -292,7 +292,7 @@ jobs:
       # runner is x86_64 and would corrupt the aarch64 binary.
       - name: Install packaging tools
         if: contains(matrix.target, 'linux-musl')
-        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deb,cargo-generate-rpm
 
@@ -378,7 +378,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Build inside a FreeBSD 13 VM
-        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1.6.0
         with:
           release: "13.5"
           usesh: true
@@ -454,7 +454,7 @@ jobs:
       # embeds. A build step that lost the wrapper still links fine, so
       # check the artifacts rather than trust the build.
       - name: Install rust-audit-info
-        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: rust-audit-info@0.5.4
       - name: Check every binary is auditable
@@ -501,7 +501,7 @@ jobs:
       #   gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch \
       #     --predicate-type https://cyclonedx.org/bom
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-cyclonedx
       - name: Generate the SBOM
@@ -522,7 +522,7 @@ jobs:
           sbom-path: ${{ steps.sbom.outputs.path }}
 
       - name: Create Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
           # A tag with a hyphen (v0.33.0-rc.1) is a pre-release: GitHub keeps
@@ -572,7 +572,7 @@ jobs:
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
