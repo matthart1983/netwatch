@@ -192,7 +192,7 @@ These rules have detectors and can open issues. What they have not had is a writ
 | `dns.truncation_retry` | dns | more than 10% of probe replies carry the TC bit | active |
 | `link.down` | link | the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says "Media disconnected" | active |
 | `gateway.rtt_spike` | link | gateway rtt > 3σ and at least 10ms above baseline for 3 samples | active |
-| `iface.errors` | link | rx/tx error, drop, overrun or fifo counters increment | active |
+| `iface.errors` | link | over the last minute, at least 5 interface errors, or errors over 1% of packets, or drops over 2% of packets on a wired link and 10% on wi-fi; shares are judged only above 1000 packets a minute | active |
 | `iface.saturated` | link | throughput at or above 90% of the link rate the os reports, for 3 interface samples | active |
 | `wifi.weak_signal` | link | signal at or below −70 dBm, or more than 20% of frames retried over a minute | active |
 | `path.changed` | path | a hop differs between consecutive traces to the same target | active |

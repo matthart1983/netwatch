@@ -931,7 +931,7 @@ impl Engine {
                 }),
                 _ => {}
             }
-            let mut values = metric_values(&scoped);
+            let mut values = metric_values(&scoped, &self.settings.thresholds);
             add_sigma_metrics(&mut values, &scoped, base, floor);
             let available = self.coverage.rules.iter().any(|r| {
                 r.rule == issue.rule && r.status == super::coverage::Availability::Available
@@ -1590,7 +1590,7 @@ fn add_sigma_metrics(
 /// Flatten observations into the metric namespace the verify conditions use.
 /// Every key here matches an `Evidence::metric` a detector emits — that shared
 /// vocabulary is what lets a rule declare its own success condition.
-fn metric_values(obs: &Observations) -> HashMap<String, f64> {
+fn metric_values(obs: &Observations, t: &super::detectors::Thresholds) -> HashMap<String, f64> {
     let mut m = HashMap::new();
     for (r, metric) in [
         ("ipv6.broken", "ipv6.probe_loss"),
@@ -1664,6 +1664,10 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
             m.insert("iface.carrier".to_string(), if up { 1.0 } else { 0.0 });
         }
         m.insert("iface.error_rate".to_string(), iface.error_rate() as f64);
+        m.insert("iface.fault_ratio".to_string(), iface.fault_ratio(t));
+        if let Some(share) = iface.drop_share_pct(t) {
+            m.insert("iface.drop_share".to_string(), share);
+        }
         if let Some(u) = iface.utilisation_pct() {
             m.insert("iface.utilisation".to_string(), u);
         }
@@ -3641,7 +3645,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(!metric_values(&link(None)).contains_key("iface.carrier"));
+        assert!(!metric_values(&link(None), &Default::default()).contains_key("iface.carrier"));
         engine.observe(&link(Some(false)), &base);
         let id = engine.primary()[0].id.clone();
         for _ in 0..10 {

@@ -250,7 +250,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "interface errors",
         category: "link",
         severity: Severity::Medium,
-        trigger: "rx/tx error, drop, overrun or fifo counters increment",
+        trigger: "over the last minute, at least 5 interface errors, or errors over 1% of packets, or drops over 2% of packets on a wired link and 10% on wi-fi; shares are judged only above 1000 packets a minute",
         suppresses: &[],
         status: RuleStatus::Active,
         maturity: Maturity::Beta,
@@ -912,7 +912,9 @@ pub fn default_verify(id: &str) -> Option<Verify> {
         "gateway.unreachable" => Verify::below("gateway.loss", 1.0, "%").holding_for(60),
         "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 2.0, "σ").holding_for(120),
         "link.down" => Verify::above("iface.carrier", 0.0, "").holding_for(30),
-        "iface.errors" => Verify::below("iface.error_rate", 1.0, "/min").holding_for(300),
+        "iface.errors" => {
+            Verify::below("iface.fault_ratio", 0.5, "× the open line").holding_for(300)
+        }
         "iface.saturated" => Verify::below("iface.utilisation", 90.0, "%").holding_for(60),
         "wifi.weak_signal" => Verify::above("wifi.rssi", -70.0, "dBm").holding_for(120),
         "path.changed" => Verify::below("path.hop_changes", 1.0, "").holding_for(300),
@@ -1000,11 +1002,7 @@ mod tests {
     /// stands, and the item with what the text gets wrong. The guard below
     /// skips them. The item rewrites the text and removes its row; a row
     /// whose text has already changed fails, so none outlives its reason.
-    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[(
-        "iface.errors",
-        "rx/tx error, drop, overrun or fifo counters increment",
-        "B19: fires on the per-minute error and drop floors, not on any increment",
-    )];
+    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[];
 
     /// The quantities a trigger quotes. Digits glued to a word name
     /// something (p50, v6, 5xx) and are not quantities; a unit glued to a
@@ -1100,6 +1098,16 @@ mod tests {
                 &["sigma_k", "gateway_delta_floor_ms", "consecutive_n"],
             ),
             ("wifi.weak_signal", &["wifi_rssi_dbm", "wifi_retry_pct"]),
+            (
+                "iface.errors",
+                &[
+                    "iface_error_floor",
+                    "iface_error_pct",
+                    "iface_drop_pct",
+                    "iface_drop_pct_wifi",
+                    "iface_min_packets",
+                ],
+            ),
             ("iface.saturated", &["saturation_pct", "consecutive_n"]),
             ("path.rtt_spike", &["sigma_k"]),
             (

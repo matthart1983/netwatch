@@ -58,6 +58,16 @@ All notable changes to NetWatch will be documented in this file.
   an answer too small to truncate, so the rule's coverage row now reads "not measured"
   until a truncated reply is seen, instead of "ready".
 
+- **`iface.errors` judges drops and errors as a share of packets, and can close.** The
+  rule opened on 60 drops a minute and closed only under one error or drop a minute, so a
+  Wi-Fi driver discarding broadcast frames opened it and it never closed. It now opens
+  on 5 errors in a minute, errors over 1% of packets, or drops over 2% of packets on a
+  wired link and 10% on Wi-Fi, with shares judged only above 1,000 packets a minute. It
+  closes once it has stayed under half its open line for five minutes.
+  `diagnose_thresholds` gains `iface_error_pct`, `iface_drop_pct`, `iface_drop_pct_wifi`
+  and `iface_min_packets`; `iface_error_floor`'s default moves from 1 to 5, and
+  `iface_drop_floor` now only feeds the slow-resolver cause check. The rule stays beta.
+
 - **A slow or silent resolver is compared with the public reference resolver.** The
   cross-check's query to 1.1.1.1 was already sent every probe cycle and its timing thrown
   away. It is now kept, and sent whether or not your resolver answers. When the reference

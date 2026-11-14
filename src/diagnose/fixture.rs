@@ -128,6 +128,7 @@ fn healthy_iface() -> IfaceObs {
         tx_dropped: 0,
         errors_per_min: 0,
         drops_per_min: Some(0),
+        packets_per_min: Some(12_000),
         link_rate_bps: Some(1e9),
         wireless: Some(false),
         signal_dbm: None,
@@ -1748,44 +1749,41 @@ mod tests {
         assert_eq!(unknown, 180);
     }
 
-    /// A Wi-Fi driver's background drops open iface.errors two seconds in
-    /// and hold it open to the end, because it closes only under 1/min
-    /// errors and drops combined; `PENDING_CLOSE` in episode.rs says so.
-    /// The drops are all that hold it: without them the errors open it at
-    /// 124 s and it closes at 659 s, 300 s after the last error leaves the
-    /// minute's count.
+    /// A Wi-Fi driver drops 70 unwanted frames a minute throughout. That
+    /// is 0.6% of the 12,000 packets the link carries, so it opens nothing;
+    /// the errors open iface.errors once five are in the minute's count and
+    /// it closes 300 s after they fall under half that. Judged by count, as
+    /// a recording without packet counts still is, the drops open it two
+    /// seconds in and hold it open to the end.
     #[test]
-    fn background_wifi_drops_hold_iface_errors_open() {
+    fn background_wifi_drops_neither_open_nor_hold_iface_errors() {
         assert_eq!(
             pinned_spans("iface-errors-wifi-drops"),
-            vec![("2026-09-03 06:44:02".to_string(), None, None)]
+            vec![span(
+                "2026-09-03 06:46:12",
+                "2026-09-03 06:54:55",
+                "auto-closed"
+            )]
         );
         let scenario = scenarios()
             .into_iter()
             .find(|s| s.id == "iface-errors-wifi-drops")
             .unwrap();
-        let errors_alone = record(&Scenario {
+        let by_count = record(&Scenario {
             obs: |t| {
                 let mut obs = iface_errors_wifi_drops(t);
-                obs.iface.as_mut().unwrap().drops_per_min = Some(0);
+                obs.iface.as_mut().unwrap().packets_per_min = None;
                 obs
             },
             ..scenario
         });
-        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&errors_alone);
+        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&by_count);
         let spans: Vec<_> = decisions
             .issues
             .into_iter()
             .map(|s| (s.opened, s.closed, s.close_reason))
             .collect();
-        assert_eq!(
-            spans,
-            vec![span(
-                "2026-09-03 06:46:04",
-                "2026-09-03 06:54:59",
-                "auto-closed"
-            )]
-        );
+        assert_eq!(spans, vec![("2026-09-03 06:44:02".to_string(), None, None)]);
     }
 
     /// Without an age under its own name a target's result is dropped as

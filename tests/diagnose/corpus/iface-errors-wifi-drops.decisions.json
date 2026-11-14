@@ -4,9 +4,10 @@
   "issues": [
     {
       "key": "iface.errors|wlan0",
-      "opened": "2026-09-03 06:44:02",
-      "closed": null,
-      "top_cause": "iface.errors/ring_buffer_small"
+      "opened": "2026-09-03 06:46:12",
+      "closed": "2026-09-03 06:54:55",
+      "top_cause": "iface.errors/ring_buffer_small",
+      "close_reason": "auto-closed"
     }
   ]
 }

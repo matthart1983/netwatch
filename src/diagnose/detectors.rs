@@ -73,14 +73,25 @@ pub struct Thresholds {
     pub loaded_rtt_delta_ms: f64,
     /// Interface utilisation counted as saturation.
     pub saturation_pct: f64,
-    /// Interface *errors* per minute before the rule fires. Errors are rare
-    /// and always mean something, so the floor is low.
+    /// Interface *errors* per minute at which `iface.errors` opens, whatever
+    /// the traffic. Errors are rare, but a single one in a minute is not a
+    /// fault.
     pub iface_error_floor: f64,
-    /// Interface *drops* per minute before the rule fires. Much higher than
-    /// the error floor: a wireless NIC drops multicast and management frames
-    /// as a matter of course, and reporting one drop a minute as a fault
-    /// trains people to ignore the tab.
+    /// Interface *drops* per minute that count as local loss where packet
+    /// counts are missing: a recording from before they were kept, and the
+    /// `interface_drops` check on a slow resolver.
     pub iface_drop_floor: f64,
+    /// Errors as a share of packets at which `iface.errors` opens.
+    pub iface_error_pct: f64,
+    /// Drops as a share of packets at which `iface.errors` opens on a wired
+    /// link.
+    pub iface_drop_pct: f64,
+    /// The same on Wi-Fi, and where the link type is unknown. A radio drops
+    /// multicast and management frames it has no use for as a matter of
+    /// course, and reporting that trains people to ignore the tab.
+    pub iface_drop_pct_wifi: f64,
+    /// Packets a minute below which a share of them is not judged.
+    pub iface_min_packets: f64,
     /// Share of DNS replies carrying the TC bit before truncation is a
     /// finding. Some truncation is normal for large answers over UDP.
     pub dns_tc_pct: f64,
@@ -113,8 +124,12 @@ impl Default for Thresholds {
             socket_rtt_ms: 100.0,
             loaded_rtt_delta_ms: 100.0,
             saturation_pct: 90.0,
-            iface_error_floor: 1.0,
+            iface_error_floor: 5.0,
             iface_drop_floor: 60.0,
+            iface_error_pct: 1.0,
+            iface_drop_pct: 2.0,
+            iface_drop_pct_wifi: 10.0,
+            iface_min_packets: 1000.0,
             dns_tc_pct: 10.0,
             dns_failure_pct: 5.0,
             dns_mismatch_pct: 50.0,
@@ -246,6 +261,10 @@ impl Thresholds {
         check("saturation_pct", |t| &mut t.saturation_pct, share);
         check("iface_error_floor", |t| &mut t.iface_error_floor, number);
         check("iface_drop_floor", |t| &mut t.iface_drop_floor, number);
+        check("iface_error_pct", |t| &mut t.iface_error_pct, share);
+        check("iface_drop_pct", |t| &mut t.iface_drop_pct, share);
+        check("iface_drop_pct_wifi", |t| &mut t.iface_drop_pct_wifi, share);
+        check("iface_min_packets", |t| &mut t.iface_min_packets, number);
         check("dns_tc_pct", |t| &mut t.dns_tc_pct, share);
         check("dns_failure_pct", |t| &mut t.dns_failure_pct, share);
         check("dns_mismatch_pct", |t| &mut t.dns_mismatch_pct, share);
@@ -446,6 +465,10 @@ pub struct IfaceObs {
     /// `None` where the platform does not count drops (macOS), which is not
     /// the same as none dropped.
     pub drops_per_min: Option<u64>,
+    /// Packets received and sent over the same minute. `None` in recordings
+    /// made before it was kept, where drops are judged by count.
+    #[serde(default)]
+    pub packets_per_min: Option<u64>,
     pub link_rate_bps: Option<f64>,
     pub rx_bps: f64,
     pub tx_bps: f64,
@@ -467,6 +490,65 @@ impl IfaceObs {
     pub fn error_rate(&self) -> u64 {
         self.drops_per_min
             .map_or(self.errors_per_min, |d| self.errors_per_min + d)
+    }
+
+    /// How far this interface's errors and drops are over the lines
+    /// `iface.errors` opens on: the largest of errors a minute over the
+    /// floor, errors as a share of packets over theirs, and drops as a share
+    /// of packets over the line for this kind of link. `1.0` is the open
+    /// line. The rule opens and verifies on this one statistic.
+    ///
+    /// A share is judged only above [`Thresholds::iface_min_packets`]: 70
+    /// drops in a minute of 200 packets is a quiet radio discarding
+    /// broadcast, and it is 35%.
+    pub fn fault_ratio(&self, t: &Thresholds) -> f64 {
+        let over = |value: f64, line: f64| {
+            if value <= 0.0 {
+                0.0
+            } else {
+                (value / line.max(f64::MIN_POSITIVE)).min(1000.0)
+            }
+        };
+        let errors = self.errors_per_min as f64;
+        let mut ratio = over(errors, t.iface_error_floor);
+        match self.packets_per_min {
+            Some(packets) if packets > 0 && packets as f64 >= t.iface_min_packets => {
+                let share = |n: f64| n / packets as f64 * 100.0;
+                ratio = ratio.max(over(share(errors), t.iface_error_pct));
+                if let Some(drops) = self.drops_per_min {
+                    ratio = ratio.max(over(share(drops as f64), self.drop_line_pct(t)));
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Some(drops) = self.drops_per_min {
+                    ratio = ratio.max(over(drops as f64, t.iface_drop_floor));
+                }
+            }
+        }
+        ratio
+    }
+
+    /// The drop share this link is held to: the wired line only for a link
+    /// known to be wired.
+    pub fn drop_line_pct(&self, t: &Thresholds) -> f64 {
+        if self.wireless == Some(false) {
+            t.iface_drop_pct
+        } else {
+            t.iface_drop_pct_wifi
+        }
+    }
+
+    /// Drops as a share of packets, where both were counted and there were
+    /// enough packets for a share to mean anything.
+    pub fn drop_share_pct(&self, t: &Thresholds) -> Option<f64> {
+        let packets = self
+            .packets_per_min
+            .filter(|p| *p as f64 >= t.iface_min_packets)?;
+        (packets > 0).then(|| {
+            self.drops_per_min
+                .map(|d| d as f64 / packets as f64 * 100.0)
+        })?
     }
 
     pub fn utilisation_pct(&self) -> Option<f64> {
@@ -1602,10 +1684,8 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
     // Where drops are not counted the rule stands on errors alone, and
     // neither cause can weigh one against the other.
     let errors = iface.errors_per_min;
-    let drops_over_floor = iface
-        .drops_per_min
-        .is_some_and(|d| d as f64 >= t.iface_drop_floor);
-    if errors as f64 >= t.iface_error_floor || drops_over_floor {
+    let fault_ratio = iface.fault_ratio(t);
+    if fault_ratio >= 1.0 {
         let mut d = Detection::new(
             "iface.errors",
             Subject::Iface {
@@ -1614,6 +1694,16 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
         );
         d.evidence.push(
             Evidence::new("iface.error_rate", iface.error_rate() as f64, "/min").with_window(60, 1),
+        );
+        if let Some(share) = iface.drop_share_pct(t) {
+            d.evidence
+                .push(Evidence::new("iface.drop_share", share, "%").with_window(
+                    60,
+                    iface.packets_per_min.unwrap_or(0).min(u32::MAX as u64) as u32,
+                ));
+        }
+        d.evidence.push(
+            Evidence::new("iface.fault_ratio", fault_ratio, "× the open line").with_window(60, 1),
         );
         d.causes = vec![
             Cause::new(
@@ -3634,6 +3724,7 @@ mod tests {
             tx_dropped: 0,
             errors_per_min: 0,
             drops_per_min: Some(0),
+            packets_per_min: None,
             link_rate_bps: None,
             wireless: Some(wireless),
             signal_dbm: signal,
@@ -3785,6 +3876,7 @@ mod tests {
                 wireless: Some(true),
                 link_rate_bps: None,
                 drops_per_min: Some(drops_per_min),
+                packets_per_min: None,
                 ..eth0()
             }),
             ..obs_with_dns(DnsObs {
@@ -5365,6 +5457,7 @@ mod tests {
                 tx_dropped: 0,
                 errors_per_min: 40,
                 drops_per_min: Some(12),
+                packets_per_min: None,
                 link_rate_bps: Some(1e9),
                 wireless: Some(false),
                 signal_dbm: None,
@@ -5413,6 +5506,7 @@ mod tests {
             tx_dropped: 0,
             errors_per_min: 0,
             drops_per_min: Some(0),
+            packets_per_min: None,
             link_rate_bps: Some(1e9),
             wireless: Some(false),
             signal_dbm: None,
@@ -5435,18 +5529,75 @@ mod tests {
 
     #[test]
     fn iface_errors_fires_at_the_error_floor() {
-        // One error a minute: errors are rare and always mean something.
-        let found = link_rules(IfaceObs {
-            errors_per_min: 1,
+        // Five errors in a minute, whatever the traffic. One stray CRC
+        // error is not a fault.
+        let found = |errors_per_min| {
+            link_rules(IfaceObs {
+                errors_per_min,
+                ..eth0()
+            })
+        };
+        assert!(found(4).is_empty());
+        assert_eq!(found(5), ["iface.errors"]);
+    }
+
+    /// With packet counts, drops and errors are shares of what the link
+    /// carried: 2% on a wired link, 10% on a radio or an unknown link, and
+    /// 1% for errors, judged only above 1000 packets a minute.
+    #[test]
+    fn iface_errors_judges_shares_of_packets_above_the_packet_floor() {
+        let t = Thresholds::default();
+        let link = |wireless, packets, drops, errors| IfaceObs {
+            wireless,
+            packets_per_min: Some(packets),
+            drops_per_min: Some(drops),
+            errors_per_min: errors,
             ..eth0()
-        });
-        assert_eq!(found, ["iface.errors"]);
+        };
+        // 70 drops a minute, the count that used to open it: 0.7% of a busy
+        // link, and unjudged on a quiet one.
+        assert!(link_rules(link(Some(true), 10_000, 70, 0)).is_empty());
+        assert!(link_rules(link(Some(true), 200, 70, 0)).is_empty());
+        // Wired: 2%.
+        assert!(link_rules(link(Some(false), 10_000, 199, 0)).is_empty());
+        assert_eq!(
+            link_rules(link(Some(false), 10_000, 200, 0)),
+            ["iface.errors"]
+        );
+        // A radio, or a link of unknown kind: 10%.
+        assert!(link_rules(link(Some(true), 10_000, 999, 0)).is_empty());
+        assert_eq!(
+            link_rules(link(Some(true), 10_000, 1_000, 0)),
+            ["iface.errors"]
+        );
+        assert!(link_rules(link(None, 10_000, 999, 0)).is_empty());
+        // Errors: 1% of packets, under the count floor.
+        assert!(
+            link_rules(link(Some(false), 300, 4, 0)).is_empty(),
+            "too few packets"
+        );
+        let lossy = IfaceObs {
+            errors_per_min: 4,
+            ..link(Some(false), 300, 0, 0)
+        };
+        assert!(lossy.fault_ratio(&t) < 1.0);
+        let d = iface_errors(link(Some(false), 10_000, 400, 0));
+        let metrics: Vec<&str> = d.evidence.iter().map(|e| e.metric.as_str()).collect();
+        assert_eq!(
+            metrics,
+            ["iface.error_rate", "iface.drop_share", "iface.fault_ratio"]
+        );
+        assert_eq!(d.evidence[1].value, 4.0);
+        assert_eq!(d.evidence[2].value, 2.0, "twice the wired line");
+        // The verify reads the same statistic.
+        assert_eq!(d.verify.metric, "iface.fault_ratio");
     }
 
     #[test]
     fn iface_errors_fires_at_the_drop_floor() {
         let found = link_rules(IfaceObs {
             drops_per_min: Some(60),
+            packets_per_min: None,
             ..eth0()
         });
         assert_eq!(found, ["iface.errors"]);
@@ -5459,6 +5610,7 @@ mod tests {
         let found = link_rules(IfaceObs {
             errors_per_min: 0,
             drops_per_min: Some(59),
+            packets_per_min: None,
             ..eth0()
         });
         assert!(!found.contains(&"iface.errors"), "{found:?}");
@@ -5470,6 +5622,7 @@ mod tests {
         IfaceObs {
             errors_per_min,
             drops_per_min: None,
+            packets_per_min: None,
             ..eth0()
         }
     }
@@ -5491,18 +5644,19 @@ mod tests {
     #[test]
     fn without_drop_counters_iface_errors_judges_errors_only() {
         assert!(link_rules(uncounted_drops(0)).is_empty());
-        let d = iface_errors(uncounted_drops(3));
+        let d = iface_errors(uncounted_drops(6));
         assert_eq!(d.evidence[0].metric, "iface.error_rate");
-        assert_eq!(d.evidence[0].value, 3.0);
-        assert_eq!(uncounted_drops(3).error_rate(), 3);
+        assert_eq!(d.evidence[0].value, 6.0);
+        assert_eq!(uncounted_drops(6).error_rate(), 6);
         let counted = IfaceObs {
             drops_per_min: Some(5),
-            ..uncounted_drops(3)
+            packets_per_min: None,
+            ..uncounted_drops(6)
         };
-        assert_eq!(counted.error_rate(), 8);
+        assert_eq!(counted.error_rate(), 11);
 
         let obs = Observations {
-            iface: Some(uncounted_drops(3)),
+            iface: Some(uncounted_drops(6)),
             ..Default::default()
         };
         let coverage = crate::diagnose::coverage::Coverage::from_observations(
@@ -5529,7 +5683,7 @@ mod tests {
     #[test]
     fn ring_buffer_cause_is_not_run_without_drop_counters() {
         use crate::diagnose::engine::{Engine, FixedClock};
-        let d = iface_errors(uncounted_drops(3));
+        let d = iface_errors(uncounted_drops(6));
         let cause = |id| d.causes.iter().find(|c| c.id == id).unwrap();
         let ring = cause("ring_buffer_small");
         assert_eq!(ring.confidence(), super::super::issue::Confidence::Untested);
@@ -6055,6 +6209,7 @@ mod tests {
                 tx_dropped: 0,
                 errors_per_min: 0,
                 drops_per_min: Some(0),
+                packets_per_min: None,
                 link_rate_bps: None,
                 rx_bps: 0.0,
                 tx_bps: 0.0,
@@ -6283,6 +6438,7 @@ mod tests {
                 obs: Observations {
                     iface: Some(IfaceObs {
                         drops_per_min: None,
+                        packets_per_min: None,
                         errors_per_min: 40,
                         ..eth0()
                     }),

@@ -86,7 +86,7 @@ note = "A laptop on Wi-Fi at -53 dBm moves away at 120 s: -78 dBm, with 14% of f
 id = "iface-errors-wifi-drops"
 kind = "synthetic"
 rules = ["iface.errors"]
-note = "A Wi-Fi driver drops 70 unwanted frames a minute throughout, and the link takes 30 errors a minute from 120 s to 300 s. The drops alone open iface.errors at 2 s, and it never closes: it closes only under 1/min errors and drops combined. Pinned open until B19."
+note = "A Wi-Fi driver drops 70 unwanted frames a minute throughout, 0.6% of the packets the link carries, and the link takes 30 errors a minute from 120 s to 300 s. The drops open nothing. The errors open iface.errors at 132 s, and it closes at 655 s, 300 s after they fall under half its line."
 
 [[episode]]
 id = "target-resolve-failed"

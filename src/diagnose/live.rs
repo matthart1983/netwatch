@@ -121,6 +121,7 @@ pub struct LiveSampler {
     /// that logged 40 errors during boot last month is not a live fault) and
     /// not on a single tick's delta, which reported as "/min" is off by 60.
     iface_history: HashMap<String, IfaceCounters>,
+    packet_history: HashMap<String, IfaceCounters>,
     /// Target → the last trace we saw, for the path diff.
     prev_path: HashMap<String, Vec<HopObs>>,
     /// Interface name → the last minute of (tx retries, tx packets) deltas,
@@ -445,6 +446,14 @@ impl LiveSampler {
             .entry(t.name.clone())
             .or_insert_with(|| IfaceCounters::new(errors, drops));
         let (errors_per_min, drops_per_min) = history.observe(completed, errors, drops);
+        // The same minute's packets, so drops and errors can be read as a
+        // share of what the link carried.
+        let packets = t.rx_packets + t.tx_packets;
+        let (packets_per_min, _) = self
+            .packet_history
+            .entry(t.name.clone())
+            .or_insert_with(|| IfaceCounters::new(packets, 0))
+            .observe(completed, packets, 0);
         let counter_window_secs = Some(
             completed
                 .saturating_duration_since(history.started_at)
@@ -478,6 +487,7 @@ impl LiveSampler {
             counter_window_secs,
             errors_per_min,
             drops_per_min: drops_counted.then_some(drops_per_min),
+            packets_per_min: Some(packets_per_min),
             // Wired only. A wifi PHY rate moves with every retrain and is
             // not the rate the link can carry, so on wifi the saturation
             // rule stays dormant rather than crying wolf.

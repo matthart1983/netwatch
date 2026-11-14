@@ -1932,11 +1932,7 @@ mod tests {
     /// The owner accepts each row in the PR that adds it, and
     /// `pending_close_entries_are_still_needed` fails once the rule closes
     /// in an episode, so the row goes with the fix.
-    const PENDING_CLOSE: &[(&str, &str)] = &[(
-        "iface.errors",
-        "it closes only under 1/min errors and drops combined, which a Wi-Fi \
-         driver's background drops never allow, until B19 retunes it",
-    )];
+    const PENDING_CLOSE: &[(&str, &str)] = &[];
 
     /// Each corpus entry that lists `rule` among the rules it pins, with its
     /// pinned spans of that rule.
