@@ -105,7 +105,7 @@ mod wait_on_address {
     use core::ffi::c_void;
 
     #[link(name = "synchronization")]
-    extern "system" {
+    unsafe extern "system" {
         fn WaitOnAddress(
             address: *const c_void,
             compare_address: *const c_void,
