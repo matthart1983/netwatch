@@ -1903,11 +1903,18 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
 
 // ------------------------------------------------------------- gateway
 
+/// Why a check on the gateway's neighbour entry did not run.
+const NEIGHBOUR_UNKNOWN: &str =
+    "no neighbour entry for the gateway; the table is read on linux, for ipv4 gateways";
+
 fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<Detection> {
     let Some(gw) = &obs.gateway else {
         return vec![];
     };
-    if gw.arp_ok != Some(false) && gw.icmp_ok {
+    // The neighbour table informs the causes below and opens nothing: an
+    // entry is briefly incomplete whenever the kernel re-resolves it, and a
+    // gateway that answers echo is reachable whatever the table says.
+    if gw.icmp_ok {
         return detect_gateway_rtt(gw, base, t);
     }
     // The probe failed, but the internet answered — so the gateway is
@@ -1949,18 +1956,18 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                     Some(true) => CheckResult::pass(
                         "arp_resolves",
                         "arp resolves",
-                        "the gateway answered arp",
+                        "the neighbour table holds a resolved entry for the gateway",
                     ),
                     Some(false) => CheckResult::fail(
                         "arp_resolves",
                         "arp resolves",
-                        "no arp reply from the gateway",
+                        "the gateway's neighbour entry is incomplete: nothing answered arp",
                     ),
                     None => CheckResult::not_run(
                         "arp_resolves",
                         "arp resolves",
-                        Availability::NotImplemented,
-                        "no arp probe has run",
+                        Availability::NotMeasured,
+                        NEIGHBOUR_UNKNOWN,
                     ),
                 },
                 CheckResult::fail(
@@ -1979,16 +1986,18 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                     Some(false) => CheckResult::pass(
                         "arp_fails",
                         "arp fails",
-                        "no arp reply — we may not be on its segment",
+                        "the gateway's neighbour entry is incomplete: we may not be on its segment",
                     ),
-                    Some(true) => {
-                        CheckResult::fail("arp_fails", "arp fails", "arp resolved normally")
-                    }
+                    Some(true) => CheckResult::fail(
+                        "arp_fails",
+                        "arp fails",
+                        "the neighbour table holds a resolved entry for the gateway",
+                    ),
                     None => CheckResult::not_run(
                         "arp_fails",
                         "arp fails",
-                        Availability::NotImplemented,
-                        "no arp probe has run",
+                        Availability::NotMeasured,
+                        NEIGHBOUR_UNKNOWN,
                     ),
                 }
                 .weighted(2.0),
@@ -5091,6 +5100,24 @@ mod tests {
             detect(&obs, &store(), &Thresholds::default()).is_empty(),
             "the internet answered through this gateway — it is plainly up"
         );
+    }
+
+    /// The neighbour table fills in the causes and opens nothing. An entry
+    /// is incomplete for a moment whenever the kernel re-resolves it, and a
+    /// gateway answering echo is reachable.
+    #[test]
+    fn an_incomplete_neighbour_entry_alone_does_not_open_gateway_unreachable() {
+        let obs = Observations {
+            gateway: Some(GatewayObs {
+                rtt_ms: Some(2.0),
+                loss_pct: 0.0,
+                icmp_ok: true,
+                arp_ok: Some(false),
+                ..dead_gateway()
+            }),
+            ..Default::default()
+        };
+        assert!(detect(&obs, &store(), &Thresholds::default()).is_empty());
     }
 
     #[test]

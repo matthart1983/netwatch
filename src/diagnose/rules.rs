@@ -186,7 +186,7 @@ pub const CATALOGUE: &[Rule] = &[
         // The root cause of nearly everything else, so it suppresses widely.
         // A quiet router alone is not enough: a failed internet probe has to
         // corroborate it, and no ARP probe exists to consult.
-        trigger: "icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; arp is not probed",
+        trigger: "icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; the neighbour table informs the causes and does not open the issue",
         suppresses: &[
             "dns.slow_resolver",
             "dns.failing",
@@ -212,7 +212,7 @@ pub const CATALOGUE: &[Rule] = &[
             "an unprivileged run that cannot send icmp at all",
         ],
         recovery: "the gateway answers again, or something beyond it does",
-        platforms: "linux and macos; the neighbour table is not consulted, so arp is reported as unmeasured",
+        platforms: "linux and macos; the neighbour table is read on linux for ipv4 gateways, and elsewhere arp is reported as unmeasured",
     },
     Rule {
         id: "link.down",

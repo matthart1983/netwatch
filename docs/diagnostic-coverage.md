@@ -14,7 +14,7 @@ Runtime availability is a separate question, answered per host by `netwatch diag
 
 gateway unreachable · severity Critical · stable
 
-**Fires when:** icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; arp is not probed
+**Fires when:** icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; the neighbour table informs the causes and does not open the issue
 
 **Evidence required:**
 
@@ -28,7 +28,7 @@ gateway unreachable · severity Critical · stable
 
 **Recovery:** the gateway answers again, or something beyond it does
 
-**Platforms:** linux and macos; the neighbour table is not consulted, so arp is reported as unmeasured
+**Platforms:** linux and macos; the neighbour table is read on linux for ipv4 gateways, and elsewhere arp is reported as unmeasured
 
 **Suppresses:** `dns.slow_resolver`, `dns.failing`, `gateway.rtt_spike`, `path.high_loss`, `path.rtt_spike`, `tcp.retrans_burst`, `tcp.connect_failures`, `target.resolve_failed`, `target.connect_failed`, `target.tls_failed`, `target.http_error`, `target.slow_stage`
 

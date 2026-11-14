@@ -233,6 +233,77 @@ fn platform_default_route_interface() -> Option<String> {
 /// Two cfg'd definitions rather than one function with cfg'd blocks: the block
 /// form leaves a `return` that is needless on exactly one platform, which is a
 /// lint you only see on that platform's CI.
+/// Whether the kernel's neighbour table holds a resolved link-layer address
+/// for `addr`: `Some(true)` for an entry that resolved (reachable, stale,
+/// delay or probe), `Some(false)` for one that did not (incomplete or
+/// failed), and `None` when there is no entry, the address is not IPv4, or
+/// the platform's table is not read.
+///
+/// Read, never probed: netwatch sends no ARP of its own. The health probe's
+/// pings are what make the kernel resolve the gateway, so while they run the
+/// entry is current.
+pub fn neighbour_resolved(addr: &str) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let table = std::fs::read_to_string("/proc/net/arp").ok()?;
+        parse_proc_arp(&table, addr)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = addr;
+        None
+    }
+}
+
+/// `/proc/net/arp` for one address. The flags column is `ATF_*`: `0x2`
+/// (`ATF_COM`) is set once the address resolved, and an entry the kernel is
+/// still asking about, or gave up on, shows `0x0` with a zero hardware
+/// address. Several devices can hold an entry for one address; any resolved
+/// one counts.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_arp(table: &str, addr: &str) -> Option<bool> {
+    const ATF_COM: u32 = 0x2;
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let ip = cols.next()?;
+            let flags = cols.nth(1)?;
+            let flags = u32::from_str_radix(flags.trim_start_matches("0x"), 16).ok()?;
+            (ip == addr).then_some(flags & ATF_COM != 0)
+        })
+        .reduce(|a, b| a || b)
+}
+
+#[cfg(test)]
+mod neighbour_tests {
+    use super::parse_proc_arp;
+
+    const TABLE: &str = "\
+IP address       HW type     Flags       HW address            Mask     Device
+192.168.8.1      0x1         0x2         3c:52:a1:10:22:f0     *        wlp2s0
+192.168.8.77     0x1         0x0         00:00:00:00:00:00     *        wlp2s0
+10.0.0.1         0x1         0x0         00:00:00:00:00:00     *        eth1
+10.0.0.1         0x1         0x6         52:54:00:aa:bb:cc     *        eth0
+";
+
+    #[test]
+    fn a_resolved_entry_reads_true_and_an_incomplete_one_false() {
+        assert_eq!(parse_proc_arp(TABLE, "192.168.8.1"), Some(true));
+        assert_eq!(parse_proc_arp(TABLE, "192.168.8.77"), Some(false));
+    }
+
+    #[test]
+    fn no_entry_is_unknown_and_any_resolved_device_counts() {
+        assert_eq!(parse_proc_arp(TABLE, "192.168.8.2"), None);
+        assert_eq!(parse_proc_arp(TABLE, "192.168.8"), None, "no prefix match");
+        assert_eq!(parse_proc_arp(TABLE, "10.0.0.1"), Some(true));
+        assert_eq!(parse_proc_arp("", "10.0.0.1"), None);
+        assert_eq!(parse_proc_arp(TABLE, "fe80::1"), None);
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn link_speed_bps(iface: &str) -> Option<u64> {
     // /sys/class/net/<if>/speed is in Mb/s, and reads -1 (or fails with

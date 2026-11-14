@@ -68,6 +68,14 @@ All notable changes to NetWatch will be documented in this file.
   and `iface_min_packets`; `iface_error_floor`'s default moves from 1 to 5, and
   `iface_drop_floor` now only feeds the slow-resolver cause check. The rule stays beta.
 
+- **`gateway.unreachable` reads the kernel's neighbour table on Linux.** Its two ARP
+  checks always read "not run", because netwatch sends no ARP. They now read the
+  gateway's entry in `/proc/net/arp`: a resolved entry (stale included) supports "up but
+  not answering ICMP", and an incomplete one supports "wrong VLAN or address conflict".
+  The table only informs the causes. It never opens the issue, and an incomplete entry on
+  a gateway that answers echo no longer can. IPv6 gateways and other platforms still
+  read "not measured".
+
 - **A slow or silent resolver is compared with the public reference resolver.** The
   cross-check's query to 1.1.1.1 was already sent every probe cycle and its timing thrown
   away. It is now kept, and sent whether or not your resolver answers. When the reference

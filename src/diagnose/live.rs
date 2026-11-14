@@ -804,16 +804,18 @@ fn gateway(app: &App) -> Option<GatewayObs> {
             .pct()
             .map(|p| health.internet_rtt_ms.is_some() && p < 100.0)
     };
+    let arp_ok = crate::platform::neighbour_resolved(&addr);
     Some(GatewayObs {
         addr: Some(addr),
         rtt_ms: health.gateway_rtt_ms,
         loss_pct,
         internet_reachable,
-        // No ARP probe yet, so this stays unknown. Mirroring the ICMP result
-        // here made the checks assert "no arp reply from the gateway" about a
-        // probe that was never sent — and an unprivileged run, which cannot
-        // send ICMP at all, produced that line every time.
-        arp_ok: None,
+        // What the kernel's neighbour table says, where it is read. Unknown
+        // otherwise: mirroring the ICMP result here made the checks assert
+        // "no arp reply from the gateway" about something nobody looked at,
+        // and an unprivileged run, which cannot send ICMP at all, produced
+        // that line every time.
+        arp_ok,
         icmp_ok,
     })
 }
