@@ -70,6 +70,76 @@ fn grapheme_width(g: &str) -> usize {
     }
 }
 
+/// Wrap `lines` to `max_cols`, with every continuation row indented to where
+/// its line's own text starts.
+///
+/// `Paragraph`'s wrap restarts each continuation at column 0, so an indented
+/// step that ran past the edge came back flush left and read as a new, more
+/// important line:
+///
+/// ```text
+///   192.168.8.1 answered in 1.4ms during the check; run: sudo netwatch
+/// resolver set 192.168.8.1 --unmanaged
+/// ```
+///
+/// The hang is the line's leading blanks, plus a short list marker (`1.`,
+/// `·`, `→`, `✓`) when it opens with one, so a numbered cause wraps under its
+/// own words rather than under its number. Breaks fall between words; a word
+/// wider than the row is left for the caller's own wrap to cut.
+pub fn wrap_hanging(
+    lines: Vec<ratatui::text::Line<'static>>,
+    max_cols: usize,
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line, Span};
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if max_cols < 8 || width(&text) <= max_cols {
+            out.push(line);
+            continue;
+        }
+        let body = text.trim_start_matches(' ');
+        let mut hang = text.len() - body.len();
+        if let Some((marker, rest)) = body.split_once(' ') {
+            if !rest.is_empty()
+                && !marker.is_empty()
+                && width(marker) <= 2
+                && !marker.chars().all(char::is_alphabetic)
+            {
+                hang += width(marker) + 1;
+            }
+        }
+        // A hang deeper than half the row leaves no room to wrap into.
+        let hang = if hang > max_cols / 2 { 0 } else { hang };
+
+        let (style, alignment) = (line.style, line.alignment);
+        let mut row: Vec<Span<'static>> = Vec::new();
+        let mut used = 0usize;
+        let push_row = |row: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>| {
+            let mut l = Line::from(std::mem::take(row));
+            l.style = style;
+            l.alignment = alignment;
+            out.push(l);
+        };
+        for span in line.spans {
+            for word in span.content.split_inclusive(' ') {
+                let w = width(word.trim_end_matches(' '));
+                if used > hang && used + w > max_cols {
+                    push_row(&mut row, &mut out);
+                    row.push(Span::raw(" ".repeat(hang)));
+                    used = hang;
+                }
+                row.push(Span::styled(word.to_string(), span.style));
+                used += width(word);
+            }
+        }
+        if !row.is_empty() {
+            push_row(&mut row, &mut out);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +244,52 @@ mod tests {
         assert_eq!(prefix("ab\r\ncd", 3), "ab\r\nc");
         assert_eq!(prefix("あ\r\nい", 2), "あ\r\n");
         assert_eq!(prefix("ab", 0), "");
+    }
+}
+
+#[cfg(test)]
+mod wrap_hanging_tests {
+    use super::wrap_hanging;
+    use ratatui::text::Line;
+
+    fn rows(text: &str, cols: usize) -> Vec<String> {
+        wrap_hanging(vec![Line::from(text.to_string())], cols)
+            .into_iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .map(|r| r.trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_continuation_row_starts_under_its_lines_own_text() {
+        assert_eq!(
+            rows("  alpha beta gamma delta", 14),
+            ["  alpha beta", "  gamma delta"]
+        );
+    }
+
+    #[test]
+    fn a_numbered_item_wraps_under_its_words_not_its_number() {
+        assert_eq!(
+            rows("3. local conntrack or nftables", 20),
+            ["3. local conntrack", "   or nftables"]
+        );
+    }
+
+    #[test]
+    fn a_line_that_fits_is_left_alone() {
+        assert_eq!(rows("  short", 20), ["  short"]);
+    }
+
+    #[test]
+    fn no_row_is_wider_than_asked() {
+        for r in rows("  one two three four five six seven eight nine ten", 17) {
+            assert!(super::width(&r) <= 17, "{r:?}");
+        }
     }
 }

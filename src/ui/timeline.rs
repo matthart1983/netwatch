@@ -11,7 +11,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Length(2), // filter chips
+            Constraint::Length(1), // filter chips
             Constraint::Length(5), // activity strip
             Constraint::Min(8),    // events log
             Constraint::Length(3), // footer
@@ -40,18 +40,21 @@ enum Kind {
 impl Kind {
     fn label(self) -> &'static str {
         match self {
-            Kind::Crit => "CRIT",
-            Kind::Warn => "WARN",
-            Kind::Info => "INFO",
-            Kind::Ok => "OK",
+            Kind::Crit => "crit",
+            Kind::Warn => "warn",
+            Kind::Info => "info",
+            Kind::Ok => "ok",
         }
     }
     fn color(self, t: &crate::theme::Theme) -> Color {
         match self {
             Kind::Crit => t.status_error,
             Kind::Warn => t.status_warn,
-            Kind::Info => t.status_info,
-            Kind::Ok => t.status_good,
+            // Routine events take no status colour. A connection opening is
+            // not good news and one closing is not information of note; in
+            // green and cyan they were most of the colour on the screen, and
+            // the amber and red rows they surround are the ones that matter.
+            Kind::Info | Kind::Ok => t.text_muted,
         }
     }
 }
@@ -71,13 +74,13 @@ enum Category {
 impl Category {
     fn label(self) -> &'static str {
         match self {
-            Category::Conn => "CONN",
-            Category::Dns => "DNS",
-            Category::Rtt => "RTT",
-            Category::Iface => "IFACE",
+            Category::Conn => "conn",
+            Category::Dns => "dns",
+            Category::Rtt => "rtt",
+            Category::Iface => "iface",
             Category::Proc => "PROC",
             Category::Reset => "RESET",
-            Category::Alert => "ALERT",
+            Category::Alert => "alert",
         }
     }
 }
@@ -88,6 +91,10 @@ struct Event {
     category: Category,
     summary: String,
     detail: String,
+    /// The far end, for the events that have one: where `↵` goes.
+    remote: Option<String>,
+    /// How many identical events this row stands for.
+    count: usize,
 }
 
 fn build_events(app: &App) -> Vec<Event> {
@@ -100,25 +107,40 @@ fn build_events(app: &App) -> Vec<Event> {
 
     // Connection lifecycle from ConnectionTimeline.tracked
     for tracked in &app.connection_timeline.tracked {
+        // A listener or an unconnected datagram socket is a standing fact,
+        // not something that happened. They were listed as `established`
+        // to `0.0.0.0`, one event per socket.
+        if matches!(tracked.state.as_str(), "LISTEN" | "UNCONN") {
+            continue;
+        }
         let host = remote_host(&tracked.key.remote_addr);
-        let proc = tracked.process_name.clone().unwrap_or_else(|| "—".into());
-        let summary = format!(
-            "{} → {} {}",
-            proc,
-            host,
-            if tracked.is_active {
-                "established"
-            } else {
-                "closed"
-            }
-        );
+        let verb = if tracked.is_active {
+            "opened"
+        } else {
+            "closed"
+        };
+        // No process is no name, not a process called `—`: most closed
+        // sockets have none by the time they are seen, and `— → 127.0.0.53`
+        // down the whole list read as a column of missing data.
+        let summary = match &tracked.process_name {
+            Some(proc) => format!("{proc} → {host} {verb}"),
+            None => format!("{host} {verb}"),
+        };
         let detail = format!(
             "{}  age {}",
             tracked.key.protocol,
             duration_label(tracked.last_seen.duration_since(tracked.first_seen))
         );
         events.push(Event {
-            when: tracked.last_seen,
+            // An open connection happened when it was first seen. Stamped
+            // with `last_seen`, which every poll moves to now, each live
+            // socket was a fresh `0s ago` event on every frame and the list
+            // was the connection table again, 400 rows of it.
+            when: if tracked.is_active {
+                tracked.first_seen
+            } else {
+                tracked.last_seen
+            },
             kind: if tracked.is_active {
                 Kind::Ok
             } else {
@@ -127,6 +149,8 @@ fn build_events(app: &App) -> Vec<Event> {
             category: Category::Conn,
             summary,
             detail,
+            remote: Some(host.clone()),
+            count: 1,
         });
     }
 
@@ -158,6 +182,8 @@ fn build_events(app: &App) -> Vec<Event> {
                             label, rtt, baseline
                         ),
                         detail: format!("{:.1}× normal", rtt / baseline),
+                        remote: None,
+                        count: 1,
                     });
                     break;
                 }
@@ -180,6 +206,8 @@ fn build_events(app: &App) -> Vec<Event> {
             category: Category::Iface,
             summary: format!("{} {}", iface_ev.name, kind_label),
             detail: iface_ev.detail.clone(),
+            remote: None,
+            count: 1,
         });
     }
 
@@ -205,16 +233,60 @@ fn build_events(app: &App) -> Vec<Event> {
             when: Instant::now(),
             kind,
             category: Category::Dns,
-            summary: format!("{}  {}", label, truncate(&pkt.info, 60)),
+            // The endpoints are the detail's job; the summary is the answer.
+            summary: format!(
+                "{}  {}",
+                label,
+                truncate(crate::ui::packets::info_after_endpoints(&pkt.info), 120)
+            ),
             detail: format!(
                 "from {}",
                 crate::collectors::packets::format_endpoint(&pkt.src_ip, pkt.src_port.unwrap_or(0))
             ),
+            remote: None,
+            count: 1,
         });
     }
 
     events.sort_by_key(|b| std::cmp::Reverse(b.when));
-    events
+    fold_repeats(events)
+}
+
+/// One row for a run of events that say the same thing at the same moment.
+///
+/// A resolver lookup opens and closes a UDP socket in under a second, and a
+/// browser opens six connections to one host at once. Each was its own row,
+/// so the list was mostly the same sentence repeated; the ones that differed
+/// were pages down. Adjacent events with the same kind and text within two
+/// seconds of each other become one row with a count.
+fn fold_repeats(events: Vec<Event>) -> Vec<Event> {
+    let mut out: Vec<Event> = Vec::with_capacity(events.len());
+    for ev in events {
+        if let Some(last) = out.last_mut() {
+            let near = last.when.saturating_duration_since(ev.when).as_secs() <= 2;
+            if near
+                && last.kind == ev.kind
+                && last.category == ev.category
+                && last.summary == ev.summary
+            {
+                last.count += 1;
+                continue;
+            }
+        }
+        out.push(ev);
+    }
+    out
+}
+
+/// The remote address of the event under the cursor, if it has one. Read by
+/// `↵`, from the same list the table draws, so the row that is highlighted is
+/// the row that is opened.
+pub fn selected_remote(app: &App) -> Option<String> {
+    build_events(app)
+        .iter()
+        .filter(|e| filter_matches(app.ui.timeline_filter, e))
+        .nth(app.ui.scroll.timeline_scroll)
+        .and_then(|e| e.remote.clone())
 }
 
 fn alert_to_event(alert: &Alert) -> Event {
@@ -228,6 +300,8 @@ fn alert_to_event(alert: &Alert) -> Event {
         category: Category::Alert,
         summary: format!("{}  {}", alert.category.label(), alert.message),
         detail: alert.detail.clone(),
+        remote: None,
+        count: 1,
     }
 }
 
@@ -515,7 +589,7 @@ fn render_events(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
         return;
     }
 
-    let header = "  age        kind   cat    event";
+    let header = "  age        kind  cat    event";
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             header,
@@ -542,7 +616,12 @@ fn render_events(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
         .timeline_scroll
         .min(filtered.len().saturating_sub(1));
     let now = Instant::now();
+    // The row's fixed cells take 26 columns. The summary gets what the detail
+    // and the repeat count leave, not a flat 50 with half the row empty.
+    let text_w = (inner.width as usize).saturating_sub(2 + 26);
     for (i, ev) in filtered.iter().skip(scroll).take(max_rows).enumerate() {
+        let detail_w = crate::ui::text::width(&ev.detail).min(50);
+        let summary_w = text_w.saturating_sub(detail_w + 2 + 5).max(24);
         let row_y = inner.y + 1 + i as u16;
         let is_selected = i + scroll == app.ui.scroll.timeline_scroll;
         let age = format_age(now.duration_since(ev.when));
@@ -564,8 +643,16 @@ fn render_events(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
             ),
             Span::raw(" "),
             Span::styled(
-                truncate(&ev.summary, 50),
+                truncate(&ev.summary, summary_w),
                 Style::default().fg(t.text_primary),
+            ),
+            Span::styled(
+                if ev.count > 1 {
+                    format!(" ×{}", ev.count)
+                } else {
+                    String::new()
+                },
+                Style::default().fg(t.brand),
             ),
             Span::raw("  "),
             Span::styled(truncate(&ev.detail, 50), Style::default().fg(t.text_muted)),

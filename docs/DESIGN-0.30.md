@@ -449,8 +449,19 @@ capture-clearing action moved to `X`. DNS query→reply latency in the decode,
 compared against the resolver's own baseline. A stream summary panel beside the
 decode, carrying the resolver's query/reply counts and percentiles.
 
-**Not built.** The `:` command palette and the drill-through breadcrumb (§1.5,
-§6). Per-column selection chips (§3.2). The mirrored/labelled graph contract on
+**Built in 1.0 (2026-11 layout review).** The tab bar's width densities — full
+names, short names, digits with the current tab named — in place of §1.1's
+per-chip truncation order; chips that do not fit are left out whole. Tables that
+drop columns in priority order rather than clip (Dashboard connections,
+Connections, Processes) and that leave out the rate and round-trip columns when
+capture is off, saying so in the panel metadata (§2.2). Content-sized lists on
+Interfaces and Processes (§2.1). The `:` command palette and the drill-through
+breadcrumb with `esc` back (§1.5, §6); the palette lists each command with its
+key and runs it through the ordinary key handler. `src/layout_tests.rs` draws
+every tab at 80×24 through 200×55 and asserts the tab digits, `? help`, whole
+table headers and a non-empty dashboard.
+
+**Not built.** Per-column selection chips (§3.2). The mirrored/labelled graph contract on
 tabs other than Dashboard (§4). The per-tab layouts in §7 for tabs 2, 3, 5, 6,
 7, 8 and 0. Expert analysis for retransmission ordinals, SACK ranges, DNS
 truncation and RTO (§7, `4 packets`) — the column and its navigation exist, the

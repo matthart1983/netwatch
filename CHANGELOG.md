@@ -4,6 +4,26 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
+  `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change
+  in a minor release.
+- **Issue forms for a Diagnose false positive, a missed detection and a rule idea.**
+- **Pinned corpus episodes for the five stable rules.** `gateway.unreachable` and the four
+  `target.*` failure rules had none. Each now has an episode in which it opens and closes,
+  and a test requires one of every stable rule.
+- **A false-alert soak for Diagnose.** `examples/diagnose_quiet_soak.rs` records every
+  tick on an ordinary host and reports monitored host-weeks and opens per rule, replayed
+  against the current rules and judged against `tests/soak/witness.py`, an independent
+  log of pings and lookups. See `tests/soak/README.md`. No result is published yet.
+- **`:` opens a command palette.** Type part of an action's name and press `↵`. It lists the
+  current tab's actions first, then the ones that work everywhere, each with the key that does
+  the same thing.
+- **`Esc` goes back after `↵`.** Drilling from Processes, Timeline or Topology into Connections,
+  or from Connections into Packets, now leaves a path on the status row
+  (`connections › packets   esc back`), and `Esc` steps back along it and drops the filter the
+  drill applied.
+
 ### Changed
 - **Three Diagnose rules go back to beta, so five set `diagnose run`'s exit status.**
   `path.high_loss`, `tcp.bufferbloat_remote` and `dns.hijack_suspect` keep their written
@@ -99,19 +119,134 @@ All notable changes to NetWatch will be documented in this file.
   `dns.failing`, `dns.slow_resolver`) all had their inputs. Until then the grey line names
   the core rule that is waiting and why. Behind a local stub resolver the line adds that
   DNS speed was not judged. `diagnose run`'s outcomes and exit codes are unchanged.
+- **Processes reads like the rest of the app.** A process with no traffic is no longer a grey
+  row: names are primary text and counts secondary, as in Connections, and only zero or
+  unmeasured values are muted. The drill-in is indented like the Connections detail, and without
+  capture lists connections per remote in place of a rate of `0` and an empty chart.
+- **The Processes chart is the same chart as everywhere else.** The drill-in draws rx over tx
+  under a `● rx  ● tx  peak  avg` header with a time axis, one sample per sub-column, as
+  Interfaces and Stats do. It was a single rx plot that stretched sixty samples across the
+  width, so a one-second burst drew as a solid block.
+- **Diagnose is one box when nothing is wrong.** The quiet screen says so and fills the page;
+  the list of checks lives on the coverage screen (`c`).
+- **One spike no longer flattens the Stats and Interfaces graphs.** When a peak stands five times
+  above the rest of the window, the plot clips it at full height and the header says
+  `spike clipped`. The peak figure is unchanged, and a burst that lasts is never clipped.
+- **Control strips take one row.** Connections, Interfaces, Stats, Timeline and Processes had a blank
+  row under theirs.
+- **The Egress legend is spelled out.** It reads `~ asn allowed by network, not by name` and
+  `— no policy rule covers it`.
+- **Stats keeps its status row at 80×24.** The breakdown panels shrink first; the header used
+  to lose the verdict row instead.
+- **`t` no longer cycles the theme.** It did on the six tabs with no `t` of their own, while on
+  Dashboard, Stats, Timeline and Diagnose it was that tab's control. The theme is in Settings
+  (`,`).
+- **The tab bar fits the terminal.** Below 141 columns it shortens tab names (`1 dash  2 conns`),
+  and below about 108 it shows digits with only the current tab named. It used to run off the
+  right edge: at 120 columns `0 egress` was missing, at 80 so were tabs 7 to 9.
+- **Tables narrow instead of clipping.** The Connections tab's row was 132 columns wide, so in a
+  120-column terminal `rx/s`, `tx/s`, `rtt` and `age` were off screen. Connections, Processes and
+  the Dashboard's connections panel now give up their least-read columns first. At 80 columns the
+  Dashboard's connections panel was drawn empty.
+- **With capture off, the rate columns are left out.** Dashboard, Connections and Processes drew
+  `rx/s`, `tx/s` and `rtt` as a dash on every row. They now omit those columns and say
+  "rates and rtt need capture" in the panel title. Dense says the same in its connections box.
+- **Interfaces and Processes size their tables to their rows**, and the graph or drill-in panel
+  below takes the rest of the screen.
+- **One header row for attribution coverage**, in place of two, with byte counts in KB and MB.
+- **One mark for "not measured".** Dense wrote `--`, the Dashboard `–` and the tabs `—`. All
+  three are now `—`.
+- **The footer keeps `? help`.** When hints do not fit it drops the tab range, scrolling and the
+  recorder keys first. It used to drop from the right, which is where `? help` and `q quit` are.
+- **Egress and Settings use the same key-hint style as the other tabs**, and Egress column
+  headers and the detail panes' headings are lowercase like the rest.
+- **Table rows fade less.** The last row of a long list was dimmed to 55% and an idle row is
+  already muted, which made the bottom of the Processes list unreadable. The floor is 78%.
 
-### Added
-- **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
-  `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change
-  in a minor release.
-- **Issue forms for a Diagnose false positive, a missed detection and a rule idea.**
-- **Pinned corpus episodes for the five stable rules.** `gateway.unreachable` and the four
-  `target.*` failure rules had none. Each now has an episode in which it opens and closes,
-  and a test requires one of every stable rule.
-- **A false-alert soak for Diagnose.** `examples/diagnose_quiet_soak.rs` records every
-  tick on an ordinary host and reports monitored host-weeks and opens per rule, replayed
-  against the current rules and judged against `tests/soak/witness.py`, an independent
-  log of pings and lookups. See `tests/soak/README.md`. No result is published yet.
+- **Colour means health, and only health.** Connection states are no longer green, cyan and amber
+  for `estab`, `listen` and `time-wait`: an ordinary state is plain text, and only the half-closed
+  ones an application has left open take the warning colour. Routine Timeline events are muted,
+  so the warnings among them stand out. A retransmit count with no baseline is amber, not red.
+- **Timeline folds repeats.** Identical events within two seconds of each other are one row with
+  a count (`×6`), so DNS lookups no longer bury everything else.
+- **Stats tiles say what they count.** `packets` and `retrans` count the capture ring, not the
+  session, and are labelled that way. The per-second average, which divided the ring's size by
+  the session's age, is gone.
+- **The `app` column widens when the terminal has room**, so server names are shown whole.
+- **The geo column is left out when there is no GeoIP database** to fill it.
+- **The Dashboard's connections panel shows `retr` and `verdict` only when a row has one.**
+- **The Packets `info` column no longer repeats the source and destination** shown in the
+  columns beside it, so flags and sequence numbers fit.
+- **Typing a filter keeps a footer.** The filter line shows `↵ apply  esc cancel`, and an active
+  Connections filter is shown in the control strip.
+- **The sort picker, memory overlay and Diagnose coverage screen use the shared key-hint style**
+  and lowercase headers.
+
+- **A selected group in Connections lists what is inside it.** The detail pane was one line that
+  repeated the row. It now lists the group's remotes (or, grouped by remote, its processes) with
+  connection counts, states and rates, busiest first.
+- **The Connections table is as tall as its rows.** Rows it cannot fill go to the detail pane, up
+  to 18. Connections with no process are grouped as `unattributed`, not `—`, and sockets with no
+  peer (`0.0.0.0:*`) sort to the end of their group.
+- **Settings labels are lowercase** like the rest of the interface, and the title shows the
+  config path with `~` for the home directory.
+
+- **Packets pane titles are lowercase** (`payload`, `hex`), Interfaces and Stats say `rx`/`tx`,
+  and Egress shows `sort: volume` and `: command` in its footer.
+
+### Fixed
+- **One mark for zero and one for "not measured".** A zero rate or total printed `-` in
+  Processes, the attribution row and the detail panes, beside `0` in Connections and `—` for
+  unmeasured. Zero is now `0` everywhere and `—` means there was no measurement.
+- **The Packets hex pane lines up with its ascii pane.** In a pane narrower than 53 columns each
+  16-byte line wrapped, and the offsets in the two panes stopped matching. Narrow panes now show
+  eight bytes to a line.
+- **Packets no longer draws empty boxes on a short terminal.** With a packet selected at 80×24
+  the payload and hex boxes were two borders each with nothing inside. Under twelve rows the
+  column is the protocol decode alone.
+- **Interfaces detail lists only what it reads.** `SSID`, `link rate` and `uptime` were a fixed
+  `—` on every interface, and `collisions` a fixed `0` in the healthy colour.
+- **Timeline rows use the width they have.** Summaries were cut at 50 columns with half the row
+  empty, DNS errors repeated both endpoints before the answer, and a connection with no process
+  read `— → 127.0.0.53`.
+- **The Dashboard interfaces panel and the Topology hop table fit 80 columns.** `tx/s` and
+  `loss` were clipped at the panel edge and hop rows lost their jitter. Topology now says when
+  the graph is hidden for lack of room.
+- **The Packets list is readable in an 80-column terminal.** The table wanted 129 columns and
+  the shortfall came out of the time and both endpoints, leaving `20:10:` and `104.18.`. Narrow
+  terminals now drop the stream number, the length and the milliseconds, and an endpoint that is
+  still too long is cut before its port, not through it.
+- **The Connections panel keeps its name at 80 columns.** A long attribution warning in the
+  border overwrote it.
+- **Stats bars are proportional to their values.** They were drawn from the number after it had
+  been scaled to its unit, so `906 B` filled the track and `261.2 MB` above it got a third.
+- **Stats counts protocols by name.** The panel knew TCP, UDP, DNS, ICMP and ARP and filed
+  everything else under `other`, so an HTTPS download read `other 99%`.
+- **Processes columns line up with their headers.** The pid column was five wide and Linux pids
+  run to seven digits, which pushed the rest of the row right. Rows with equal rates also
+  changed order on every refresh.
+- **Packets keeps its tab bar in an 80×24 terminal.** The panes asked for 33 rows and the header
+  was the one that shrank.
+- **Timeline no longer lists every open connection as `0s ago`.** An open connection is stamped
+  when it was first seen, and listeners are not events.
+- **Topology and the Processes drill-in no longer count `0.0.0.0` and `::` as peers.** In a
+  terminal too narrow for the graph, Topology gives the space to the hop table.
+- **Connections rows under a group say `estab`, like the group**, not `ESTABLISHED`.
+- **Wrapped text in the Diagnose detail pane keeps its indent.**
+- **Frames are drawn whole.** Each frame is now wrapped in a synchronized update, so a tab
+  switch can no longer be seen half-painted on terminals that support it.
+- **`↵` on a Timeline event opens that event's connection.** It indexed a differently ordered
+  list with the table's cursor and opened whichever connection shared the row number.
+- **The hop table's colours match its legend.** A 14 ms hop was amber under a legend that puts
+  amber at 50 ms.
+- **A hop that ignores probes is `quiet`, not lossy**, when a hop behind it answers every one.
+- **Transmit rates are readable in the `dark` theme.** They were ANSI blue on a dark ground.
+- **A cancelled export is not reported with a success tick.**
+- **Loopback addresses are not LAN peers** in Topology.
+- **Dense shows seven-digit pids whole** and writes `TIMEWAIT`, not `TIME_W`.
+- **`PgUp`, `PgDn` and `Home` scroll the help overlay.**
+- **The selected row is readable in the `terminal` theme.** Muted text and the selection ground
+  are both ANSI 8 there, so the cursor on an idle process or a dim cell was a blank grey band.
 
 ## [1.0.0-rc.3] - 2026-11-10
 

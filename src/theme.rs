@@ -190,7 +190,10 @@ pub fn dark() -> Theme {
         status_error: Color::Red,
         status_info: Color::Cyan,
         rx_rate: Color::Green,
-        tx_rate: Color::Blue,
+        // ANSI blue is the darkest slot in most dark palettes (#0000ee in
+        // xterm's), which on a dark ground made the tx column the one a
+        // reader could not read. Light blue is the same hue with contrast.
+        tx_rate: Color::LightBlue,
         key_hint: Color::Yellow,
         selection_bg: Color::Rgb(40, 40, 60),
         highlight_bg: Color::Rgb(60, 60, 80),

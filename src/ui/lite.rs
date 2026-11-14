@@ -945,9 +945,9 @@ fn render_table(f: &mut Frame, app: &App, l: &Layout, paused: bool) {
 
     put(f, l.x_process, ROW_TABLE_HEAD, "process", head, end);
     put(f, l.x_host, ROW_TABLE_HEAD, "host", head, end);
-    put_right(f, l.x_down + W_RATE - 1, ROW_TABLE_HEAD, "DOWN", head);
-    put_right(f, l.x_up + W_RATE - 1, ROW_TABLE_HEAD, "UP", head);
-    put_right(f, l.x_rtt + W_RTT - 1, ROW_TABLE_HEAD, "RTT", head);
+    put_right(f, l.x_down + W_RATE - 1, ROW_TABLE_HEAD, "down", head);
+    put_right(f, l.x_up + W_RATE - 1, ROW_TABLE_HEAD, "up", head);
+    put_right(f, l.x_rtt + W_RTT - 1, ROW_TABLE_HEAD, "rtt", head);
     // Derived, like the axis label — but from the sparkline's OWN depth, which
     // is the per-group history cap, not the chart width. The two series have
     // different depths, so reusing the chart's number here would trade a

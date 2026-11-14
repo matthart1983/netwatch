@@ -9,6 +9,7 @@ pub mod lite;
 pub mod memory_stats;
 pub mod monochrome;
 pub mod packets;
+pub mod palette;
 pub mod processes;
 pub mod quit_confirm;
 pub mod sanitize;

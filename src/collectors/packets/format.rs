@@ -87,14 +87,20 @@ pub(crate) fn format_endpoint(host: &str, port: impl std::fmt::Display) -> Strin
 /// Only the selected packet's dump is ever drawn, so the Packets tab builds
 /// it from the frame when it draws one.
 pub fn hex_dump(raw: &[u8]) -> String {
+    hex_dump_wide(raw, 16)
+}
+
+/// [`hex_dump`] with `per_line` bytes on a line, for a pane too narrow for 16.
+pub fn hex_dump_wide(raw: &[u8], per_line: usize) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let per_line = per_line.max(1);
     // Six characters of offset and gap, three per byte.
-    let mut out = String::with_capacity(raw.len().div_ceil(16) * (6 + 16 * 3));
-    for (i, chunk) in raw.chunks(16).enumerate() {
+    let mut out = String::with_capacity(raw.len().div_ceil(per_line) * (6 + per_line * 3));
+    for (i, chunk) in raw.chunks(per_line).enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        let _ = write!(out, "{:04x}  ", i * 16);
+        let _ = write!(out, "{:04x}  ", i * per_line);
         for (j, &b) in chunk.iter().enumerate() {
             if j > 0 {
                 out.push(' ');
@@ -108,12 +114,18 @@ pub fn hex_dump(raw: &[u8]) -> String {
 
 /// The same bytes as printable characters, aligned with [`hex_dump`].
 pub fn ascii_dump(raw: &[u8]) -> String {
-    let mut out = String::with_capacity(raw.len().div_ceil(16) * (6 + 16 + 1));
-    for (i, chunk) in raw.chunks(16).enumerate() {
+    ascii_dump_wide(raw, 16)
+}
+
+/// [`ascii_dump`] with `per_line` bytes on a line, to match [`hex_dump_wide`].
+pub fn ascii_dump_wide(raw: &[u8], per_line: usize) -> String {
+    let per_line = per_line.max(1);
+    let mut out = String::with_capacity(raw.len().div_ceil(per_line) * (6 + per_line + 1));
+    for (i, chunk) in raw.chunks(per_line).enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        let _ = write!(out, "{:04x}  ", i * 16);
+        let _ = write!(out, "{:04x}  ", i * per_line);
         out.extend(chunk.iter().map(|&b| {
             if b.is_ascii_graphic() || b == b' ' {
                 char::from(b)

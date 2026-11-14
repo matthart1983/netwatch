@@ -392,8 +392,10 @@ pub fn conn_cols(w: u16) -> Vec<Col> {
     let content_x_end = w - 3;
     vec![
         left(2, 1, ""),
-        left(4, 13, "PROCESS"),
-        right(18, 5, "PID"),
+        // Seven for the pid: `pid_max` on a 64-bit kernel is 4194304, and at
+        // five the column drew every long-lived desktop process as `1977…`.
+        left(4, 11, "PROCESS"),
+        right(16, 7, "PID"),
         left(25, 30 + host_extra, "REMOTE"),
         right(57 + shift, 5, "PORT"),
         left(64 + shift, 5, "PROTO"),
@@ -1177,7 +1179,7 @@ fn put_right(f: &mut Frame, x_end: u16, y: u16, s: &str, style: Style) {
 fn short_state(state: &str) -> &str {
     match state {
         "ESTABLISHED" => "ESTAB",
-        "TIME_WAIT" | "TIME-WAIT" => "TIME_W",
+        "TIME_WAIT" | "TIME-WAIT" => "TIMEWAIT",
         "CLOSE_WAIT" | "CLOSE-WAIT" => "CLOSE_W",
         "FIN_WAIT1" | "FIN_WAIT_1" | "FIN-WAIT-1" => "FIN_W1",
         "FIN_WAIT2" | "FIN_WAIT_2" | "FIN-WAIT-2" => "FIN_W2",
@@ -1196,9 +1198,30 @@ fn detail_stats_width(l: &Layout, internals_w: u16) -> u16 {
         .saturating_sub(DETAIL_STATS_X + 2)
 }
 
-/// Unavailable values render as a dim `--` in place, never as a blank or a
+/// The connections box's right-hand title: the sort, or why the columns it
+/// sorts by are empty. Without capture every DOWN, UP and RTT cell is `—`,
+/// and "sort ↓ down" over a column of dashes explains nothing.
+fn conns_right(app: &App) -> &'static str {
+    if crate::ui::widgets::capture_failure(app).is_some() {
+        "no capture · rates and rtt need it"
+    } else {
+        "sort ↓ down"
+    }
+}
+
+/// A history with nothing in it to plot. It gets the dim baseline, not a
+/// sparkline: a row of zeros drawn in the series colour put a bright flat
+/// line on every idle connection, the loudest thing in the table.
+fn flat<'a, I>(history: I) -> bool
+where
+    I: IntoIterator<Item = &'a u64>,
+{
+    history.into_iter().all(|&v| v == 0)
+}
+
+/// Unavailable values render as a dim `—` in place, never as a blank or a
 /// zero: a missing measurement and a measured zero are different facts.
-const NA: &str = "--";
+const NA: &str = crate::ui::widgets::NO_VALUE;
 
 fn rtt_str(rtt: Option<f64>) -> String {
     match rtt {
@@ -2025,7 +2048,7 @@ fn render_conns(
             key: Some("4"),
             title: Some("conns"),
             sub: Some(&sub),
-            right: Some("sort ↓ down"),
+            right: Some(conns_right(app)),
             // Only keys that do something. `/ filter`, `sort` and `export`
             // were printed here before any of them were implemented — and in a
             // design whose whole premise is that the border *is* the
@@ -2167,7 +2190,7 @@ fn render_conns(
             Style::default().fg(if dead { quiet } else { secondary }),
         );
         let spark = &l.conn_cols[conn_col::SPARK];
-        if dead || c.history.is_empty() {
+        if dead || flat(&c.history) {
             paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
         } else {
             let s = fit_conn_history(&c.history, spark.w as usize * 2);
@@ -2271,7 +2294,7 @@ fn render_group_row(
         Style::default().fg(if r.dead { quiet } else { t.text_secondary }),
     );
     let spark = &l.conn_cols[conn_col::SPARK];
-    if r.dead || history.is_empty() {
+    if r.dead || flat(history) {
         paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
     } else {
         let s = fit_conn_history(history, spark.w as usize * 2);
@@ -2664,7 +2687,7 @@ fn render_compact(f: &mut Frame, app: &App, area: Rect) {
             key: Some("4"),
             title: Some("conns"),
             sub: Some(&rows.len().to_string()),
-            right: Some("sort ↓ down"),
+            right: Some(conns_right(app)),
             foot_left: &[("V", " view"), ("q", "uit")],
             foot_right: Some(&foot_right),
             ..Default::default()
@@ -2729,7 +2752,7 @@ fn render_compact(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(quiet),
         );
         let spark = &cl.cols[cpt_col::SPARK];
-        if c.history.is_empty() {
+        if flat(&c.history) {
             paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
         } else {
             let s = fit_conn_history(&c.history, spark.w as usize * 2);

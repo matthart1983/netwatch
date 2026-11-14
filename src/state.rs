@@ -45,6 +45,9 @@ pub struct AppCaches {
     /// Rolling RX rate history per (process, pid) for the Process drill-in
     /// chart. Updated each connection-collector tick.
     pub top_proc_rx_history: HashMap<(String, Option<u32>), VecDeque<u64>>,
+    /// The same for TX, so the drill-in draws both directions as the
+    /// Interfaces and Stats charts do.
+    pub top_proc_tx_history: HashMap<(String, Option<u32>), VecDeque<u64>>,
     /// Recent interface up/down/IP-changed events surfaced on the Timeline tab.
     /// Populated when info_tick detects a delta from the previous snapshot.
     pub iface_events: VecDeque<IfaceChangeEvent>,
@@ -140,10 +143,15 @@ pub struct AppUiState {
     pub scroll: UiScrollState,
     pub sort_states: HashMap<Tab, TabSortState>,
     pub sort_picker: SortPickerState,
+    /// The `:` command palette.
+    pub palette: crate::ui::palette::PaletteState,
 
     pub paused: bool,
     pub last_area: Rect,
     pub selected_interface: Option<usize>,
+    /// The tabs `↵` drilled through to reach this one, oldest first. `esc`
+    /// steps back along it; switching tabs any other way forgets it.
+    pub drill_path: Vec<crate::app::Tab>,
 
     // ── Chip-row filter selections ──
     pub interface_filter: InterfaceFilter,
@@ -265,10 +273,12 @@ impl AppUiState {
             scroll: UiScrollState::default(),
             sort_states: default_sort_states(),
             sort_picker: SortPickerState::default(),
+            palette: crate::ui::palette::PaletteState::default(),
 
             paused: false,
             last_area: Rect::default(),
             selected_interface: None,
+            drill_path: Vec::new(),
 
             interface_filter: InterfaceFilter::Active,
             connection_state_filter: ConnectionStateFilter::All,

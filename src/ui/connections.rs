@@ -7,11 +7,150 @@ use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Clear, Paragraph},
 };
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// Columns the rx/s, tx/s and rtt cells take in a row, gutters included.
+const RATE_COLS: usize = 30;
+
+/// The table's columns for one frame, shared by the header and both kinds of
+/// row so they cannot disagree.
+///
+/// The row was a fixed 145 columns: 132 without geo. In a 120-column terminal
+/// that put rx/s half off the right edge and tx/s, rtt and age past it — the
+/// numbers the tab exists to show, on the terminal width most people run. The
+/// name columns are the elastic ones, so they give: geo goes first (it is
+/// blank without a database anyway), then `app` narrows, then `remote`, down
+/// to widths that still hold an address.
+#[derive(Clone, Copy)]
+struct ConnCols {
+    process: usize,
+    /// Off in the compact layout, with `age`: under ~100 columns the rates
+    /// outrank both.
+    proto: bool,
+    age: bool,
+    remote: usize,
+    app: usize,
+    geo: bool,
+    no_rates: bool,
+}
+
+/// `text` cut to `w` columns, and nothing at all in a column of none.
+fn cell(text: &str, w: usize) -> String {
+    if w == 0 {
+        String::new()
+    } else {
+        truncate(text, w).to_string()
+    }
+}
+
+impl ConnCols {
+    const REMOTE: usize = 32;
+    const APP: usize = 22;
+    const GEO: usize = 13;
+    /// How far `app` widens when the terminal has the room.
+    const APP_GROW: usize = 26;
+
+    const PROCESS: usize = 20;
+
+    fn fit(width: usize, show_geo: bool, no_rates: bool) -> Self {
+        let rates = if no_rates { 0 } else { RATE_COLS };
+        // marker, process, proto and their gutters; state; age.
+        let fixed = 2 + Self::PROCESS + 1 + 6 + (1 + STATE_COL) + 5 + rates;
+        // remote, a gutter, app.
+        let names = Self::REMOTE + 1 + Self::APP;
+        let room = width.saturating_sub(fixed);
+        let full = Self {
+            process: Self::PROCESS,
+            proto: true,
+            age: true,
+            remote: Self::REMOTE,
+            app: Self::APP,
+            geo: false,
+            no_rates,
+        };
+        // Width past what the columns need goes to `app`, where the server
+        // name is. At a fixed 22 it read `HTTPS-ECH api.anthrop…` on a
+        // terminal with forty columns to spare. The name stays in `app` and
+        // the address in `remote` on purpose: the address is what the socket
+        // is connected to, and the name is what the client claimed in its
+        // handshake. A process can claim any name it likes.
+        let grown = |spare: usize| Self::APP + spare.min(Self::APP_GROW);
+        if show_geo && room >= names + Self::GEO {
+            return Self {
+                geo: true,
+                app: grown(room - names - Self::GEO),
+                ..full
+            };
+        }
+        if room >= names {
+            return Self {
+                app: grown(room - names),
+                ..full
+            };
+        }
+        if room > 18 {
+            let room = room.min(names) - 1;
+            let remote = room.saturating_sub(10).clamp(18, Self::REMOTE).min(room);
+            // An `app` cell under four columns is an ellipsis. `remote` has it.
+            let remote = if room - remote < 4 { room } else { remote };
+            return Self {
+                remote,
+                app: room - remote,
+                ..full
+            };
+        }
+        // Compact, for an 80-column terminal: a shorter process name, no
+        // proto, no app, no age. What is left is who, where, state and the
+        // rates, which is the question the tab answers.
+        let process = 14;
+        let fixed = 2 + process + 1 + (1 + STATE_COL) + rates;
+        Self {
+            process,
+            proto: false,
+            age: false,
+            remote: width.saturating_sub(fixed + 1).max(8),
+            app: 0,
+            ..full
+        }
+    }
+
+    /// The proto cell with its gutter, or nothing in the compact layout.
+    fn proto_cell(&self, proto: &str) -> String {
+        if self.proto {
+            format!("{proto:<5} ")
+        } else {
+            String::new()
+        }
+    }
+
+    fn header(&self) -> String {
+        let mut h = format!(
+            "  {:<process$} {}{:<remote$} {:<app$}",
+            "process",
+            self.proto_cell("proto"),
+            "remote",
+            cell("app", self.app),
+            process = self.process,
+            remote = self.remote,
+            app = self.app,
+        );
+        if self.geo {
+            h.push_str(&format!(" {:<12}", "geo"));
+        }
+        h.push_str(&format!(" {:<width$}", "state", width = STATE_COL));
+        if !self.no_rates {
+            h.push_str(&format!(" {:>10}  {:>9}  {:>5} ", "rx/s", "tx/s", "rtt"));
+        }
+        if self.age {
+            h.push_str(&format!(" {:>4}", "age"));
+        }
+        h
+    }
+}
 
 /// Width of the state column. `state_label` guarantees every state name fits,
 /// so nothing in this column is ever truncated.
@@ -83,15 +222,38 @@ pub fn sort(conns: &mut [Connection], column: usize, ascending: bool) {
 /// Layout constraints for the Connections tab. Kept as a function so the
 /// renderer and the mouse hit-tester share a single source of truth — when
 /// the chip row or detail strip's height changes, both sides update together.
-fn layout_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+/// The most rows the detail strip grows to when the table has rows to spare.
+const DETAIL_MAX_ROWS: u16 = 18;
+
+/// The tab's bands for a table of `rows` rows.
+///
+/// The table used to take every spare row. Eight folded groups in a 45-row
+/// terminal drew a box with 23 empty lines above a detail strip too short to
+/// list the selected group's remotes. Rows the table cannot fill now go to the
+/// detail strip, up to [`DETAIL_MAX_ROWS`]; a full table gets the same split
+/// as before.
+fn layout_chunks(area: Rect, rows: usize) -> std::rc::Rc<[Rect]> {
+    let header = widgets::ATTRIBUTION_HEADER_ROWS;
+    // Ten rows where there are ten to give. The bands used to ask for 27, and
+    // at 24 the header paid: the coverage row went missing.
+    let base = 10
+        .min(area.height.saturating_sub(header + 1 + 6 + 3))
+        .max(4);
+    // Border, column header, border.
+    let table = (rows.min(u16::MAX as usize - 3) as u16 + 3).max(5);
+    let spare = area.height.saturating_sub(header + 1 + 3 + table);
+    // On a short terminal a table with more rows than it can show takes rows
+    // back from the strip: at 80×24 the strip held nine and the table three.
+    let floor = if area.height >= 40 { base } else { base.min(6) };
+    let detail = spare.clamp(floor, DETAIL_MAX_ROWS.max(floor));
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),  // header and attribution coverage
-            Constraint::Length(2),  // chip row
-            Constraint::Min(8),     // table
-            Constraint::Length(10), // detail strip
-            Constraint::Length(3),  // footer
+            Constraint::Length(header), // header and attribution coverage
+            Constraint::Length(1),      // chip row
+            Constraint::Min(5),         // table
+            Constraint::Length(detail), // detail strip
+            Constraint::Length(3),      // footer
         ])
         .split(area)
 }
@@ -99,8 +261,8 @@ fn layout_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
 /// Inner table area (inside the bordered block) where data rows are drawn.
 /// Used by `handle_mouse` to map a screen y-coordinate back to a connection
 /// index without duplicating the layout chunk arithmetic.
-pub(crate) fn table_inner_area(area: Rect) -> Rect {
-    let chunks = layout_chunks(area);
+pub(crate) fn table_inner_area(area: Rect, rows: usize) -> Rect {
+    let chunks = layout_chunks(area, rows);
     let outer = chunks[2];
     // Same four-sided inset as the panel the rows are drawn in. Corner style
     // doesn't affect `inner`, but deriving it from the shared chrome means a
@@ -115,17 +277,17 @@ pub(crate) fn compute_window_top(selected: usize, total: usize, visible_rows: us
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = layout_chunks(area);
     // One view and one row list for the whole frame. A poll can publish
     // between two reads, and the table and the detail strip would then
     // describe different rows.
     let view = current_view(app);
     let rows = view.rows(&app.ui.connection_collapsed);
+    let chunks = layout_chunks(area, rows.len());
 
     render_header(f, app, &view, chunks[0]);
     render_chip_row(f, app, &view, chunks[1]);
     render_connection_table(f, app, &view, &rows, chunks[2]);
-    render_detail_strip(f, app, &rows, chunks[3]);
+    render_detail_strip(f, app, &view, &rows, chunks[3]);
     render_footer(f, app, chunks[4]);
 
     if app.ui.traceroute_view_open {
@@ -188,6 +350,24 @@ fn render_chip_row(f: &mut Frame, app: &App, view: &ConnView, area: Rect) {
             ));
         }
         spans.push(Span::raw(" "));
+    }
+
+    // The text filter, when one is on. It was only in the header's extras,
+    // which the tab bar pushes off the row at most widths, so a filtered
+    // table looked like a table that had lost most of its rows.
+    if let Some(filter) = active_connection_filter(app) {
+        spans.push(Span::styled("  filter ", Style::default().fg(t.text_muted)));
+        spans.push(Span::styled(
+            format!(" {} ", truncate(filter, 24)),
+            Style::default()
+                .fg(t.text_primary)
+                .bg(t.selection_bg)
+                .bold(),
+        ));
+        spans.push(Span::styled(
+            "  esc clears",
+            Style::default().fg(t.text_muted),
+        ));
     }
 
     // Right-aligned group toggle: " group: process / remote / none"
@@ -673,9 +853,13 @@ impl ConnView {
         match group {
             ConnectionGroup::Process => order.sort_by_cached_key(|&i| {
                 let c = &conns[i];
+                // Sockets with no peer sink to the end of their group. `0.0.0.0:*`
+                // sorts ahead of every address, so three idle sockets used to
+                // sit above the connections a reader opened the group to see.
                 (
                     case_insensitive_key(c.process_name.as_deref().unwrap_or("~")),
                     Reverse(TotalF64(c.rx_rate.unwrap_or(0.0))),
+                    is_wildcard(&c.remote_addr),
                     c.remote_addr.as_str(),
                 )
             }),
@@ -937,19 +1121,36 @@ fn render_connection_table(
 
     // In the border row for the same reason: past ~120 columns the header line
     // has no room left for it.
-    let rates = view.rate_coverage.map(|(rated, flows)| {
-        format!(
-            " rates: {} of {} flows ",
-            widgets::format_count(rated),
-            widgets::format_count(flows)
-        )
-    });
+    // With capture off and not one flow rated, the rx/s, tx/s and rtt columns
+    // are `—` on every row. They go, and the border says why: a wall of
+    // dashes is the tool failing quietly.
+    let no_rates = widgets::capture_failure(app).is_some()
+        && view.rate_coverage.is_none_or(|(rated, _)| rated == 0)
+        && rows.iter().all(|r| match r {
+            ConnRow::Conn { conn } => {
+                conn.rx_rate.is_none() && conn.tx_rate.is_none() && conn.handshake_rtt_us.is_none()
+            }
+            ConnRow::Parent { .. } => true,
+        });
+    let rates = if no_rates {
+        Some(" rates and rtt need capture ".to_string())
+    } else {
+        view.rate_coverage.map(|(rated, flows)| {
+            format!(
+                " rates: {} of {} flows ",
+                widgets::format_count(rated),
+                widgets::format_count(flows)
+            )
+        })
+    };
 
     let title_right = if view.groups.is_empty() {
         format!(" {conn_count} shown  group: none ")
     } else {
-        let noun = match app.ui.connection_group {
-            ConnectionGroup::Remote => "hosts",
+        let noun = match (app.ui.connection_group, view.groups.len()) {
+            (ConnectionGroup::Remote, 1) => "host",
+            (ConnectionGroup::Remote, _) => "hosts",
+            (_, 1) => "process",
             _ => "processes",
         };
         format!(
@@ -969,11 +1170,11 @@ fn render_connection_table(
     // Column header. Mirrors the layout in `render_conn_row`. The GEO column
     // is only shown when the user has toggled `g`; it sits between REMOTE and
     // STATE so it qualifies the destination it describes.
-    let header_text: &str = if app.ui.show_geo {
-        "  process              proto  remote                          app                    geo           state         rx/s         tx/s     rtt    age"
-    } else {
-        "  process              proto  remote                          app                    state         rx/s         tx/s     rtt    age"
-    };
+    // A geo column needs something to look locations up in. With `g` on and
+    // no database it was thirteen columns of dashes on every row.
+    let geo = app.ui.show_geo && (app.geo_cache.has_offline_db() || app.user_config.geoip_online);
+    let cols = ConnCols::fit(usize::from(inner.width.saturating_sub(2)), geo, no_rates);
+    let header_text = cols.header();
     let header_area = Rect {
         x: inner.x + 1,
         y: inner.y,
@@ -1007,7 +1208,7 @@ fn render_connection_table(
         };
         match row {
             ConnRow::Conn { conn } => {
-                render_conn_row(f, app, inner, row_y, conn, is_selected, row_alpha)
+                render_conn_row(f, app, inner, row_y, conn, is_selected, row_alpha, cols)
             }
             ConnRow::Parent { group, collapsed } => render_group_row(
                 f,
@@ -1018,6 +1219,7 @@ fn render_connection_table(
                 *collapsed,
                 is_selected,
                 row_alpha,
+                cols,
             ),
         }
     }
@@ -1055,6 +1257,17 @@ fn table_block(
     let width_of = crate::ui::text::width;
     // Inside the two corners.
     let room = (width as usize).saturating_sub(2);
+    // A warning too long for the row loses its second clause before it costs
+    // the panel its name: at 80 columns the border read `╭ilable · new
+    // connections unattributed`.
+    let fits = |w: &str| width_of(TITLE) + width_of(w) + width_of(&counts) <= room;
+    let warning = warning.and_then(|w| {
+        if fits(&w) {
+            return Some(w);
+        }
+        let short = format!("{} ", w.split(" · ").next().unwrap_or_default());
+        fits(&short).then_some(short)
+    });
     let taken = width_of(TITLE) + warning.as_deref().map_or(0, width_of) + width_of(&counts);
     let rates = rates.filter(|r| taken + width_of(r) <= room);
     widgets::panel_block(t)
@@ -1094,13 +1307,14 @@ fn render_group_row(
     collapsed: bool,
     is_selected: bool,
     row_alpha: f32,
+    cols: ConnCols,
 ) {
     let t = &app.theme;
     let r = &group.rollup;
     let chevron = if collapsed { "▶ " } else { "▼ " };
     // The group name gets the full 20-char cell the child rows split between
     // process and PID — the point of the tree is that the name is legible.
-    let name = truncate(&group.key, 20);
+    let name = truncate(group_name(&group.key), 20);
 
     let facet_label = match app.ui.connection_group {
         ConnectionGroup::Remote => {
@@ -1110,6 +1324,8 @@ fn render_group_row(
                 format!("{} procs", r.facets)
             }
         }
+        // No pid is what makes a row unattributed; `0 pids` only repeats it.
+        _ if r.facets == 0 => String::new(),
         _ => {
             if r.facets == 1 {
                 "1 pid".to_string()
@@ -1135,12 +1351,7 @@ fn render_group_row(
             format!("{label} {}", r.state_count)
         }
     };
-    let state_color = match r.state.as_str() {
-        "ESTABLISHED" => t.status_good,
-        "LISTEN" => t.status_info,
-        "TIME_WAIT" | "TIME-WAIT" => t.status_warn,
-        _ => t.text_muted,
-    };
+    let state_color = conn_state_color(&r.state, t);
 
     let rx_str = if r.rx_rate > 0.0 {
         crate::ui::widgets::format_bytes_rate(r.rx_rate)
@@ -1172,7 +1383,7 @@ fn render_group_row(
         // The group name carries the row's weight; the children sit at
         // normal intensity beneath it.
         Span::styled(
-            format!("{name:<20}"),
+            format!("{:<w$}", truncate(&name, cols.process), w = cols.process),
             Style::default().fg(t.text_primary).bold(),
         ),
         // PROTO belongs to an individual flow, so a rollup leaves it empty
@@ -1180,34 +1391,41 @@ fn render_group_row(
         // protocol. The summary goes in the REMOTE cell, which is where the
         // eye already is and which has the width to spell it out.
         Span::raw(" "),
-        Span::styled("     ".to_string(), Style::default().fg(t.text_muted)),
-        Span::raw(" "),
+        Span::styled(cols.proto_cell(""), Style::default().fg(t.text_muted)),
         Span::styled(
             format!(
-                "{:<32}",
+                "{:<width$}",
                 truncate(
                     &format!(
-                        "{} conn{} · {facet_label}",
+                        "{} conn{}{}{facet_label}",
                         r.conns,
-                        if r.conns == 1 { "" } else { "s" }
+                        if r.conns == 1 { "" } else { "s" },
+                        if facet_label.is_empty() { "" } else { " · " }
                     ),
-                    32
-                )
+                    cols.remote
+                ),
+                width = cols.remote
             ),
             Style::default().fg(t.text_secondary),
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:<22}", if r.degraded { "retransmits" } else { "" }),
+            format!(
+                "{:<width$}",
+                cell(if r.degraded { "retransmits" } else { "" }, cols.app),
+                width = cols.app
+            ),
+            // Amber, not red: a retransmit count with no baseline to compare
+            // against is something to look at, not something known to be wrong.
             Style::default().fg(if r.degraded {
-                t.status_error
+                t.status_warn
             } else {
                 t.text_muted
             }),
         ),
     ];
 
-    if app.ui.show_geo {
+    if cols.geo {
         // Geo is a property of one endpoint, so a rollup has nothing honest
         // to put here. Hold the column so the children stay aligned.
         spans.push(Span::styled(
@@ -1216,22 +1434,29 @@ fn render_group_row(
         ));
     }
 
-    spans.extend([
-        Span::styled(
-            format!(" {:<width$}", state_cell, width = STATE_COL),
-            Style::default().fg(state_color),
-        ),
-        Span::styled(format!(" {rx_str:>10}"), Style::default().fg(t.rx_rate)),
-        Span::raw(" "),
-        Span::styled(format!(" {tx_str:>9}"), Style::default().fg(t.tx_rate)),
-        Span::raw(" "),
-        Span::styled(
-            format!(" {rtt_str:>5}"),
-            Style::default().fg(t.text_primary),
-        ),
-        Span::raw(" "),
-        Span::styled(format!(" {:>4}", ""), Style::default().fg(t.text_muted)),
-    ]);
+    spans.extend([Span::styled(
+        format!(" {:<width$}", state_cell, width = STATE_COL),
+        Style::default().fg(state_color),
+    )]);
+    if !cols.no_rates {
+        spans.extend([
+            Span::styled(format!(" {rx_str:>10}"), Style::default().fg(t.rx_rate)),
+            Span::raw(" "),
+            Span::styled(format!(" {tx_str:>9}"), Style::default().fg(t.tx_rate)),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {rtt_str:>5}"),
+                Style::default().fg(t.text_primary),
+            ),
+            Span::raw(" "),
+        ]);
+    }
+    if cols.age {
+        spans.push(Span::styled(
+            format!(" {:>4}", ""),
+            Style::default().fg(t.text_muted),
+        ));
+    }
 
     let faded_spans = if (row_alpha - 1.0).abs() < f32::EPSILON {
         spans
@@ -1260,6 +1485,7 @@ fn render_conn_row(
     conn: &Connection,
     is_selected: bool,
     row_alpha: f32,
+    cols: ConnCols,
 ) {
     let t = &app.theme;
     let state_color = conn_state_color(&conn.state, t);
@@ -1267,7 +1493,9 @@ fn render_conn_row(
         (conn.rx_rate, conn.tx_rate),
         (Some(r), _) if r > 0.0
     ) || matches!(conn.tx_rate, Some(r) if r > 0.0);
-    let dot_color = if active { t.status_good } else { t.status_info };
+    // Lit when the flow is carrying traffic, dim otherwise. An idle row's dot
+    // used to be cyan, so the gutter was a column of colour that said nothing.
+    let dot_color = if active { t.status_good } else { t.text_muted };
 
     let pid_str = conn
         .pid
@@ -1289,14 +1517,15 @@ fn render_conn_row(
         t.status_info
     };
 
-    let rx_str = conn
-        .rx_rate
-        .map(crate::ui::widgets::format_bytes_rate)
-        .unwrap_or_else(|| "—".into());
-    let tx_str = conn
-        .tx_rate
-        .map(crate::ui::widgets::format_bytes_rate)
-        .unwrap_or_else(|| "—".into());
+    // Measured and idle is `0`; not measured is `—`. The idle case was `-`,
+    // one stroke shorter than the other and in the same column.
+    let rate = |r: Option<f64>| match r {
+        Some(r) if r < 1.0 => "0".to_string(),
+        Some(r) => crate::ui::widgets::format_bytes_rate(r),
+        None => crate::ui::widgets::NO_VALUE.to_string(),
+    };
+    let rx_str = rate(conn.rx_rate);
+    let tx_str = rate(conn.tx_rate);
 
     let rtt_str = conn
         .handshake_rtt_us
@@ -1333,15 +1562,18 @@ fn render_conn_row(
             Style::default().fg(if is_selected { t.brand } else { dot_color }),
         ),
         Span::styled(
-            format!("{:<20}", proc_label),
+            format!(
+                "{:<w$}",
+                truncate(proc_label.trim_end(), cols.process),
+                w = cols.process
+            ),
             Style::default().fg(t.text_primary),
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:<5}", conn.protocol),
+            cols.proto_cell(&conn.protocol),
             Style::default().fg(proto_color),
         ),
-        Span::raw(" "),
         Span::styled(
             // Same reasoning under `group: remote`: the host is the parent's
             // name, so the child shows the port that distinguishes it.
@@ -1353,32 +1585,43 @@ fn render_conn_row(
                         .rsplit_once(':')
                         .map(|(_, p)| p.to_string())
                         .unwrap_or_default();
+                    let w = cols.remote.saturating_sub(4);
                     if port.is_empty() {
-                        format!("    {:<28}", truncate(host, 28))
+                        format!("    {:<w$}", truncate(host, w))
                     } else {
-                        format!("    :{port:<27}")
+                        let port = truncate(&format!(":{port}"), w);
+                        format!("    {port:<w$}")
                     }
                 }
-                _ => format!("{:<32}", truncate(&conn.remote_addr, 32)),
+                _ => format!(
+                    "{:<w$}",
+                    truncate(&conn.remote_addr, cols.remote),
+                    w = cols.remote
+                ),
             },
             Style::default().fg(t.text_primary),
         ),
         Span::raw(" "),
         Span::styled(
             format!(
-                "{:<22}",
-                truncate(&render_app_protocol(&conn.app_protocol), 22)
+                "{:<w$}",
+                cell(&render_app_protocol(&conn.app_protocol), cols.app),
+                w = cols.app
             ),
             Style::default().fg(app_protocol_color(&conn.app_protocol, t)),
         ),
     ];
 
-    if app.ui.show_geo {
+    if cols.geo {
         let host = host_only(&conn.remote_addr);
         let geo_str = format_geo_cell(app, host);
         spans.push(Span::styled(
             format!(" {:<12}", truncate(&geo_str, 12)),
-            Style::default().fg(t.status_info),
+            Style::default().fg(if geo_str == "—" {
+                t.text_muted
+            } else {
+                t.text_secondary
+            }),
         ));
     }
 
@@ -1399,35 +1642,39 @@ fn render_conn_row(
             conn.out_of_order
         )
     } else {
-        truncate(&conn.state, 12).to_string()
+        // The same word the group row above it uses. This arm alone printed
+        // the kernel's `ESTABLISHED` under a parent reading `estab`.
+        crate::ui::widgets::state_label(&conn.state)
     };
-    let state_span_color = if conn.retransmits > 0 {
-        t.status_error
-    } else if conn.out_of_order > 0 {
+    let state_span_color = if conn.retransmits > 0 || conn.out_of_order > 0 {
         t.status_warn
     } else {
         state_color
     };
 
-    spans.extend([
-        Span::styled(
-            format!(" {:<width$}", state_cell, width = STATE_COL),
-            Style::default().fg(state_span_color),
-        ),
-        Span::styled(format!(" {:>10}", rx_str), Style::default().fg(t.rx_rate)),
-        Span::raw(" "),
-        Span::styled(format!(" {:>9}", tx_str), Style::default().fg(t.tx_rate)),
-        Span::raw(" "),
-        Span::styled(
-            format!(" {:>5}", rtt_str),
-            Style::default().fg(t.text_primary),
-        ),
-        Span::raw(" "),
-        Span::styled(
+    spans.extend([Span::styled(
+        format!(" {:<width$}", state_cell, width = STATE_COL),
+        Style::default().fg(state_span_color),
+    )]);
+    if !cols.no_rates {
+        spans.extend([
+            Span::styled(format!(" {:>10}", rx_str), Style::default().fg(t.rx_rate)),
+            Span::raw(" "),
+            Span::styled(format!(" {:>9}", tx_str), Style::default().fg(t.tx_rate)),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {:>5}", rtt_str),
+                Style::default().fg(t.text_primary),
+            ),
+            Span::raw(" "),
+        ]);
+    }
+    if cols.age {
+        spans.push(Span::styled(
             format!(" {:>4}", age_str),
             Style::default().fg(t.text_muted),
-        ),
-    ]);
+        ));
+    }
     let faded_spans = if (row_alpha - 1.0).abs() < f32::EPSILON {
         spans
     } else {
@@ -1476,7 +1723,7 @@ fn format_duration_short(d: std::time::Duration) -> String {
     }
 }
 
-fn render_detail_strip(f: &mut Frame, app: &App, rows: &[ConnRow], area: Rect) {
+fn render_detail_strip(f: &mut Frame, app: &App, view: &ConnView, rows: &[ConnRow], area: Rect) {
     let t = &app.theme;
     let selected = selected_row(app, rows);
 
@@ -1494,8 +1741,9 @@ fn render_detail_strip(f: &mut Frame, app: &App, rows: &[ConnRow], area: Rect) {
         // A group header has no single flow to detail, so the title carries
         // the rollup rather than pretending one child stands for all of them.
         Some(ConnRow::Parent { group, .. }) => format!(
-            " detail  {}  {} connections ",
-            group.key, group.rollup.conns
+            " detail  {}  {} ",
+            group_name(&group.key),
+            widgets::plural(group.rollup.conns, "connection")
         ),
         None => " detail ".to_string(),
     };
@@ -1537,23 +1785,11 @@ fn render_detail_strip(f: &mut Frame, app: &App, rows: &[ConnRow], area: Rect) {
     let conn = match selected {
         Some(ConnRow::Conn { conn }) => conn,
         Some(ConnRow::Parent { group, collapsed }) => {
-            let r = &group.rollup;
-            hint(
-                f,
-                &format!(
-                    "{} · {} connections · {} in, {} out{}   —   space to {}",
-                    group.key,
-                    r.conns,
-                    crate::ui::widgets::format_bytes_rate(r.rx_rate),
-                    crate::ui::widgets::format_bytes_rate(r.tx_rate),
-                    if r.degraded { " · retransmits" } else { "" },
-                    if *collapsed { "expand" } else { "fold" },
-                ),
-            );
+            render_group_detail(f, app, view, group, *collapsed, inner);
             return;
         }
         None => {
-            hint(f, "No connection selected");
+            hint(f, "no connection selected");
             return;
         }
     };
@@ -1567,29 +1803,204 @@ fn render_detail_strip(f: &mut Frame, app: &App, rows: &[ConnRow], area: Rect) {
     render_detail_left(f, app, cols[0], conn);
     render_detail_right(f, app, cols[1], conn);
 
-    // Action keys at bottom
-    let action_y = inner.y + inner.height.saturating_sub(1);
-    let action_area = Rect {
-        x: inner.x + 1,
-        y: action_y,
-        width: inner.width.saturating_sub(2),
-        height: 1,
+    // No key row here. It repeated the footer two rows below (`↵ packets`,
+    // `T trace`, `/ filter`) and the control strip above (`f cycles`,
+    // `G groups`) in a third style, `Enter → Packets`, capitalised.
+}
+
+/// One line of a group's detail: the connections that share a remote (or,
+/// grouped by remote, a process).
+struct GroupMember<'a> {
+    key: String,
+    conns: Vec<&'a Connection>,
+}
+
+impl GroupMember<'_> {
+    fn rate(&self, of: impl Fn(&Connection) -> Option<f64>) -> Option<f64> {
+        let rates: Vec<f64> = self.conns.iter().filter_map(|c| of(c)).collect();
+        (!rates.is_empty()).then(|| rates.iter().sum())
+    }
+}
+
+/// What a group's children add up to, by the other axis: a process's remotes,
+/// or a remote's processes. Busiest first, then the most connections.
+fn group_members<'a>(
+    view: &'a ConnView,
+    group: &ConnGroup,
+    by_remote: bool,
+) -> Vec<GroupMember<'a>> {
+    let mut members: Vec<GroupMember<'a>> = Vec::new();
+    for &i in &group.children {
+        let c = &view.conns[i];
+        let key = if by_remote {
+            c.remote_addr.clone()
+        } else {
+            c.process_name.clone().unwrap_or_else(|| "—".into())
+        };
+        match members.iter_mut().find(|m| m.key == key) {
+            Some(m) => m.conns.push(c),
+            None => members.push(GroupMember {
+                key,
+                conns: vec![c],
+            }),
+        }
+    }
+    members.sort_by(|a, b| {
+        let rate = |m: &GroupMember| {
+            TotalF64(m.rate(|c| c.rx_rate).unwrap_or(0.0) + m.rate(|c| c.tx_rate).unwrap_or(0.0))
+        };
+        rate(b)
+            .cmp(&rate(a))
+            .then_with(|| is_wildcard(&a.key).cmp(&is_wildcard(&b.key)))
+            .then_with(|| b.conns.len().cmp(&a.conns.len()))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    members
+}
+
+/// A group's name as drawn. Connections with no process are keyed `—`, which
+/// as a row of its own reads as a missing value, not as a group.
+pub(crate) fn group_name(key: &str) -> &str {
+    if key == "—" {
+        "unattributed"
+    } else {
+        key
+    }
+}
+
+/// A socket bound to every address with no peer: `0.0.0.0:*`, `[::]:*`, `*:*`.
+/// It is a socket the process holds open, not a conversation with anyone.
+fn is_wildcard(remote: &str) -> bool {
+    let host = host_only(remote);
+    matches!(host, "0.0.0.0" | "[::]" | "::" | "*")
+}
+
+/// The detail pane for a group header.
+///
+/// It used to be one line, `chrome · 13 connections · 5 KB/s in`, in a box ten
+/// rows tall: the same three numbers as the row it was the detail for. A group
+/// has more to say than that without unfolding it. Thirteen connections are
+/// usually four remotes, and which four is the question.
+fn render_group_detail(
+    f: &mut Frame,
+    app: &App,
+    view: &ConnView,
+    group: &ConnGroup,
+    collapsed: bool,
+    inner: Rect,
+) {
+    let t = &app.theme;
+    let r = &group.rollup;
+    let by_remote = !matches!(app.ui.connection_group, ConnectionGroup::Remote);
+    let members = group_members(view, group, by_remote);
+    let muted = Style::default().fg(t.text_muted);
+    let rate = |v: Option<f64>| match v {
+        None => widgets::NO_VALUE.to_string(),
+        Some(v) if v <= 0.0 => "0".to_string(),
+        Some(v) => widgets::format_bytes_rate(v),
     };
-    let key_style = Style::default().fg(t.key_hint).bold();
-    let dim = Style::default().fg(t.text_muted);
-    let action_line = Line::from(vec![
-        Span::styled("Enter", key_style),
-        Span::styled(" → Packets   ", dim),
-        Span::styled("T", key_style),
-        Span::styled(" Traceroute   ", dim),
-        Span::styled("/", key_style),
-        Span::styled(" Filter   ", dim),
-        Span::styled("f", key_style),
-        Span::styled(" Cycle state   ", dim),
-        Span::styled("G", key_style),
-        Span::styled(" Cycle group", dim),
-    ]);
-    f.render_widget(Paragraph::new(action_line), action_area);
+
+    let mut summary = vec![
+        Span::styled("  ", muted),
+        Span::styled(
+            widgets::plural(members.len(), if by_remote { "remote" } else { "process" }),
+            Style::default().fg(t.text_primary),
+        ),
+    ];
+    // Unmeasured is not zero. With no rate on any member the two columns
+    // would be dashes top to bottom, so they are not drawn.
+    let rated = members
+        .iter()
+        .any(|m| m.rate(|c| c.rx_rate).is_some() || m.rate(|c| c.tx_rate).is_some());
+    if rated {
+        summary.push(Span::styled(
+            format!(
+                " · {} in, {} out",
+                rate(Some(r.rx_rate)),
+                rate(Some(r.tx_rate))
+            ),
+            muted,
+        ));
+    }
+    if r.degraded {
+        summary.push(Span::styled(
+            " · retransmits",
+            Style::default().fg(t.status_warn),
+        ));
+    }
+    summary.push(Span::styled("    ", muted));
+    summary.push(Span::styled(
+        "space",
+        Style::default().fg(t.key_hint).bold(),
+    ));
+    summary.push(Span::styled(
+        if collapsed { " expand" } else { " fold" },
+        muted,
+    ));
+
+    const FIXED: usize = 2 + 1 + 5 + 2 + 14 + 11 + 11;
+    let key_w = (inner.width as usize).saturating_sub(FIXED).clamp(12, 44);
+    let mut lines = vec![
+        Line::from(summary),
+        Line::from(Span::styled(
+            format!(
+                "  {:<key_w$} {:>5}  {:<14}{:>11}{:>11}",
+                if by_remote { "remote" } else { "process" },
+                "conns",
+                "state",
+                if rated { "rx/s" } else { "" },
+                if rated { "tx/s" } else { "" }
+            ),
+            muted,
+        )),
+    ];
+    let room = (inner.height as usize).saturating_sub(lines.len());
+    let shown = if members.len() > room {
+        room.saturating_sub(1)
+    } else {
+        members.len()
+    };
+    for m in members.iter().take(shown) {
+        let (state, count) = dominant_state(&m.conns);
+        let label = widgets::state_label(&state);
+        let state_cell = if count == m.conns.len() {
+            label
+        } else {
+            format!("{label} {count}/{}", m.conns.len())
+        };
+        let idle = is_wildcard(&m.key);
+        let text = if idle {
+            muted
+        } else {
+            Style::default().fg(t.text_secondary)
+        };
+        let mut line = vec![
+            Span::styled(format!("  {:<key_w$} ", cell(&m.key, key_w)), text),
+            Span::styled(format!("{:>5}  ", m.conns.len()), text),
+            Span::styled(
+                format!("{:<14}", cell(&state_cell, 14)),
+                Style::default().fg(conn_state_color(&state, t)),
+            ),
+        ];
+        if rated {
+            line.push(Span::styled(
+                format!("{:>11}", rate(m.rate(|c| c.rx_rate))),
+                text,
+            ));
+            line.push(Span::styled(
+                format!("{:>11}", rate(m.rate(|c| c.tx_rate))),
+                text,
+            ));
+        }
+        lines.push(Line::from(line));
+    }
+    if shown < members.len() {
+        lines.push(Line::from(Span::styled(
+            format!("  + {} more · space to expand", members.len() - shown),
+            muted,
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
@@ -1613,7 +2024,7 @@ fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
         .unwrap_or_else(|| "—".into());
 
     let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled("FLOW", Style::default().fg(t.text_muted))),
+        Line::from(Span::styled("flow", Style::default().fg(t.text_muted))),
         Line::from(vec![
             Span::styled(
                 conn.local_addr.to_string(),
@@ -1636,27 +2047,33 @@ fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
             ),
             Span::styled(format!("age {}", age), Style::default().fg(t.text_muted)),
         ]),
-        Line::from(format!(
-            "Match: {:?} · {}",
-            conn.attribution,
-            conn.evidence
-                .unknown_reason
-                .map(|r| format!("{r:?}"))
-                .unwrap_or_else(|| format!(
-                    "verified · {}ms old",
-                    conn.evidence
-                        .observed_at
-                        .map(|t| t.elapsed().as_millis())
-                        .unwrap_or(0)
-                ))
-        )),
         Line::from(vec![
-            Span::styled("STATS  ", Style::default().fg(t.text_muted)),
-            Span::styled(format!("RX {}", rx), Style::default().fg(t.rx_rate)),
+            Span::styled("match  ", Style::default().fg(t.text_muted)),
+            Span::styled(
+                format!(
+                    "{} · {}",
+                    format!("{:?}", conn.attribution).to_lowercase(),
+                    conn.evidence
+                        .unknown_reason
+                        .map(|r| format!("{r:?}").to_lowercase())
+                        .unwrap_or_else(|| format!(
+                            "verified · {}ms old",
+                            conn.evidence
+                                .observed_at
+                                .map(|t| t.elapsed().as_millis())
+                                .unwrap_or(0)
+                        ))
+                ),
+                Style::default().fg(t.text_secondary),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("stats  ", Style::default().fg(t.text_muted)),
+            Span::styled(format!("rx {}", rx), Style::default().fg(t.rx_rate)),
             Span::styled("    ", Style::default()),
-            Span::styled(format!("TX {}", tx), Style::default().fg(t.tx_rate)),
+            Span::styled(format!("tx {}", tx), Style::default().fg(t.tx_rate)),
             Span::styled("    ", Style::default()),
-            Span::styled(format!("RTT {}", rtt), Style::default().fg(t.text_primary)),
+            Span::styled(format!("rtt {}", rtt), Style::default().fg(t.text_primary)),
         ]),
     ];
 
@@ -1724,7 +2141,7 @@ fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) 
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("RX {window}"),
+            format!("rx {window}"),
             Style::default().fg(t.text_muted),
         ))),
         hdr_area,
@@ -1761,17 +2178,7 @@ fn render_detail_right(f: &mut Frame, app: &App, area: Rect, conn: &Connection) 
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     if app.ui.connection_filter_input {
-        let filter_line = Line::from(vec![
-            Span::styled(" / ", Style::default().fg(app.theme.brand).bold()),
-            Span::raw(&app.ui.connection_filter_text),
-            Span::styled("█", Style::default().fg(app.theme.text_primary)),
-        ]);
-        let bar = Paragraph::new(filter_line).block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(app.theme.key_hint)),
-        );
-        f.render_widget(bar, area);
+        crate::ui::widgets::render_filter_bar(f, &app.theme, area, &app.ui.connection_filter_text);
         return;
     }
 
@@ -1981,16 +2388,20 @@ fn rtt_sparkline(history: &std::collections::VecDeque<f64>) -> String {
 }
 
 /// A connection row's state colour. Linux and Windows spell states as `ss`
-/// does (`CLOSE-WAIT`), macOS as lsof does (`CLOSE_WAIT`), so each takes both:
-/// a CLOSE-WAIT socket an application never closed is what the error colour
-/// is there to flag.
+/// does (`CLOSE-WAIT`), macOS as lsof does (`CLOSE_WAIT`), so each takes both.
+///
+/// Status colours are for health, and a socket's state is mostly not health:
+/// an established connection is the ordinary case, a listener is waiting, and
+/// one in TIME-WAIT is finishing normally. Those used to be green, cyan and
+/// amber, which put twenty green words down the column and left green meaning
+/// nothing. They are text now. The half-closed states keep the warning colour:
+/// a CLOSE-WAIT socket is one its application has not closed, which is worth
+/// a look and is not, on its own, an error.
 fn conn_state_color(state: &str, t: &crate::theme::Theme) -> Color {
     match state {
-        "ESTABLISHED" => t.status_good,
-        "LISTEN" => t.status_info,
-        "TIME_WAIT" | "TIME-WAIT" => t.status_warn,
+        "ESTABLISHED" => t.text_secondary,
         "CLOSE_WAIT" | "CLOSE-WAIT" | "FIN_WAIT1" | "FIN_WAIT_1" | "FIN-WAIT-1" | "FIN_WAIT2"
-        | "FIN_WAIT_2" | "FIN-WAIT-2" => t.status_error,
+        | "FIN_WAIT_2" | "FIN-WAIT-2" => t.status_warn,
         _ => t.text_muted,
     }
 }
@@ -2028,6 +2439,44 @@ fn extract_ip(addr: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    /// At 120 columns the row ran 16 past the edge and took rx/s, tx/s, rtt
+    /// and age with it. Every column the header names must be on screen at
+    /// the widths people run, and rows are cut from the same widths.
+    #[test]
+    fn the_table_fits_its_columns_into_the_terminal() {
+        use super::ConnCols;
+        for (terminal, show_geo) in [(120usize, true), (120, false), (132, true), (160, true)] {
+            let width = terminal - 4;
+            let cols = ConnCols::fit(width, show_geo, false);
+            let header = cols.header();
+            assert!(
+                crate::ui::text::width(&header) <= width,
+                "{terminal}: header is {} of {width}",
+                crate::ui::text::width(&header)
+            );
+            for name in ["process", "remote", "state", "rx/s", "tx/s", "rtt", "age"] {
+                assert!(header.contains(name), "{terminal}: no {name} in {header:?}");
+            }
+            assert!(cols.remote >= 18, "{terminal}: remote is {}", cols.remote);
+        }
+        // Room for everything: nothing is narrowed.
+        let wide = ConnCols::fit(196, true, false);
+        assert!(wide.geo);
+        assert_eq!(wide.remote, ConnCols::REMOTE);
+        // And the spare width goes to `app`, where the server name is.
+        assert_eq!(wide.app, ConnCols::APP + ConnCols::APP_GROW);
+        // Geo is the first to go, before a name is cut.
+        assert!(!ConnCols::fit(136, true, false).geo);
+        // 80 columns: compact, and the rates are still whole.
+        let narrow = ConnCols::fit(76, true, false);
+        let header = narrow.header();
+        assert!(crate::ui::text::width(&header) <= 76, "{header:?}");
+        for name in ["process", "remote", "state", "rx/s", "tx/s", "rtt"] {
+            assert!(header.contains(name), "80: no {name} in {header:?}");
+        }
+        assert!(narrow.remote >= 14, "remote is {}", narrow.remote);
+    }
+
     use super::*;
     use crate::collectors::connections::Connection;
     use std::collections::VecDeque;
@@ -2315,6 +2764,7 @@ mod tests {
                     b.process_name.as_deref().unwrap_or("~"),
                 )
                 .then_with(|| cmp_f64(a.rx_rate.unwrap_or(0.0), b.rx_rate.unwrap_or(0.0)).reverse())
+                .then_with(|| is_wildcard(&a.remote_addr).cmp(&is_wildcard(&b.remote_addr)))
                 .then_with(|| a.remote_addr.cmp(&b.remote_addr))
             } else {
                 cmp_case_insensitive(host_only(&a.remote_addr), host_only(&b.remote_addr))
@@ -2399,7 +2849,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 50)).unwrap();
         terminal.draw(|f| render(f, app, f.area())).unwrap();
         let buffer = terminal.backend().buffer();
-        let table = layout_chunks(buffer.area)[2];
+        let table = layout_chunks(buffer.area, visible_row_count(app))[2];
         (0..buffer.area.width)
             .map(|x| buffer[(x, table.y)].symbol())
             .collect()
@@ -2745,9 +3195,14 @@ mod tests {
             "FIN_WAIT_2",
             "FIN-WAIT-2",
         ] {
-            assert_eq!(conn_state_color(s, &theme), theme.status_error, "{s}");
+            assert_eq!(conn_state_color(s, &theme), theme.status_warn, "{s}");
         }
-        assert_eq!(conn_state_color("TIME-WAIT", &theme), theme.status_warn);
+        // Ordinary states are not health and take no status colour.
+        assert_eq!(
+            conn_state_color("ESTABLISHED", &theme),
+            theme.text_secondary
+        );
+        assert_eq!(conn_state_color("TIME-WAIT", &theme), theme.text_muted);
         assert_eq!(conn_state_color("SYN-SENT", &theme), theme.text_muted);
     }
 
@@ -2836,11 +3291,11 @@ mod tests {
             app.graph_style = style;
             // 30 samples at each rate. 150 seconds is not `3m`.
             for (refresh_rate_ms, label) in [
-                (1000, "RX 30s"),
-                (500, "RX 15s"),
-                (4000, "RX 2m"),
-                (4500, "RX 135s"),
-                (5000, "RX 150s"),
+                (1000, "rx 30s"),
+                (500, "rx 15s"),
+                (4000, "rx 2m"),
+                (4500, "rx 135s"),
+                (5000, "rx 150s"),
             ] {
                 app.user_config.refresh_rate_ms = refresh_rate_ms;
                 let mut terminal =
