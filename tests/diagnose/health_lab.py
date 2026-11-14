@@ -51,8 +51,10 @@ SEED_SAMPLES = 2400
 # lab.rs CORE_RULES: the coverage rows each line carries.
 CORE_RULES = ['link.down', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
               'dns.failing', 'dns.slow_resolver']
-# Healthy seconds on seeded baselines before a scenario's fault goes in.
-WARMUP_SECS = 15
+# Healthy seconds on seeded baselines before a scenario's fault goes in. Long
+# enough for the first window of six DNS probe cycles to close: until it has,
+# dns.slow_resolver has nothing to judge and its coverage row says so.
+WARMUP_SECS = 30
 # Seconds a scenario keeps running after its last expected close, so an issue
 # that reopens at once is seen doing it.
 SETTLE_SECS = 15

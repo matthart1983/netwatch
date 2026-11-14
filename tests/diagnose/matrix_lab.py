@@ -37,9 +37,17 @@ The open lines below restate rules.rs and detectors.rs for the lab's seeded
 baselines. If a default threshold moves and this file does not, 0.9 runs start
 opening or 1.1 runs stop, and the table here is the first place to look.
 
-Not built yet: shapes other than step-and-hold (ramp, intermittent, single
-spike, step during warm-up, fingerprint change), dns.failing, and every rule
-that has no baseline.
+Two more shapes run beside the step, each at five times the line:
+
+  spike   the fault is in for SPIKE_SECS and gone. One slow sample is not a
+          finding, so the run is negative by construction: the rule must not
+          open. It is watched for a full fault window afterwards.
+  ramp    the fault climbs to its full size in RAMP_STEPS equal steps over one
+          fault window and then holds for another. Positive once the held
+          value measures over the line: the rule must open, once, and close.
+
+Not built yet: intermittent faults, a step during warm-up, a fingerprint
+change, dns.failing, and every rule that has no baseline.
 """
 import argparse, json, math, os, pathlib, signal, socket, statistics, struct, subprocess, sys, threading, time
 
@@ -47,6 +55,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import health_lab as hl
 
 FACTORS = [0.0, 0.5, 0.85, 1.15, 2.0, 5.0]
+SHAPES = ['step', 'spike', 'ramp']
+# How large the spike and the ramp's last step are, in line distances.
+SHAPE_FACTOR = 5.0
+# Shorter than two probe cycles, so a spike reaches one sample of any rule.
+SPIKE_SECS = 6
+RAMP_STEPS = 5
 BASES_MS = [1, 20, 80]
 POSITIVE, NEGATIVE = 1.1, 0.9
 # Reference probes per measurement, and the pause between them.
@@ -141,15 +155,25 @@ RULES = {
 }
 
 
-def cells(rules, reps):
-    return [{'name': f'{rule}@{base}ms×{factor:g}#{rep}', 'rule': rule, 'base_ms': base,
-             'factor': factor, 'rep': rep}
-            for rule in rules for base in BASES_MS for factor in FACTORS for rep in range(reps)]
+def cells(rules, reps, shapes=('step',)):
+    out = []
+    for rule in rules:
+        for base in BASES_MS:
+            for rep in range(reps):
+                if 'step' in shapes:
+                    out += [{'name': f'{rule}@{base}ms×{factor:g}#{rep}', 'rule': rule, 'base_ms': base,
+                             'factor': factor, 'rep': rep, 'shape': 'step'} for factor in FACTORS]
+                out += [{'name': f'{rule}@{base}ms~{shape}#{rep}', 'rule': rule, 'base_ms': base,
+                         'factor': SHAPE_FACTOR, 'rep': rep, 'shape': shape}
+                        for shape in shapes if shape != 'step']
+    return out
 
 
 def cell_secs(cell):
     spec = RULES[cell['rule']]
-    return hl.WARMUP_SECS + spec['fault_secs'] + spec['close_within_s'] + hl.SETTLE_SECS
+    # A ramp climbs for one fault window and holds for another.
+    fault = spec['fault_secs'] * (2 if cell.get('shape') == 'ramp' else 1)
+    return hl.WARMUP_SECS + fault + spec['close_within_s'] + hl.SETTLE_SECS
 
 
 def measure(reference):
@@ -187,8 +211,9 @@ def run_cell(cell, artifacts):
     seed = seed_for(base)
     mean, sigma = seed[spec['metric']]['mean'], seed[spec['metric']]['sigma']
     distance = spec['line'](mean, sigma) - mean
+    shape = cell.get('shape', 'step')
     at = {'fault': None, 'clear': None, 'closed': None}
-    measured, fault = {}, {'step_ms': 0.0, 'staged': False}
+    measured, fault = {}, {'step_ms': 0.0, 'staged': False, 'ramp': 0}
     with hl.Lab() as lab:
         lab.seed.write_text(json.dumps(seed))
         if base > 1:
@@ -214,16 +239,36 @@ def run_cell(cell, artifacts):
                     step = aim - (measured.get('base_ms') or mean)
                     if cell['factor'] > 0 and step >= MIN_STEP_MS:
                         fault.update(step_ms=step, staged=True)
-                        lab.stage(spec['fault'](step))
+                        first = step / RAMP_STEPS if shape == 'ramp' else step
+                        fault['ramp'] = 1
+                        lab.stage(spec['fault'](first))
                     at['fault'] = t
-                    probe['fault'] = threading.Thread(target=reference, args=('fault_ms',))
-                    probe['fault'].start()
+                    if shape == 'step':
+                        probe['fault'] = threading.Thread(target=reference, args=('fault_ms',))
+                        probe['fault'].start()
                 return
             if at['clear'] is None:
-                if t - at['fault'] >= spec['fault_secs']:
+                held = t - at['fault']
+                if shape == 'ramp' and fault['staged'] and fault['ramp'] < RAMP_STEPS \
+                        and held >= fault['ramp'] * spec['fault_secs'] / RAMP_STEPS:
+                    fault['ramp'] += 1
+                    # Taken out and put back: the ICMP-only netem is not
+                    # replaced in place.
+                    lab.stage(spec['clear'])
+                    lab.stage(spec['fault'](fault['step_ms'] * fault['ramp'] / RAMP_STEPS))
+                    if fault['ramp'] == RAMP_STEPS:
+                        probe['fault'] = threading.Thread(target=reference, args=('fault_ms',))
+                        probe['fault'].start()
+                lasts = {'step': spec['fault_secs'], 'spike': SPIKE_SECS,
+                         'ramp': 2 * spec['fault_secs']}[shape]
+                if held >= lasts:
                     if fault['staged']:
                         lab.stage(spec['clear'])
                     at['clear'] = t
+                return
+            # A spike is watched for a fault window after it has gone: the
+            # sample it reached must not be joined by a second.
+            if shape == 'spike' and t - at['clear'] < spec['fault_secs']:
                 return
             if hl.is_open(r, rule):
                 at['closed'] = None
@@ -251,6 +296,9 @@ def run_cell(cell, artifacts):
     others = sorted({i['rule'] for r in rows for i in r['issues']
                      if i['state'] in hl.OPEN and i['rule'] != rule})
     kind = label(ratio)
+    if shape == 'spike':
+        # Negative by construction, provided the spike went in at all.
+        kind = 'negative' if fault['staged'] else 'unmeasured'
     if kind == 'positive':
         verdict = ('miss' if not in_fault else 'reopened' if len(opens) > 1
                    else 'stuck_open' if still_open else 'hit')
@@ -259,7 +307,7 @@ def run_cell(cell, artifacts):
     else:
         verdict = kind
     return {
-        **cell, 'label': kind, 'verdict': verdict, 'ratio': None if ratio is None else round(ratio, 3),
+        **cell, 'shape': shape, 'label': kind, 'verdict': verdict, 'ratio': None if ratio is None else round(ratio, 3),
         'seed_mean_ms': mean, 'distance_ms': round(distance, 2), 'asked_step_ms': round(fault['step_ms'], 2),
         'base_ms_measured': base_ms and round(base_ms, 2), 'fault_ms_measured': fault_ms and round(fault_ms, 2),
         'opens': len(opens), 'open_before_fault': bool(opens) and opens[0] < at['fault'],
@@ -377,6 +425,8 @@ def main():
     ap.add_argument('--reps', type=int, default=1, help='runs of each cell (default %(default)s)')
     ap.add_argument('--base', type=int, nargs='+', choices=BASES_MS, help='base latencies, ms (default: all)')
     ap.add_argument('--factor', type=float, nargs='+', choices=FACTORS, help='steps (default: all)')
+    ap.add_argument('--shape', nargs='+', choices=SHAPES, default=SHAPES,
+                    help='fault shapes (default: all)')
     ap.add_argument('--jobs', type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)),
                     help='cells run at once (default %(default)s); more makes timing noisier')
     ap.add_argument('--out', default='matrix-lab.json')
@@ -399,9 +449,9 @@ def main():
     if args.summarise:
         summary = summarise(json.loads(pathlib.Path(args.summarise).read_text())['runs'])
     else:
-        todo = [c for c in cells(args.rule, args.reps)
+        todo = [c for c in cells(args.rule, args.reps, args.shape)
                 if (not args.base or c['base_ms'] in args.base)
-                and (not args.factor or c['factor'] in args.factor)]
+                and (not args.factor or c['shape'] != 'step' or c['factor'] in args.factor)]
         if args.list:
             worst = sum(cell_secs(c) for c in todo)
             print(f'{len(todo)} cells, at most {worst / 3600:.1f} runner-hours, '
