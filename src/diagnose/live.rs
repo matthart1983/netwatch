@@ -821,7 +821,13 @@ fn dns(app: &App) -> Option<DnsObs> {
 
     // A resolver the probe could not query (a scoped link-local address, no
     // socket) is not a resolver failing 100% of queries; it is no observation.
-    let failure_rate_pct = health.dns_loss.pct()?;
+    let lost_pct = health.dns_loss.pct()?;
+    // The latest cycle's failed share, which `dns.failing` closes on: a
+    // SERVFAIL is a reply to the Health tile and a failure to the rule.
+    let failure_rate_pct = health.dns_probe_history.back().map_or(lost_pct, |p| {
+        let per_cycle = crate::collectors::health::DNS_PROBES_PER_CYCLE as f64;
+        lost_pct.max(failed_queries(p) as f64 / per_cycle * 100.0)
+    });
 
     // One sample per probe, so the window is samples × the probe interval —
     // not × a bare 5, which silently became wrong the moment the cadence
@@ -867,6 +873,9 @@ fn dns(app: &App) -> Option<DnsObs> {
     // The reference resolver is the alternate that gets timed: it is asked
     // every cycle over the same uplink, whatever the configured resolver
     // does. It is no alternate to itself.
+    let reference = (resolver != crate::collectors::health::REFERENCE_RESOLVER)
+        .then(|| dns_reference(&health.dns_reference_rtt_history))
+        .flatten();
     let reference_rtt = (resolver != crate::collectors::health::REFERENCE_RESOLVER)
         .then(|| reference_rtt(&health.dns_reference_rtt_history))
         .flatten();
@@ -898,6 +907,7 @@ fn dns(app: &App) -> Option<DnsObs> {
             None => cfg.dns_servers.get(1).cloned(),
         },
         alt_rtt_ms: reference_rtt,
+        reference,
         icmp_rtt_ms: None,
         cached_rtt_ms: None,
         window_secs,
@@ -965,8 +975,8 @@ fn reference_rtt(history: &std::collections::VecDeque<Option<f64>>) -> Option<f6
 /// resolver has answered nothing at all.
 ///
 /// `probes` and `completed` are the prober's per-cycle histories, pushed
-/// together, oldest first. A SERVFAIL is a reply here, as it is to the
-/// probe.
+/// together, oldest first. A SERVFAIL is a reply to the probe and a failure
+/// here.
 fn dns_window(
     probes: &std::collections::VecDeque<crate::collectors::health::DnsProbe>,
     completed: &std::collections::VecDeque<Instant>,
@@ -975,14 +985,15 @@ fn dns_window(
     let per_cycle = crate::collectors::health::DNS_PROBES_PER_CYCLE as u32;
     let cycles = (DNS_FAIL_WINDOW / per_cycle) as usize;
     let recent = probes.iter().rev().take(cycles);
-    let (mut queries, mut answered, mut recent_unanswered) = (0, 0, 0);
+    let (mut queries, mut answered, mut recent_unanswered, mut servfail) = (0, 0, 0, 0);
     for p in recent {
-        let lost = per_cycle - (p.replies as u32).min(per_cycle);
+        let failed = failed_queries(p);
         if queries < DNS_FAIL_RECENT {
-            recent_unanswered += lost;
+            recent_unanswered += failed;
         }
         queries += per_cycle;
-        answered += per_cycle - lost;
+        answered += per_cycle - failed;
+        servfail += (p.servfail as u32).min(failed);
     }
     // The two histories are the same length unless a reader caught the
     // prober between pushes; pair them from the newest end.
@@ -990,7 +1001,7 @@ fn dns_window(
         .iter()
         .rev()
         .zip(completed.iter().rev())
-        .take_while(|(p, _)| p.replies == 0)
+        .take_while(|(p, _)| failed_queries(p) == per_cycle)
         .map(|(_, at)| *at);
     let (newest, oldest) = silent.fold((None, None), |(newest, _), at| {
         (newest.or(Some(at)), Some(at))
@@ -1006,8 +1017,41 @@ fn dns_window(
         unanswered: queries - answered,
         recent_unanswered,
         all_lost_secs,
+        servfail,
         ..Default::default()
     }
+}
+
+/// How many of one cycle's queries failed: no reply, or a SERVFAIL. The
+/// resolver said it could not answer, and to whoever asked that is the same
+/// as silence. REFUSED is not counted: a resolver may refuse the probe's
+/// root-NS question by policy and resolve everything else.
+fn failed_queries(p: &crate::collectors::health::DnsProbe) -> u32 {
+    let per_cycle = crate::collectors::health::DNS_PROBES_PER_CYCLE as u32;
+    let replies = (p.replies as u32).min(per_cycle);
+    per_cycle - replies + (p.servfail as u32).min(replies)
+}
+
+/// How the reference resolver has answered, for telling a broken resolver
+/// from a broken uplink. `None` when it was not asked (third-party probes
+/// off, or it is the configured resolver).
+fn dns_reference(
+    history: &std::collections::VecDeque<Option<f64>>,
+) -> Option<super::detectors::DnsReference> {
+    if history.is_empty() {
+        return None;
+    }
+    let recent: Vec<bool> = history
+        .iter()
+        .rev()
+        .take(REFERENCE_RTT_CYCLES)
+        .map(Option::is_some)
+        .collect();
+    Some(super::detectors::DnsReference {
+        asked: recent.len() as u32,
+        answered: recent.iter().filter(|a| **a).count() as u32,
+        ever_answered: history.iter().any(Option::is_some),
+    })
 }
 
 /// Nearest-rank percentile. `None` on an empty sample set rather than 0.0 —
@@ -1169,6 +1213,55 @@ mod tests {
             Some(9.0),
         ];
         assert_eq!(reference_rtt(&h(&stale)), None);
+    }
+
+    /// A SERVFAIL is a reply to the probe and a failed lookup to whoever
+    /// asked. A resolver that answers everything with it is failing, and the
+    /// window says how much of the failure was that.
+    #[test]
+    fn a_servfail_is_a_failed_query_and_a_cycle_of_them_is_silence() {
+        use crate::collectors::health::DnsProbe;
+        let t0 = Instant::now();
+        let at: std::collections::VecDeque<Instant> = (0..8)
+            .map(|i| t0 + std::time::Duration::from_secs(i * 5))
+            .collect();
+        let ok = DnsProbe {
+            replies: 3,
+            ..Default::default()
+        };
+        let servfail = DnsProbe {
+            replies: 3,
+            servfail: 3,
+            ..Default::default()
+        };
+        let mut probes: std::collections::VecDeque<DnsProbe> = (0..8).map(|_| ok).collect();
+        probes[6].servfail = 1;
+        let w = dns_window(&probes, &at);
+        assert_eq!((w.queries, w.unanswered, w.servfail), (24, 1, 1));
+        assert_eq!(w.all_lost_secs, None);
+
+        for p in probes.iter_mut().skip(4) {
+            *p = servfail;
+        }
+        let w = dns_window(&probes, &at);
+        assert_eq!(
+            (w.unanswered, w.servfail, w.recent_unanswered),
+            (12, 12, 12)
+        );
+        assert_eq!(w.all_lost_secs, Some(15.0));
+    }
+
+    #[test]
+    fn the_reference_summary_keeps_whether_it_ever_answered() {
+        let h = |v: &[Option<f64>]| v.iter().copied().collect::<std::collections::VecDeque<_>>();
+        assert_eq!(dns_reference(&h(&[])), None);
+        let r = dns_reference(&h(&[None, None, None])).unwrap();
+        assert_eq!((r.asked, r.answered, r.ever_answered), (3, 0, false));
+        // It answered before the newest six cycles and not since.
+        let mut gone = vec![Some(9.0); 4];
+        gone.extend([None; 6]);
+        let r = dns_reference(&h(&gone)).unwrap();
+        assert_eq!((r.asked, r.answered, r.ever_answered), (6, 0, true));
     }
 
     #[test]

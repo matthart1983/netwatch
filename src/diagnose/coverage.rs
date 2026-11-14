@@ -24,6 +24,11 @@ pub const CORE_RULES: [&str; 5] = [
     "dns.slow_resolver",
 ];
 
+/// Why `dns.truncation_retry` is not evaluated while the probe sees no
+/// truncated reply.
+pub const TRUNCATION_UNSEEN: &str =
+    "the probe's answers are too small to truncate; larger answers are not sampled";
+
 /// How a stub resolver's `dns.slow_resolver` row begins its reason.
 const STUB_REASON: &str = "limited:";
 
@@ -281,7 +286,11 @@ impl Coverage {
                 "gateway.rtt_spike" => baseline(obs.gateway.as_ref().and_then(|g| g.rtt_ms), obs.gateway.as_ref().and_then(|g| g.addr.as_deref()), "gateway.rtt"),
                 "dns.slow_resolver" if stub.is_some() => (Available, stub.as_deref().unwrap_or_default()),
                 "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "no window of resolver timings has closed yet; the first takes six probe cycles"),
-                "dns.failing" | "dns.truncation_retry" => present(obs.dns.as_ref().is_some_and(|d| d.queries > 0), "no DNS query outcomes measured"),
+                "dns.failing" => present(obs.dns.as_ref().is_some_and(|d| d.queries > 0), "no DNS query outcomes measured"),
+                // The probe asks for the root NS set, which fits in 512 bytes
+                // on any resolver. No truncated reply to that question is not
+                // a resolver that never truncates.
+                "dns.truncation_retry" => present(obs.dns.as_ref().is_some_and(|d| d.truncated > 0), TRUNCATION_UNSEEN),
                 "dns.hijack_suspect" => present(obs.dns.as_ref().and_then(|d| d.cross.as_ref()).is_some(), "resolver cross-check not measured"),
                 id if id.starts_with("path.") && obs.paths.is_empty() => (AwaitingTest, "run a traceroute; results remain usable for 120 seconds"),
                 "path.changed" => present(obs.paths.iter().any(|p| p.previous.is_some() && !p.hops.is_empty()), "current and previous traces required"),
@@ -541,6 +550,39 @@ mod tests {
             "run a traceroute",
         ));
         assert!(rows(&extra).core().checked());
+    }
+
+    /// The probe's root-NS answer cannot truncate, so its replies arriving
+    /// whole is no evidence about truncation. The rule is evaluated only
+    /// once a truncated reply has actually been seen.
+    #[test]
+    fn truncation_is_not_measured_until_a_truncated_reply_is_seen() {
+        let row = |truncated: u32| {
+            let mut dns = (crate::diagnose::fixture::scenarios()[0].obs)(0)
+                .dns
+                .expect("the fixture has a resolver");
+            dns.queries = 30;
+            dns.truncated = truncated;
+            let obs = Observations {
+                dns: Some(dns),
+                ..Default::default()
+            };
+            let base = BaselineStore::new(crate::diagnose::baseline::NetworkFingerprint::new(
+                "eth0",
+                None,
+                vec![],
+                None,
+            ));
+            Coverage::from_observations(&obs, &base, SigmaFloor::default())
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "dns.truncation_retry")
+                .expect("a row for the rule")
+        };
+        let unseen = row(0);
+        assert_eq!(unseen.status, Availability::NotMeasured);
+        assert_eq!(unseen.reason, TRUNCATION_UNSEEN);
+        assert_eq!(row(4).status, Availability::Available);
     }
 
     #[test]

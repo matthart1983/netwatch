@@ -45,6 +45,19 @@ All notable changes to NetWatch will be documented in this file.
   judged. The issue no longer quotes a p95. A `consecutive_n` of 1 still opens it on one
   window; values above 2 no longer make it wait longer. The rule stays beta.
 
+- **`dns.failing` counts SERVFAIL as a failure and uses the reference resolver to place
+  the fault.** A resolver that answered every query with SERVFAIL read as healthy, because
+  a reply was a reply. Those queries now count with the unanswered ones, and the issue
+  gains a cause for it. Two more checks compare with 1.1.1.1 over the same uplink: it
+  answering while your resolver does not points at the resolver, and both going quiet
+  where it used to answer points at the uplink. Where it has never answered, or was not
+  asked, the checks read as not run. REFUSED is not counted, because a resolver may
+  refuse the probe's root-NS question by policy.
+
+- **`dns.truncation_retry` says when it has nothing to judge.** The probe's question has
+  an answer too small to truncate, so the rule's coverage row now reads "not measured"
+  until a truncated reply is seen, instead of "ready".
+
 - **A slow or silent resolver is compared with the public reference resolver.** The
   cross-check's query to 1.1.1.1 was already sent every probe cycle and its timing thrown
   away. It is now kept, and sent whether or not your resolver answers. When the reference

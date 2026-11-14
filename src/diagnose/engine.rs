@@ -1767,6 +1767,7 @@ mod tests {
     fn dns(p50: f64) -> DnsObs {
         DnsObs {
             window: Default::default(),
+            reference: None,
             resolver: "169.254.1.1".into(),
             rtt_p50_ms: Some(p50),
             rtt_p95_ms: Some(p50 * 1.2),

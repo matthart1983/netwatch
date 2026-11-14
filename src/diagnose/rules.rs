@@ -134,7 +134,7 @@ pub const CATALOGUE: &[Rule] = &[
         title: "dns resolution failing",
         category: "dns",
         severity: Severity::High,
-        trigger: "at least 5 of the last 60 probe queries unanswered, one of them among the newest 12, with the lower confidence bound on that share above 5%; or every query unanswered for 15s",
+        trigger: "at least 5 of the last 60 probe queries unanswered or answered SERVFAIL, one of them among the newest 12, with the lower confidence bound on that share above 5%; or every query failing that way for 15s",
         suppresses: &["dns.slow_resolver", "target.resolve_failed"],
         status: RuleStatus::Active,
         maturity: Maturity::Beta,

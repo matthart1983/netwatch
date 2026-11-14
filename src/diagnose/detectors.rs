@@ -504,6 +504,49 @@ pub struct DnsObs {
     /// existed, and then the rule falls back to `failure_rate_pct`.
     #[serde(default)]
     pub window: DnsWindow,
+    /// How the reference resolver answered over the same cycles. `None` when
+    /// it was not asked.
+    #[serde(default)]
+    pub reference: Option<DnsReference>,
+}
+
+/// The reference resolver's answers over its newest cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DnsReference {
+    pub asked: u32,
+    pub answered: u32,
+    /// Whether it has answered at all on this network. A network that blocks
+    /// outbound DNS to public resolvers never lets it, and its silence there
+    /// says nothing about the uplink.
+    pub ever_answered: bool,
+}
+
+/// What comparing the configured resolver with the reference says about a
+/// resolver that is failing. The reference is asked over the same uplink, so
+/// its answers place the fault on one side of the resolver or the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceVerdict {
+    /// The reference answers: the uplink works and the resolver does not.
+    ResolverOnly,
+    /// The reference stopped answering too: the fault is before either.
+    BothFailing,
+    /// The reference has never answered here; outbound DNS may be blocked.
+    NeverAnswered,
+    /// The reference was not asked.
+    NotAsked,
+}
+
+impl DnsObs {
+    pub fn reference_verdict(&self) -> ReferenceVerdict {
+        match self.reference {
+            None | Some(DnsReference { asked: 0, .. }) => ReferenceVerdict::NotAsked,
+            Some(r) if !r.ever_answered => ReferenceVerdict::NeverAnswered,
+            Some(r) if r.answered * 2 >= r.asked => ReferenceVerdict::ResolverOnly,
+            Some(r) if r.answered == 0 => ReferenceVerdict::BothFailing,
+            // A reference answering some of the time settles nothing.
+            Some(_) => ReferenceVerdict::NotAsked,
+        }
+    }
 }
 
 /// The DNS probe's last [`DNS_FAIL_WINDOW`] queries, or fewer when the probe
@@ -511,6 +554,7 @@ pub struct DnsObs {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct DnsWindow {
     pub queries: u32,
+    /// Queries that failed: no reply, or a SERVFAIL.
     pub unanswered: u32,
     /// Unanswered among the newest [`DNS_FAIL_RECENT`] queries.
     #[serde(default)]
@@ -520,6 +564,9 @@ pub struct DnsWindow {
     /// latest cycle got an answer, or only one cycle has failed so far.
     #[serde(default)]
     pub all_lost_secs: Option<f64>,
+    /// How many of `unanswered` were answered SERVFAIL rather than lost.
+    #[serde(default)]
+    pub servfail: u32,
     /// The span of the closed window `rtt_p50_ms` is the median of, and how
     /// many of its probe cycles answered. Zero where the p50 did not come
     /// from one: a fixture, or a recording made before the windows.
@@ -1987,6 +2034,82 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                 .with_window(secs, queries),
             );
         }
+        // The reference resolver is asked over the same uplink every cycle.
+        // Whether it answers while this one does not places the fault on
+        // one side of the resolver or the other. A reference that has never
+        // answered here, or was not asked, settles nothing and says so.
+        let reference = crate::collectors::health::REFERENCE_RESOLVER;
+        let verdict = dns.reference_verdict();
+        let counts = dns.reference.map_or(String::new(), |r| {
+            format!("{} of its last {} cycles", r.answered, r.asked)
+        });
+        let unsettled = match verdict {
+            ReferenceVerdict::NeverAnswered => format!(
+                "{reference} has never answered on this network; outbound dns may be blocked"
+            ),
+            _ => format!("{reference} was not asked, or answered only some of the time"),
+        };
+        let (answers, also_silent) = (
+            "the reference resolver answers over the same uplink",
+            "the reference resolver is unanswered too",
+        );
+        let reference_answers = match verdict {
+            ReferenceVerdict::ResolverOnly => CheckResult::pass(
+                "reference_answers_over_the_same_uplink",
+                answers,
+                format!(
+                    "{reference} answered {counts} while {} failed",
+                    dns.resolver
+                ),
+            ),
+            ReferenceVerdict::BothFailing => CheckResult::fail(
+                "reference_answers_over_the_same_uplink",
+                answers,
+                format!("{reference} answered {counts}"),
+            ),
+            _ => CheckResult::not_run(
+                "reference_answers_over_the_same_uplink",
+                answers,
+                Availability::NotMeasured,
+                unsettled.clone(),
+            ),
+        };
+        let reference_silent = match verdict {
+            ReferenceVerdict::BothFailing => CheckResult::pass(
+                "reference_also_unanswered",
+                also_silent,
+                format!("{reference} answered {counts}, and it used to answer here"),
+            ),
+            ReferenceVerdict::ResolverOnly => CheckResult::fail(
+                "reference_also_unanswered",
+                also_silent,
+                format!("{reference} answered {counts}"),
+            ),
+            _ => CheckResult::not_run(
+                "reference_also_unanswered",
+                also_silent,
+                Availability::NotMeasured,
+                unsettled.clone(),
+            ),
+        };
+        let servfail = match (dns.window.queries, dns.window.servfail) {
+            (0, _) => CheckResult::not_run(
+                "servfail_replies",
+                "servfail replies",
+                Availability::NotMeasured,
+                "reply codes were not recorded",
+            ),
+            (queries, 0) => CheckResult::fail(
+                "servfail_replies",
+                "servfail replies",
+                format!("none of the last {queries} queries was answered SERVFAIL"),
+            ),
+            (queries, n) => CheckResult::pass(
+                "servfail_replies",
+                "servfail replies",
+                format!("{n} of the last {queries} queries were answered SERVFAIL"),
+            ),
+        };
         d.causes = vec![
             Cause::new(
                 "resolver_down",
@@ -1995,19 +2118,32 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                 // on the live path is always. Reading that as "no reply" made
                 // every failing resolver rank as down; a check that was never
                 // made is skipped, and the next-test suggester can offer it.
-                vec![match dns.icmp_rtt_ms {
-                    None => CheckResult::not_run(
-                        "resolver_unreachable",
-                        "resolver unreachable",
-                        Availability::NotImplemented,
-                        "no icmp probe of the resolver has run",
-                    ),
-                    Some(rtt) => CheckResult::fail(
-                        "resolver_unreachable",
-                        "resolver unreachable",
-                        format!("resolver answers icmp in {rtt:.1}ms"),
-                    ),
-                }],
+                vec![
+                    match dns.icmp_rtt_ms {
+                        None => CheckResult::not_run(
+                            "resolver_unreachable",
+                            "resolver unreachable",
+                            Availability::NotImplemented,
+                            "no icmp probe of the resolver has run",
+                        ),
+                        Some(rtt) => CheckResult::fail(
+                            "resolver_unreachable",
+                            "resolver unreachable",
+                            format!("resolver answers icmp in {rtt:.1}ms"),
+                        ),
+                    },
+                    reference_answers,
+                ],
+            ),
+            Cause::new(
+                "resolver_erroring",
+                "the resolver answers, but with SERVFAIL: its upstream or its own configuration is failing",
+                vec![servfail],
+            ),
+            Cause::new(
+                "uplink_down",
+                "the uplink is failing, and the resolver with it",
+                vec![reference_silent],
             ),
             Cause::new(
                 "udp53_filtered",
@@ -3390,6 +3526,7 @@ mod tests {
     fn slow_dns() -> DnsObs {
         DnsObs {
             window: Default::default(),
+            reference: None,
             resolver: "169.254.1.1".into(),
             rtt_p50_ms: Some(40.0),
             rtt_p95_ms: Some(48.0),
@@ -3966,6 +4103,85 @@ mod tests {
         detect(&obs_with_dns(dns), &store(), &Thresholds::default())
             .into_iter()
             .find(|d| d.rule == "dns.failing")
+    }
+
+    /// The check a failing resolver's cause carries, by cause and check id.
+    fn failing_check(dns: DnsObs, cause: &str, check: &str) -> Option<bool> {
+        let d = detect(&obs_with_dns(dns), &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "dns.failing")
+            .expect("dns.failing should fire");
+        let cause = d.causes.iter().find(|c| c.id == cause).expect("the cause");
+        cause
+            .checks
+            .iter()
+            .find(|c| c.id == check)
+            .expect("the check")
+            .passed
+    }
+
+    fn silent_dns(reference: Option<DnsReference>, servfail: u32) -> DnsObs {
+        let mut dns = slow_dns();
+        dns.window = DnsWindow {
+            queries: 60,
+            unanswered: 30,
+            recent_unanswered: 12,
+            servfail,
+            ..Default::default()
+        };
+        dns.reference = reference;
+        dns
+    }
+
+    /// The reference resolver shares the uplink. It answering while the
+    /// configured one does not blames the resolver; both silent, where the
+    /// reference used to answer, blames what they share. A reference that
+    /// never answered here, or was not asked, blames nothing.
+    #[test]
+    fn the_reference_resolver_places_a_dns_failure() {
+        let reference = |answered, ever_answered| {
+            Some(DnsReference {
+                asked: 6,
+                answered,
+                ever_answered,
+            })
+        };
+        let checks = |r| {
+            (
+                failing_check(
+                    silent_dns(r, 0),
+                    "resolver_down",
+                    "reference_answers_over_the_same_uplink",
+                ),
+                failing_check(silent_dns(r, 0), "uplink_down", "reference_also_unanswered"),
+            )
+        };
+        assert_eq!(checks(reference(6, true)), (Some(true), Some(false)));
+        assert_eq!(checks(reference(0, true)), (Some(false), Some(true)));
+        assert_eq!(checks(reference(0, false)), (None, None), "blocked");
+        assert_eq!(checks(None), (None, None), "not asked");
+        assert_eq!(checks(reference(2, true)), (None, None), "undecided");
+    }
+
+    #[test]
+    fn servfail_replies_name_a_resolver_that_answers_and_cannot_resolve() {
+        let check = |servfail| {
+            failing_check(
+                silent_dns(None, servfail),
+                "resolver_erroring",
+                "servfail_replies",
+            )
+        };
+        assert_eq!(check(20), Some(true));
+        assert_eq!(check(0), Some(false));
+        // A recording from before reply codes were kept.
+        let mut old = silent_dns(None, 0);
+        old.window = DnsWindow::default();
+        old.failure_rate_pct = 100.0;
+        assert_eq!(
+            failing_check(old, "resolver_erroring", "servfail_replies"),
+            None
+        );
     }
 
     /// The old rule read one lost query in a cycle of three as 33% and

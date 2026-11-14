@@ -818,6 +818,7 @@ mod tests {
         let resolver = Observations {
             dns: Some(DnsObs {
                 window: Default::default(),
+                reference: None,
                 resolver: "192.0.2.2".into(),
                 rtt_p50_ms: Some(2.0),
                 rtt_p95_ms: Some(3.0),

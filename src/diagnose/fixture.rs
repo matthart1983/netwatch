@@ -151,6 +151,7 @@ fn healthy_gateway() -> GatewayObs {
 fn slow_dns() -> DnsObs {
     DnsObs {
         window: Default::default(),
+        reference: None,
         resolver: RESOLVER.into(),
         rtt_p50_ms: Some(40.0),
         rtt_p95_ms: Some(48.0),
@@ -877,6 +878,7 @@ fn dns_slow_router(t: u64) -> Observations {
     // measures.
     obs.dns = Some(DnsObs {
         window: Default::default(),
+        reference: None,
         resolver: GATEWAY.into(),
         rtt_p50_ms: Some(p50),
         rtt_p95_ms: Some(p95),

@@ -2540,6 +2540,7 @@ mod tests {
         let slow_resolver = Observations {
             dns: Some(DnsObs {
                 window: Default::default(),
+                reference: None,
                 resolver: "192.0.2.53".into(),
                 rtt_p50_ms: Some(40.0),
                 rtt_p95_ms: Some(48.0),
