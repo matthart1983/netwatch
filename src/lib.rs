@@ -101,6 +101,8 @@ mod tests {
 /// standard library's references need no search. The release binary was
 /// never affected; this keeps `cargo test` working on Windows.
 #[cfg(all(windows, target_env = "msvc"))]
+// Declares two Win32 functions and never calls them.
+#[allow(unsafe_code)]
 mod wait_on_address {
     use core::ffi::c_void;
 
