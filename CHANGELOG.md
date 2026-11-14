@@ -5,6 +5,12 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Packet filters take CIDR ranges and `!=`** (#202). `ip.src == 192.168.0.0/24`,
+  `ip.addr == 2001:db8::/32` and a bare `10.0.0.0/8` match the addresses in the range.
+  A range used to be accepted and then matched nothing. `ip.src != 10.0.0.1` and
+  `port != 443` are the negation of `==`, where `!=` used to be rejected. A range with an
+  impossible prefix length, such as `/33`, is rejected instead of being searched for as
+  text.
 - **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
   `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change
   in a minor release.

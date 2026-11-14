@@ -484,6 +484,8 @@ const FULL_HELP: &[Section] = &[
             ("192.168.1.1", "Match source or destination IP"),
             ("ip.addr == X", "The same; IPv6 in any spelling"),
             ("ip.src == X / ip.dst == X", "Match specific direction"),
+            ("ip.src == 10.0.0.0/8", "Match a range (CIDR), IPv4 or IPv6"),
+            ("ip.src != X, port != N", "Not equal"),
             ("port 443", "Match source or destination port"),
             ("stream 7", "Match stream index"),
             ("contains \"text\"", "Search in info/payload"),

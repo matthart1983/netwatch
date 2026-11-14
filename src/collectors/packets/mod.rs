@@ -7116,6 +7116,114 @@ mod tests {
             assert!(!matches(filter), "{filter}");
         }
     }
+
+    /// Issue #202. A range in CIDR notation matches the addresses inside
+    /// it, typed as the network or as any address in it, on either family.
+    #[test]
+    fn address_filters_match_a_cidr_range() {
+        let (_, v4) = replay_ssh("192.0.2.10:51234", "198.51.100.7:22");
+        let (_, v6) = replay_ssh("[2001:db8::10]:50022", "[2001:db8:1::20]:22");
+        let matches = |filter: &str, pkt| matches_packet(&parse_filter(filter).expect(filter), pkt);
+        for filter in [
+            "ip.src == 192.0.2.0/24",
+            "ip.src == 192.0.2.77/24",
+            "ip.src==192.0.2.10/32",
+            "ip.dst == 198.51.100.0/22",
+            "ip.addr == 198.51.0.0/16",
+            "192.0.2.0/24",
+            "192.0.2.0/24 and port 22",
+            "ip.addr == 0.0.0.0/0",
+            "ip.src == ::ffff:192.0.2.0/24",
+        ] {
+            assert!(matches(filter, &v4[0]), "{filter}");
+        }
+        for filter in [
+            "ip.src == 192.0.3.0/24",
+            "ip.src == 192.0.2.11/32",
+            "ip.dst == 192.0.2.0/24",
+            "ip.src == 198.51.100.0/24",
+            "10.0.0.0/8",
+            // Another family's range holds none of these addresses.
+            "ip.addr == ::/0",
+        ] {
+            assert!(!matches(filter, &v4[0]), "{filter}");
+        }
+        for filter in [
+            "ip.src == 2001:db8::/48",
+            "ip.dst == 2001:db8:1::/48",
+            "ip.addr == 2001:DB8::/32",
+            "2001:db8::/64",
+            "ip.addr == ::/0",
+        ] {
+            assert!(matches(filter, &v6[0]), "{filter}");
+        }
+        for filter in [
+            "ip.dst == 2001:db8::/48",
+            "ip.src == 2001:db8:1::/48",
+            "ip.addr == 0.0.0.0/0",
+        ] {
+            assert!(!matches(filter, &v6[0]), "{filter}");
+        }
+    }
+
+    /// Something written as a range that is not one is no filter. Kept as
+    /// text it matched nothing, which reads as "no such traffic".
+    #[test]
+    fn a_malformed_cidr_range_is_rejected() {
+        for filter in [
+            "ip.src == 192.0.2.0/33",
+            "ip.src == 192.0.2.0/",
+            "ip.src == 192.0.2.0/-1",
+            "ip.src == 192.0.2.0/abc",
+            "ip.addr == 2001:db8::/129",
+            "ip.dst == 192.0.2./24",
+            "192.0.2.0/33",
+        ] {
+            assert!(parse_filter(filter).is_none(), "{filter}");
+        }
+        // A slash in a word that is not an address is still a text search.
+        for text in ["/index.html", "text/html"] {
+            assert!(
+                matches!(parse_filter(text), Some(FilterExpr::Contains(_))),
+                "{text}"
+            );
+        }
+    }
+
+    /// Issue #202. `!=` is the negation of `==`, with or without spaces.
+    #[test]
+    fn not_equals_excludes_what_equals_selects() {
+        let (_, packets) = replay_ssh("192.0.2.10:51234", "198.51.100.7:22");
+        let syn = &packets[0];
+        let matches = |filter: &str| matches_packet(&parse_filter(filter).expect(filter), syn);
+        for filter in [
+            "ip.src != 192.0.2.99",
+            "ip.src!=192.0.2.99",
+            "ip.dst != 192.0.2.10",
+            "ip.addr != 203.0.113.1",
+            "ip.src != 10.0.0.0/8",
+            "port != 443",
+            "ip.src != 192.0.2.99 and port 22",
+        ] {
+            assert!(matches(filter), "{filter}");
+        }
+        for filter in [
+            "ip.src != 192.0.2.10",
+            "ip.src != 192.0.2.0/24",
+            "ip.dst != 198.51.100.7",
+            // Either end equal excludes the packet.
+            "ip.addr != 192.0.2.10",
+            "ip.addr != 198.51.100.7",
+            "port != 22",
+        ] {
+            assert!(!matches(filter), "{filter}");
+        }
+        // The spelling that already worked still does, and means the same.
+        assert!(!matches("!ip.src == 192.0.2.10"));
+        assert!(matches("!dns"));
+        assert!(matches("! dns"));
+        assert!(parse_filter("port != http").is_none());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

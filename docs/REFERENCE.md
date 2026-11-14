@@ -208,6 +208,8 @@ tcp                        # Protocol
 192.168.1.42               # IP address (src or dst)
 ip.addr == 2001:db8::1     # The same; IPv6 in any spelling
 ip.src == 10.0.0.1         # Directional
+ip.src == 10.0.0.0/8       # A range, in CIDR notation; IPv6 too
+ip.src != 10.0.0.1         # Not equal; the same as !ip.src == 10.0.0.1
 port 443                   # Port
 stream 7                   # Stream index
 contains "hello"           # Text search
@@ -219,6 +221,7 @@ ech:true                   # Encrypted ClientHello present
 decrypted:true             # Only TLS-decrypted records
 tcp and port 443           # Combinators (and / or)
 !dns                       # Negation
+port != 443                # Not equal works for port too
 google                     # Bare word → contains "google"
 ```
 
