@@ -115,6 +115,11 @@ alert accounting, historical baseline inputs, and an explicit DNS/target family
 mapping. Current QuietSample recordings alone do not establish false alerts per
 device-week or supply a week of baseline history.
 
+The [false-alert soak](../tests/soak/README.md#diagnose-false-alert-soak) is the
+tool for that: it records every tick on an ordinary host beside an independent
+witness, and reports monitored host-weeks and opens per rule, replayed against
+the current rules. No soak result has been published yet.
+
 
 ## One bounded diagnosis
 
@@ -133,9 +138,9 @@ part of the interface:
 | 2 | incomplete — no usable observation arrived inside the budget |
 | 3 | bad arguments, or the session could not start |
 
-An issue from a beta rule (one whose contract is not yet reviewed; see
-[diagnostic-coverage.md](diagnostic-coverage.md#not-yet-contracted)) is reported, tagged
-`beta`, but sets exit 1 only with `--include-beta`.
+An issue from a beta rule (see [Rule maturity](#rule-maturity)) is reported, tagged
+`beta`, but sets exit 1 only with `--include-beta`. Each finding in the JSON says
+which it is in `maturity`.
 
 Exit 0 and exit 2 are deliberately different. A run that gathered nothing has
 established nothing, and a script that treats silence as health will report a
@@ -199,9 +204,14 @@ dns_ceiling_ms = 100.0     # a resolver median above this is slow, baseline or n
 socket_rtt_ms = 100.0
 loaded_rtt_delta_ms = 100.0
 saturation_pct = 90.0
-iface_error_floor = 1.0    # interface errors per minute
-iface_drop_floor = 60.0    # interface drops per minute
+iface_error_floor = 5.0    # interface errors per minute, whatever the traffic
+iface_error_pct = 1.0      # or errors as a share of packets
+iface_drop_pct = 2.0       # drops as a share of packets, wired
+iface_drop_pct_wifi = 10.0 # the same on Wi-Fi, or when the link type is unknown
+iface_min_packets = 1000.0 # packets a minute below which a share is not judged
+iface_drop_floor = 60.0    # drops per minute read as local loss by the slow-resolver check
 dns_tc_pct = 10.0
+dns_failure_pct = 5.0      # share of DNS queries unanswered or answered SERVFAIL that counts as failing
 dns_mismatch_pct = 50.0
 wifi_rssi_dbm = -70.0
 wifi_retry_pct = 20.0
@@ -243,6 +253,21 @@ close only once the metric has stayed under 2σ for the verify hold. With one
 line for both, a gateway hovering at 3σ closed each time it dipped under for
 two minutes and reopened each time it rose. A noisy link now takes longer to
 close.
+
+`dns.slow_resolver` judges the median of a window of six probe cycles, and
+its baseline learns that same median, once per window. In the TUI a cycle runs
+every five seconds, so a window is 30 seconds; `diagnose run` probes every
+second, so its windows are six seconds, and a refresh slower than five seconds
+closes a window at 30 seconds with the cycles it has. The windows do not
+overlap, and the rule opens when two in a row are over its line, so in the TUI
+a resolver that turns slow is reported 45 to 75 seconds later. With an even
+number of cycles the median is the lower of the middle two, so a window counts
+as slow only when more than half of it was. Nothing is judged before the first
+window closes. A window in which fewer than half the cycles got an answer has
+no median: that is `dns.failing`'s case. The rule used to judge a median over
+the whole ten-minute probe history, which took five minutes to move, in either
+direction. A baseline learned before this change holds that slower statistic;
+its mean carries over and its spread relearns.
 
 `dns.slow_resolver` closes once the resolver's median has stayed under one
 line for 60 s, set when the issue opens: 0.8 of the line it opened on, or 2σ
@@ -465,6 +490,77 @@ reset the sampler's histories. Cancellation stops new requests and discards
 late results; an operation already in progress may take its bounded timeout to
 return. STUN now reports resolution, send, receive and malformed-response errors,
 and only a complete two-server mapping comparison is usable.
+
+## When the tab says "no issues"
+
+An empty issue list is one of three things, and the verdict line says which:
+
+| Line begins | Marker | Meaning |
+| --- | --- | --- |
+| `no issues · link, gateway and dns checked against their baselines` | green ● | Baselines are ready and all five core rules had their inputs, so each could have opened and did not. |
+| `no visible issues · not yet checked: …` | grey ◌ | A core rule has no input yet. The line names it and why. |
+| `no visible issues · baselines learning …` | grey ◌ | Baselines are still being learned. |
+
+The core rules are `link.down`, `gateway.unreachable`, `gateway.rtt_spike`,
+`dns.failing` and `dns.slow_resolver`: is the link up, does the gateway answer
+at its usual speed, does the resolver. Every other rule needs a test you run, a
+target you configure, or traffic that may not exist, so none of them holds the
+green marker back and none of them is covered by it.
+
+Behind a local stub resolver such as 127.0.0.53 the probe times the stub's
+cache, so resolver speed leaves the core set and the line ends `dns speed not
+judged: the local stub answers from cache`.
+
+The green line is a statement about those five rules on this network since the
+baselines became ready. It is not a claim that the host is healthy, and
+`netwatch diagnose run`'s exit 0 still means only that no counted issue was
+found.
+
+## Rule maturity
+
+Every rule is `beta` or `stable`, set by hand in `rules.rs` and pinned by a test.
+
+| Maturity | In the tab | In `diagnose run` |
+| --- | --- | --- |
+| stable | shown | sets exit 1 |
+| beta | shown, tagged `beta` | listed; sets exit 1 only with `--include-beta` |
+
+Five rules are stable: `gateway.unreachable`, `target.resolve_failed`,
+`target.connect_failed`, `target.tls_failed` and `target.http_error`. Each is a
+yes-or-no condition that has to hold for three probes, has a written contract,
+and has a trigger text that describes its detector as it is.
+
+That is all stable means today. No rule has been through repeated
+fault-injection runs with measured impairments, and no false-alert rate has been
+measured on real networks. The 25 beta rules include the ones most people meet
+first (`dns.slow_resolver`, `dns.failing`, `link.down`, `gateway.rtt_spike`), so
+`netwatch diagnose run` exits 0 while DNS is failing unless you pass
+`--include-beta`.
+
+Three rules have a written contract and are beta anyway:
+
+- `path.high_loss` judges loss per hop, and three probes a hop make one lost
+  probe read as 33%. It is also evaluated only when a trace runs, which by
+  default is when you press `t`.
+- `tcp.bufferbloat_remote` opens without the loaded-versus-idle test that would
+  place the queue, so it cannot prove the socket was under load.
+- `dns.hijack_suspect` opens on two resolvers disagreeing, which CDNs and
+  split-horizon DNS do by design. Its private-address branch is sound; the
+  disagreement branch is not yet.
+
+### What `netwatch --demo` shows
+
+The demo replays a recorded incident through the real engine. The three rules it
+opens (`dns.slow_resolver`, `path.changed`, `tcp.bufferbloat_remote`) are all
+beta and are tagged so on screen. The resolver switch you confirm in the demo is
+simulated: the status line and the banner say so, and nothing on your machine
+changes. Live netwatch never applies a step. For a slow or silent resolver it
+times the public reference resolver (1.1.1.1) over the same uplink every probe
+cycle, and when that answers in under a quarter of your resolver's time it says
+so, with the command to switch and a note that your lookups would then go to
+that provider. It closes an issue itself only when its verify condition holds on
+what it measures afterwards. With `third_party_probes = false` the reference is
+not asked and no such step appears.
 
 ## Rule coverage document
 

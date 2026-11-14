@@ -115,7 +115,20 @@ pub const CAUSES: &[CauseSpec] = &[
     CauseSpec {
         rule: "dns.failing",
         cause: "resolver_down",
-        checks: &["resolver_unreachable"],
+        checks: &[
+            "resolver_unreachable",
+            "reference_answers_over_the_same_uplink",
+        ],
+    },
+    CauseSpec {
+        rule: "dns.failing",
+        cause: "resolver_erroring",
+        checks: &["servfail_replies"],
+    },
+    CauseSpec {
+        rule: "dns.failing",
+        cause: "uplink_down",
+        checks: &["reference_also_unanswered"],
     },
     CauseSpec {
         rule: "dns.failing",

@@ -102,6 +102,9 @@ fn sample_time(
         Some(times.kernel)
     } else if rule.starts_with("egress.") {
         Some(times.egress)
+    } else if rule == "dns.slow_resolver" {
+        // Judged on a closed window of probe cycles, not on each cycle.
+        Some(times.health.dns_window)
     } else if rule.starts_with("dns.") {
         Some(times.health.dns)
     } else if rule.starts_with("gateway.") {
@@ -708,7 +711,7 @@ impl Engine {
         times: Option<&ObservationTimes>,
         now: DateTime<Local>,
     ) -> Option<DateTime<Local>> {
-        let need = self.settings.thresholds.consecutive_n.max(1);
+        let need = self.settings.thresholds.confirmations(d.rule);
         let sample = times
             .and_then(|t| sample_time(d.rule, &d.subject, t))
             .flatten();
@@ -928,7 +931,7 @@ impl Engine {
                 }),
                 _ => {}
             }
-            let mut values = metric_values(&scoped);
+            let mut values = metric_values(&scoped, &self.settings.thresholds);
             add_sigma_metrics(&mut values, &scoped, base, floor);
             let available = self.coverage.rules.iter().any(|r| {
                 r.rule == issue.rule && r.status == super::coverage::Availability::Available
@@ -978,6 +981,10 @@ impl Engine {
                         || issue.rule.starts_with("wifi.")
                     {
                         15
+                    } else if issue.rule == "dns.slow_resolver" {
+                        // One sample per window; a window that ran a cycle
+                        // long is still the next one.
+                        crate::collectors::health::DNS_WINDOW_SECS * 5 / 2
                     } else {
                         30
                     };
@@ -1357,8 +1364,20 @@ impl Engine {
                     ),
                 };
             }
+            // Green is earned: ready baselines and an empty list say nothing
+            // unless the core rules had their inputs and could have opened.
+            let core = self.coverage.core();
+            if core.checked() {
+                return Verdict::Clear {
+                    dns_speed_unjudged: core.dns_speed_unjudged,
+                };
+            }
             return Verdict::Incomplete {
-                detail: self.coverage.label(),
+                detail: format!(
+                    "not yet checked: {} · {}",
+                    core.waiting_label(),
+                    self.coverage.label()
+                ),
             };
         }
 
@@ -1393,11 +1412,20 @@ fn merge_remediation(existing: &mut Vec<super::issue::Step>, fresh: Vec<super::i
         .collect();
 }
 
+/// What a clear verdict says was checked.
+pub const CLEAR_CHECKED: &str = "link, gateway and dns checked against their baselines";
+
 /// What the verdict line says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    /// Baselines are ready and no Issue is open.
-    Clear,
+    /// No Issue is open, baselines are ready, and every core rule
+    /// ([`super::coverage::CORE_RULES`]) had its inputs, so each could have
+    /// opened and did not. A statement about those rules, not about health.
+    Clear {
+        /// The resolver is a local stub: its speed was left out, and the
+        /// line says so.
+        dns_speed_unjudged: bool,
+    },
     /// No Issue is open, but netwatch doesn't yet have the baselines to say so
     /// with confidence.
     Learning {
@@ -1420,7 +1448,10 @@ impl Verdict {
     /// The exact text of the line, so the TUI, the toast and `y` copy agree.
     pub fn line(&self) -> String {
         match self {
-            Verdict::Clear => "no issues · baselines ready".to_string(),
+            Verdict::Clear { .. } => match self.clear_note() {
+                Some(note) => format!("no issues · {CLEAR_CHECKED} · {note}"),
+                None => format!("no issues · {CLEAR_CHECKED}"),
+            },
             Verdict::Learning { detail } | Verdict::Incomplete { detail } => {
                 format!("no visible issues · {detail}")
             }
@@ -1441,6 +1472,16 @@ impl Verdict {
         !matches!(self, Verdict::Issues { .. })
     }
 
+    /// What a clear verdict has to add about what it left out.
+    pub fn clear_note(&self) -> Option<&'static str> {
+        match self {
+            Verdict::Clear {
+                dns_speed_unjudged: true,
+            } => Some("dns speed not judged: the local stub answers from cache"),
+            _ => None,
+        }
+    }
+
     /// Short form for tight chrome — a box title, a Lite status cell, a Dense
     /// subtitle.
     ///
@@ -1451,7 +1492,7 @@ impl Verdict {
     /// specific claim the design review objected to.
     pub fn chip(&self) -> &'static str {
         match self {
-            Verdict::Clear => "nominal",
+            Verdict::Clear { .. } => "nominal",
             Verdict::Learning { .. } => "learning",
             Verdict::Incomplete { .. } => "limited",
             Verdict::Issues { count, .. } => {
@@ -1488,7 +1529,7 @@ impl Verdict {
             // A clear verdict is green; a learning one is not — it is an
             // absence of information, and green would misreport it as health.
             None => match self {
-                Verdict::Clear => t.status_good,
+                Verdict::Clear { .. } => t.status_good,
                 _ => t.text_muted,
             },
         }
@@ -1549,7 +1590,7 @@ fn add_sigma_metrics(
 /// Flatten observations into the metric namespace the verify conditions use.
 /// Every key here matches an `Evidence::metric` a detector emits — that shared
 /// vocabulary is what lets a rule declare its own success condition.
-fn metric_values(obs: &Observations) -> HashMap<String, f64> {
+fn metric_values(obs: &Observations, t: &super::detectors::Thresholds) -> HashMap<String, f64> {
     let mut m = HashMap::new();
     for (r, metric) in [
         ("ipv6.broken", "ipv6.probe_loss"),
@@ -1594,7 +1635,11 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
         if let Some(p95) = dns.rtt_p95_ms {
             m.insert("dns.rtt_p95".to_string(), p95);
         }
+        // The latest cycle's share, under both names: `dns.failing` closes on
+        // the cycle rate, and issues opened before the rule judged a window
+        // still name the older metric in their verify.
         m.insert("dns.failure_rate".to_string(), dns.failure_rate_pct);
+        m.insert("dns.cycle_failure_rate".to_string(), dns.failure_rate_pct);
         m.insert("dns.tc_rate".to_string(), dns.truncation_rate_pct);
         if let Some(c) = &dns.cross {
             // A private answer is a total mismatch, whatever the history
@@ -1619,6 +1664,10 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
             m.insert("iface.carrier".to_string(), if up { 1.0 } else { 0.0 });
         }
         m.insert("iface.error_rate".to_string(), iface.error_rate() as f64);
+        m.insert("iface.fault_ratio".to_string(), iface.fault_ratio(t));
+        if let Some(share) = iface.drop_share_pct(t) {
+            m.insert("iface.drop_share".to_string(), share);
+        }
         if let Some(u) = iface.utilisation_pct() {
             m.insert("iface.utilisation".to_string(), u);
         }
@@ -1721,6 +1770,8 @@ mod tests {
 
     fn dns(p50: f64) -> DnsObs {
         DnsObs {
+            window: Default::default(),
+            reference: None,
             resolver: "169.254.1.1".into(),
             rtt_p50_ms: Some(p50),
             rtt_p95_ms: Some(p50 * 1.2),
@@ -1771,8 +1822,6 @@ mod tests {
         e.observe(&obs(1.0), &b);
         clock.advance_secs(1);
         e.observe(&obs(40.0), &b);
-        clock.advance_secs(1);
-        e.observe(&obs(40.0), &b);
         assert_eq!(e.open_count(), 0, "the streak was broken by a good sample");
         clock.advance_secs(1);
         e.observe(&obs(40.0), &b);
@@ -1790,8 +1839,8 @@ mod tests {
         let b = base();
         let start = std::time::Instant::now();
         let mut times = ObservationTimes::default();
-        times.health.dns = Some(start);
-        // One slow probe result, visible for ten ticks until the next probe.
+        times.health.dns_window = Some(start);
+        // One slow window, visible on every tick until the next one closes.
         for tick in 0..10 {
             e.observe_live_at(
                 &obs(40.0),
@@ -1800,17 +1849,24 @@ mod tests {
                 start + std::time::Duration::from_millis(tick * 500),
             );
         }
-        assert_eq!(e.open_count(), 0, "one probe result is one sample");
-        for probe in 1..=2u64 {
-            times.health.dns = Some(start + std::time::Duration::from_secs(5 * probe));
-            e.observe_live_at(
-                &obs(40.0),
-                &b,
-                &times,
-                start + std::time::Duration::from_secs(5 * probe),
-            );
-        }
-        assert_eq!(e.open_count(), 1, "three distinct probes confirm it");
+        assert_eq!(e.open_count(), 0, "one window is one sample");
+        // A newer probe cycle is not a newer window.
+        times.health.dns = Some(start + std::time::Duration::from_secs(5));
+        e.observe_live_at(
+            &obs(40.0),
+            &b,
+            &times,
+            start + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(e.open_count(), 0, "a probe cycle is not a sample");
+        times.health.dns_window = Some(start + std::time::Duration::from_secs(30));
+        e.observe_live_at(
+            &obs(40.0),
+            &b,
+            &times,
+            start + std::time::Duration::from_secs(30),
+        );
+        assert_eq!(e.open_count(), 1, "two distinct windows confirm it");
     }
 
     struct ClockRef(std::sync::Arc<FixedClock>);
@@ -3589,7 +3645,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(!metric_values(&link(None)).contains_key("iface.carrier"));
+        assert!(!metric_values(&link(None), &Default::default()).contains_key("iface.carrier"));
         engine.observe(&link(Some(false)), &base);
         let id = engine.primary()[0].id.clone();
         for _ in 0..10 {
@@ -3776,9 +3832,11 @@ mod tests {
         let base = base();
         engine.observe(&obs(40.0), &base);
         let id = engine.primary()[0].id.clone();
+        let at = std::time::Instant::now();
         let mut times = ObservationTimes {
             health: crate::collectors::health::ProbeTimes {
-                dns: Some(std::time::Instant::now()),
+                dns: Some(at),
+                dns_window: Some(at),
                 ..Default::default()
             },
             ..Default::default()
@@ -3787,14 +3845,18 @@ mod tests {
         clock.advance_secs(90);
         engine.observe_live(&obs(1.0), &base, &times);
         assert!(engine.get(&id).unwrap().state.is_open());
-        times.health.dns = Some(times.health.dns.unwrap() + std::time::Duration::from_nanos(1));
+        times.health.dns_window =
+            Some(times.health.dns_window.unwrap() + std::time::Duration::from_nanos(1));
+        times.health.dns = times.health.dns_window;
         engine.observe_live(&obs(1.0), &base, &times);
         assert!(
             engine.get(&id).unwrap().state.is_open(),
             "wall clock jumps cannot satisfy a hold"
         );
         for _ in 0..3 {
-            times.health.dns = Some(times.health.dns.unwrap() + std::time::Duration::from_secs(20));
+            times.health.dns_window =
+                Some(times.health.dns_window.unwrap() + std::time::Duration::from_secs(20));
+            times.health.dns = times.health.dns_window;
             engine.observe_live(&obs(1.0), &base, &times);
         }
         assert!(!engine.get(&id).unwrap().state.is_open());
@@ -3832,22 +3894,102 @@ mod tests {
         let id = engine.primary()[0].id.clone();
         let mut times = ObservationTimes::default();
         let start = std::time::Instant::now();
-        for seconds in [0, 20, 80, 100, 120] {
-            times.health.dns = Some(start + std::time::Duration::from_secs(seconds));
+        // Windows 80 s apart are not consecutive: the hold starts over.
+        for seconds in [0, 30, 110, 140] {
+            times.health.dns_window = Some(start + std::time::Duration::from_secs(seconds));
+            times.health.dns = times.health.dns_window;
             engine.observe_live(&obs(1.0), &base, &times);
             assert!(engine.get(&id).unwrap().state.is_open());
         }
-        times.health.dns = Some(start + std::time::Duration::from_secs(140));
+        times.health.dns_window = Some(start + std::time::Duration::from_secs(170));
+        times.health.dns = times.health.dns_window;
         engine.observe_live(&obs(1.0), &base, &times);
         assert!(!engine.get(&id).unwrap().state.is_open());
     }
 
+    /// An engine that has seen nothing has checked nothing, however ready
+    /// its baselines are.
     #[test]
-    fn a_clear_verdict_is_one_quiet_line() {
+    fn an_empty_list_with_nothing_evaluated_is_not_clear() {
         let (e, _clock) = engine_at("2026-09-03 06:48:10");
+        let verdict = e.verdict(&base());
+        assert!(matches!(verdict, Verdict::Incomplete { .. }), "{verdict:?}");
+        let line = verdict.line();
+        assert!(
+            line.starts_with("no visible issues · not yet checked: "),
+            "{line}"
+        );
+        for rule in crate::diagnose::coverage::CORE_RULES {
+            assert!(line.contains(rule), "{rule}: {line}");
+        }
+    }
+
+    /// Green is earned: the fixture's healthy minutes carry a link, a
+    /// gateway that answers, and a resolver, all against ready baselines.
+    #[test]
+    fn a_clear_verdict_needs_every_core_rule_evaluated() {
+        use crate::diagnose::fixture;
+        let (mut e, _clock) = engine_at("2026-09-03 06:44:10");
+        let b = fixture::baselines();
+        // Without the scenario's reroute, which is already under way.
+        let mut healthy = fixture::observations_with(10, false);
+        healthy.paths.clear();
+        e.observe(&healthy, &b);
+        assert!(
+            e.primary_issues().is_empty(),
+            "the fixture starts healthy: {:?}",
+            e.primary_issues()
+                .iter()
+                .map(|i| &i.rule)
+                .collect::<Vec<_>>()
+        );
+        let verdict = e.verdict(&b);
         assert_eq!(
-            e.verdict(&base()).line(),
-            "no visible issues · coverage not recorded"
+            verdict,
+            Verdict::Clear {
+                dns_speed_unjudged: false
+            },
+            "{:?}",
+            e.coverage().core()
+        );
+        assert_eq!(
+            verdict.line(),
+            "no issues · link, gateway and dns checked against their baselines"
+        );
+        assert_eq!(verdict.chip(), "nominal");
+
+        // Take the gateway away and the same empty list is no longer a check.
+        let mut blind = healthy.clone();
+        blind.gateway = None;
+        e.observe(&blind, &b);
+        let verdict = e.verdict(&b);
+        assert!(matches!(verdict, Verdict::Incomplete { .. }), "{verdict:?}");
+        assert!(
+            verdict.line().contains("gateway.unreachable not measured"),
+            "{}",
+            verdict.line()
+        );
+
+        // Behind a local stub, resolver speed leaves the core set and the
+        // line says it was not judged (decision M5).
+        let mut stub = healthy;
+        if let Some(dns) = stub.dns.as_mut() {
+            dns.resolver = "127.0.0.53".into();
+        }
+        e.observe(&stub, &b);
+        let verdict = e.verdict(&b);
+        assert_eq!(
+            verdict,
+            Verdict::Clear {
+                dns_speed_unjudged: true
+            }
+        );
+        assert!(
+            verdict
+                .line()
+                .ends_with("dns speed not judged: the local stub answers from cache"),
+            "{}",
+            verdict.line()
         );
     }
 

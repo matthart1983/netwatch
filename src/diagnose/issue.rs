@@ -1011,7 +1011,7 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_since: Option<String>,
     /// Opened by a beta rule ([`super::rules::Rule::beta`]). Copied when the
-    /// issue opens, so a later contract review does not rewrite history.
+    /// issue opens, so a later change of maturity does not rewrite history.
     #[serde(default)]
     pub beta: bool,
     pub state: IssueState,

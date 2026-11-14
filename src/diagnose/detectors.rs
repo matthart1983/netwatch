@@ -73,17 +73,32 @@ pub struct Thresholds {
     pub loaded_rtt_delta_ms: f64,
     /// Interface utilisation counted as saturation.
     pub saturation_pct: f64,
-    /// Interface *errors* per minute before the rule fires. Errors are rare
-    /// and always mean something, so the floor is low.
+    /// Interface *errors* per minute at which `iface.errors` opens, whatever
+    /// the traffic. Errors are rare, but a single one in a minute is not a
+    /// fault.
     pub iface_error_floor: f64,
-    /// Interface *drops* per minute before the rule fires. Much higher than
-    /// the error floor: a wireless NIC drops multicast and management frames
-    /// as a matter of course, and reporting one drop a minute as a fault
-    /// trains people to ignore the tab.
+    /// Interface *drops* per minute that count as local loss where packet
+    /// counts are missing: a recording from before they were kept, and the
+    /// `interface_drops` check on a slow resolver.
     pub iface_drop_floor: f64,
+    /// Errors as a share of packets at which `iface.errors` opens.
+    pub iface_error_pct: f64,
+    /// Drops as a share of packets at which `iface.errors` opens on a wired
+    /// link.
+    pub iface_drop_pct: f64,
+    /// The same on Wi-Fi, and where the link type is unknown. A radio drops
+    /// multicast and management frames it has no use for as a matter of
+    /// course, and reporting that trains people to ignore the tab.
+    pub iface_drop_pct_wifi: f64,
+    /// Packets a minute below which a share of them is not judged.
+    pub iface_min_packets: f64,
     /// Share of DNS replies carrying the TC bit before truncation is a
     /// finding. Some truncation is normal for large answers over UDP.
     pub dns_tc_pct: f64,
+    /// Share of DNS queries going unanswered that `dns.failing` treats as a
+    /// fault. The rule opens when the lower confidence bound on the share,
+    /// over the last [`DNS_FAIL_WINDOW`] queries, is above this.
+    pub dns_failure_pct: f64,
     /// Share of cross-check cycles whose local answer disagreed with the
     /// validating reference before the resolver is suspected.
     pub dns_mismatch_pct: f64,
@@ -109,9 +124,14 @@ impl Default for Thresholds {
             socket_rtt_ms: 100.0,
             loaded_rtt_delta_ms: 100.0,
             saturation_pct: 90.0,
-            iface_error_floor: 1.0,
+            iface_error_floor: 5.0,
             iface_drop_floor: 60.0,
+            iface_error_pct: 1.0,
+            iface_drop_pct: 2.0,
+            iface_drop_pct_wifi: 10.0,
+            iface_min_packets: 1000.0,
             dns_tc_pct: 10.0,
+            dns_failure_pct: 5.0,
             dns_mismatch_pct: 50.0,
             wifi_rssi_dbm: -70.0,
             wifi_retry_pct: 20.0,
@@ -119,7 +139,56 @@ impl Default for Thresholds {
     }
 }
 
+/// Queries `dns.failing` judges over: the last 20 probe cycles of three.
+pub const DNS_FAIL_WINDOW: u32 = 60;
+/// Unanswered queries in the window below which `dns.failing` stays shut,
+/// whatever the share: two lost of six is 33% and is also two packets.
+pub const DNS_FAIL_MIN: u32 = 5;
+/// The newest queries at least one of the unanswered must be among. Without
+/// it the window keeps saying "failing" for a minute and a half after the
+/// resolver recovers, and the close's hold only starts after that.
+pub const DNS_FAIL_RECENT: u32 = 12;
+/// How long every query must go unanswered for `dns.failing` to open
+/// without waiting for the window to fill.
+pub const DNS_ALL_LOST_SECS: f64 = 15.0;
+/// The unanswered share at which `dns.failing` is High rather than Medium.
+pub const DNS_FAIL_HIGH_PCT: f64 = 50.0;
+
+/// The lower end of the 95% Wilson score interval for `failed` of `n`, as a
+/// percentage. Where the plain share calls one lost query of three 33%, this
+/// calls it "at least 6%", and seven of sixty "at least 5.8%": it says how
+/// little loss the count is still consistent with.
+pub fn wilson_lower_pct(failed: u32, n: u32) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let (n, z) = (n as f64, 1.959_964_f64);
+    let p = failed as f64 / n;
+    let centre = p + z * z / (2.0 * n);
+    let spread = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt();
+    ((centre - spread) / (1.0 + z * z / n)).max(0.0) * 100.0
+}
+
 impl Thresholds {
+    /// Distinct samples a rule's condition must hold for before it opens.
+    ///
+    /// `consecutive_n` for most rules, where one sample is one probe and a
+    /// single slow one is not a finding. `dns.failing` judges a window of
+    /// sixty queries, so its first qualifying sample already rests on more
+    /// evidence than three probes would; making it wait for more only delays
+    /// it.
+    pub fn confirmations(&self, rule: &str) -> u32 {
+        match rule {
+            "dns.failing" => 1,
+            // One sample is the median of a 30 s window that shares no probe
+            // with the last; two of them are a minute of slow answers, and
+            // a third would only add half a minute. A `consecutive_n` under
+            // two still lowers it.
+            "dns.slow_resolver" => self.consecutive_n.clamp(1, 2),
+            _ => self.consecutive_n.max(1),
+        }
+    }
+
     /// The floor under every baseline's σ, for scoring and for learning.
     pub fn sigma_floor(&self) -> SigmaFloor {
         SigmaFloor {
@@ -192,7 +261,12 @@ impl Thresholds {
         check("saturation_pct", |t| &mut t.saturation_pct, share);
         check("iface_error_floor", |t| &mut t.iface_error_floor, number);
         check("iface_drop_floor", |t| &mut t.iface_drop_floor, number);
+        check("iface_error_pct", |t| &mut t.iface_error_pct, share);
+        check("iface_drop_pct", |t| &mut t.iface_drop_pct, share);
+        check("iface_drop_pct_wifi", |t| &mut t.iface_drop_pct_wifi, share);
+        check("iface_min_packets", |t| &mut t.iface_min_packets, number);
         check("dns_tc_pct", |t| &mut t.dns_tc_pct, share);
+        check("dns_failure_pct", |t| &mut t.dns_failure_pct, share);
         check("dns_mismatch_pct", |t| &mut t.dns_mismatch_pct, share);
         check("wifi_rssi_dbm", |t| &mut t.wifi_rssi_dbm, number);
         check("wifi_retry_pct", |t| &mut t.wifi_retry_pct, share);
@@ -391,6 +465,10 @@ pub struct IfaceObs {
     /// `None` where the platform does not count drops (macOS), which is not
     /// the same as none dropped.
     pub drops_per_min: Option<u64>,
+    /// Packets received and sent over the same minute. `None` in recordings
+    /// made before it was kept, where drops are judged by count.
+    #[serde(default)]
+    pub packets_per_min: Option<u64>,
     pub link_rate_bps: Option<f64>,
     pub rx_bps: f64,
     pub tx_bps: f64,
@@ -412,6 +490,65 @@ impl IfaceObs {
     pub fn error_rate(&self) -> u64 {
         self.drops_per_min
             .map_or(self.errors_per_min, |d| self.errors_per_min + d)
+    }
+
+    /// How far this interface's errors and drops are over the lines
+    /// `iface.errors` opens on: the largest of errors a minute over the
+    /// floor, errors as a share of packets over theirs, and drops as a share
+    /// of packets over the line for this kind of link. `1.0` is the open
+    /// line. The rule opens and verifies on this one statistic.
+    ///
+    /// A share is judged only above [`Thresholds::iface_min_packets`]: 70
+    /// drops in a minute of 200 packets is a quiet radio discarding
+    /// broadcast, and it is 35%.
+    pub fn fault_ratio(&self, t: &Thresholds) -> f64 {
+        let over = |value: f64, line: f64| {
+            if value <= 0.0 {
+                0.0
+            } else {
+                (value / line.max(f64::MIN_POSITIVE)).min(1000.0)
+            }
+        };
+        let errors = self.errors_per_min as f64;
+        let mut ratio = over(errors, t.iface_error_floor);
+        match self.packets_per_min {
+            Some(packets) if packets > 0 && packets as f64 >= t.iface_min_packets => {
+                let share = |n: f64| n / packets as f64 * 100.0;
+                ratio = ratio.max(over(share(errors), t.iface_error_pct));
+                if let Some(drops) = self.drops_per_min {
+                    ratio = ratio.max(over(share(drops as f64), self.drop_line_pct(t)));
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Some(drops) = self.drops_per_min {
+                    ratio = ratio.max(over(drops as f64, t.iface_drop_floor));
+                }
+            }
+        }
+        ratio
+    }
+
+    /// The drop share this link is held to: the wired line only for a link
+    /// known to be wired.
+    pub fn drop_line_pct(&self, t: &Thresholds) -> f64 {
+        if self.wireless == Some(false) {
+            t.iface_drop_pct
+        } else {
+            t.iface_drop_pct_wifi
+        }
+    }
+
+    /// Drops as a share of packets, where both were counted and there were
+    /// enough packets for a share to mean anything.
+    pub fn drop_share_pct(&self, t: &Thresholds) -> Option<f64> {
+        let packets = self
+            .packets_per_min
+            .filter(|p| *p as f64 >= t.iface_min_packets)?;
+        (packets > 0).then(|| {
+            self.drops_per_min
+                .map(|d| d as f64 / packets as f64 * 100.0)
+        })?
     }
 
     pub fn utilisation_pct(&self) -> Option<f64> {
@@ -444,9 +581,131 @@ pub struct DnsObs {
     pub window_secs: u64,
     /// The latest answer cross-check against a validating reference.
     pub cross: Option<DnsCross>,
+    /// Answered and unanswered queries over the last probe cycles, which is
+    /// what `dns.failing` judges. Empty in recordings made before it
+    /// existed, and then the rule falls back to `failure_rate_pct`.
+    #[serde(default)]
+    pub window: DnsWindow,
+    /// How the reference resolver answered over the same cycles. `None` when
+    /// it was not asked.
+    #[serde(default)]
+    pub reference: Option<DnsReference>,
+}
+
+/// The reference resolver's answers over its newest cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DnsReference {
+    pub asked: u32,
+    pub answered: u32,
+    /// Whether it has answered at all on this network. A network that blocks
+    /// outbound DNS to public resolvers never lets it, and its silence there
+    /// says nothing about the uplink.
+    pub ever_answered: bool,
+}
+
+/// What comparing the configured resolver with the reference says about a
+/// resolver that is failing. The reference is asked over the same uplink, so
+/// its answers place the fault on one side of the resolver or the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceVerdict {
+    /// The reference answers: the uplink works and the resolver does not.
+    ResolverOnly,
+    /// The reference stopped answering too: the fault is before either.
+    BothFailing,
+    /// The reference has never answered here; outbound DNS may be blocked.
+    NeverAnswered,
+    /// The reference was not asked.
+    NotAsked,
 }
 
 impl DnsObs {
+    pub fn reference_verdict(&self) -> ReferenceVerdict {
+        match self.reference {
+            None | Some(DnsReference { asked: 0, .. }) => ReferenceVerdict::NotAsked,
+            Some(r) if !r.ever_answered => ReferenceVerdict::NeverAnswered,
+            Some(r) if r.answered * 2 >= r.asked => ReferenceVerdict::ResolverOnly,
+            Some(r) if r.answered == 0 => ReferenceVerdict::BothFailing,
+            // A reference answering some of the time settles nothing.
+            Some(_) => ReferenceVerdict::NotAsked,
+        }
+    }
+}
+
+/// The DNS probe's last [`DNS_FAIL_WINDOW`] queries, or fewer when the probe
+/// has not sent that many to this resolver yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct DnsWindow {
+    pub queries: u32,
+    /// Queries that failed: no reply, or a SERVFAIL.
+    pub unanswered: u32,
+    /// Unanswered among the newest [`DNS_FAIL_RECENT`] queries.
+    #[serde(default)]
+    pub recent_unanswered: u32,
+    /// How long the newest run of cycles with no answer at all has lasted,
+    /// from the first such cycle's completion to the last's. `None` when the
+    /// latest cycle got an answer, or only one cycle has failed so far.
+    #[serde(default)]
+    pub all_lost_secs: Option<f64>,
+    /// How many of `unanswered` were answered SERVFAIL rather than lost.
+    #[serde(default)]
+    pub servfail: u32,
+    /// The span of the closed window `rtt_p50_ms` is the median of, and how
+    /// many of its probe cycles answered. Zero where the p50 did not come
+    /// from one: a fixture, or a recording made before the windows.
+    #[serde(default)]
+    pub rtt_secs: u64,
+    #[serde(default)]
+    pub rtt_cycles: u32,
+}
+
+impl DnsWindow {
+    pub fn unanswered_pct(&self) -> f64 {
+        if self.queries == 0 {
+            0.0
+        } else {
+            self.unanswered as f64 / self.queries as f64 * 100.0
+        }
+    }
+}
+
+/// Why `dns.failing` is open on these observations, if it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DnsFailing {
+    /// Enough of the window went unanswered that the share's lower bound is
+    /// over the line.
+    Window,
+    /// Nothing has been answered for [`DNS_ALL_LOST_SECS`].
+    AllLost,
+    /// A recording from before the window existed: the latest cycle's share.
+    Cycle,
+}
+
+impl DnsObs {
+    /// Whether the resolver is failing, and on which evidence.
+    pub fn failing(&self, t: &Thresholds) -> Option<DnsFailing> {
+        let w = &self.window;
+        if w.queries == 0 {
+            return (self.failure_rate_pct > t.dns_failure_pct).then_some(DnsFailing::Cycle);
+        }
+        if w.all_lost_secs.is_some_and(|s| s >= DNS_ALL_LOST_SECS) {
+            return Some(DnsFailing::AllLost);
+        }
+        (w.unanswered >= DNS_FAIL_MIN
+            && w.recent_unanswered > 0
+            && wilson_lower_pct(w.unanswered, w.queries) > t.dns_failure_pct)
+            .then_some(DnsFailing::Window)
+    }
+
+    /// The unanswered share `dns.failing` reports: over the window when there
+    /// is one, otherwise the latest cycle's.
+    pub fn unanswered_pct(&self) -> f64 {
+        if self.window.queries == 0 {
+            self.failure_rate_pct
+        } else {
+            self.window.unanswered_pct()
+        }
+    }
+
     /// The configured resolver is a stub on this host, such as
     /// systemd-resolved's 127.0.0.53. The probe asks root NS, which the stub
     /// answers from its cache, so what it times is the stub's round trip,
@@ -1425,10 +1684,8 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
     // Where drops are not counted the rule stands on errors alone, and
     // neither cause can weigh one against the other.
     let errors = iface.errors_per_min;
-    let drops_over_floor = iface
-        .drops_per_min
-        .is_some_and(|d| d as f64 >= t.iface_drop_floor);
-    if errors as f64 >= t.iface_error_floor || drops_over_floor {
+    let fault_ratio = iface.fault_ratio(t);
+    if fault_ratio >= 1.0 {
         let mut d = Detection::new(
             "iface.errors",
             Subject::Iface {
@@ -1437,6 +1694,16 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
         );
         d.evidence.push(
             Evidence::new("iface.error_rate", iface.error_rate() as f64, "/min").with_window(60, 1),
+        );
+        if let Some(share) = iface.drop_share_pct(t) {
+            d.evidence
+                .push(Evidence::new("iface.drop_share", share, "%").with_window(
+                    60,
+                    iface.packets_per_min.unwrap_or(0).min(u32::MAX as u64) as u32,
+                ));
+        }
+        d.evidence.push(
+            Evidence::new("iface.fault_ratio", fault_ratio, "× the open line").with_window(60, 1),
         );
         d.causes = vec![
             Cause::new(
@@ -1636,11 +1903,18 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
 
 // ------------------------------------------------------------- gateway
 
+/// Why a check on the gateway's neighbour entry did not run.
+const NEIGHBOUR_UNKNOWN: &str =
+    "no neighbour entry for the gateway; the table is read on linux, for ipv4 gateways";
+
 fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<Detection> {
     let Some(gw) = &obs.gateway else {
         return vec![];
     };
-    if gw.arp_ok != Some(false) && gw.icmp_ok {
+    // The neighbour table informs the causes below and opens nothing: an
+    // entry is briefly incomplete whenever the kernel re-resolves it, and a
+    // gateway that answers echo is reachable whatever the table says.
+    if gw.icmp_ok {
         return detect_gateway_rtt(gw, base, t);
     }
     // The probe failed, but the internet answered — so the gateway is
@@ -1682,18 +1956,18 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                     Some(true) => CheckResult::pass(
                         "arp_resolves",
                         "arp resolves",
-                        "the gateway answered arp",
+                        "the neighbour table holds a resolved entry for the gateway",
                     ),
                     Some(false) => CheckResult::fail(
                         "arp_resolves",
                         "arp resolves",
-                        "no arp reply from the gateway",
+                        "the gateway's neighbour entry is incomplete: nothing answered arp",
                     ),
                     None => CheckResult::not_run(
                         "arp_resolves",
                         "arp resolves",
-                        Availability::NotImplemented,
-                        "no arp probe has run",
+                        Availability::NotMeasured,
+                        NEIGHBOUR_UNKNOWN,
                     ),
                 },
                 CheckResult::fail(
@@ -1712,16 +1986,18 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                     Some(false) => CheckResult::pass(
                         "arp_fails",
                         "arp fails",
-                        "no arp reply — we may not be on its segment",
+                        "the gateway's neighbour entry is incomplete: we may not be on its segment",
                     ),
-                    Some(true) => {
-                        CheckResult::fail("arp_fails", "arp fails", "arp resolved normally")
-                    }
+                    Some(true) => CheckResult::fail(
+                        "arp_fails",
+                        "arp fails",
+                        "the neighbour table holds a resolved entry for the gateway",
+                    ),
                     None => CheckResult::not_run(
                         "arp_fails",
                         "arp fails",
-                        Availability::NotImplemented,
-                        "no arp probe has run",
+                        Availability::NotMeasured,
+                        NEIGHBOUR_UNKNOWN,
                     ),
                 }
                 .weighted(2.0),
@@ -1822,17 +2098,117 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     };
     let mut out = Vec::new();
 
-    if dns.failure_rate_pct > 5.0 {
+    if let Some(why) = dns.failing(t) {
         let mut d = Detection::new(
             "dns.failing",
             Subject::Resolver {
                 addr: dns.resolver.clone(),
             },
         );
-        d.evidence.push(
-            Evidence::new("dns.failure_rate", dns.failure_rate_pct, "%")
-                .with_window(dns.window_secs, dns.queries),
+        let share = dns.unanswered_pct();
+        // Losing one query in eight is a fault and is not an outage.
+        d.severity = if share >= DNS_FAIL_HIGH_PCT {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+        let (secs, queries) = if dns.window.queries == 0 {
+            (dns.window_secs, dns.queries)
+        } else {
+            (
+                dns.window.queries as u64 / crate::collectors::health::DNS_PROBES_PER_CYCLE as u64
+                    * crate::app::HEALTH_PROBE_TICKS as u64,
+                dns.window.queries,
+            )
+        };
+        d.evidence
+            .push(Evidence::new("dns.failure_rate", share, "%").with_window(secs, queries));
+        if why == DnsFailing::Window {
+            d.evidence.push(
+                Evidence::new(
+                    "dns.failure_rate_lower",
+                    wilson_lower_pct(dns.window.unanswered, dns.window.queries),
+                    "%",
+                )
+                .with_window(secs, queries),
+            );
+        }
+        // The reference resolver is asked over the same uplink every cycle.
+        // Whether it answers while this one does not places the fault on
+        // one side of the resolver or the other. A reference that has never
+        // answered here, or was not asked, settles nothing and says so.
+        let reference = crate::collectors::health::REFERENCE_RESOLVER;
+        let verdict = dns.reference_verdict();
+        let counts = dns.reference.map_or(String::new(), |r| {
+            format!("{} of its last {} cycles", r.answered, r.asked)
+        });
+        let unsettled = match verdict {
+            ReferenceVerdict::NeverAnswered => format!(
+                "{reference} has never answered on this network; outbound dns may be blocked"
+            ),
+            _ => format!("{reference} was not asked, or answered only some of the time"),
+        };
+        let (answers, also_silent) = (
+            "the reference resolver answers over the same uplink",
+            "the reference resolver is unanswered too",
         );
+        let reference_answers = match verdict {
+            ReferenceVerdict::ResolverOnly => CheckResult::pass(
+                "reference_answers_over_the_same_uplink",
+                answers,
+                format!(
+                    "{reference} answered {counts} while {} failed",
+                    dns.resolver
+                ),
+            ),
+            ReferenceVerdict::BothFailing => CheckResult::fail(
+                "reference_answers_over_the_same_uplink",
+                answers,
+                format!("{reference} answered {counts}"),
+            ),
+            _ => CheckResult::not_run(
+                "reference_answers_over_the_same_uplink",
+                answers,
+                Availability::NotMeasured,
+                unsettled.clone(),
+            ),
+        };
+        let reference_silent = match verdict {
+            ReferenceVerdict::BothFailing => CheckResult::pass(
+                "reference_also_unanswered",
+                also_silent,
+                format!("{reference} answered {counts}, and it used to answer here"),
+            ),
+            ReferenceVerdict::ResolverOnly => CheckResult::fail(
+                "reference_also_unanswered",
+                also_silent,
+                format!("{reference} answered {counts}"),
+            ),
+            _ => CheckResult::not_run(
+                "reference_also_unanswered",
+                also_silent,
+                Availability::NotMeasured,
+                unsettled.clone(),
+            ),
+        };
+        let servfail = match (dns.window.queries, dns.window.servfail) {
+            (0, _) => CheckResult::not_run(
+                "servfail_replies",
+                "servfail replies",
+                Availability::NotMeasured,
+                "reply codes were not recorded",
+            ),
+            (queries, 0) => CheckResult::fail(
+                "servfail_replies",
+                "servfail replies",
+                format!("none of the last {queries} queries was answered SERVFAIL"),
+            ),
+            (queries, n) => CheckResult::pass(
+                "servfail_replies",
+                "servfail replies",
+                format!("{n} of the last {queries} queries were answered SERVFAIL"),
+            ),
+        };
         d.causes = vec![
             Cause::new(
                 "resolver_down",
@@ -1841,19 +2217,32 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                 // on the live path is always. Reading that as "no reply" made
                 // every failing resolver rank as down; a check that was never
                 // made is skipped, and the next-test suggester can offer it.
-                vec![match dns.icmp_rtt_ms {
-                    None => CheckResult::not_run(
-                        "resolver_unreachable",
-                        "resolver unreachable",
-                        Availability::NotImplemented,
-                        "no icmp probe of the resolver has run",
-                    ),
-                    Some(rtt) => CheckResult::fail(
-                        "resolver_unreachable",
-                        "resolver unreachable",
-                        format!("resolver answers icmp in {rtt:.1}ms"),
-                    ),
-                }],
+                vec![
+                    match dns.icmp_rtt_ms {
+                        None => CheckResult::not_run(
+                            "resolver_unreachable",
+                            "resolver unreachable",
+                            Availability::NotImplemented,
+                            "no icmp probe of the resolver has run",
+                        ),
+                        Some(rtt) => CheckResult::fail(
+                            "resolver_unreachable",
+                            "resolver unreachable",
+                            format!("resolver answers icmp in {rtt:.1}ms"),
+                        ),
+                    },
+                    reference_answers,
+                ],
+            ),
+            Cause::new(
+                "resolver_erroring",
+                "the resolver answers, but with SERVFAIL: its upstream or its own configuration is failing",
+                vec![servfail],
+            ),
+            Cause::new(
+                "uplink_down",
+                "the uplink is failing, and the resolver with it",
+                vec![reference_silent],
             ),
             Cause::new(
                 "udp53_filtered",
@@ -2086,7 +2475,11 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         return out;
     }
 
-    let mut ev = Evidence::new("dns.rtt_p50", p50, "ms").with_window(dns.window_secs, dns.queries);
+    let (secs, samples) = match dns.window.rtt_cycles {
+        0 => (dns.window_secs, dns.queries),
+        cycles => (dns.window.rtt_secs, cycles),
+    };
+    let mut ev = Evidence::new("dns.rtt_p50", p50, "ms").with_window(secs, samples);
     if let Some(b) = baseline {
         ev = ev.with_baseline(b.mean, b.sigma_floored(t.sigma_floor()));
     }
@@ -2391,16 +2784,35 @@ fn dns_close_line(baseline: Option<&Baseline>, t: &Thresholds) -> f64 {
 /// Steps for a failing or slow resolver. A switch is proposed only to an
 /// alternate that was measured: for a slow resolver, one that answered in
 /// under a quarter of `slow_p50`, the line `alt_resolver_is_fast` passes on;
-/// for a failing one (`None`), answering at all is the case for it. Live, no
-/// alternate is timed until A11 keeps the reference resolver's RTT, so today
-/// the step appears only in the demo, which simulates it.
+/// for a failing one (`None`), answering at all is the case for it.
+///
+/// Live, the alternate that is timed is the public reference resolver. That
+/// is an instruction and never an Apply step: moving someone's lookups to a
+/// third party is their decision, so the step gives the measurement and the
+/// command and says where the lookups would go. The Apply step is for an
+/// alternate the host already has configured, which today only the demo
+/// supplies, and the demo simulates it.
 fn dns_remediation(dns: &DnsObs, slow_p50: Option<f64>) -> Vec<Step> {
     let mut steps = Vec::new();
     let measured = match (&dns.alt_resolver, dns.alt_rtt_ms) {
         (Some(alt), Some(rtt)) if slow_p50.is_none_or(|p50| rtt < p50 / 4.0) => Some((alt, rtt)),
         _ => None,
     };
-    if let Some((alt, rtt)) = measured {
+    let reference = crate::collectors::health::REFERENCE_RESOLVER;
+    if let Some((alt, rtt)) = measured.filter(|(alt, _)| alt.as_str() == reference) {
+        let against = match slow_p50 {
+            Some(p50) => format!("while {} took {p50:.0}ms", dns.resolver),
+            None => format!("while {} did not answer", dns.resolver),
+        };
+        steps.push(Step::instruct(
+            format!("try the public resolver {alt}"),
+            format!(
+                "{alt} answered in {rtt:.1}ms over the same uplink {against}. To use it: \
+                 resolvectl dns <iface> {alt}, or set it in your network settings. Your \
+                 lookups then go to that provider; netwatch changes nothing itself"
+            ),
+        ));
+    } else if let Some((alt, rtt)) = measured {
         // The live `↵` writes nothing, so the text says what to run instead
         // of promising an edit netwatch will not make.
         steps.push(Step::apply(
@@ -3212,6 +3624,8 @@ mod tests {
 
     fn slow_dns() -> DnsObs {
         DnsObs {
+            window: Default::default(),
+            reference: None,
             resolver: "169.254.1.1".into(),
             rtt_p50_ms: Some(40.0),
             rtt_p95_ms: Some(48.0),
@@ -3319,6 +3733,7 @@ mod tests {
             tx_dropped: 0,
             errors_per_min: 0,
             drops_per_min: Some(0),
+            packets_per_min: None,
             link_rate_bps: None,
             wireless: Some(wireless),
             signal_dbm: signal,
@@ -3470,6 +3885,7 @@ mod tests {
                 wireless: Some(true),
                 link_rate_bps: None,
                 drops_per_min: Some(drops_per_min),
+                packets_per_min: None,
                 ..eth0()
             }),
             ..obs_with_dns(DnsObs {
@@ -3771,6 +4187,220 @@ mod tests {
         assert_eq!(d.evidence[0].value, 120.0);
         assert_eq!(d.evidence[0].baseline, Some(80.0));
         assert_eq!(d.severity, Severity::Medium, "1.5 times the mean");
+    }
+
+    /// `dns.failing` on a window of `queries`, `unanswered` of them, with the
+    /// resolver otherwise healthy.
+    fn failing(queries: u32, unanswered: u32, all_lost_secs: Option<f64>) -> Option<Detection> {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.window = DnsWindow {
+            queries,
+            unanswered,
+            recent_unanswered: unanswered.min(1),
+            all_lost_secs,
+            ..Default::default()
+        };
+        detect(&obs_with_dns(dns), &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "dns.failing")
+    }
+
+    /// The check a failing resolver's cause carries, by cause and check id.
+    fn failing_check(dns: DnsObs, cause: &str, check: &str) -> Option<bool> {
+        let d = detect(&obs_with_dns(dns), &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "dns.failing")
+            .expect("dns.failing should fire");
+        let cause = d.causes.iter().find(|c| c.id == cause).expect("the cause");
+        cause
+            .checks
+            .iter()
+            .find(|c| c.id == check)
+            .expect("the check")
+            .passed
+    }
+
+    fn silent_dns(reference: Option<DnsReference>, servfail: u32) -> DnsObs {
+        let mut dns = slow_dns();
+        dns.window = DnsWindow {
+            queries: 60,
+            unanswered: 30,
+            recent_unanswered: 12,
+            servfail,
+            ..Default::default()
+        };
+        dns.reference = reference;
+        dns
+    }
+
+    /// The reference resolver shares the uplink. It answering while the
+    /// configured one does not blames the resolver; both silent, where the
+    /// reference used to answer, blames what they share. A reference that
+    /// never answered here, or was not asked, blames nothing.
+    #[test]
+    fn the_reference_resolver_places_a_dns_failure() {
+        let reference = |answered, ever_answered| {
+            Some(DnsReference {
+                asked: 6,
+                answered,
+                ever_answered,
+            })
+        };
+        let checks = |r| {
+            (
+                failing_check(
+                    silent_dns(r, 0),
+                    "resolver_down",
+                    "reference_answers_over_the_same_uplink",
+                ),
+                failing_check(silent_dns(r, 0), "uplink_down", "reference_also_unanswered"),
+            )
+        };
+        assert_eq!(checks(reference(6, true)), (Some(true), Some(false)));
+        assert_eq!(checks(reference(0, true)), (Some(false), Some(true)));
+        assert_eq!(checks(reference(0, false)), (None, None), "blocked");
+        assert_eq!(checks(None), (None, None), "not asked");
+        assert_eq!(checks(reference(2, true)), (None, None), "undecided");
+    }
+
+    #[test]
+    fn servfail_replies_name_a_resolver_that_answers_and_cannot_resolve() {
+        let check = |servfail| {
+            failing_check(
+                silent_dns(None, servfail),
+                "resolver_erroring",
+                "servfail_replies",
+            )
+        };
+        assert_eq!(check(20), Some(true));
+        assert_eq!(check(0), Some(false));
+        // A recording from before reply codes were kept.
+        let mut old = silent_dns(None, 0);
+        old.window = DnsWindow::default();
+        old.failure_rate_pct = 100.0;
+        assert_eq!(
+            failing_check(old, "resolver_erroring", "servfail_replies"),
+            None
+        );
+    }
+
+    /// The old rule read one lost query in a cycle of three as 33% and
+    /// opened. One packet is not a failing resolver.
+    #[test]
+    fn dns_failing_needs_five_lost_and_a_lower_bound_over_the_line() {
+        assert!(failing(3, 1, None).is_none(), "one lost of three");
+        assert!(
+            failing(9, 3, None).is_none(),
+            "under five lost, whatever the share"
+        );
+        assert!(
+            failing(60, 5, None).is_none(),
+            "5 of 60 is consistent with 3.6%"
+        );
+        assert!(
+            failing(60, 6, None).is_none(),
+            "6 of 60 is consistent with 4.7%"
+        );
+        let d = failing(60, 7, None).expect("7 of 60 is at least 5.8%");
+        assert_eq!(d.severity, Severity::Medium);
+        assert_eq!(d.evidence[0].metric, "dns.failure_rate");
+        assert!((d.evidence[0].value - 11.666).abs() < 0.01);
+        assert_eq!(d.evidence[0].samples, 60);
+        assert_eq!(d.evidence[1].metric, "dns.failure_rate_lower");
+        assert!(d.evidence[1].value > 5.0 && d.evidence[1].value < 6.0);
+        // A short window can open too, when what it holds is bad enough.
+        assert!(failing(15, 6, None).is_some(), "6 of 15 is at least 20%");
+    }
+
+    /// After an outage the window still holds its losses for a hundred
+    /// seconds. The rule stops on the newest queries being clean, so the
+    /// close's hold starts at the recovery and not after the window drains.
+    #[test]
+    fn dns_failing_stops_once_the_newest_queries_are_all_answered() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.window = DnsWindow {
+            queries: 60,
+            unanswered: 18,
+            recent_unanswered: 0,
+            all_lost_secs: None,
+            ..Default::default()
+        };
+        let t = Thresholds::default();
+        assert_eq!(dns.failing(&t), None);
+        dns.window.recent_unanswered = 1;
+        assert_eq!(dns.failing(&t), Some(DnsFailing::Window));
+    }
+
+    #[test]
+    fn dns_failing_is_high_once_half_the_queries_go_unanswered() {
+        assert_eq!(failing(60, 29, None).unwrap().severity, Severity::Medium);
+        assert_eq!(failing(60, 30, None).unwrap().severity, Severity::High);
+    }
+
+    /// A dead resolver should not have to fail five queries' worth of
+    /// timeouts before anyone is told.
+    #[test]
+    fn dns_failing_opens_on_fifteen_seconds_of_silence() {
+        assert!(failing(6, 3, Some(14.0)).is_none());
+        let d = failing(6, 3, Some(15.0)).expect("nothing answered for 15s");
+        assert_eq!(
+            d.evidence.len(),
+            1,
+            "no lower bound is quoted for the fast path"
+        );
+        // A run of silence that has ended is not one.
+        assert!(failing(6, 3, None).is_none());
+    }
+
+    /// Recordings from before the window existed carry only the latest
+    /// cycle's share, and are judged on it as they were.
+    #[test]
+    fn dns_failing_reads_an_old_recording_by_its_cycle_share() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        assert_eq!(dns.window, DnsWindow::default());
+        dns.failure_rate_pct = 5.0;
+        assert!(dns.failing(&Thresholds::default()).is_none());
+        dns.failure_rate_pct = 33.3;
+        assert_eq!(dns.failing(&Thresholds::default()), Some(DnsFailing::Cycle));
+    }
+
+    #[test]
+    fn the_wilson_lower_bound_matches_worked_values() {
+        assert_eq!(wilson_lower_pct(0, 0), 0.0);
+        assert_eq!(wilson_lower_pct(0, 60), 0.0);
+        assert!(
+            (wilson_lower_pct(7, 60) - 5.77).abs() < 0.05,
+            "{}",
+            wilson_lower_pct(7, 60)
+        );
+        assert!(
+            (wilson_lower_pct(6, 60) - 4.66).abs() < 0.05,
+            "{}",
+            wilson_lower_pct(6, 60)
+        );
+        assert!(
+            (wilson_lower_pct(1, 3) - 6.15).abs() < 0.05,
+            "{}",
+            wilson_lower_pct(1, 3)
+        );
+        assert!(wilson_lower_pct(60, 60) > 93.0);
+    }
+
+    #[test]
+    fn only_dns_failing_confirms_on_its_first_sample() {
+        let mut t = Thresholds::default();
+        assert_eq!(t.confirmations("dns.failing"), 1);
+        // Two windows, unless the user asked for fewer samples than that.
+        assert_eq!(t.confirmations("dns.slow_resolver"), 2);
+        t.consecutive_n = 1;
+        assert_eq!(t.confirmations("dns.slow_resolver"), 1);
+        t.consecutive_n = 8;
+        assert_eq!(t.confirmations("dns.slow_resolver"), 2);
+        let t = Thresholds::default();
+        assert_eq!(t.confirmations("gateway.rtt_spike"), t.consecutive_n);
     }
 
     #[test]
@@ -4472,6 +5102,24 @@ mod tests {
         );
     }
 
+    /// The neighbour table fills in the causes and opens nothing. An entry
+    /// is incomplete for a moment whenever the kernel re-resolves it, and a
+    /// gateway answering echo is reachable.
+    #[test]
+    fn an_incomplete_neighbour_entry_alone_does_not_open_gateway_unreachable() {
+        let obs = Observations {
+            gateway: Some(GatewayObs {
+                rtt_ms: Some(2.0),
+                loss_pct: 0.0,
+                icmp_ok: true,
+                arp_ok: Some(false),
+                ..dead_gateway()
+            }),
+            ..Default::default()
+        };
+        assert!(detect(&obs, &store(), &Thresholds::default()).is_empty());
+    }
+
     #[test]
     fn an_unprobed_arp_is_never_rendered_as_a_failed_arp() {
         // netwatch sends no ARP of its own, so `arp_ok` is `None` on every
@@ -4836,6 +5484,7 @@ mod tests {
                 tx_dropped: 0,
                 errors_per_min: 40,
                 drops_per_min: Some(12),
+                packets_per_min: None,
                 link_rate_bps: Some(1e9),
                 wireless: Some(false),
                 signal_dbm: None,
@@ -4884,6 +5533,7 @@ mod tests {
             tx_dropped: 0,
             errors_per_min: 0,
             drops_per_min: Some(0),
+            packets_per_min: None,
             link_rate_bps: Some(1e9),
             wireless: Some(false),
             signal_dbm: None,
@@ -4906,18 +5556,75 @@ mod tests {
 
     #[test]
     fn iface_errors_fires_at_the_error_floor() {
-        // One error a minute: errors are rare and always mean something.
-        let found = link_rules(IfaceObs {
-            errors_per_min: 1,
+        // Five errors in a minute, whatever the traffic. One stray CRC
+        // error is not a fault.
+        let found = |errors_per_min| {
+            link_rules(IfaceObs {
+                errors_per_min,
+                ..eth0()
+            })
+        };
+        assert!(found(4).is_empty());
+        assert_eq!(found(5), ["iface.errors"]);
+    }
+
+    /// With packet counts, drops and errors are shares of what the link
+    /// carried: 2% on a wired link, 10% on a radio or an unknown link, and
+    /// 1% for errors, judged only above 1000 packets a minute.
+    #[test]
+    fn iface_errors_judges_shares_of_packets_above_the_packet_floor() {
+        let t = Thresholds::default();
+        let link = |wireless, packets, drops, errors| IfaceObs {
+            wireless,
+            packets_per_min: Some(packets),
+            drops_per_min: Some(drops),
+            errors_per_min: errors,
             ..eth0()
-        });
-        assert_eq!(found, ["iface.errors"]);
+        };
+        // 70 drops a minute, the count that used to open it: 0.7% of a busy
+        // link, and unjudged on a quiet one.
+        assert!(link_rules(link(Some(true), 10_000, 70, 0)).is_empty());
+        assert!(link_rules(link(Some(true), 200, 70, 0)).is_empty());
+        // Wired: 2%.
+        assert!(link_rules(link(Some(false), 10_000, 199, 0)).is_empty());
+        assert_eq!(
+            link_rules(link(Some(false), 10_000, 200, 0)),
+            ["iface.errors"]
+        );
+        // A radio, or a link of unknown kind: 10%.
+        assert!(link_rules(link(Some(true), 10_000, 999, 0)).is_empty());
+        assert_eq!(
+            link_rules(link(Some(true), 10_000, 1_000, 0)),
+            ["iface.errors"]
+        );
+        assert!(link_rules(link(None, 10_000, 999, 0)).is_empty());
+        // Errors: 1% of packets, under the count floor.
+        assert!(
+            link_rules(link(Some(false), 300, 4, 0)).is_empty(),
+            "too few packets"
+        );
+        let lossy = IfaceObs {
+            errors_per_min: 4,
+            ..link(Some(false), 300, 0, 0)
+        };
+        assert!(lossy.fault_ratio(&t) < 1.0);
+        let d = iface_errors(link(Some(false), 10_000, 400, 0));
+        let metrics: Vec<&str> = d.evidence.iter().map(|e| e.metric.as_str()).collect();
+        assert_eq!(
+            metrics,
+            ["iface.error_rate", "iface.drop_share", "iface.fault_ratio"]
+        );
+        assert_eq!(d.evidence[1].value, 4.0);
+        assert_eq!(d.evidence[2].value, 2.0, "twice the wired line");
+        // The verify reads the same statistic.
+        assert_eq!(d.verify.metric, "iface.fault_ratio");
     }
 
     #[test]
     fn iface_errors_fires_at_the_drop_floor() {
         let found = link_rules(IfaceObs {
             drops_per_min: Some(60),
+            packets_per_min: None,
             ..eth0()
         });
         assert_eq!(found, ["iface.errors"]);
@@ -4930,6 +5637,7 @@ mod tests {
         let found = link_rules(IfaceObs {
             errors_per_min: 0,
             drops_per_min: Some(59),
+            packets_per_min: None,
             ..eth0()
         });
         assert!(!found.contains(&"iface.errors"), "{found:?}");
@@ -4941,6 +5649,7 @@ mod tests {
         IfaceObs {
             errors_per_min,
             drops_per_min: None,
+            packets_per_min: None,
             ..eth0()
         }
     }
@@ -4962,18 +5671,19 @@ mod tests {
     #[test]
     fn without_drop_counters_iface_errors_judges_errors_only() {
         assert!(link_rules(uncounted_drops(0)).is_empty());
-        let d = iface_errors(uncounted_drops(3));
+        let d = iface_errors(uncounted_drops(6));
         assert_eq!(d.evidence[0].metric, "iface.error_rate");
-        assert_eq!(d.evidence[0].value, 3.0);
-        assert_eq!(uncounted_drops(3).error_rate(), 3);
+        assert_eq!(d.evidence[0].value, 6.0);
+        assert_eq!(uncounted_drops(6).error_rate(), 6);
         let counted = IfaceObs {
             drops_per_min: Some(5),
-            ..uncounted_drops(3)
+            packets_per_min: None,
+            ..uncounted_drops(6)
         };
-        assert_eq!(counted.error_rate(), 8);
+        assert_eq!(counted.error_rate(), 11);
 
         let obs = Observations {
-            iface: Some(uncounted_drops(3)),
+            iface: Some(uncounted_drops(6)),
             ..Default::default()
         };
         let coverage = crate::diagnose::coverage::Coverage::from_observations(
@@ -5000,7 +5710,7 @@ mod tests {
     #[test]
     fn ring_buffer_cause_is_not_run_without_drop_counters() {
         use crate::diagnose::engine::{Engine, FixedClock};
-        let d = iface_errors(uncounted_drops(3));
+        let d = iface_errors(uncounted_drops(6));
         let cause = |id| d.causes.iter().find(|c| c.id == id).unwrap();
         let ring = cause("ring_buffer_small");
         assert_eq!(ring.confidence(), super::super::issue::Confidence::Untested);
@@ -5272,6 +5982,73 @@ mod tests {
         assert_eq!(icmp.passed, Some(true));
     }
 
+    /// Decision OD-2: the public reference resolver is named with its
+    /// measurement and the command, and is never something netwatch applies.
+    #[test]
+    fn the_reference_resolver_is_an_instruction_never_an_apply_step() {
+        use super::super::issue::StepKind;
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let reference = DnsObs {
+            alt_resolver: Some(crate::collectors::health::REFERENCE_RESOLVER.into()),
+            alt_rtt_ms: Some(8.0),
+            ..slow_dns()
+        };
+        let found = detect(
+            &obs_with_dns(reference.clone()),
+            &base,
+            &Thresholds::default(),
+        );
+        let slow = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("slow");
+        assert!(slow.remediation.iter().all(|s| s.kind != StepKind::Apply));
+        let step = &slow.remediation[0];
+        assert_eq!(step.text, "try the public resolver 1.1.1.1");
+        for want in [
+            "1.1.1.1 answered in 8.0ms over the same uplink while 169.254.1.1 took 40ms",
+            "resolvectl dns <iface> 1.1.1.1",
+            "Your lookups then go to that provider",
+            "netwatch changes nothing itself",
+        ] {
+            assert!(step.detail.contains(want), "{want}: {}", step.detail);
+        }
+        // And the cause ranking gets its strongest check, measured.
+        let check = slow.causes[0]
+            .checks
+            .iter()
+            .find(|c| c.id == "alt_resolver_is_fast")
+            .expect("the check");
+        assert_eq!(check.passed, Some(true), "{check:?}");
+
+        // A resolver that answers nothing, beside a reference that does.
+        let mut silent = reference;
+        silent.window = DnsWindow {
+            queries: 12,
+            unanswered: 12,
+            recent_unanswered: 12,
+            all_lost_secs: Some(20.0),
+            ..Default::default()
+        };
+        let found = detect(&obs_with_dns(silent), &base, &Thresholds::default());
+        let failing = found
+            .iter()
+            .find(|d| d.rule == "dns.failing")
+            .expect("failing");
+        assert!(failing
+            .remediation
+            .iter()
+            .all(|s| s.kind != StepKind::Apply));
+        assert!(
+            failing.remediation[0]
+                .detail
+                .contains("while 169.254.1.1 did not answer"),
+            "{}",
+            failing.remediation[0].detail
+        );
+    }
+
     /// REVIEW §2.4: propose a resolver only after measuring it. Live, the
     /// second configured resolver is never timed, so the switch used to be
     /// offered on nothing but its presence in resolv.conf.
@@ -5459,6 +6236,7 @@ mod tests {
                 tx_dropped: 0,
                 errors_per_min: 0,
                 drops_per_min: Some(0),
+                packets_per_min: None,
                 link_rate_bps: None,
                 rx_bps: 0.0,
                 tx_bps: 0.0,
@@ -5687,6 +6465,7 @@ mod tests {
                 obs: Observations {
                     iface: Some(IfaceObs {
                         drops_per_min: None,
+                        packets_per_min: None,
                         errors_per_min: 40,
                         ..eth0()
                     }),

@@ -121,6 +121,7 @@ pub struct LiveSampler {
     /// that logged 40 errors during boot last month is not a live fault) and
     /// not on a single tick's delta, which reported as "/min" is off by 60.
     iface_history: HashMap<String, IfaceCounters>,
+    packet_history: HashMap<String, IfaceCounters>,
     /// Target → the last trace we saw, for the path diff.
     prev_path: HashMap<String, Vec<HopObs>>,
     /// Interface name → the last minute of (tx retries, tx packets) deltas,
@@ -228,14 +229,16 @@ impl LiveSampler {
         let mut out = Vec::new();
 
         // Learn the statistic the rule judges. `dns.slow_resolver` compares
-        // the rolling p50 of the probe history against this baseline, so the
-        // baseline has to be fed that p50 — feeding it the latest single probe
-        // taught it a noisier, lower number than the one it was later asked
-        // to judge, and the 3σ test drifted with the difference.
-        let dns_p50 = dns_p50_to_learn(health.dns_rtt_ms, &health.dns_rtt_history);
+        // the median of a closed window of probe cycles against this
+        // baseline, so the baseline is fed that median, once per window.
+        // Feeding it a single probe taught it a noisier, lower number than
+        // the one it was later asked to judge, and the 3σ test drifted with
+        // the difference. A window where the resolver mostly did not answer
+        // has no median and teaches nothing.
+        let dns_p50 = dns_p50_to_learn(health.dns_rtt_window.as_ref());
         if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), dns_p50) {
             if health.completed.dns_target.as_ref() == Some(&resolver) {
-                if let Some(at) = self.fresh_reading("dns", health.completed.dns) {
+                if let Some(at) = self.fresh_reading("dns.window", health.completed.dns_window) {
                     out.push(Reading::new(resolver, "dns.rtt_p50", rtt, at));
                 }
             }
@@ -443,6 +446,14 @@ impl LiveSampler {
             .entry(t.name.clone())
             .or_insert_with(|| IfaceCounters::new(errors, drops));
         let (errors_per_min, drops_per_min) = history.observe(completed, errors, drops);
+        // The same minute's packets, so drops and errors can be read as a
+        // share of what the link carried.
+        let packets = t.rx_packets + t.tx_packets;
+        let (packets_per_min, _) = self
+            .packet_history
+            .entry(t.name.clone())
+            .or_insert_with(|| IfaceCounters::new(packets, 0))
+            .observe(completed, packets, 0);
         let counter_window_secs = Some(
             completed
                 .saturating_duration_since(history.started_at)
@@ -476,6 +487,7 @@ impl LiveSampler {
             counter_window_secs,
             errors_per_min,
             drops_per_min: drops_counted.then_some(drops_per_min),
+            packets_per_min: Some(packets_per_min),
             // Wired only. A wifi PHY rate moves with every retrain and is
             // not the rate the link can carry, so on wifi the saturation
             // rule stays dormant rather than crying wolf.
@@ -792,16 +804,18 @@ fn gateway(app: &App) -> Option<GatewayObs> {
             .pct()
             .map(|p| health.internet_rtt_ms.is_some() && p < 100.0)
     };
+    let arp_ok = crate::platform::neighbour_resolved(&addr);
     Some(GatewayObs {
         addr: Some(addr),
         rtt_ms: health.gateway_rtt_ms,
         loss_pct,
         internet_reachable,
-        // No ARP probe yet, so this stays unknown. Mirroring the ICMP result
-        // here made the checks assert "no arp reply from the gateway" about a
-        // probe that was never sent — and an unprivileged run, which cannot
-        // send ICMP at all, produced that line every time.
-        arp_ok: None,
+        // What the kernel's neighbour table says, where it is read. Unknown
+        // otherwise: mirroring the ICMP result here made the checks assert
+        // "no arp reply from the gateway" about something nobody looked at,
+        // and an unprivileged run, which cannot send ICMP at all, produced
+        // that line every time.
+        arp_ok,
         icmp_ok,
     })
 }
@@ -819,9 +833,14 @@ fn dns(app: &App) -> Option<DnsObs> {
 
     // A resolver the probe could not query (a scoped link-local address, no
     // socket) is not a resolver failing 100% of queries; it is no observation.
-    let failure_rate_pct = health.dns_loss.pct()?;
+    let lost_pct = health.dns_loss.pct()?;
+    // The latest cycle's failed share, which `dns.failing` closes on: a
+    // SERVFAIL is a reply to the Health tile and a failure to the rule.
+    let failure_rate_pct = health.dns_probe_history.back().map_or(lost_pct, |p| {
+        let per_cycle = crate::collectors::health::DNS_PROBES_PER_CYCLE as f64;
+        lost_pct.max(failed_queries(p) as f64 / per_cycle * 100.0)
+    });
 
-    let samples: Vec<f64> = health.dns_rtt_history.iter().flatten().copied().collect();
     // One sample per probe, so the window is samples × the probe interval —
     // not × a bare 5, which silently became wrong the moment the cadence
     // constant moved.
@@ -863,10 +882,29 @@ fn dns(app: &App) -> Option<DnsObs> {
         }
     });
 
+    // The reference resolver is the alternate that gets timed: it is asked
+    // every cycle over the same uplink, whatever the configured resolver
+    // does. It is no alternate to itself.
+    let reference = (resolver != crate::collectors::health::REFERENCE_RESOLVER)
+        .then(|| dns_reference(&health.dns_reference_rtt_history))
+        .flatten();
+    let reference_rtt = (resolver != crate::collectors::health::REFERENCE_RESOLVER)
+        .then(|| reference_rtt(&health.dns_reference_rtt_history))
+        .flatten();
+
     Some(DnsObs {
+        window: super::detectors::DnsWindow {
+            rtt_secs: health.dns_rtt_window.map_or(0, |w| w.secs),
+            rtt_cycles: health.dns_rtt_window.map_or(0, |w| w.answered),
+            ..dns_window(&health.dns_probe_history, &health.completed.dns_history)
+        },
         resolver,
-        rtt_p50_ms: percentile(&samples, 0.5).or(health.dns_rtt_ms),
-        rtt_p95_ms: percentile(&samples, 0.95),
+        // The newest closed window, held until the next one closes. Nothing
+        // is judged before the first: a median of the cycles so far would be
+        // a different statistic from the one the baseline learns.
+        rtt_p50_ms: dns_p50_to_learn(health.dns_rtt_window.as_ref()),
+        // A handful of cycles has no tail worth quoting.
+        rtt_p95_ms: None,
         failure_rate_pct,
         truncation_rate_pct,
         queries: replies.max(health.dns_rtt_history.len() as u32),
@@ -876,11 +914,12 @@ fn dns(app: &App) -> Option<DnsObs> {
             .filter(|s| s.is_none())
             .count() as u32,
         truncated,
-        // netwatch probes one resolver today. The alternate-resolver check is
-        // the strongest discriminator the DNS rule has, so this is the first
-        // thing the pipeline should add; until then it reports "not run".
-        alt_resolver: cfg.dns_servers.get(1).cloned(),
-        alt_rtt_ms: None,
+        alt_resolver: match reference_rtt {
+            Some(_) => Some(crate::collectors::health::REFERENCE_RESOLVER.to_string()),
+            None => cfg.dns_servers.get(1).cloned(),
+        },
+        alt_rtt_ms: reference_rtt,
+        reference,
         icmp_rtt_ms: None,
         cached_rtt_ms: None,
         window_secs,
@@ -922,20 +961,119 @@ fn observed_config(app: &App) -> ObservedConfig {
     }
 }
 
+/// Cycles the reference resolver's round trip is taken over, and how many
+/// of them must have answered for there to be one.
+const REFERENCE_RTT_CYCLES: usize = 6;
+const REFERENCE_RTT_MIN_ANSWERS: usize = 3;
+
+/// The reference resolver's median round trip over its newest cycles, or
+/// `None` when it answered fewer than half of them. One fast answer is not a
+/// resolver worth pointing someone at.
+fn reference_rtt(history: &std::collections::VecDeque<Option<f64>>) -> Option<f64> {
+    let answers: Vec<f64> = history
+        .iter()
+        .rev()
+        .take(REFERENCE_RTT_CYCLES)
+        .flatten()
+        .copied()
+        .collect();
+    (answers.len() >= REFERENCE_RTT_MIN_ANSWERS)
+        .then(|| percentile(&answers, 0.5))
+        .flatten()
+}
+
+/// The probe's newest cycles as `dns.failing` judges them: up to
+/// [`DNS_FAIL_WINDOW`] queries, how many went unanswered, and how long the
+/// resolver has answered nothing at all.
+///
+/// `probes` and `completed` are the prober's per-cycle histories, pushed
+/// together, oldest first. A SERVFAIL is a reply to the probe and a failure
+/// here.
+fn dns_window(
+    probes: &std::collections::VecDeque<crate::collectors::health::DnsProbe>,
+    completed: &std::collections::VecDeque<Instant>,
+) -> super::detectors::DnsWindow {
+    use super::detectors::{DNS_FAIL_RECENT, DNS_FAIL_WINDOW};
+    let per_cycle = crate::collectors::health::DNS_PROBES_PER_CYCLE as u32;
+    let cycles = (DNS_FAIL_WINDOW / per_cycle) as usize;
+    let recent = probes.iter().rev().take(cycles);
+    let (mut queries, mut answered, mut recent_unanswered, mut servfail) = (0, 0, 0, 0);
+    for p in recent {
+        let failed = failed_queries(p);
+        if queries < DNS_FAIL_RECENT {
+            recent_unanswered += failed;
+        }
+        queries += per_cycle;
+        answered += per_cycle - failed;
+        servfail += (p.servfail as u32).min(failed);
+    }
+    // The two histories are the same length unless a reader caught the
+    // prober between pushes; pair them from the newest end.
+    let silent = probes
+        .iter()
+        .rev()
+        .zip(completed.iter().rev())
+        .take_while(|(p, _)| failed_queries(p) == per_cycle)
+        .map(|(_, at)| *at);
+    let (newest, oldest) = silent.fold((None, None), |(newest, _), at| {
+        (newest.or(Some(at)), Some(at))
+    });
+    let all_lost_secs = match (newest, oldest) {
+        (Some(newest), Some(oldest)) if newest > oldest => {
+            Some(newest.duration_since(oldest).as_secs_f64())
+        }
+        _ => None,
+    };
+    super::detectors::DnsWindow {
+        queries,
+        unanswered: queries - answered,
+        recent_unanswered,
+        all_lost_secs,
+        servfail,
+        ..Default::default()
+    }
+}
+
+/// How many of one cycle's queries failed: no reply, or a SERVFAIL. The
+/// resolver said it could not answer, and to whoever asked that is the same
+/// as silence. REFUSED is not counted: a resolver may refuse the probe's
+/// root-NS question by policy and resolve everything else.
+fn failed_queries(p: &crate::collectors::health::DnsProbe) -> u32 {
+    let per_cycle = crate::collectors::health::DNS_PROBES_PER_CYCLE as u32;
+    let replies = (p.replies as u32).min(per_cycle);
+    per_cycle - replies + (p.servfail as u32).min(replies)
+}
+
+/// How the reference resolver has answered, for telling a broken resolver
+/// from a broken uplink. `None` when it was not asked (third-party probes
+/// off, or it is the configured resolver).
+fn dns_reference(
+    history: &std::collections::VecDeque<Option<f64>>,
+) -> Option<super::detectors::DnsReference> {
+    if history.is_empty() {
+        return None;
+    }
+    let recent: Vec<bool> = history
+        .iter()
+        .rev()
+        .take(REFERENCE_RTT_CYCLES)
+        .map(Option::is_some)
+        .collect();
+    Some(super::detectors::DnsReference {
+        asked: recent.len() as u32,
+        answered: recent.iter().filter(|a| **a).count() as u32,
+        ever_answered: history.iter().any(Option::is_some),
+    })
+}
+
 /// Nearest-rank percentile. `None` on an empty sample set rather than 0.0 —
 /// "no measurement" and "zero milliseconds" are different claims.
-/// The DNS p50 the baseline may learn from this cycle, or `None` when the
-/// cycle got no reply. The p50 comes from the history, which still holds the
-/// replies from before an outage; learning it while the resolver is silent
-/// would advance the baseline on timings that did not happen again, and
-/// narrow its spread with every failed probe.
-fn dns_p50_to_learn(
-    latest: Option<f64>,
-    history: &std::collections::VecDeque<Option<f64>>,
-) -> Option<f64> {
-    let latest = latest?;
-    let samples: Vec<f64> = history.iter().flatten().copied().collect();
-    percentile(&samples, 0.5).or(Some(latest))
+/// The DNS p50 the rule judges and the baseline learns: the median of the
+/// newest closed window, or `None` when there is no window yet or the
+/// resolver went unanswered for most of it. One function serves both, so the
+/// two cannot come apart.
+fn dns_p50_to_learn(window: Option<&crate::collectors::health::DnsRttWindow>) -> Option<f64> {
+    window?.p50_ms
 }
 
 fn percentile(values: &[f64], p: f64) -> Option<f64> {
@@ -1063,6 +1201,122 @@ mod tests {
         app.health_prober.publish_for_test(status);
         let observations = LiveSampler::new().sample(&app, &Thresholds::default());
         assert!(observations.gateway.is_some());
+    }
+
+    #[test]
+    fn the_reference_rtt_needs_three_answers_in_the_newest_six_cycles() {
+        let h = |v: &[Option<f64>]| v.iter().copied().collect::<std::collections::VecDeque<_>>();
+        assert_eq!(reference_rtt(&h(&[])), None);
+        assert_eq!(reference_rtt(&h(&[Some(9.0), Some(11.0)])), None);
+        assert_eq!(
+            reference_rtt(&h(&[Some(9.0), None, Some(11.0), None, Some(40.0)])),
+            Some(11.0)
+        );
+        // Old answers do not stand in for new silence.
+        let stale = [
+            Some(9.0),
+            Some(9.0),
+            Some(9.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(9.0),
+        ];
+        assert_eq!(reference_rtt(&h(&stale)), None);
+    }
+
+    /// A SERVFAIL is a reply to the probe and a failed lookup to whoever
+    /// asked. A resolver that answers everything with it is failing, and the
+    /// window says how much of the failure was that.
+    #[test]
+    fn a_servfail_is_a_failed_query_and_a_cycle_of_them_is_silence() {
+        use crate::collectors::health::DnsProbe;
+        let t0 = Instant::now();
+        let at: std::collections::VecDeque<Instant> = (0..8)
+            .map(|i| t0 + std::time::Duration::from_secs(i * 5))
+            .collect();
+        let ok = DnsProbe {
+            replies: 3,
+            ..Default::default()
+        };
+        let servfail = DnsProbe {
+            replies: 3,
+            servfail: 3,
+            ..Default::default()
+        };
+        let mut probes: std::collections::VecDeque<DnsProbe> = (0..8).map(|_| ok).collect();
+        probes[6].servfail = 1;
+        let w = dns_window(&probes, &at);
+        assert_eq!((w.queries, w.unanswered, w.servfail), (24, 1, 1));
+        assert_eq!(w.all_lost_secs, None);
+
+        for p in probes.iter_mut().skip(4) {
+            *p = servfail;
+        }
+        let w = dns_window(&probes, &at);
+        assert_eq!(
+            (w.unanswered, w.servfail, w.recent_unanswered),
+            (12, 12, 12)
+        );
+        assert_eq!(w.all_lost_secs, Some(15.0));
+    }
+
+    #[test]
+    fn the_reference_summary_keeps_whether_it_ever_answered() {
+        let h = |v: &[Option<f64>]| v.iter().copied().collect::<std::collections::VecDeque<_>>();
+        assert_eq!(dns_reference(&h(&[])), None);
+        let r = dns_reference(&h(&[None, None, None])).unwrap();
+        assert_eq!((r.asked, r.answered, r.ever_answered), (3, 0, false));
+        // It answered before the newest six cycles and not since.
+        let mut gone = vec![Some(9.0); 4];
+        gone.extend([None; 6]);
+        let r = dns_reference(&h(&gone)).unwrap();
+        assert_eq!((r.asked, r.answered, r.ever_answered), (6, 0, true));
+    }
+
+    #[test]
+    fn the_dns_window_counts_the_newest_twenty_cycles_and_times_the_silence() {
+        use crate::collectors::health::DnsProbe;
+        let t0 = Instant::now();
+        let cycle = |replies: u8| DnsProbe {
+            replies,
+            ..Default::default()
+        };
+        let at = |n: usize| -> std::collections::VecDeque<Instant> {
+            (0..n)
+                .map(|i| t0 + std::time::Duration::from_secs(i as u64 * 5))
+                .collect()
+        };
+        // 25 cycles: the oldest five lost everything and have left the window.
+        let mut probes: std::collections::VecDeque<DnsProbe> =
+            (0..25).map(|i| cycle(if i < 5 { 0 } else { 3 })).collect();
+        let w = dns_window(&probes, &at(25));
+        assert_eq!((w.queries, w.unanswered, w.all_lost_secs), (60, 0, None));
+        // A loss five cycles back is in the window and no longer recent.
+        probes[20].replies = 1;
+        let w = dns_window(&probes, &at(25));
+        assert_eq!((w.unanswered, w.recent_unanswered), (2, 0));
+        probes[20].replies = 3;
+        // One query lost in the newest cycle: counted, and not a silence.
+        probes.back_mut().unwrap().replies = 2;
+        let w = dns_window(&probes, &at(25));
+        assert_eq!(
+            (w.unanswered, w.recent_unanswered, w.all_lost_secs),
+            (1, 1, None)
+        );
+        // One silent cycle has no duration yet; four span fifteen seconds.
+        probes.back_mut().unwrap().replies = 0;
+        assert_eq!(dns_window(&probes, &at(25)).all_lost_secs, None);
+        for p in probes.iter_mut().rev().take(4) {
+            p.replies = 0;
+        }
+        let w = dns_window(&probes, &at(25));
+        assert_eq!((w.unanswered, w.all_lost_secs), (12, Some(15.0)));
+        // A probe that has barely started reports what it has.
+        let few: std::collections::VecDeque<DnsProbe> = (0..2).map(|_| cycle(3)).collect();
+        assert_eq!(dns_window(&few, &at(2)).queries, 6);
     }
 
     #[test]
@@ -1717,20 +1971,49 @@ mod tests {
         }
     }
 
+    /// What `dns.slow_resolver` judges and what its baseline learns are one
+    /// number: the median of the newest closed window. Before a window has
+    /// closed there is neither, whatever the cycles so far measured.
     #[test]
-    fn a_dns_cycle_without_a_reply_teaches_the_baseline_nothing() {
-        let history: std::collections::VecDeque<Option<f64>> =
-            [Some(12.0), Some(14.0), Some(13.0), None].into();
-        // The resolver stopped answering: the history still has old replies,
-        // but this cycle measured nothing.
-        assert_eq!(dns_p50_to_learn(None, &history), None);
-        // A reply this cycle learns the p50 the rule judges.
-        assert_eq!(dns_p50_to_learn(Some(13.0), &history), Some(13.0));
-        // A first reply with no history yet learns that reply.
-        assert_eq!(
-            dns_p50_to_learn(Some(9.0), &std::collections::VecDeque::new()),
-            Some(9.0)
-        );
+    fn the_judged_and_learned_dns_statistic_are_the_same() {
+        let judged_and_learned = |app: &App| {
+            let mut sampler = LiveSampler::new();
+            let obs = sampler.sample(app, &app.diagnose.engine.settings().thresholds);
+            let learned: Vec<f64> = sampler
+                .readings(app)
+                .into_iter()
+                .filter(|r| r.metric == "dns.rtt_p50")
+                .map(|r| r.value)
+                .collect();
+            (
+                obs.dns.expect("the resolver was probed").rtt_p50_ms,
+                learned,
+            )
+        };
+
+        let app = probes_off_app((Some(1.0), 0.0));
+        assert_eq!(judged_and_learned(&app), (None, vec![]));
+
+        let mut status = (*app.health_prober.status()).clone();
+        status.dns_rtt_window = Some(crate::collectors::health::DnsRttWindow {
+            p50_ms: Some(7.0),
+            cycles: 6,
+            answered: 6,
+            secs: 30,
+        });
+        status.completed.dns_window = status.completed.dns;
+        app.health_prober.publish_for_test(status.clone());
+        assert_eq!(judged_and_learned(&app), (Some(7.0), vec![7.0]));
+
+        // The resolver went mostly unanswered: no speed to judge or learn.
+        status.dns_rtt_window = Some(crate::collectors::health::DnsRttWindow {
+            p50_ms: None,
+            cycles: 6,
+            answered: 2,
+            secs: 30,
+        });
+        app.health_prober.publish_for_test(status);
+        assert_eq!(judged_and_learned(&app), (None, vec![]));
     }
 
     #[test]

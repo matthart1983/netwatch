@@ -25,6 +25,8 @@ This takes effect at 1.0.0. Until then 0.40 and its release candidates hold to i
 
 **Unstable.** Rules marked beta, and what `--include-beta` returns. A beta finding keeps the shape of any other finding, but its thresholds can change and the rule can go away.
 
+**Which rules are stable can change in a minor release.** Five are at 1.0: `gateway.unreachable` and the four `target.*` failure rules. A rule that becomes stable starts setting exit 1 on hosts where it used to be listed only, and a stable rule that turns out to open on a healthy network goes back to beta. Either move is listed at the top of that release's notes. If your automation must not change with them, match on `rule` instead of the exit status.
+
 **Experimental**, which can change or go in any release:
 
 - AI Insights

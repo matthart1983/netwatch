@@ -1,0 +1,96 @@
+name: Diagnose matrix
+
+# The Diagnose lab matrix (tests/diagnose/matrix_lab.py) stages the same fault
+# at 0 to 5 times each baseline rule's open line, over three base latencies,
+# several times each, and counts misses and false opens against a label
+# measured by an independent reference probe. Its counts are the lab half of
+# what a rule's maturity rests on (docs/DIAGNOSE.md, "Rule maturity").
+#
+# Weekly, or by hand. It is not part of ci.yml and holds no release: it takes
+# hours, and until a rule is put forward for stable on its numbers it reports
+# without gating. Two weekly runs at 4 reps pool to 72 positives and 72
+# negatives a rule, past the 60 the bar asks for.
+on:
+  schedule:
+    - cron: '30 2 * * 3'
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: 'runs of each cell'
+        type: string
+        default: '4'
+      gate:
+        description: 'fail on any miss or false open'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        rule: [gateway.rtt_spike, dns.slow_resolver, path.rtt_spike]
+    env:
+      REPS: ${{ inputs.reps || '4' }}
+      GATE: ${{ inputs.gate && '--gate' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install libpcap and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev iproute2 iputils-ping util-linux
+
+      # As health-lab.yml: the faults are netem qdiscs, one under prio with a
+      # u32 filter, and a cloud kernel may ship netem only in its -extra package.
+      - name: Load the qdiscs the faults use
+        run: |
+          sudo modprobe -a sch_netem sch_prio cls_u32 || {
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a sch_netem sch_prio cls_u32
+          }
+
+      - name: Build the driver
+        run: cargo build --example diagnose_lab
+
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Check the runner allows the lab's namespaces
+        shell: bash
+        run: |
+          unshare --user --map-root-user --net --mount sh -c \
+            'mount -t sysfs sysfs /sys && ls /sys/class/net &&
+             ip link add d0 type veth peer name d1 && tc qdisc add dev d0 root netem delay 1ms'
+
+      # Two cells at a time: a runner has four cores, and a cell that waits
+      # for a core measures the wait.
+      - name: Run the matrix
+        env:
+          RULE: ${{ matrix.rule }}
+        run: |
+          python3 tests/diagnose/matrix_lab.py --rule "$RULE" --reps "$REPS" --jobs 2 \
+            --out "matrix-lab-$RULE.json" $GATE
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diagnose-matrix-${{ matrix.rule }}
+          path: matrix-lab-*.json
+          if-no-files-found: warn

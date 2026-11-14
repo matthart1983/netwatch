@@ -300,6 +300,18 @@
     },
     {
       "group": "check",
+      "name": "check.dns.failing.resolver_down.reference_answers_over_the_same_uplink"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.failing.resolver_erroring.servfail_replies"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.failing.uplink_down.reference_also_unanswered"
+    },
+    {
+      "group": "check",
       "name": "check.dns.failing.udp53_filtered.resolver_reachable"
     },
     {
@@ -1315,7 +1327,7 @@
       "name": "open.egress.policy_violation"
     }
   ],
-  "hash": "e476c3f5ae717da6",
+  "hash": "21ed6ee78a2d6659",
   "meta_columns": [
     "episode",
     "source",

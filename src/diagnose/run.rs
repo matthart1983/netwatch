@@ -452,6 +452,9 @@ struct Sampling {
 #[derive(Serialize)]
 struct Finding<'a> {
     kind: Kind,
+    /// "beta" or "stable", from the flag the issue stored when it opened.
+    /// `beta` stays beside it and says the same thing as a boolean.
+    maturity: &'static str,
     #[serde(flatten)]
     issue: &'a Issue,
 }
@@ -470,7 +473,11 @@ fn json_report(
         findings
             .iter()
             .filter(|f| f.kind() == kind)
-            .map(|issue| Finding { kind, issue })
+            .map(|issue| Finding {
+                kind,
+                maturity: super::rules::Maturity::of_issue(issue.beta).label(),
+                issue,
+            })
             .collect()
     };
     serde_json::json!({
@@ -810,6 +817,8 @@ mod tests {
         // A measured resolver alone is evidence as well.
         let resolver = Observations {
             dns: Some(DnsObs {
+                window: Default::default(),
+                reference: None,
                 resolver: "192.0.2.2".into(),
                 rtt_p50_ms: Some(2.0),
                 rtt_p95_ms: Some(3.0),
@@ -832,7 +841,7 @@ mod tests {
         assert!(!evidence(&gateway, Some("api")));
     }
 
-    /// Decision B-10, revised: the rules without a reviewed contract are
+    /// Decision B-10, revised: the rules not marked stable are
     /// beta. Their issues are shown and tagged, and set the exit status only
     /// with `--include-beta`.
     #[test]
@@ -857,6 +866,7 @@ mod tests {
             false,
         );
         assert_eq!(json["issues"][0]["beta"], true);
+        assert_eq!(json["issues"][0]["maturity"], "beta");
         assert_eq!(json["include_beta"], false);
         // No finding, exit 0, and an Issue listed: the schema has to allow it.
         crate::schemas::test_support::check(crate::schemas::DIAGNOSE_RUN.file, &json);
@@ -874,7 +884,7 @@ mod tests {
         assert_eq!(
             outcome(std::slice::from_ref(&issue), true, false),
             Outcome::Finding,
-            "a contracted rule's issue counts without the flag"
+            "a stable rule's issue counts without the flag"
         );
     }
 
@@ -986,12 +996,14 @@ mod tests {
         let mut findings = select(engine.issues(), None);
         let issues = findings.len();
         findings.push(symmetric_nat());
+        // The fixture's issues all come from beta rules, so they are counted
+        // here; the beta gate has its own test.
         let json = json_report(
-            outcome(&findings, true, false),
+            outcome(&findings, true, true),
             &sampling(true),
             engine.coverage(),
             &findings,
-            false,
+            true,
         );
         assert_eq!(json["schema"], 2);
         assert_eq!(json["outcome"], "finding");
@@ -1001,6 +1013,12 @@ mod tests {
         for entry in listed("issues") {
             assert_eq!(entry["kind"], "issue", "{entry}");
             assert_ne!(entry["severity"], "info", "{entry}");
+            let maturity = if entry["beta"] == true {
+                "beta"
+            } else {
+                "stable"
+            };
+            assert_eq!(entry["maturity"], maturity, "{entry}");
         }
         let observations = listed("observations");
         assert_eq!(observations.len(), 1);

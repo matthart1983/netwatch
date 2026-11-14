@@ -10,7 +10,7 @@
     },
     {
       "key": "dns.slow_resolver|169.254.1.1",
-      "opened": "2026-09-03 06:48:20",
+      "opened": "2026-09-03 06:48:30",
       "closed": null,
       "top_cause": "dns.slow_resolver/upstream_slow"
     },

@@ -1,0 +1,13 @@
+{
+  "episode": "target-http-error",
+  "frames": 781,
+  "issues": [
+    {
+      "key": "target.http_error|api|target-config:synthetic-api",
+      "opened": "2026-09-03 06:49:00",
+      "closed": "2026-09-03 06:54:00",
+      "top_cause": "target.http_error/service_error",
+      "close_reason": "auto-closed"
+    }
+  ]
+}

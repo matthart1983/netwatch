@@ -33,6 +33,11 @@ pub struct HealthStatus {
     pub gateway_rtt_history: VecDeque<Option<f64>>,
     pub dns_rtt_history: VecDeque<Option<f64>>,
     pub internet_rtt_history: VecDeque<Option<f64>>,
+    /// The newest closed [`DNS_WINDOW_SECS`] window of DNS probe cycles;
+    /// `completed.dns_window` is when it closed. `None` until one has.
+    pub dns_rtt_window: Option<DnsRttWindow>,
+    /// The window still filling.
+    pub dns_window_fill: DnsWindowFill,
     /// Per-cycle reply flags from the DNS probe, one entry per probe cycle.
     /// The RTT series says whether the resolver answered; this says *what*
     /// it answered — a truncated reply or a SERVFAIL is a reply.
@@ -41,8 +46,91 @@ pub struct HealthStatus {
     /// answer disagreed with the validating reference.
     pub dns_cross: Option<DnsCrossCheck>,
     pub dns_cross_history: VecDeque<bool>,
+    /// How long [`REFERENCE_RESOLVER`] took to answer the cross-check's
+    /// question, one entry per cycle that asked it; `None` where it did not
+    /// answer. Asked whether or not the configured resolver answered, so
+    /// there is something to compare a slow or silent resolver with.
+    pub dns_reference_rtt_history: VecDeque<Option<f64>>,
     /// The latest STUN mapping probe. Runs every [`STUN_EVERY`] cycles.
     pub nat: Option<NatProbe>,
+}
+
+/// How many probe cycles make one DNS RTT window. `dns.slow_resolver` judges
+/// the median of a window and its baseline learns that same median.
+///
+/// Six cycles are [`DNS_WINDOW_SECS`] at the TUI's five-second cadence. A
+/// window is counted in cycles so that `diagnose run`, which probes every
+/// second inside a 30 s budget, still closes several; it is capped in time so
+/// that a slow refresh does not stretch one window over minutes.
+///
+/// The windows are fixed and do not overlap. A median over the whole rolling
+/// history took half the history to move: with ten minutes kept, a resolver
+/// that turned slow was reported five minutes later and cleared five minutes
+/// after it recovered, and consecutive readings shared all but one sample, so
+/// confirming over three of them confirmed nothing.
+pub const DNS_WINDOW_CYCLES: usize = 6;
+
+/// The longest a DNS RTT window stays open, however few cycles it has.
+pub const DNS_WINDOW_SECS: u64 = 30;
+
+/// One closed window of DNS probe cycles.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DnsRttWindow {
+    /// The median of the cycles that got a reply, the lower of the middle two
+    /// when their count is even; `None` when fewer than half
+    /// did, which is `dns.failing`'s case and no reading of the resolver's
+    /// speed.
+    pub p50_ms: Option<f64>,
+    pub cycles: u32,
+    pub answered: u32,
+    /// From the last window's close, or the first cycle of all, to this
+    /// window's.
+    pub secs: u64,
+}
+
+impl DnsRttWindow {
+    fn close(cycles: &[Option<f64>], secs: u64) -> Self {
+        let mut replies: Vec<f64> = cycles.iter().flatten().copied().collect();
+        replies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let answered = replies.len();
+        // The lower median: a window half slow and half not reads as not, so
+        // the level has to hold for more than half a window to count.
+        let median = answered.checked_sub(1).map(|last| replies[last / 2]);
+        Self {
+            p50_ms: median.filter(|_| answered * 2 >= cycles.len()),
+            cycles: cycles.len() as u32,
+            answered: answered as u32,
+            secs,
+        }
+    }
+}
+
+/// The cycles of a window that has not closed yet, and when it started: the
+/// last window's close, or the first cycle of all.
+#[derive(Clone, Debug, Default)]
+pub struct DnsWindowFill {
+    cycles: Vec<Option<f64>>,
+    started: Option<std::time::Instant>,
+}
+
+impl HealthStatus {
+    /// Add one DNS cycle to the window that is filling, and close the window
+    /// with it once it holds [`DNS_WINDOW_CYCLES`] or has been open for
+    /// [`DNS_WINDOW_SECS`]. The next window starts empty.
+    pub(crate) fn roll_dns_window(&mut self, rtt: Option<f64>, completed: std::time::Instant) {
+        let fill = &mut self.dns_window_fill;
+        let started = *fill.started.get_or_insert(completed);
+        fill.cycles.push(rtt);
+        let secs = completed.saturating_duration_since(started).as_secs();
+        if fill.cycles.len() >= DNS_WINDOW_CYCLES || secs >= DNS_WINDOW_SECS {
+            self.dns_rtt_window = Some(DnsRttWindow::close(&fill.cycles, secs));
+            self.completed.dns_window = Some(completed);
+            *fill = DnsWindowFill {
+                cycles: Vec::new(),
+                started: Some(completed),
+            };
+        }
+    }
 }
 
 /// What a probe's loss figure means.
@@ -114,6 +202,10 @@ pub struct ProbeTimes {
     pub dns: Option<std::time::Instant>,
     pub internet: Option<std::time::Instant>,
     pub nat: Option<std::time::Instant>,
+    /// When the newest DNS RTT window closed. `dns.slow_resolver` is sampled
+    /// on this clock: one window is one sample, however many cycles or ticks
+    /// it spans.
+    pub dns_window: Option<std::time::Instant>,
     pub gateway_target: Option<String>,
     pub dns_target: Option<String>,
 }
@@ -261,9 +353,12 @@ impl HealthProber {
                 gateway_rtt_history: VecDeque::new(),
                 dns_rtt_history: VecDeque::new(),
                 internet_rtt_history: VecDeque::new(),
+                dns_rtt_window: None,
+                dns_window_fill: Default::default(),
                 dns_probe_history: VecDeque::new(),
                 dns_cross: None,
                 dns_cross_history: VecDeque::new(),
+                dns_reference_rtt_history: VecDeque::new(),
                 nat: None,
             }))),
             busy: Arc::new(AtomicBool::new(false)),
@@ -333,7 +428,9 @@ impl HealthProber {
 trait Probes {
     fn gateway(&self, target: &str) -> (Option<f64>, Loss);
     fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe);
-    fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck>;
+    /// The cross-check, when the configured resolver answered it, and how
+    /// long the reference took to answer its half, when it did.
+    fn dns_cross_check(&self, server: &str) -> (Option<DnsCrossCheck>, Option<f64>);
     fn stun(&self, cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String>;
     fn internet(&self, target: &str) -> (Option<f64>, Loss);
 }
@@ -347,7 +444,7 @@ impl Probes for Network {
     fn dns(&self, server: &str) -> (Option<f64>, Loss, DnsProbe) {
         run_dns_query(server)
     }
-    fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck> {
+    fn dns_cross_check(&self, server: &str) -> (Option<DnsCrossCheck>, Option<f64>) {
         run_dns_cross_check(server)
     }
     fn stun(&self, cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String> {
@@ -425,10 +522,11 @@ fn run_cycle(
         let completed = std::time::Instant::now();
         // Same cycle, same resolver: what does it say a public name
         // resolves to, against a reference that validates?
-        let cross = if cycle.third_party {
-            probes.dns_cross_check(dns)
+        let (cross, reference_rtt) = if cycle.third_party {
+            let (cross, rtt) = probes.dns_cross_check(dns);
+            (cross, Some(rtt))
         } else {
-            None
+            (None, None)
         };
         let mut next = (**safe_read(snapshot, "health::probe::read_dns")).clone();
         if next.completed.dns_target.as_deref() != Some(dns) {
@@ -436,6 +534,20 @@ fn run_cycle(
             next.completed.dns_history.clear();
             next.dns_probe_history.clear();
             next.dns_cross_history.clear();
+            next.dns_rtt_window = None;
+            next.dns_window_fill = Default::default();
+            next.completed.dns_window = None;
+        }
+        match reference_rtt {
+            Some(rtt) => {
+                next.dns_reference_rtt_history.push_back(rtt);
+                if next.dns_reference_rtt_history.len() > RTT_HISTORY_MAX {
+                    next.dns_reference_rtt_history.pop_front();
+                }
+            }
+            // Third-party probes are off: what was measured while they were
+            // on is not a current reading.
+            None => next.dns_reference_rtt_history.clear(),
         }
         next.dns_rtt_ms = rtt;
         next.dns_loss = loss;
@@ -447,6 +559,7 @@ fn run_cycle(
                 next.completed.dns_history.pop_front();
             }
             next.dns_rtt_history.make_contiguous();
+            next.roll_dns_window(rtt, completed);
             next.dns_probe_history.push_back(flags);
             if next.dns_probe_history.len() > RTT_HISTORY_MAX {
                 next.dns_probe_history.pop_front();
@@ -751,6 +864,10 @@ pub(crate) fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> 
     Some(sock)
 }
 
+/// Queries the DNS probe sends each cycle. Diagnose counts unanswered
+/// queries over a window of cycles, and needs to know how many were asked.
+pub const DNS_PROBES_PER_CYCLE: usize = 3;
+
 /// The reachability probe: three root-NS queries, timed.
 ///
 /// Returns the mean rtt, the loss, and the reply flags — a SERVFAIL or a
@@ -759,7 +876,7 @@ pub(crate) fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> 
 fn run_dns_query(server: &str) -> (Option<f64>, Loss, DnsProbe) {
     use std::net::{IpAddr, SocketAddr};
 
-    const PROBES: usize = 3;
+    const PROBES: usize = DNS_PROBES_PER_CYCLE;
     let lost = |n: usize| (PROBES - n) as f64 / PROBES as f64 * 100.0;
 
     // `IpAddr::parse` rejects IPv6 zone identifiers (e.g. `fe80::1%en0`),
@@ -823,24 +940,36 @@ pub fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 
 /// Ask the configured resolver and a validating reference the same public
 /// name, and compare.
-fn run_dns_cross_check(server: &str) -> Option<DnsCrossCheck> {
+///
+/// The reference is asked first and whatever the configured resolver does,
+/// and its round trip is returned beside the comparison: when the configured
+/// resolver is slow or silent, how the reference fared over the same uplink
+/// is the measurement that tells a resolver problem from a network one.
+fn run_dns_cross_check(server: &str) -> (Option<DnsCrossCheck>, Option<f64>) {
     use std::net::{IpAddr, SocketAddr};
 
-    let local_addr: IpAddr = server.parse().ok()?;
-    let sock = dns_socket(local_addr)?;
-    let local_q = build_dns_query(0x5a11, CROSS_CHECK_NAME, 1, false);
-    let (local_reply, _) = dns_exchange(&sock, SocketAddr::new(local_addr, 53), &local_q, 0x5a11)?;
+    let reference = REFERENCE_RESOLVER
+        .parse::<IpAddr>()
+        .ok()
+        .and_then(|addr| Some((addr, dns_socket(addr)?)))
+        .and_then(|(addr, sock)| {
+            let q = build_dns_query(0x5a12, CROSS_CHECK_NAME, 1, true);
+            dns_exchange(&sock, SocketAddr::new(addr, 53), &q, 0x5a12)
+        });
+    let reference_rtt = reference.as_ref().map(|(_, rtt)| *rtt);
+    let reference = reference.map(|(r, _)| r);
 
-    let reference_addr: IpAddr = REFERENCE_RESOLVER.parse().ok()?;
-    let ref_sock = dns_socket(reference_addr)?;
-    let ref_q = build_dns_query(0x5a12, CROSS_CHECK_NAME, 1, true);
-    let reference = dns_exchange(
-        &ref_sock,
-        SocketAddr::new(reference_addr, 53),
-        &ref_q,
-        0x5a12,
-    )
-    .map(|(r, _)| r);
+    let local = server
+        .parse::<IpAddr>()
+        .ok()
+        .and_then(|addr| Some((addr, dns_socket(addr)?)))
+        .and_then(|(addr, sock)| {
+            let q = build_dns_query(0x5a11, CROSS_CHECK_NAME, 1, false);
+            dns_exchange(&sock, SocketAddr::new(addr, 53), &q, 0x5a11)
+        });
+    let Some((local_reply, _)) = local else {
+        return (None, reference_rtt);
+    };
 
     let private_answer = local_reply.answers.iter().any(|ip| is_private_v4(*ip));
     let (reference_answers, validated) = match &reference {
@@ -857,15 +986,18 @@ fn run_dns_cross_check(server: &str) -> Option<DnsCrossCheck> {
             .iter()
             .any(|ip| reference_answers.contains(ip));
 
-    Some(DnsCrossCheck {
-        name: CROSS_CHECK_NAME.to_string(),
-        local: local_reply.answers,
-        reference_resolver: REFERENCE_RESOLVER.to_string(),
-        reference: reference_answers,
-        validated,
-        private_answer,
-        mismatch,
-    })
+    (
+        Some(DnsCrossCheck {
+            name: CROSS_CHECK_NAME.to_string(),
+            local: local_reply.answers,
+            reference_resolver: REFERENCE_RESOLVER.to_string(),
+            reference: reference_answers,
+            validated,
+            private_answer,
+            mismatch,
+        }),
+        reference_rtt,
+    )
 }
 
 /// A standard recursive query for `name`/`qtype`. With `dnssec`, an EDNS OPT
@@ -1316,6 +1448,80 @@ fn parse_avg_rtt(output: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    fn rolled(cycles: &[(Option<f64>, u64)]) -> (HealthStatus, std::time::Instant) {
+        use std::time::Duration;
+        let mut status = (*HealthProber::new().status()).clone();
+        let t0 = std::time::Instant::now();
+        for &(rtt, at) in cycles {
+            status.roll_dns_window(rtt, t0 + Duration::from_secs(at));
+        }
+        (status, t0)
+    }
+
+    #[test]
+    fn a_dns_window_is_six_cycles_and_shares_none_with_the_next() {
+        let first: Vec<(Option<f64>, u64)> =
+            (0..5).map(|i| (Some(10.0 + i as f64), i * 5)).collect();
+        let (status, _) = rolled(&first);
+        assert_eq!(
+            status.dns_rtt_window, None,
+            "five cycles in, nothing is closed"
+        );
+
+        // The sixth cycle closes the window it is in.
+        let mut cycles = first.clone();
+        cycles.push((Some(15.0), 25));
+        let (status, t0) = rolled(&cycles);
+        let closed = DnsRttWindow {
+            p50_ms: Some(12.0),
+            cycles: 6,
+            answered: 6,
+            secs: 25,
+        };
+        assert_eq!(status.dns_rtt_window, Some(closed));
+        assert_eq!(
+            status.completed.dns_window,
+            Some(t0 + std::time::Duration::from_secs(25))
+        );
+
+        // The next window shares no cycle with the last: its median is the
+        // new level in full, and the old window stands until it closes.
+        cycles.extend((6..11).map(|i| (Some(99.0), i * 5)));
+        let (status, _) = rolled(&cycles);
+        assert_eq!(status.dns_rtt_window, Some(closed));
+        cycles.push((Some(99.0), 55));
+        let (status, _) = rolled(&cycles);
+        let next = status.dns_rtt_window.unwrap();
+        assert_eq!((next.p50_ms, next.cycles, next.secs), (Some(99.0), 6, 30));
+    }
+
+    /// `diagnose run` probes every second: six cycles are six seconds. A
+    /// refresh so slow that six cycles would take minutes closes on time.
+    #[test]
+    fn a_dns_window_follows_the_cadence_but_never_runs_past_thirty_seconds() {
+        let fast: Vec<(Option<f64>, u64)> = (0..6).map(|i| (Some(8.0), i)).collect();
+        let w = rolled(&fast).0.dns_rtt_window.unwrap();
+        assert_eq!((w.cycles, w.secs), (6, 5));
+
+        let slow: Vec<(Option<f64>, u64)> = (0..3).map(|i| (Some(8.0), i * 25)).collect();
+        assert_eq!(rolled(&slow[..2]).0.dns_rtt_window, None);
+        let w = rolled(&slow).0.dns_rtt_window.unwrap();
+        assert_eq!((w.cycles, w.secs), (3, 50));
+    }
+
+    #[test]
+    fn a_window_the_resolver_mostly_missed_has_no_median() {
+        let window = |answered: u64| {
+            let cycles: Vec<(Option<f64>, u64)> = (0..6)
+                .map(|i| ((i < answered).then_some(20.0), i * 5))
+                .collect();
+            rolled(&cycles).0.dns_rtt_window.unwrap()
+        };
+        assert_eq!(window(2).p50_ms, None);
+        assert_eq!((window(2).cycles, window(2).answered), (6, 2));
+        assert_eq!(window(3).p50_ms, Some(20.0));
+    }
+
     /// Answers every probe at once, and writes down who was asked. The
     /// internet targets answer as `internet` says, 0% loss for any not in it.
     #[derive(Default)]
@@ -1345,9 +1551,9 @@ mod tests {
             self.saw(format!("dns {server}"));
             (Some(2.0), Loss::Measured(0.0), DnsProbe::default())
         }
-        fn dns_cross_check(&self, server: &str) -> Option<DnsCrossCheck> {
+        fn dns_cross_check(&self, server: &str) -> (Option<DnsCrossCheck>, Option<f64>) {
             self.saw(format!("cross {server} and {REFERENCE_RESOLVER}"));
-            Some(DnsCrossCheck {
+            let cross = Some(DnsCrossCheck {
                 name: CROSS_CHECK_NAME.into(),
                 local: vec![],
                 reference_resolver: REFERENCE_RESOLVER.into(),
@@ -1355,7 +1561,8 @@ mod tests {
                 validated: false,
                 private_answer: false,
                 mismatch: false,
-            })
+            });
+            (cross, Some(9.0))
         }
         fn stun(&self, _: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String> {
             self.saw("stun".into());

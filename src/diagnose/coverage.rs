@@ -11,6 +11,51 @@ use serde::{Deserialize, Serialize};
 /// still needs nothing but serde and fmt.
 pub use super::issue::Availability;
 
+/// The rules that must have been evaluated before an empty issue list is
+/// reported as checked rather than as incomplete: is the link up, does the
+/// gateway answer and at its usual speed, does the resolver answer and at
+/// its usual speed. Everything else in the catalogue needs a test someone
+/// runs, a target someone configures, or traffic that may not exist.
+pub const CORE_RULES: [&str; 5] = [
+    "link.down",
+    "gateway.unreachable",
+    "gateway.rtt_spike",
+    "dns.failing",
+    "dns.slow_resolver",
+];
+
+/// Why `dns.truncation_retry` is not evaluated while the probe sees no
+/// truncated reply.
+pub const TRUNCATION_UNSEEN: &str =
+    "the probe's answers are too small to truncate; larger answers are not sampled";
+
+/// How a stub resolver's `dns.slow_resolver` row begins its reason.
+const STUB_REASON: &str = "limited:";
+
+/// What stands between an empty issue list and saying the core was checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Core {
+    /// Core rules without their inputs, and why.
+    pub waiting: Vec<(&'static str, Availability)>,
+    /// The resolver is a local stub, so its speed was not judged.
+    pub dns_speed_unjudged: bool,
+}
+
+impl Core {
+    pub fn checked(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    /// "gateway.rtt_spike learning, dns.failing not_measured".
+    pub fn waiting_label(&self) -> String {
+        self.waiting
+            .iter()
+            .map(|(rule, why)| format!("{rule} {}", why.label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleCoverage {
     pub rule: String,
@@ -99,6 +144,32 @@ impl Coverage {
             let area = row.rule.split('.').next().unwrap_or("");
             areas.iter().position(|a| a == area)
         });
+    }
+
+    /// Which of the [`CORE_RULES`] have not been evaluated, and whether
+    /// resolver speed was left out because the resolver is a local stub.
+    pub fn core(&self) -> Core {
+        let mut core = Core::default();
+        for id in CORE_RULES {
+            let row = self.rules.iter().find(|r| r.rule == id);
+            // Decision M5: behind a local stub the probe times the stub's
+            // cache, which says nothing about the upstream. The rule stays
+            // available for what it does measure, and leaves the core set.
+            if id == "dns.slow_resolver"
+                && row.is_some_and(|r| {
+                    r.status == Availability::Available && r.reason.starts_with(STUB_REASON)
+                })
+            {
+                core.dns_speed_unjudged = true;
+                continue;
+            }
+            match row {
+                Some(r) if r.status == Availability::Available => {}
+                Some(r) => core.waiting.push((id, r.status.clone())),
+                None => core.waiting.push((id, Availability::Unknown)),
+            }
+        }
+        core
     }
 
     pub fn label(&self) -> String {
@@ -192,7 +263,7 @@ impl Coverage {
             .filter(|d| d.rtt_p50_ms.is_some() && d.is_local_stub())
             .map(|d| {
                 format!(
-                    "limited: measures the local stub at {}, not the upstream",
+                    "{STUB_REASON} measures the local stub at {}, not the upstream",
                     d.resolver
                 )
             });
@@ -214,8 +285,12 @@ impl Coverage {
                 "gateway.unreachable" => present(obs.gateway.as_ref().is_some_and(|g| g.addr.is_some() && g.internet_reachable.is_some()), "gateway and corroborating internet probe required"),
                 "gateway.rtt_spike" => baseline(obs.gateway.as_ref().and_then(|g| g.rtt_ms), obs.gateway.as_ref().and_then(|g| g.addr.as_deref()), "gateway.rtt"),
                 "dns.slow_resolver" if stub.is_some() => (Available, stub.as_deref().unwrap_or_default()),
-                "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "resolver RTT not measured; absolute threshold remains usable without a baseline"),
-                "dns.failing" | "dns.truncation_retry" => present(obs.dns.as_ref().is_some_and(|d| d.queries > 0), "no DNS query outcomes measured"),
+                "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "no window of resolver timings has closed yet; the first takes six probe cycles"),
+                "dns.failing" => present(obs.dns.as_ref().is_some_and(|d| d.queries > 0), "no DNS query outcomes measured"),
+                // The probe asks for the root NS set, which fits in 512 bytes
+                // on any resolver. No truncated reply to that question is not
+                // a resolver that never truncates.
+                "dns.truncation_retry" => present(obs.dns.as_ref().is_some_and(|d| d.truncated > 0), TRUNCATION_UNSEEN),
                 "dns.hijack_suspect" => present(obs.dns.as_ref().and_then(|d| d.cross.as_ref()).is_some(), "resolver cross-check not measured"),
                 id if id.starts_with("path.") && obs.paths.is_empty() => (AwaitingTest, "run a traceroute; results remain usable for 120 seconds"),
                 "path.changed" => present(obs.paths.iter().any(|p| p.previous.is_some() && !p.hops.is_empty()), "current and previous traces required"),
@@ -435,6 +510,95 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows(rows: &[(&str, Availability, &str)]) -> Coverage {
+        Coverage {
+            rules: rows
+                .iter()
+                .map(|(rule, status, reason)| RuleCoverage {
+                    rule: rule.to_string(),
+                    status: status.clone(),
+                    reason: reason.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_core_is_checked_only_when_every_core_rule_is_available() {
+        let all: Vec<(&str, Availability, &str)> = CORE_RULES
+            .iter()
+            .map(|r| (*r, Availability::Available, "inputs present"))
+            .collect();
+        assert!(rows(&all).core().checked());
+
+        let mut learning = all.clone();
+        learning[2].1 = Availability::Learning;
+        let core = rows(&learning).core();
+        assert!(!core.checked());
+        assert_eq!(core.waiting_label(), "gateway.rtt_spike learning");
+
+        // A rule with no row at all was not evaluated either.
+        let core = rows(&all[..4]).core();
+        assert_eq!(core.waiting_label(), "dns.slow_resolver unknown");
+
+        // Rules outside the core never hold it up.
+        let mut extra = all.clone();
+        extra.push((
+            "path.changed",
+            Availability::AwaitingTest,
+            "run a traceroute",
+        ));
+        assert!(rows(&extra).core().checked());
+    }
+
+    /// The probe's root-NS answer cannot truncate, so its replies arriving
+    /// whole is no evidence about truncation. The rule is evaluated only
+    /// once a truncated reply has actually been seen.
+    #[test]
+    fn truncation_is_not_measured_until_a_truncated_reply_is_seen() {
+        let row = |truncated: u32| {
+            let mut dns = (crate::diagnose::fixture::scenarios()[0].obs)(0)
+                .dns
+                .expect("the fixture has a resolver");
+            dns.queries = 30;
+            dns.truncated = truncated;
+            let obs = Observations {
+                dns: Some(dns),
+                ..Default::default()
+            };
+            let base = BaselineStore::new(crate::diagnose::baseline::NetworkFingerprint::new(
+                "eth0",
+                None,
+                vec![],
+                None,
+            ));
+            Coverage::from_observations(&obs, &base, SigmaFloor::default())
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "dns.truncation_retry")
+                .expect("a row for the rule")
+        };
+        let unseen = row(0);
+        assert_eq!(unseen.status, Availability::NotMeasured);
+        assert_eq!(unseen.reason, TRUNCATION_UNSEEN);
+        assert_eq!(row(4).status, Availability::Available);
+    }
+
+    #[test]
+    fn a_stub_resolver_takes_dns_speed_out_of_the_core() {
+        let mut all: Vec<(&str, Availability, &str)> = CORE_RULES
+            .iter()
+            .map(|r| (*r, Availability::Available, "inputs present"))
+            .collect();
+        all[4].2 = "limited: measures the local stub at 127.0.0.53, not the upstream";
+        let core = rows(&all).core();
+        assert!(core.checked());
+        assert!(core.dns_speed_unjudged);
+        // A stub whose speed is not even measured is still waiting.
+        all[4].1 = Availability::NotMeasured;
+        assert!(!rows(&all).core().checked());
+    }
     use crate::diagnose::{baseline::NetworkFingerprint, fixture};
 
     #[test]

@@ -120,6 +120,9 @@ pub struct ProbeAges {
     pub path: Option<f64>,
     pub gateway: Option<f64>,
     pub dns: Option<f64>,
+    /// Since the newest DNS RTT window closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_window: Option<f64>,
     pub internet: Option<f64>,
     pub nat: Option<f64>,
     /// Newest target completion, kept for recordings written before probe
@@ -149,6 +152,7 @@ impl ProbeAges {
             path: age(times.path),
             gateway: age(times.health.gateway),
             dns: age(times.health.dns),
+            dns_window: age(times.health.dns_window),
             internet: age(times.health.internet),
             nat: age(times.health.nat),
             targets: times
@@ -211,6 +215,9 @@ impl ProbeAges {
         };
         times.health.gateway = at(self.gateway);
         times.health.dns = at(self.dns);
+        // A recording from before DNS windows sampled the slow-resolver rule
+        // on every cycle; it replays that way.
+        times.health.dns_window = at(self.dns_window.or(self.dns));
         times.health.internet = at(self.internet);
         times.health.nat = at(self.nat);
         times.health.gateway_target = self.gateway_target.clone();
@@ -408,6 +415,9 @@ pub struct Recorder {
     ring: VecDeque<Frame>,
     active: Option<Active>,
     next_quiet_at: f64,
+    /// Record every quiet stretch instead of one sample a day. See
+    /// [`Recorder::continuous`].
+    continuous: bool,
 }
 
 impl Recorder {
@@ -417,7 +427,22 @@ impl Recorder {
             ring: VecDeque::new(),
             active: None,
             next_quiet_at: now_unix + random_offset(86_400.0),
+            continuous: false,
         }
+    }
+
+    /// Record all the time: quiet samples back to back, each
+    /// [`QUIET_SAMPLE_SECS`] long, with an incident's recording taking over
+    /// when something opens. This is what a false-alert soak needs: every
+    /// monitored second is on disk, so the time a rule stayed quiet can be
+    /// counted, and replayed against a later version of the rule.
+    ///
+    /// Not for ordinary use. A day of it is about a hundred files, and
+    /// [`prune`] would start deleting them within the week.
+    pub fn continuous(mut self, now_unix: f64) -> Self {
+        self.continuous = true;
+        self.next_quiet_at = now_unix;
+        self
     }
 
     /// Move the next quiet sample to `at` (unix seconds).
@@ -453,7 +478,11 @@ impl Recorder {
                 self.start(EpisodeSource::Live, &tick, true, None);
                 self.track(&tick, &open);
             } else if tick.at >= self.next_quiet_at {
-                self.next_quiet_at = tick.at + 86_400.0 + random_offset(3_600.0) - 1_800.0;
+                self.next_quiet_at = if self.continuous {
+                    tick.at
+                } else {
+                    tick.at + 86_400.0 + random_offset(3_600.0) - 1_800.0
+                };
                 self.start(EpisodeSource::QuietSample, &tick, false, None);
             }
             return None;
@@ -467,11 +496,17 @@ impl Recorder {
             // Something broke during the quiet sample. Its last ten minutes
             // become the incident's pre-roll, taken from the ring because the
             // ring's frames still carry their own baseline snapshots.
+            //
+            // A continuous recording keeps every frame it has instead: the
+            // minutes before the pre-roll were monitored time, and dropping
+            // them would undercount it.
             active.episode.source = EpisodeSource::Live;
-            active.network = None;
-            active.episode.frames = self.ring.iter().cloned().collect();
-            for f in &mut active.episode.frames {
-                strip_repeat_snapshot(&mut active.network, f);
+            if !self.continuous {
+                active.network = None;
+                active.episode.frames = self.ring.iter().cloned().collect();
+                for f in &mut active.episode.frames {
+                    strip_repeat_snapshot(&mut active.network, f);
+                }
             }
             active.started_at = active.episode.frames.first().map_or(tick.at, |f| f.at);
             active.episode.started = active
@@ -1897,11 +1932,7 @@ mod tests {
     /// The owner accepts each row in the PR that adds it, and
     /// `pending_close_entries_are_still_needed` fails once the rule closes
     /// in an episode, so the row goes with the fix.
-    const PENDING_CLOSE: &[(&str, &str)] = &[(
-        "iface.errors",
-        "it closes only under 1/min errors and drops combined, which a Wi-Fi \
-         driver's background drops never allow, until B19 retunes it",
-    )];
+    const PENDING_CLOSE: &[(&str, &str)] = &[];
 
     /// Each corpus entry that lists `rule` among the rules it pins, with its
     /// pinned spans of that rule.
@@ -1970,6 +2001,31 @@ mod tests {
                 } else {
                     None
                 }
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A stable rule sets `diagnose run`'s exit status, so the least it owes
+    /// is a pinned episode in which it opens and then closes on its own
+    /// verify. No exemptions: a stable rule that cannot close is not stable.
+    #[test]
+    fn every_stable_rule_opens_and_closes_in_a_pinned_episode() {
+        let failures: Vec<String> = crate::diagnose::rules::CATALOGUE
+            .iter()
+            .filter(|rule| !rule.beta())
+            .filter_map(|rule| {
+                let episodes = pinned_spans_of(rule.id);
+                let closes = episodes
+                    .iter()
+                    .any(|(_, spans)| spans.iter().any(|span| closed_by(span, VERIFY)));
+                (!closes).then(|| {
+                    format!(
+                        "{}: stable, and no episode in {MANIFEST} that lists it shows it \
+                         opening and auto-closing",
+                        rule.id
+                    )
+                })
             })
             .collect();
         assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -2737,6 +2793,51 @@ mod tests {
         assert!(ep.issue_keys().is_empty());
         assert!(ep.duration_secs() >= QUIET_SAMPLE_SECS - 5.0);
         assert!(replay(ep).matches());
+    }
+
+    /// A soak counts quiet time, so none of it may go unrecorded: samples
+    /// run back to back, an incident keeps the quiet minutes before it, and
+    /// every file replays to what was recorded.
+    #[test]
+    fn a_continuous_recorder_leaves_no_time_unrecorded() {
+        let mut s = Session::new();
+        s.recorder = Recorder::new(EnvProfile::detect("no privileges", 1000), T0).continuous(T0);
+        s.run(healthy, 2.0 * 3_600.0, 5.0);
+        s.run(|_| 80.0, 300.0, 5.0);
+        s.run(healthy, 3_600.0, 5.0);
+        let quiet = s
+            .finished
+            .iter()
+            .filter(|e| e.source == EpisodeSource::QuietSample)
+            .count();
+        let live: Vec<&Episode> = s
+            .finished
+            .iter()
+            .filter(|e| e.source == EpisodeSource::Live)
+            .collect();
+        assert!(quiet >= 9, "{quiet} quiet samples in three hours");
+        assert_eq!(live.len(), 1);
+        // The incident began partway through a sample, and kept all of it.
+        let before = live[0].issues[0].ts.as_str();
+        let lead = live[0]
+            .frames
+            .iter()
+            .take_while(|f| f.ts.as_str() < before)
+            .count();
+        assert!(lead > 1, "the incident kept {lead} frames from before it");
+        let recorded: f64 = s.finished.iter().map(Episode::duration_secs).sum();
+        let elapsed = s.at - T0;
+        assert!(
+            recorded > elapsed * 0.97,
+            "{recorded:.0}s recorded of {elapsed:.0}s"
+        );
+        for ep in &s.finished {
+            assert!(
+                replay(ep).matches(),
+                "{:#?}",
+                replay(ep).divergences.first()
+            );
+        }
     }
 
     #[test]

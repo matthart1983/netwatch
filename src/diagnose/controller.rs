@@ -41,6 +41,9 @@ pub struct DiagnoseController {
     status_tick: u32,
     /// Ticks since the baselines were last written.
     persist_tick: u32,
+    /// Set by the soak harness: record every tick, quiet or not, and never
+    /// prune. See [`crate::diagnose::episode::Recorder::continuous`].
+    pub soak: bool,
     /// Created on the first live tick when `diagnose_record_episodes` is on.
     pub recorder: Option<crate::diagnose::episode::Recorder>,
     /// Where finished episodes are written. `None` in unit tests, so a test
@@ -89,6 +92,7 @@ impl DiagnoseController {
             demo: None,
             status_tick: 0,
             persist_tick: 0,
+            soak: false,
             recorder: None,
             episode_dir: if cfg!(test) {
                 None
@@ -642,14 +646,20 @@ impl App {
             return;
         }
         let at = wall.timestamp_micros() as f64 / 1e6;
+        let soak = self.diagnose.soak;
         let recorder = self.diagnose.recorder.get_or_insert_with(|| {
-            episode::Recorder::new(
+            let recorder = episode::Recorder::new(
                 episode::EnvProfile::detect(
                     self.diagnose.capability.label(),
                     self.user_config.refresh_rate_ms,
                 ),
                 at,
-            )
+            );
+            if soak {
+                recorder.continuous(at)
+            } else {
+                recorder
+            }
         });
         let finished = recorder.record(episode::Tick {
             at,
@@ -672,11 +682,15 @@ impl App {
                         tracing::warn!(target: "netwatch::diagnose", error = %e, "episode not saved")
                     }
                 }
-                episode::prune(
-                    &dir,
-                    std::time::Duration::from_secs(episode::RETAIN_SECS),
-                    episode::RETAIN_BYTES,
-                );
+                // A soak's recordings are its result; the harness owns
+                // their retention.
+                if !soak {
+                    episode::prune(
+                        &dir,
+                        std::time::Duration::from_secs(episode::RETAIN_SECS),
+                        episode::RETAIN_BYTES,
+                    );
+                }
             });
         }
     }
@@ -903,6 +917,8 @@ mod tests {
     fn a_40ms_resolver_opens_an_issue(app: &mut App) -> bool {
         let obs = Observations {
             dns: Some(DnsObs {
+                window: Default::default(),
+                reference: None,
                 resolver: "192.0.2.53".into(),
                 rtt_p50_ms: Some(40.0),
                 rtt_p95_ms: Some(48.0),

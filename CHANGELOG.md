@@ -2,6 +2,117 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Three Diagnose rules go back to beta, so five set `diagnose run`'s exit status.**
+  `path.high_loss`, `tcp.bufferbloat_remote` and `dns.hijack_suspect` keep their written
+  contracts and are shown as before, tagged beta, but count toward exit 1 only with
+  `--include-beta`. The first judges loss per hop from three probes, the second opens
+  without a test that proves the socket was under load, and the third opens when two
+  resolvers disagree, which CDNs and split-horizon DNS do by design. The stable rules are
+  `gateway.unreachable` and the four `target.*` failure rules. A script that relied on
+  exit 1 from one of the three needs `--include-beta` or a match on `rule`.
+- **A rule's maturity is set by hand instead of derived from its documentation.** Having
+  the four contract fields filled in used to make a rule count. Now each rule is marked
+  beta or stable in the catalogue, a test pins the stable list, and a stable rule may not
+  have a trigger text that is known to misdescribe its detector.
+- **The trigger texts of four rules describe what their detectors do.** `iface.saturated`
+  holds for three interface samples, not 30 seconds. `path.high_loss` also opens when
+  every hop after the lossy one is silent. `path.rtt_spike` falls back to the internet
+  probe's baseline. `tcp.bufferbloat_remote` opens whether or not the link test has run.
+  `gateway.unreachable` no longer lists an ARP probe as evidence, since none exists.
+- **The demo banner says the resolver switch is simulated.** `docs/DIAGNOSE.md` gains a
+  "Rule maturity" section that says what stable does and does not mean, and the README
+  caption says the demo's rules are beta.
+
+- **`dns.failing` judges the last 60 probe queries instead of the latest three.** One
+  lost query in a cycle of three read as 33% and opened the issue. The rule now needs at
+  least 5 unanswered queries in the last 60, one of them among the newest 12, and a 95%
+  lower confidence bound on that share above 5%, which seven of sixty meets and six do not. A resolver that answers nothing
+  for 15 seconds still opens it without waiting. It opens on the first sample that
+  qualifies, is Medium below 50% unanswered and High from there, and closes after 120
+  seconds of cycles with nothing lost. `diagnose_thresholds` gains `dns_failure_pct`
+  (default 5). The rule stays beta.
+
+- **`dns.slow_resolver` judges windows of six probe cycles instead of the whole probe
+  history.** The rule compared a median over ten minutes of probes with its baseline, so
+  a resolver that turned slow was reported about five minutes later and cleared about five
+  minutes after it recovered. It now judges the median of each six-cycle window, 30
+  seconds in the TUI and six seconds in `diagnose run`, and opens when two windows in a
+  row are over its line: 45 to 75 seconds in the TUI. Its baseline learns the same
+  median, once per window. A window where fewer than half the cycles were answered is not
+  judged. The issue no longer quotes a p95. A `consecutive_n` of 1 still opens it on one
+  window; values above 2 no longer make it wait longer. The rule stays beta.
+
+- **`dns.failing` counts SERVFAIL as a failure and uses the reference resolver to place
+  the fault.** A resolver that answered every query with SERVFAIL read as healthy, because
+  a reply was a reply. Those queries now count with the unanswered ones, and the issue
+  gains a cause for it. Two more checks compare with 1.1.1.1 over the same uplink: it
+  answering while your resolver does not points at the resolver, and both going quiet
+  where it used to answer points at the uplink. Where it has never answered, or was not
+  asked, the checks read as not run. REFUSED is not counted, because a resolver may
+  refuse the probe's root-NS question by policy.
+
+- **`dns.truncation_retry` says when it has nothing to judge.** The probe's question has
+  an answer too small to truncate, so the rule's coverage row now reads "not measured"
+  until a truncated reply is seen, instead of "ready".
+
+- **`iface.errors` judges drops and errors as a share of packets, and can close.** The
+  rule opened on 60 drops a minute and closed only under one error or drop a minute, so a
+  Wi-Fi driver discarding broadcast frames opened it and it never closed. It now opens
+  on 5 errors in a minute, errors over 1% of packets, or drops over 2% of packets on a
+  wired link and 10% on Wi-Fi, with shares judged only above 1,000 packets a minute. It
+  closes once it has stayed under half its open line for five minutes.
+  `diagnose_thresholds` gains `iface_error_pct`, `iface_drop_pct`, `iface_drop_pct_wifi`
+  and `iface_min_packets`; `iface_error_floor`'s default moves from 1 to 5, and
+  `iface_drop_floor` now only feeds the slow-resolver cause check. The rule stays beta.
+
+- **`gateway.unreachable` reads the kernel's neighbour table on Linux.** Its two ARP
+  checks always read "not run", because netwatch sends no ARP. They now read the
+  gateway's entry in `/proc/net/arp`: a resolved entry (stale included) supports "up but
+  not answering ICMP", and an incomplete one supports "wrong VLAN or address conflict".
+  The table only informs the causes. It never opens the issue, and an incomplete entry on
+  a gateway that answers echo no longer can. IPv6 gateways and other platforms still
+  read "not measured".
+
+- **macOS: `link.down` sees an unplugged cable.** The interface's UP flag is the admin
+  state and stays set when the cable is pulled or the radio has no network. netwatch now
+  also reads ifconfig's `status: inactive` line. Interfaces that report no media status,
+  such as `lo0` and `utun`, still stand on the flag. This was written and tested on Linux
+  against sample ifconfig output and has not been run on a Mac.
+
+- **A slow or silent resolver is compared with the public reference resolver.** The
+  cross-check's query to 1.1.1.1 was already sent every probe cycle and its timing thrown
+  away. It is now kept, and sent whether or not your resolver answers. When the reference
+  answers in under a quarter of your resolver's median, `dns.slow_resolver`'s "alt
+  resolver is fast" check passes on a measurement instead of reading "not run", and the
+  issue carries a step naming 1.1.1.1 with its time and the command to switch. For
+  `dns.failing` the step says the reference answered while yours did not. It is an
+  instruction and never applied, and it says your lookups would go to that provider. No
+  new traffic: same query, same destination, same cadence.
+
+- **Diagnose can say it checked and found nothing.** The verdict never reached its green
+  state: ready baselines and an empty list always read "no visible issues" in grey. It now
+  turns green, as `no issues · link, gateway and dns checked against their baselines`,
+  once the five core rules (`link.down`, `gateway.unreachable`, `gateway.rtt_spike`,
+  `dns.failing`, `dns.slow_resolver`) all had their inputs. Until then the grey line names
+  the core rule that is waiting and why. Behind a local stub resolver the line adds that
+  DNS speed was not judged. `diagnose run`'s outcomes and exit codes are unchanged.
+
+### Added
+- **`diagnose run --json` findings carry `maturity`**, `"beta"` or `"stable"`, beside the
+  `beta` boolean, which stays. `STABILITY.md` says that which rules are stable can change
+  in a minor release.
+- **Issue forms for a Diagnose false positive, a missed detection and a rule idea.**
+- **Pinned corpus episodes for the five stable rules.** `gateway.unreachable` and the four
+  `target.*` failure rules had none. Each now has an episode in which it opens and closes,
+  and a test requires one of every stable rule.
+- **A false-alert soak for Diagnose.** `examples/diagnose_quiet_soak.rs` records every
+  tick on an ordinary host and reports monitored host-weeks and opens per rule, replayed
+  against the current rules and judged against `tests/soak/witness.py`, an independent
+  log of pings and lookups. See `tests/soak/README.md`. No result is published yet.
+
 ## [1.0.0-rc.3] - 2026-11-10
 
 ### Fixed

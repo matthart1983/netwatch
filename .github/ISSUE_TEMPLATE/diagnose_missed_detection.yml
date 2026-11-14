@@ -1,0 +1,42 @@
+name: Diagnose missed detection
+description: Something was wrong with the network and Diagnose said nothing, or named the wrong thing
+labels: ["diagnose", "missed-detection"]
+body:
+  - type: textarea
+    id: fault
+    attributes:
+      label: What was wrong
+      description: The fault, and how you confirmed it (router log, another tool, the provider).
+    validations:
+      required: true
+  - type: textarea
+    id: shown
+    attributes:
+      label: What netwatch showed
+      description: No issue, a different issue, or the right issue with the wrong top cause.
+    validations:
+      required: true
+  - type: input
+    id: rule
+    attributes:
+      label: Rule you expected
+      description: A rule id if you know it. Leave empty if none fits.
+  - type: textarea
+    id: coverage
+    attributes:
+      label: Coverage
+      description: "Paste `netwatch diagnose coverage`. A rule with no input on your machine cannot fire, and this shows which."
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS and netwatch version
+    validations:
+      required: true
+  - type: textarea
+    id: export
+    attributes:
+      label: Export
+      description: "Attach the file from `netwatch diagnose export` if you can. It pseudonymises addresses; check it before posting."

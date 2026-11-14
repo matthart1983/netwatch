@@ -51,8 +51,10 @@ SEED_SAMPLES = 2400
 # lab.rs CORE_RULES: the coverage rows each line carries.
 CORE_RULES = ['link.down', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
               'dns.failing', 'dns.slow_resolver']
-# Healthy seconds on seeded baselines before a scenario's fault goes in.
-WARMUP_SECS = 15
+# Healthy seconds on seeded baselines before a scenario's fault goes in. Long
+# enough for the first window of six DNS probe cycles to close: until it has,
+# dns.slow_resolver has nothing to judge and its coverage row says so.
+WARMUP_SECS = 30
 # Seconds a scenario keeps running after its last expected close, so an issue
 # that reopens at once is seen doing it.
 SETTLE_SECS = 15
@@ -99,27 +101,32 @@ DEVICES = {'nw0': None, 'gw0': 'gw', 'gw1': 'gw', 'inet0': 'inet'}
 #   asserted       False: measured and reported, never failed on
 SCENARIOS = [
     {'name': 'L-DNS-SLOW',
-     'fault': [('dns', 'gw', 'delay:300')], 'fault_secs': 60, 'clear': [('dns', 'gw', 'ok')],
-     # 3 healthy samples, so the 4th slow one moves the median; 3 to confirm.
-     'expect_open': [{'rule': 'dns.slow_resolver'}], 'open_within_s': 60, 'open_expect_s': 30,
-     # 12 slow samples need 10 healthy ones to lose the median (50 s), then
-     # the 60 s hold.
+     'fault': [('dns', 'gw', 'delay:300')], 'fault_secs': 150, 'clear': [('dns', 'gw', 'ok')],
+     # The rule judges windows of six cycles (30 s) and wants two slow ones in
+     # a row. A window counts once more than half its cycles are slow, so the
+     # first can be the one the fault started in: 45 s at best, 75 s at worst.
+     'expect_open': [{'rule': 'dns.slow_resolver'}], 'open_within_s': 120, 'open_expect_s': 60,
+     # The first clean window closes within 45 s of the clear, and the 60 s
+     # hold is two more.
      'expect_close': [{'rule': 'dns.slow_resolver'}], 'close_within_s': 220, 'close_expect_s': 110,
      'forbid': ['dns.failing', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
                 'link.down']},
     {'name': 'L-DNS-DOWN',
      'fault': [('dns', 'gw', 'drop:100')], 'fault_secs': 60, 'clear': [('dns', 'gw', 'ok')],
-     # 3 samples about 10 s apart, the first landing mid-cycle.
+     # Two silent cycles are 6 unanswered queries of the 15 or so sent, which
+     # opens it; cycles run about 10 s apart while nothing answers.
      'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 40, 'open_expect_s': 20,
      # dns.failing holds its verify for 120 s.
      'expect_close': [{'rule': 'dns.failing'}], 'close_within_s': 250, 'close_expect_s': 125,
      'forbid': ['dns.slow_resolver', 'gateway.unreachable', 'gateway.rtt_spike',
                 'path.rtt_spike', 'link.down']},
-    # Reported, not asserted, until B15; the windows are the ones B15 will be
-    # held to. A 60 s open bound would fail about 40% of runs, because B15
-    # needs 7 failures of 60 and 36 faulted queries give that only about 60%
-    # of the time. Today's rule reads one lost query in a cycle of 3 as 33%.
-    {'name': 'L-DNS-LOSSY', 'asserted': False,
+    # dns.failing judges the last 60 queries: it opens once 5 are unanswered
+    # and the share's lower confidence bound is over 5%. At 20% loss and 3
+    # queries every 5 s the fifth loss comes about 25 queries in, 40 s or so,
+    # but runs have taken 37 s and 79 s; by 120 s fewer than one in 500 has
+    # not seen five. The close is the rule's 120 s hold, starting within four
+    # clean cycles of the clear.
+    {'name': 'L-DNS-LOSSY',
      'fault': [('dns', 'gw', 'drop:20')], 'fault_secs': 180, 'clear': [('dns', 'gw', 'ok')],
      'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 120, 'open_expect_s': 60,
      'expect_close': [{'rule': 'dns.failing'}], 'close_within_s': 250, 'close_expect_s': 125,

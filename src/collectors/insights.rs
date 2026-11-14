@@ -651,9 +651,12 @@ mod tests {
             gateway_rtt_history: VecDeque::new(),
             dns_rtt_history: VecDeque::new(),
             internet_rtt_history: VecDeque::new(),
+            dns_rtt_window: None,
+            dns_window_fill: Default::default(),
             dns_probe_history: VecDeque::new(),
             dns_cross: None,
             dns_cross_history: VecDeque::new(),
+            dns_reference_rtt_history: VecDeque::new(),
             nat: None,
         }
     }

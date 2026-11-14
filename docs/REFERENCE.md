@@ -762,7 +762,8 @@ TUI.
   such field says so. `reason` is a stable code in `doctor` and free text in `diagnose run`'s
   `coverage`.
 - A `diagnose run` finding with `"beta": true` follows the schema, but its rule can change thresholds
-  or disappear.
+  or disappear. Which rules are stable can change in a minor release; `maturity` says which a finding
+  came from.
 - Each entry in `diagnose export`'s `episodes` is a recording in the episode format, which is
   experimental. The schema covers the bundle around them and each one's `schema_version`.
 

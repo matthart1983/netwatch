@@ -37,6 +37,7 @@ use super::detectors::{
 use super::engine::{format_ts, Clock, Engine, FixedClock, ObservationTimes, Settings};
 use super::episode::{EnvProfile, Episode, Recorder, Tick};
 use super::report::{Environment, Report, TimelineEvent};
+use crate::collectors::health::DNS_WINDOW_SECS;
 
 /// When the demo window ends. Every timestamp in the fixture is relative to
 /// this, so the whole scenario is reproducible to the second.
@@ -127,6 +128,7 @@ fn healthy_iface() -> IfaceObs {
         tx_dropped: 0,
         errors_per_min: 0,
         drops_per_min: Some(0),
+        packets_per_min: Some(12_000),
         link_rate_bps: Some(1e9),
         wireless: Some(false),
         signal_dbm: None,
@@ -149,6 +151,8 @@ fn healthy_gateway() -> GatewayObs {
 
 fn slow_dns() -> DnsObs {
     DnsObs {
+        window: Default::default(),
+        reference: None,
         resolver: RESOLVER.into(),
         rtt_p50_ms: Some(40.0),
         rtt_p95_ms: Some(48.0),
@@ -674,7 +678,6 @@ fn target_baselines() -> BaselineStore {
 /// is back at 41 ms, and the issue closes once that has held 180 s. The
 /// other stages stay at their baselines.
 fn target_slow_stage(t: u64) -> Observations {
-    use super::targets::{ConnectAttempt, Lookup, LookupOutcome, Stage, TargetContext, TargetObs};
     // A frame carries the last probe to complete, on the cadence's grid.
     let probed = t - t % 60;
     let first_byte = match probed {
@@ -682,15 +685,28 @@ fn target_slow_stage(t: u64) -> Observations {
         360..=479 => 50.0,
         _ => 41.0,
     };
-    let took = |ms| Stage {
-        ms: Some(ms),
-        error: None,
-    };
+    target_frame(api_target(probed, first_byte))
+}
+
+/// A quiet frame whose config and target list hold `target`.
+fn target_frame(target: super::targets::TargetObs) -> Observations {
     let mut obs = quiet_frame();
     if let Some(config) = &mut obs.config {
         config.targets = vec![("api".into(), API_REVISION.into())];
     }
-    obs.targets = vec![TargetObs {
+    obs.targets = vec![target];
+    obs
+}
+
+/// The `api` target as its probe at `probed` seconds found it, healthy but
+/// for `first_byte` ms to the first byte.
+fn api_target(probed: u64, first_byte: f64) -> super::targets::TargetObs {
+    use super::targets::{ConnectAttempt, Lookup, LookupOutcome, Stage, TargetContext, TargetObs};
+    let took = |ms| Stage {
+        ms: Some(ms),
+        error: None,
+    };
+    TargetObs {
         baseline_key: Some(API_REVISION.into()),
         name: "api".into(),
         host: "api.example.com".into(),
@@ -722,7 +738,106 @@ fn target_slow_stage(t: u64) -> Observations {
         // Three missed probes at the default interval.
         stale_after_secs: Some(180),
         context: TargetContext::default(),
-    }];
+    }
+}
+
+/// The `api` target probed every 60 s, with `fault` applied to the probes
+/// from 180 s to 420 s: five failing probes, then healthy ones. A target
+/// rule opens on the third and closes once its stage has held for its
+/// verify.
+fn target_fault(t: u64, fault: fn(&mut super::targets::TargetObs)) -> Observations {
+    let probed = t - t % 60;
+    let mut target = api_target(probed, 41.0);
+    if (180..=420).contains(&probed) {
+        fault(&mut target);
+    }
+    target_frame(target)
+}
+
+fn failed(error: super::targets::StageError) -> Option<super::targets::Stage> {
+    Some(super::targets::Stage {
+        ms: None,
+        error: Some(error),
+    })
+}
+
+/// The system resolver stops answering for the name: no address, so no
+/// later stage runs.
+fn target_resolve_failed(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::{LookupOutcome, StageError};
+        target.resolve = failed(StageError::ResolverFailed).expect("a stage");
+        target.addresses.clear();
+        for lookup in &mut target.lookups {
+            lookup.outcome = LookupOutcome::NoReply;
+        }
+        target.connect = None;
+        target.connect_v4 = None;
+        target.tls_stage = None;
+        target.http_stage = None;
+        target.status = None;
+        target.attempts.clear();
+        target.effective_endpoint = None;
+    })
+}
+
+/// The name resolves and the connection times out: a firewall or a route,
+/// not a stopped service, which would refuse.
+fn target_connect_failed(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::StageError;
+        target.connect = failed(StageError::Timeout);
+        target.connect_v4 = failed(StageError::Timeout);
+        for attempt in &mut target.attempts {
+            attempt.stage = failed(StageError::Timeout).expect("a stage");
+        }
+        target.tls_stage = None;
+        target.http_stage = None;
+        target.status = None;
+    })
+}
+
+/// The handshake reaches the server and its certificate has expired.
+fn target_tls_failed(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::StageError;
+        target.tls_stage = failed(StageError::CertExpired);
+        target.http_stage = None;
+        target.status = None;
+    })
+}
+
+/// Everything up to the request works and the service answers 503. The
+/// rule files that as an Observation: the service, not the network.
+fn target_http_error(t: u64) -> Observations {
+    target_fault(t, |target| {
+        use super::targets::{Stage, StageError};
+        target.http_stage = Some(Stage {
+            ms: Some(41.0),
+            error: Some(StageError::HttpStatus { status: 503 }),
+        });
+        target.status = Some(503);
+    })
+}
+
+/// The router stops answering from 120 s, pings and the TCP fallback both,
+/// and nothing beyond it answers either; from 300 s both are back. The
+/// internet probe failing too is what makes it the gateway and not a
+/// router that ignores pings.
+fn gateway_unreachable(t: u64) -> Observations {
+    let mut obs = quiet_frame();
+    if phase(t, &STORY) == Phase::Fault {
+        obs.gateway = Some(GatewayObs {
+            rtt_ms: None,
+            loss_pct: 100.0,
+            arp_ok: None,
+            icmp_ok: false,
+            internet_reachable: Some(false),
+            ..healthy_gateway()
+        });
+        // With the gateway gone the resolver behind it is silent too.
+        obs.dns = None;
+    }
     obs
 }
 
@@ -763,6 +878,8 @@ fn dns_slow_router(t: u64) -> Observations {
     // resolver, and no alternate, icmp or cached timing, which it never
     // measures.
     obs.dns = Some(DnsObs {
+        window: Default::default(),
+        reference: None,
         resolver: GATEWAY.into(),
         rtt_p50_ms: Some(p50),
         rtt_p95_ms: Some(p95),
@@ -1007,6 +1124,23 @@ pub fn scenarios() -> Vec<Scenario> {
             ..Scenario::live("target-slow-stage", 720, target_slow_stage)
         },
         Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-resolve-failed", 780, target_resolve_failed)
+        },
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-connect-failed", 780, target_connect_failed)
+        },
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-tls-failed", 780, target_tls_failed)
+        },
+        Scenario {
+            baselines: target_baselines,
+            ..Scenario::live("target-http-error", 780, target_http_error)
+        },
+        Scenario::live("gateway-unreachable", 480, gateway_unreachable),
+        Scenario {
             baselines: router_baselines,
             ..Scenario::live("dns-slow-router", 420, dns_slow_router)
         },
@@ -1079,6 +1213,10 @@ pub fn record(scenario: &Scenario) -> Episode {
         // either.
         let probed = Cadence::stamp(cadence.health, start, t);
         times.health.dns = probed;
+        // The slow-resolver rule is sampled once per closed window, as live.
+        times.health.dns_window = cadence
+            .health
+            .and_then(|_| Cadence::stamp(Some(DNS_WINDOW_SECS), start, t));
         times.health.gateway = probed;
         times.health.internet = probed;
         times.health.dns_target = obs.dns.as_ref().map(|d| d.resolver.clone());
@@ -1475,16 +1613,16 @@ mod tests {
     }
 
     /// B13 closes a slow-resolver issue relative to the line it opened on.
-    /// The router's 150 ms p50 opens the issue on the third slow probe, at
-    /// 130 s, over the ceiling and over its baseline's 21 ms line, and 11 ms
-    /// from 300 s holds under 0.8 of the lower line for 60 s. The flat 5 ms
-    /// line B13 replaced never closed it.
+    /// The router's 150 ms p50 from 120 s opens the issue on the second slow
+    /// 30 s window, at 150 s, over the ceiling and over its baseline's 21 ms
+    /// line, and 11 ms from 300 s holds under 0.8 of the lower line for 60 s,
+    /// two more windows. The flat 5 ms line B13 replaced never closed it.
     #[test]
     fn a_router_resolver_issue_closes_under_the_line_it_opened_on() {
         assert_eq!(
             pinned_spans("dns-slow-router"),
             vec![span(
-                "2026-09-03 06:46:10",
+                "2026-09-03 06:46:30",
                 "2026-09-03 06:50:00",
                 "auto-closed"
             )]
@@ -1611,44 +1749,41 @@ mod tests {
         assert_eq!(unknown, 180);
     }
 
-    /// A Wi-Fi driver's background drops open iface.errors two seconds in
-    /// and hold it open to the end, because it closes only under 1/min
-    /// errors and drops combined; `PENDING_CLOSE` in episode.rs says so.
-    /// The drops are all that hold it: without them the errors open it at
-    /// 124 s and it closes at 659 s, 300 s after the last error leaves the
-    /// minute's count.
+    /// A Wi-Fi driver drops 70 unwanted frames a minute throughout. That
+    /// is 0.6% of the 12,000 packets the link carries, so it opens nothing;
+    /// the errors open iface.errors once five are in the minute's count and
+    /// it closes 300 s after they fall under half that. Judged by count, as
+    /// a recording without packet counts still is, the drops open it two
+    /// seconds in and hold it open to the end.
     #[test]
-    fn background_wifi_drops_hold_iface_errors_open() {
+    fn background_wifi_drops_neither_open_nor_hold_iface_errors() {
         assert_eq!(
             pinned_spans("iface-errors-wifi-drops"),
-            vec![("2026-09-03 06:44:02".to_string(), None, None)]
+            vec![span(
+                "2026-09-03 06:46:12",
+                "2026-09-03 06:54:55",
+                "auto-closed"
+            )]
         );
         let scenario = scenarios()
             .into_iter()
             .find(|s| s.id == "iface-errors-wifi-drops")
             .unwrap();
-        let errors_alone = record(&Scenario {
+        let by_count = record(&Scenario {
             obs: |t| {
                 let mut obs = iface_errors_wifi_drops(t);
-                obs.iface.as_mut().unwrap().drops_per_min = Some(0);
+                obs.iface.as_mut().unwrap().packets_per_min = None;
                 obs
             },
             ..scenario
         });
-        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&errors_alone);
+        let (decisions, _) = crate::diagnose::episode::CanonicalDecisions::of(&by_count);
         let spans: Vec<_> = decisions
             .issues
             .into_iter()
             .map(|s| (s.opened, s.closed, s.close_reason))
             .collect();
-        assert_eq!(
-            spans,
-            vec![span(
-                "2026-09-03 06:46:04",
-                "2026-09-03 06:54:59",
-                "auto-closed"
-            )]
-        );
+        assert_eq!(spans, vec![("2026-09-03 06:44:02".to_string(), None, None)]);
     }
 
     /// Without an age under its own name a target's result is dropped as

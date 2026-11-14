@@ -1,0 +1,44 @@
+name: Diagnose false positive
+description: Diagnose opened an issue and the network was fine
+labels: ["diagnose", "false-positive"]
+body:
+  - type: input
+    id: rule
+    attributes:
+      label: Rule
+      description: The rule id shown in the issue detail, such as dns.slow_resolver.
+    validations:
+      required: true
+  - type: textarea
+    id: shown
+    attributes:
+      label: What netwatch showed
+      description: The issue title, the evidence lines and the top cause. A screenshot is fine.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Why it was wrong
+      description: What the network was doing, and how you know it was healthy (another tool, nothing felt slow, it happens every day at this time).
+    validations:
+      required: true
+  - type: dropdown
+    id: link
+    attributes:
+      label: Network type
+      options: [Wired, Wi-Fi, Mobile or tethered, VPN, Container or VM, Other]
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS and netwatch version
+      description: "`netwatch --version`, and the OS."
+    validations:
+      required: true
+  - type: textarea
+    id: export
+    attributes:
+      label: Export
+      description: "Attach the file from `netwatch diagnose export` if you can. It pseudonymises addresses; check it before posting."

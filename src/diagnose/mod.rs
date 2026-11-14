@@ -42,6 +42,7 @@ pub mod remediation;
 pub mod report;
 pub mod rules;
 pub mod run;
+pub mod soak;
 pub mod targets;
 
 pub use engine::{Engine, Verdict};

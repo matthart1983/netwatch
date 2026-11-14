@@ -273,6 +273,29 @@ If you add a setting, update the `build_rows_count` and `full_roundtrip` tests.
 
 ---
 
+## Diagnose rules
+
+Rules live in `src/diagnose/rules.rs` (the catalogue) and `src/diagnose/detectors.rs`
+(the logic). Every rule is `beta` or `stable`; see
+[Rule maturity](docs/DIAGNOSE.md#rule-maturity).
+
+- The most useful contribution is a report of a rule being wrong on a real network.
+  Use the "Diagnose false positive" or "Diagnose missed detection" issue form and
+  attach `netwatch diagnose export` output, which pseudonymises addresses.
+- A new rule starts as beta. Open a "Diagnose rule idea" issue first, saying what is
+  measured, what healthy situation produces the same reading, and what recovery looks
+  like.
+- A change to a trigger or threshold needs a test that fails without it, and the
+  trigger text in `rules.rs` has to quote the new numbers (a test checks this). Run
+  `cargo run -- diagnose coverage --doc` afterwards, which rewrites
+  `docs/diagnostic-coverage.md`.
+- Moving a rule to stable is its own PR. It edits the pinned list in `rules.rs` and
+  goes in the changelog, because it changes which hosts exit 1.
+- If an AI tool wrote any of the change, say so in the PR, and be ready to explain
+  every line of it yourself. A rule nobody can explain does not get merged.
+
+---
+
 ## Security
 
 - Never log or display secrets, API keys, or credentials.

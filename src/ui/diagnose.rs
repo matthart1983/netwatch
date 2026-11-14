@@ -740,18 +740,29 @@ fn verdict_state_spans(
         coverage.rules.len()
     );
     match &verdict {
-        // "Nothing found", never "healthy": the clause after it says how much
-        // of the ruleset that is based on. The engine never returns Clear
-        // until green is earned (C14); this arm is what it will draw then.
-        Verdict::Clear => vec![
-            Span::styled("● ", Style::default().fg(t.status_good)),
-            Span::styled("no issues found", Style::default().fg(t.text_primary)),
-            Span::styled(format!(" · {watching}"), Style::default().fg(t.text_muted)),
-        ],
-        // Ready baselines and an empty list are not health: the engine
-        // returns this, never Clear, until C14 says which rules must have
-        // had input. Muted, like Learning, because the module's rule is that
-        // nothing is green unless it is healthy.
+        // "Nothing found", never "healthy": the clauses after it say what
+        // was checked and how much of the ruleset had input. The engine
+        // returns Clear only once every core rule could have opened.
+        Verdict::Clear { .. } => {
+            let mut line = vec![
+                Span::styled("● ", Style::default().fg(t.status_good)),
+                Span::styled("no issues found", Style::default().fg(t.text_primary)),
+                Span::styled(
+                    format!(" · {} · {watching}", crate::diagnose::engine::CLEAR_CHECKED),
+                    Style::default().fg(t.text_muted),
+                ),
+            ];
+            if let Some(note) = verdict.clear_note() {
+                line.push(Span::styled(
+                    format!(" · {note}"),
+                    Style::default().fg(t.text_muted),
+                ));
+            }
+            line
+        }
+        // Ready baselines and an empty list are not a check: the engine
+        // returns this until every core rule has had input. Muted, like
+        // Learning, because nothing is green unless it was earned.
         Verdict::Incomplete { .. } => vec![
             Span::styled("◌ ", Style::default().fg(t.text_muted)),
             Span::styled(
@@ -1381,7 +1392,7 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
     )));
     if issue.beta {
         lines.push(Line::from(Span::styled(
-            "beta rule: contract not yet reviewed; not counted in `diagnose run`'s exit status",
+            "beta rule: not yet validated; not counted in `diagnose run`'s exit status",
             Style::default().fg(t.text_muted),
         )));
     }
@@ -1899,7 +1910,7 @@ mod tests {
             .join("\n")
     }
 
-    /// The fixture's issues come from rules without a reviewed contract, so
+    /// The fixture's issues come from beta rules, so
     /// they are beta: tagged in the list and explained in the detail pane.
     #[test]
     fn beta_issue_is_tagged() {
@@ -1911,10 +1922,7 @@ mod tests {
             screen.contains(&format!("{} beta", first.title)),
             "{screen}"
         );
-        assert!(
-            screen.contains("beta rule: contract not yet reviewed"),
-            "{screen}"
-        );
+        assert!(screen.contains("beta rule: not yet validated"), "{screen}");
     }
 
     fn draw_coverage_text(width: u16, selected: usize) -> String {
@@ -2531,6 +2539,8 @@ mod tests {
         };
         let slow_resolver = Observations {
             dns: Some(DnsObs {
+                window: Default::default(),
+                reference: None,
                 resolver: "192.0.2.53".into(),
                 rtt_p50_ms: Some(40.0),
                 rtt_p95_ms: Some(48.0),

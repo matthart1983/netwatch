@@ -205,3 +205,71 @@ cannot be combined over a phase.
   memory, threads and CPU only. It reports no GeoIP state either. It reads
   the same database paths as the driver from its config, but nothing checks
   that it loaded them.
+
+# Diagnose false-alert soak
+
+The flood soak above asks whether netwatch stays up. This one asks how often
+a Diagnose rule opens on a network where nothing is wrong. It is netwatch's
+real App left running on an ordinary host, with every tick recorded, beside a
+witness that shares no code with it.
+
+| File | What it is |
+| --- | --- |
+| `examples/diagnose_quiet_soak.rs` | `record` runs a daemon session with the recorder in continuous mode and all state under one directory. `report` adds up what one or more of those directories hold. |
+| `tests/soak/witness.py` | The witness. Every 10 seconds it pings the default gateway and two public addresses, times a lookup, reads the link state, and appends a JSON line. Standard library only. |
+| `src/diagnose/soak.rs` | The accounting `report` prints. |
+
+## Running it
+
+```sh
+cargo build --release --example diagnose_quiet_soak
+D=~/netwatch-soak/$(hostname)-wired           # one directory per host and network
+python3 tests/soak/witness.py "$D" &
+target/release/examples/diagnose_quiet_soak record "$D" --config soak.toml
+```
+
+Stop either with Ctrl-C and start it again on the same directory. Baselines
+carry over and recordings add up. `record` needs whatever privileges you
+normally give netwatch. A week is roughly 125 MB of recordings.
+
+A rule is tested only while it has input. With the default config the four
+`target.*` rules have no target and the `path.*` rules have no trace, and the
+report says "never evaluated" for them. Give the soak a config that does:
+
+```toml
+[diagnose_probes]
+trace_refresh_secs = 60
+
+[[diagnose_targets]]
+name = "example"
+host = "example.com"
+```
+
+The witness pings 1.1.1.1 and 9.9.9.9 unless told otherwise (`--anchor`).
+
+## Reading the report
+
+```sh
+target/release/examples/diagnose_quiet_soak report ~/netwatch-soak/*
+target/release/examples/diagnose_quiet_soak report --current-defaults --json ~/netwatch-soak/*
+```
+
+Per host it gives monitored hours, leaving out any gap over 10 seconds (the
+host slept, or the recorder was stopped). Per rule it gives:
+
+- **eval. wk**: host-weeks the rule had its inputs and could have opened.
+  Time spent learning a baseline does not count.
+- **recorded**: opens the engine made on the day.
+- **replayed**: opens today's engine makes from the same frames. After a rule
+  changes, this is the column that matters, and it costs seconds, not weeks.
+  `--current-defaults` also swaps in today's default thresholds.
+- **corrob. / unexpl. / unwitn.**: whether the witness saw trouble from three
+  minutes before the open to one minute after, was watching and saw none, or
+  has no sample there.
+- **95% upper**: a bound on unexplained opens per evaluated host-week. With
+  none, it is 3 divided by the host-weeks.
+
+"Unexplained" is not "false". The witness cannot see a socket's rtt or a
+route change, so it is an upper bound on false opens and a list for a person
+to go through. The recordings hold addresses and hostnames from the host they
+ran on; keep them private, as netwatch's own episode files are.

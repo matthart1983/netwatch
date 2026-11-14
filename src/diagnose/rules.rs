@@ -42,6 +42,9 @@ pub struct Rule {
     /// Observation of this rule still never hides an Issue.
     pub suppresses: &'static [RuleId],
     pub status: RuleStatus,
+    /// How far netwatch stands behind this rule. Set by hand, never derived:
+    /// a rule becomes stable by a deliberate edit that a test pins.
+    pub maturity: Maturity,
     /// What must be measured before this rule may fire. Empty means the rule
     /// has not been through a contract review yet, which the generated
     /// coverage document states rather than hides.
@@ -55,9 +58,45 @@ pub struct Rule {
     pub platforms: &'static str,
 }
 
+/// How far netwatch stands behind a rule's findings.
+///
+/// A written contract is necessary for `Stable` and is not enough for it:
+/// a rule whose trigger text is known to misdescribe its detector, or whose
+/// evidence list names something no adapter measures, stays `Beta` however
+/// complete its prose is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Maturity {
+    /// Shown and tagged beta. Counts toward `diagnose run`'s exit status only
+    /// with `--include-beta`. Thresholds can change and the rule can go away.
+    Beta,
+    /// Counts toward the exit status. Has a written contract and a trigger
+    /// text that describes the detector as it is.
+    Stable,
+}
+
+impl Maturity {
+    /// As `diagnose run` writes it in a finding's `maturity` field.
+    pub fn label(self) -> &'static str {
+        match self {
+            Maturity::Beta => "beta",
+            Maturity::Stable => "stable",
+        }
+    }
+
+    /// The maturity an issue was opened at, from the flag it stored then.
+    pub fn of_issue(beta: bool) -> Self {
+        if beta {
+            Maturity::Beta
+        } else {
+            Maturity::Stable
+        }
+    }
+}
+
 impl Rule {
-    /// Whether this rule has been through the contract review: evidence,
-    /// lookalikes, recovery and platform limits all stated.
+    /// Whether this rule has a written contract: evidence, lookalikes,
+    /// recovery and platform limits all stated. Stable rules must have one;
+    /// having one does not make a rule stable.
     pub fn contracted(&self) -> bool {
         !self.evidence.is_empty()
             && !self.lookalikes.is_empty()
@@ -65,12 +104,11 @@ impl Rule {
             && !self.platforms.is_empty()
     }
 
-    /// Beta until its contract is reviewed. A beta rule's issues are shown,
+    /// Beta until it is marked stable. A beta rule's issues are shown,
     /// tagged, and leave `diagnose run`'s exit status alone unless asked
-    /// (`--include-beta`): netwatch makes no promise about a rule nobody has
-    /// written the evidence and lookalikes down for.
+    /// (`--include-beta`).
     pub fn beta(&self) -> bool {
-        !self.contracted()
+        self.maturity != Maturity::Stable
     }
 }
 
@@ -82,9 +120,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "slow dns resolver",
         category: "dns",
         severity: Severity::Medium,
-        trigger: "resolver p50 > 3σ above baseline, at least 5ms above it and at least 2× it, or p50 > 100ms with or without a baseline, for 3 samples",
+        trigger: "resolver median over 6 probe cycles (30s in the TUI) > 3σ above baseline, at least 5ms above it and at least 2× it, or > 100ms with or without a baseline, for 2 such windows in a row",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -95,9 +134,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "dns resolution failing",
         category: "dns",
         severity: Severity::High,
-        trigger: "servfail/timeout rate > 5%, or the pipeline dns stage fails",
+        trigger: "at least 5 of the last 60 probe queries unanswered or answered SERVFAIL, one of them among the newest 12, with the lower confidence bound on that share above 5%; or every query failing that way for 15s",
         suppresses: &["dns.slow_resolver", "target.resolve_failed"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -111,6 +151,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "more than 10% of probe replies carry the TC bit",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -124,6 +165,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a private address for a public name, or disagreement with a validating reference on most cycles",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[
             "the same name asked of the configured resolver and of a reference resolver",
             "whether the answer is private, and whether the reference validated it",
@@ -144,7 +186,7 @@ pub const CATALOGUE: &[Rule] = &[
         // The root cause of nearly everything else, so it suppresses widely.
         // A quiet router alone is not enough: a failed internet probe has to
         // corroborate it, and no ARP probe exists to consult.
-        trigger: "icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; arp is not probed",
+        trigger: "icmp and the tcp fallback to the default gateway both fail, and the internet probe fails too; the neighbour table informs the causes and does not open the issue",
         suppresses: &[
             "dns.slow_resolver",
             "dns.failing",
@@ -160,8 +202,9 @@ pub const CATALOGUE: &[Rule] = &[
             "target.slow_stage",
         ],
         status: RuleStatus::Active,
+        maturity: Maturity::Stable,
         evidence: &[
-            "arp or icmp probe to the default gateway, with its result",
+            "an icmp probe to the default gateway, with a tcp fallback, and the result of each",
             "an internet probe beyond the gateway, to tell a quiet router from a broken one",
         ],
         lookalikes: &[
@@ -169,19 +212,19 @@ pub const CATALOGUE: &[Rule] = &[
             "an unprivileged run that cannot send icmp at all",
         ],
         recovery: "the gateway answers again, or something beyond it does",
-        platforms: "linux and macos; no arp probe exists yet, so arp is reported as unmeasured",
+        platforms: "linux and macos; the neighbour table is read on linux for ipv4 gateways, and elsewhere arp is reported as unmeasured",
     },
     Rule {
         id: "link.down",
         title: "link down",
         category: "link",
         severity: Severity::Critical,
-        // Each OS reports "up" differently, and macOS reports the admin flag
-        // rather than carrier. A09 moves macOS to the `status:` line and
-        // rewrites that clause.
-        trigger: "the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag, which is the admin state, so an unplugged cable is not seen; on windows ipconfig says \"Media disconnected\"",
+        // Each OS reports "up" differently. On macOS the UP flag is the
+        // admin state, so the media status line is read as well.
+        trigger: "the os reports the interface down: on linux operstate is not up, where unknown with carrier set counts as up; on macos ifconfig lacks the UP flag or reports \"status: inactive\"; on windows ipconfig says \"Media disconnected\"",
         suppresses: &["gateway.unreachable"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -195,6 +238,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "gateway rtt > 3σ and at least 10ms above baseline for 3 samples",
         suppresses: &["path.rtt_spike"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -205,9 +249,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "interface errors",
         category: "link",
         severity: Severity::Medium,
-        trigger: "rx/tx error, drop, overrun or fifo counters increment",
+        trigger: "over the last minute, at least 5 interface errors, or errors over 1% of packets, or drops over 2% of packets on a wired link and 10% on wi-fi; shares are judged only above 1000 packets a minute",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -218,9 +263,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "interface saturated",
         category: "link",
         severity: Severity::Medium,
-        trigger: "throughput above 90% of link rate for 30s",
+        trigger: "throughput at or above 90% of the link rate the os reports, for 3 interface samples",
         suppresses: &["tcp.bufferbloat_local", "path.rtt_spike"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -234,6 +280,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "signal at or below −70 dBm, or more than 20% of frames retried over a minute",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -251,6 +298,7 @@ pub const CATALOGUE: &[Rule] = &[
         // makes the pair readable: "the path changed, and it cost you 40ms".
         suppresses: &["path.rtt_spike"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -261,9 +309,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "loss on the path",
         category: "path",
         severity: Severity::High,
-        trigger: "a hop loses packets and the loss propagates to later hops",
+        trigger: "a trace hop loses at least 5% of its probes and a later hop does too; or every later hop is silent, and then the loss is reported without blaming a hop",
         suppresses: &["tcp.retrans_burst"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[
             "per-hop loss from a trace, with silent hops distinguished from lossy ones",
             "whether the destination itself answered the trace",
@@ -280,9 +329,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "path rtt above baseline",
         category: "path",
         severity: Severity::Medium,
-        trigger: "end-to-end rtt > 3σ above baseline",
+        trigger: "end-to-end rtt > 3σ above the target's baseline, or above the internet probe's baseline when the target has none yet",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -297,6 +347,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "rtt under load exceeds idle rtt by more than 100ms",
         suppresses: &["tcp.bufferbloat_remote", "path.rtt_spike"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -307,9 +358,10 @@ pub const CATALOGUE: &[Rule] = &[
         title: "receiver-side bufferbloat",
         category: "tcp",
         severity: Severity::Medium,
-        trigger: "one socket's rtt rises with its own tx while the link-level test passes",
+        trigger: "a sending socket's rtt stays at or above 100ms for 30s; it opens whether or not the link-level test has run, and names the receiver only when that test has run",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[
             "socket rtt and tx rate from the kernel, held for the verdict window",
             "an idle-versus-loaded rtt comparison on our own uplink, to place the queue",
@@ -329,6 +381,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "5 or more retransmits per minute on a socket whose rtt is under the queueing threshold",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -342,6 +395,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "rwnd is zero, or cwnd greatly exceeds rwnd",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -355,6 +409,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "more than 5 failed active or passive TCP handshakes per minute in this namespace",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -368,6 +423,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "distinct TIME_WAIT local ports exceed 60% of the ephemeral range for one address; not exhaustion proof",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -382,6 +438,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "small DF probes work, large probes time out, and reducing TCP MSS restores a transfer to the same endpoint",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -395,6 +452,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "two stun servers see different public ports from one socket",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -408,6 +466,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a v6 default route exists but v6 probes fail while v4 works",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -422,6 +481,7 @@ pub const CATALOGUE: &[Rule] = &[
         // Selected-endpoint HTTP evidence cannot establish global causality.
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -441,6 +501,7 @@ pub const CATALOGUE: &[Rule] = &[
             "target.slow_stage",
         ],
         status: RuleStatus::Active,
+        maturity: Maturity::Stable,
         evidence: &[
             "a lookup for the configured target, with the resolver that answered",
             "the outcome per resolver: answered, nxdomain, servfail or no reply",
@@ -460,6 +521,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a configured target's first address fails to connect for 3 probes",
         suppresses: &["target.tls_failed", "target.http_error", "target.slow_stage"],
         status: RuleStatus::Active,
+        maturity: Maturity::Stable,
         evidence: &[
             "a connect attempt per address and family, with the error each returned",
         ],
@@ -478,6 +540,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a configured target's TLS handshake fails for 3 probes",
         suppresses: &["target.http_error", "target.slow_stage"],
         status: RuleStatus::Active,
+        maturity: Maturity::Stable,
         evidence: &[
             "the tls handshake result on the connection that succeeded, with the certificate error",
         ],
@@ -496,6 +559,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a configured target answers 5xx, or not the expected status, for 3 probes",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Stable,
         evidence: &[
             "the response status on the configured target, against the expected status",
         ],
@@ -514,6 +578,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a target's dns, connect, tls or first-byte time > 3σ above its baseline for 3 probes",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -528,6 +593,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a destination outside the learned egress baseline (only with alert = \"all\")",
         suppresses: &[],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -541,6 +607,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "an observed destination is blocked by the loaded policy, or with alert = \"all\" falls outside it (warning only)",
         suppresses: &["egress.drift"],
         status: RuleStatus::Active,
+        maturity: Maturity::Beta,
         evidence: &[],
         lookalikes: &[],
         recovery: "",
@@ -557,7 +624,11 @@ pub const CATALOGUE: &[Rule] = &[
 pub fn coverage_markdown() -> String {
     let total = CATALOGUE.len();
     let active = CATALOGUE.iter().filter(|r| r.status.is_active()).count();
-    let contracted: Vec<&Rule> = CATALOGUE.iter().filter(|r| r.contracted()).collect();
+    let stable: Vec<&Rule> = CATALOGUE.iter().filter(|r| !r.beta()).collect();
+    let beta_contracted: Vec<&Rule> = CATALOGUE
+        .iter()
+        .filter(|r| r.beta() && r.contracted())
+        .collect();
     let mut m = String::new();
     m.push_str("# Diagnose rule coverage\n\n");
     m.push_str(
@@ -567,11 +638,20 @@ file and the catalogue disagree.\n\n",
     );
     m.push_str(&format!(
         "The catalogue contains **{total} rules**, of which **{active}** are active. \
-**{}** have been through a contract review: evidence, lookalikes, recovery and platform \
-limits all stated. The rest are listed as not yet contracted, which is a statement about \
-this document, not about whether the detector runs.\n\n",
-        contracted.len()
+**{}** are stable: their issues set `netwatch diagnose run`'s exit status. The other \
+**{}** are beta: their issues are shown and tagged beta, and set the exit status only \
+with `--include-beta`. Maturity is a statement about how far netwatch stands behind a \
+rule, not about whether its detector runs.\n\n",
+        stable.len(),
+        total - stable.len()
     ));
+    m.push_str(
+        "A stable rule has a written contract (evidence, lookalikes, recovery, platform \
+limits) and a trigger text that describes its detector as it is. A contract alone does \
+not make a rule stable. No rule has yet been through fault-injection runs or a \
+false-alert soak; stable today means the claim is narrow enough to state exactly, and \
+that is all it means.\n\n",
+    );
     m.push_str(
         "Runtime availability is a separate question, answered per host by \
 `netwatch diagnose coverage`: a rule with a detector may still have no inputs on the \
@@ -579,42 +659,26 @@ machine in front of you. An empty issue list says \"no findings\", never \"this 
 healthy\".\n\n",
     );
 
-    m.push_str("## Contracted rules\n\n");
-    for rule in &contracted {
-        m.push_str(&format!("### `{}`\n\n", rule.id));
-        m.push_str(&format!(
-            "{} · severity {:?}\n\n",
-            rule.title, rule.severity
-        ));
-        m.push_str(&format!("**Fires when:** {}\n\n", rule.trigger));
-        m.push_str("**Evidence required:**\n\n");
-        for e in rule.evidence {
-            m.push_str(&format!("- {e}\n"));
-        }
-        m.push_str("\n**Healthy lookalikes:**\n\n");
-        for l in rule.lookalikes {
-            m.push_str(&format!("- {l}\n"));
-        }
-        m.push_str(&format!("\n**Recovery:** {}\n\n", rule.recovery));
-        m.push_str(&format!("**Platforms:** {}\n\n", rule.platforms));
-        if !rule.suppresses.is_empty() {
-            m.push_str(&format!(
-                "**Suppresses:** {}\n\n",
-                rule.suppresses
-                    .iter()
-                    .map(|r| format!("`{r}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+    m.push_str("## Stable rules\n\n");
+    for rule in &stable {
+        contract_markdown(&mut m, rule);
     }
 
-    m.push_str("## Not yet contracted\n\n");
+    m.push_str("## Beta rules with a written contract\n\n");
+    m.push_str(
+        "These carry a contract and are still beta, because the contract is not yet \
+something the detector can be held to. [DIAGNOSE.md](DIAGNOSE.md#rule-maturity) says \
+why for each.\n\n",
+    );
+    for rule in &beta_contracted {
+        contract_markdown(&mut m, rule);
+    }
+
+    m.push_str("## Beta rules without a contract\n\n");
     m.push_str(
         "These rules have detectors and can open issues. What they have not had is a \
 written statement of the evidence they need and the healthy situations they must not \
-mistake for a fault. Until they do they are **beta**: their issues are shown and tagged \
-beta, and set `netwatch diagnose run`'s exit status only with `--include-beta`.\n\n",
+mistake for a fault.\n\n",
     );
     m.push_str("| Rule | Category | Fires when | Status |\n|---|---|---|---|\n");
     for rule in CATALOGUE.iter().filter(|r| !r.contracted()) {
@@ -630,6 +694,38 @@ beta, and set `netwatch diagnose run`'s exit status only with `--include-beta`.\
     m
 }
 
+/// One rule's contract as the coverage document prints it.
+fn contract_markdown(m: &mut String, rule: &Rule) {
+    m.push_str(&format!("### `{}`\n\n", rule.id));
+    m.push_str(&format!(
+        "{} · severity {:?} · {}\n\n",
+        rule.title,
+        rule.severity,
+        rule.maturity.label()
+    ));
+    m.push_str(&format!("**Fires when:** {}\n\n", rule.trigger));
+    m.push_str("**Evidence required:**\n\n");
+    for e in rule.evidence {
+        m.push_str(&format!("- {e}\n"));
+    }
+    m.push_str("\n**Healthy lookalikes:**\n\n");
+    for l in rule.lookalikes {
+        m.push_str(&format!("- {l}\n"));
+    }
+    m.push_str(&format!("\n**Recovery:** {}\n\n", rule.recovery));
+    m.push_str(&format!("**Platforms:** {}\n\n", rule.platforms));
+    if !rule.suppresses.is_empty() {
+        m.push_str(&format!(
+            "**Suppresses:** {}\n\n",
+            rule.suppresses
+                .iter()
+                .map(|r| format!("`{r}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+}
+
 pub fn lookup(id: &str) -> Option<&'static Rule> {
     CATALOGUE.iter().find(|r| r.id == id)
 }
@@ -638,8 +734,9 @@ pub fn active_count() -> usize {
     CATALOGUE.iter().filter(|r| r.status.is_active()).count()
 }
 
-/// `"24 rules · 20 active · 4 planned"` for the Diagnose footer. Being
-/// explicit about the split is the difference between a ruleset and a wishlist.
+/// `"30 rules · all active"` for the Diagnose footer, or the active and
+/// planned split when any rule is planned. Being explicit about the split is
+/// the difference between a ruleset and a wishlist.
 pub fn catalogue_label() -> String {
     let total = CATALOGUE.len();
     let active = active_count();
@@ -808,13 +905,15 @@ pub fn primary_findings(issues: &[Issue]) -> Vec<&Issue> {
 pub fn default_verify(id: &str) -> Option<Verify> {
     Some(match id {
         "dns.slow_resolver" => Verify::below("dns.rtt_p50", 80.0, "ms").holding_for(60),
-        "dns.failing" => Verify::below("dns.failure_rate", 1.0, "%").holding_for(120),
+        "dns.failing" => Verify::below("dns.cycle_failure_rate", 1.0, "%").holding_for(120),
         "dns.truncation_retry" => Verify::below("dns.tc_rate", 1.0, "%").holding_for(120),
         "dns.hijack_suspect" => Verify::below("dns.answer_mismatch", 1.0, "%").holding_for(300),
         "gateway.unreachable" => Verify::below("gateway.loss", 1.0, "%").holding_for(60),
         "gateway.rtt_spike" => Verify::below("gateway.rtt_sigma", 2.0, "σ").holding_for(120),
         "link.down" => Verify::above("iface.carrier", 0.0, "").holding_for(30),
-        "iface.errors" => Verify::below("iface.error_rate", 1.0, "/min").holding_for(300),
+        "iface.errors" => {
+            Verify::below("iface.fault_ratio", 0.5, "× the open line").holding_for(300)
+        }
         "iface.saturated" => Verify::below("iface.utilisation", 90.0, "%").holding_for(60),
         "wifi.weak_signal" => Verify::above("wifi.rssi", -70.0, "dBm").holding_for(120),
         "path.changed" => Verify::below("path.hop_changes", 1.0, "").holding_for(300),
@@ -902,38 +1001,7 @@ mod tests {
     /// stands, and the item with what the text gets wrong. The guard below
     /// skips them. The item rewrites the text and removes its row; a row
     /// whose text has already changed fails, so none outlives its reason.
-    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[
-        (
-            "dns.failing",
-            "servfail/timeout rate > 5%, or the pipeline dns stage fails",
-            "B15, then A14: servfail counts as a reply, and no pipeline branch exists",
-        ),
-        (
-            "iface.errors",
-            "rx/tx error, drop, overrun or fifo counters increment",
-            "B19: fires on the per-minute error and drop floors, not on any increment",
-        ),
-        (
-            "iface.saturated",
-            "throughput above 90% of link rate for 30s",
-            "B33: held for consecutive_n interface samples, not for 30 s",
-        ),
-        (
-            "path.high_loss",
-            "a hop loses packets and the loss propagates to later hops",
-            "B33: loss before a silent tail also opens, unattributed",
-        ),
-        (
-            "path.rtt_spike",
-            "end-to-end rtt > 3σ above baseline",
-            "B31: the baseline falls back to the internet probe's",
-        ),
-        (
-            "tcp.bufferbloat_remote",
-            "one socket's rtt rises with its own tx while the link-level test passes",
-            "B23: opens with no link test, and after a failed one",
-        ),
-    ];
+    const PENDING_TRIGGER_TEXTS: &[(&str, &str, &str)] = &[];
 
     /// The quantities a trigger quotes. Digits glued to a word name
     /// something (p50, v6, 5xx) and are not quantities; a unit glued to a
@@ -1014,6 +1082,7 @@ mod tests {
         // both 3) need the number twice.
         const QUOTED_THRESHOLDS: &[(&str, &[&str])] = &[
             ("dns.truncation_retry", &["dns_tc_pct"]),
+            ("dns.failing", &["dns_failure_pct"]),
             (
                 "dns.slow_resolver",
                 &[
@@ -1021,7 +1090,6 @@ mod tests {
                     "dns_delta_floor_ms",
                     "dns_delta_multiple",
                     "dns_ceiling_ms",
-                    "consecutive_n",
                 ],
             ),
             (
@@ -1029,6 +1097,22 @@ mod tests {
                 &["sigma_k", "gateway_delta_floor_ms", "consecutive_n"],
             ),
             ("wifi.weak_signal", &["wifi_rssi_dbm", "wifi_retry_pct"]),
+            (
+                "iface.errors",
+                &[
+                    "iface_error_floor",
+                    "iface_error_pct",
+                    "iface_drop_pct",
+                    "iface_drop_pct_wifi",
+                    "iface_min_packets",
+                ],
+            ),
+            ("iface.saturated", &["saturation_pct", "consecutive_n"]),
+            ("path.rtt_spike", &["sigma_k"]),
+            (
+                "tcp.bufferbloat_remote",
+                &["socket_rtt_ms", "verdict_hold_secs"],
+            ),
             ("tcp.bufferbloat_local", &["loaded_rtt_delta_ms"]),
             ("target.resolve_failed", &["consecutive_n"]),
             ("target.connect_failed", &["consecutive_n"]),
@@ -1040,15 +1124,50 @@ mod tests {
         // detectors, pinned by their own firing tests, and a protocol
         // constant.
         const QUOTED_LITERALS: &[(&str, f64)] = &[
+            // detectors::DNS_FAIL_MIN, _WINDOW, _RECENT and DNS_ALL_LOST_SECS,
+            // checked against the constants below.
+            ("dns.failing", 5.0),
+            ("dns.failing", 60.0),
+            ("dns.failing", 12.0),
+            ("dns.failing", 15.0),
+            // health::DNS_WINDOW_CYCLES, DNS_WINDOW_SECS and the rule's own
+            // confirmation count, checked below.
+            ("dns.slow_resolver", 6.0),
+            ("dns.slow_resolver", 30.0),
+            ("dns.slow_resolver", 2.0),
             // retrans_burst_fires_at_five_a_minute
             ("tcp.retrans_burst", 5.0),
             // kernel::tests::matched_positive_negative_and_unknown
             ("tcp.connect_failures", 5.0),
             ("tcp.timewait_exhaustion", 60.0),
+            // detect_path_loss's per-hop line, pinned by its own tests.
+            ("path.high_loss", 5.0),
             // The status the portal probe expects.
             ("captive.portal", 204.0),
         ];
 
+        use crate::diagnose::detectors::{
+            DNS_ALL_LOST_SECS, DNS_FAIL_MIN, DNS_FAIL_RECENT, DNS_FAIL_WINDOW,
+        };
+        assert_eq!(
+            (
+                DNS_FAIL_MIN as f64,
+                DNS_FAIL_WINDOW as f64,
+                DNS_FAIL_RECENT as f64,
+                DNS_ALL_LOST_SECS,
+            ),
+            (5.0, 60.0, 12.0, 15.0),
+            "dns.failing's trigger quotes these"
+        );
+        assert_eq!(
+            (
+                crate::collectors::health::DNS_WINDOW_CYCLES,
+                crate::collectors::health::DNS_WINDOW_SECS,
+                Thresholds::default().confirmations("dns.slow_resolver"),
+            ),
+            (6, 30, 2),
+            "dns.slow_resolver's trigger quotes these"
+        );
         let defaults = serde_json::to_value(Thresholds::default()).expect("thresholds serialise");
         let default_of = |field: &str| {
             defaults
@@ -1100,31 +1219,70 @@ mod tests {
         }
     }
 
+    /// The rules whose issues set `diagnose run`'s exit status. Pinned, so a
+    /// rule changes maturity by an edit here that a reviewer sees, and the
+    /// release note can list it. Each addition changes which hosts exit 1.
+    const STABLE: &[&str] = &[
+        "gateway.unreachable",
+        "target.resolve_failed",
+        "target.connect_failed",
+        "target.tls_failed",
+        "target.http_error",
+    ];
+
     #[test]
-    fn a_contracted_rule_states_all_four_parts() {
-        for rule in CATALOGUE.iter().filter(|r| r.contracted()) {
+    fn the_stable_set_is_the_pinned_one() {
+        let stable: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|r| r.maturity == Maturity::Stable)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(stable, STABLE);
+        for rule in CATALOGUE {
+            assert_eq!(rule.beta(), !STABLE.contains(&rule.id), "{}", rule.id);
+        }
+    }
+
+    #[test]
+    fn a_stable_rule_has_a_contract_and_a_trigger_that_describes_it() {
+        for rule in CATALOGUE.iter().filter(|r| r.maturity == Maturity::Stable) {
             assert!(!rule.evidence.is_empty(), "{}", rule.id);
             assert!(!rule.lookalikes.is_empty(), "{}", rule.id);
             assert!(!rule.recovery.is_empty(), "{}", rule.id);
             assert!(!rule.platforms.is_empty(), "{}", rule.id);
+            assert!(
+                !PENDING_TRIGGER_TEXTS.iter().any(|(id, ..)| *id == rule.id),
+                "{} is stable, so its trigger text cannot be one known to misdescribe its detector",
+                rule.id
+            );
+            assert!(
+                rule.status.is_active(),
+                "{} is stable and cannot be planned",
+                rule.id
+            );
         }
-        // Tier one: the rules implicated by the review's findings. The
-        // release gate is these eight; the remaining rules follow.
+    }
+
+    /// A contract is kept when a rule is demoted: the prose is still the
+    /// best statement of what the rule needs, and it is what the rule will
+    /// be held to when it is put forward again.
+    #[test]
+    fn demoted_rules_keep_their_contracts() {
         for id in [
-            "gateway.unreachable",
             "dns.hijack_suspect",
             "path.high_loss",
             "tcp.bufferbloat_remote",
-            "target.resolve_failed",
-            "target.connect_failed",
-            "target.tls_failed",
-            "target.http_error",
         ] {
-            assert!(
-                lookup(id).expect("rule exists").contracted(),
-                "{id} is tier one and must carry a contract"
-            );
+            let rule = lookup(id).expect("rule exists");
+            assert!(rule.contracted(), "{id} keeps its contract");
+            assert!(rule.beta(), "{id} is beta");
         }
+    }
+
+    #[test]
+    fn maturity_labels_round_trip_through_the_issue_flag() {
+        assert_eq!(Maturity::of_issue(true).label(), "beta");
+        assert_eq!(Maturity::of_issue(false).label(), "stable");
     }
 
     #[test]
