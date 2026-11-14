@@ -327,10 +327,14 @@ pub fn format_count(n: usize) -> String {
     out
 }
 
-/// Unpadded rate for inline use. Zero → "-", integers only.
+/// Unpadded rate for inline use. Zero → "0", integers only.
+///
+/// Zero used to be `-`, beside `—` for "not measured" and `0` in the
+/// Connections table: three marks for nothing, and no way to tell an idle flow
+/// from an unmeasured one. A caller with no measurement draws [`NO_VALUE`].
 pub fn format_bytes_rate(bytes_per_sec: f64) -> String {
     if bytes_per_sec < 1.0 {
-        return "-".to_string();
+        return "0".to_string();
     }
     let (val, unit) = if bytes_per_sec >= 1_000_000_000.0 {
         (bytes_per_sec / 1_000_000_000.0, "GB/s")
@@ -354,10 +358,10 @@ pub fn format_bytes_rate_padded(bytes_per_sec: f64) -> String {
     )
 }
 
-/// Unpadded byte total for inline use. Zero → "-", integers only.
+/// Unpadded byte total for inline use. Zero → "0", integers only.
 pub fn format_bytes_total(bytes: u64) -> String {
     if bytes == 0 {
-        return "-".to_string();
+        return "0".to_string();
     }
     let (val, unit) = if bytes >= 1_000_000_000 {
         (bytes as f64 / 1_000_000_000.0, "GB")
@@ -376,6 +380,14 @@ pub fn format_bytes_total(bytes: u64) -> String {
 pub fn format_bytes_total_padded(bytes: u64) -> String {
     format!("{:>width$}", format_bytes_total(bytes), width = TOTAL_WIDTH)
 }
+
+/// What a cell shows when a value was not measured.
+///
+/// One glyph for it, everywhere. Dense wrote `--`, the dashboard `–` and the
+/// tabs `—`, which reads as three kinds of nothing. A measured zero is a
+/// different fact and keeps its own mark: [`format_bytes_rate`] writes `-`
+/// for a rate under one byte a second.
+pub const NO_VALUE: &str = "—";
 
 /// The tab-range the footer advertises. A constant so the hint and the tab
 /// bar can be asserted against each other rather than drifting apart.
@@ -427,17 +439,79 @@ const TAB_BAR_ORIGIN: u16 = 11;
 /// Spacing between tabs.
 const TAB_GAP: &str = " ";
 
-/// Exactly what one tab occupies in the bar, selected or not.
+/// How much of each tab's name the bar can afford at this terminal width.
 ///
-/// Selected and unselected render the same width — the selected one as a
-/// single inverted span, the unselected as a coloured digit plus a name — so
-/// this is the single source of truth for the bar's geometry. The renderer
-/// and [`tab_at_column`] both walk it, which is what stopped the click
-/// hit-test from silently addressing the previous layout when the bar was
-/// restyled.
-fn tab_segment(tab: Tab) -> String {
+/// The full bar is 141 columns. Drawn into anything narrower it used to run
+/// off the right edge, so at 120 columns `9` had no name and `0 egress` was
+/// not there at all, and at 80 the last four tabs did not exist. A tab that
+/// is not drawn cannot be clicked and is not advertised, so the bar shortens
+/// instead: every digit stays, names give way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabDensity {
+    /// `1 dashboard  2 connections …`
+    Full,
+    /// `1 dash  2 conns …`
+    Short,
+    /// `1  2  3 interfaces  4 …` — only the current tab keeps its name.
+    Digits,
+}
+
+const TAB_DENSITIES: [TabDensity; 3] = [TabDensity::Full, TabDensity::Short, TabDensity::Digits];
+
+fn tab_short_name(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Dashboard => "dash",
+        Tab::Connections => "conns",
+        Tab::Interfaces => "ifaces",
+        Tab::Packets => "pkts",
+        Tab::Stats => "stats",
+        Tab::Topology => "topo",
+        Tab::Timeline => "time",
+        Tab::Processes => "procs",
+        Tab::Diagnose => "diag",
+        Tab::Egress => "egress",
+    }
+}
+
+/// Exactly what one tab occupies in the bar at a density.
+///
+/// Selected and unselected render the same width at `Full` and `Short` — the
+/// selected one as a single inverted span, the unselected as a coloured digit
+/// plus a name. At `Digits` the current tab alone carries its name, so the
+/// geometry depends on which tab is current. Either way this is the single
+/// source of truth: the renderer and [`tab_at_column`] both walk it, which is
+/// what stopped the click hit-test from silently addressing the previous
+/// layout when the bar was restyled.
+fn tab_segment(tab: Tab, density: TabDensity, current: Tab) -> String {
     let (num, name) = tab_label(tab);
-    format!(" {num} {} ", name.to_lowercase())
+    match density {
+        TabDensity::Full => format!(" {num} {} ", name.to_lowercase()),
+        TabDensity::Short => format!(" {num} {} ", tab_short_name(tab)),
+        TabDensity::Digits if tab == current => format!(" {num} {} ", name.to_lowercase()),
+        TabDensity::Digits => format!(" {num} "),
+    }
+}
+
+/// Columns the brand and the tabs occupy at a density.
+fn tab_bar_width(density: TabDensity, current: Tab) -> u16 {
+    let tabs = visible_tabs();
+    let segments: usize = tabs
+        .iter()
+        .map(|&tab| tab_segment(tab, density, current).chars().count())
+        .sum();
+    let gaps = TAB_GAP.chars().count() * tabs.len().saturating_sub(1);
+    TAB_BAR_ORIGIN + (segments + gaps) as u16
+}
+
+/// The roomiest density whose bar fits in `width` columns.
+///
+/// The last segment ends in a blank, which may hang off the edge. `Digits` is
+/// the floor: below its ~60 columns nothing shorter is still a tab bar.
+pub fn tab_density(width: u16, current: Tab) -> TabDensity {
+    TAB_DENSITIES
+        .into_iter()
+        .find(|&d| tab_bar_width(d, current) <= width.saturating_add(1))
+        .unwrap_or(TabDensity::Digits)
 }
 
 /// The tab bar itself: `1 dashboard  2 connections …`.
@@ -449,38 +523,48 @@ fn tab_segment(tab: Tab) -> String {
 ///
 /// Pure so it can be tested against [`tab_at_column`] without standing up an
 /// `App` and its collectors.
-pub fn tab_bar_spans(current: Tab, t: &Theme) -> Vec<Span<'static>> {
+pub fn tab_bar_spans(current: Tab, density: TabDensity, t: &Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, &tab) in visible_tabs().iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(TAB_GAP));
         }
-        let (num, name) = tab_label(tab);
+        let segment = tab_segment(tab, density, current);
         if tab == current {
             spans.push(Span::styled(
-                tab_segment(tab),
+                segment,
                 Style::default().fg(t.text_inverse).bg(t.active_tab).bold(),
             ));
         } else {
             // Split so the digit reads as the key it is. The two spans still
             // occupy exactly `tab_segment`'s width, which is what keeps the
             // click hit-test honest.
-            spans.push(Span::styled(
-                format!(" {num}"),
-                Style::default().fg(t.key_hint),
-            ));
-            spans.push(Span::styled(
-                format!(" {} ", name.to_lowercase()),
-                Style::default().fg(t.inactive_tab),
-            ));
+            let (num, _) = tab_label(tab);
+            let digit = format!(" {num}");
+            let rest = segment[digit.len()..].to_string();
+            spans.push(Span::styled(digit, Style::default().fg(t.key_hint)));
+            spans.push(Span::styled(rest, Style::default().fg(t.inactive_tab)));
         }
     }
     spans
 }
 
-pub fn build_header_line(app: &App, extra: Option<Vec<Span<'static>>>) -> Line<'static> {
+/// The header row for a terminal `width` columns wide.
+///
+/// The tabs come first and are never clipped: they pick the roomiest
+/// [`TabDensity`] that fits. Chips follow in priority order — paused, alerts,
+/// recorder, the tab's own extras, then the clock — and one that does not fit
+/// whole is left out rather than cut mid-word. `attribution: lsof — ebp` at
+/// the right edge told nobody anything.
+pub fn build_header_line(
+    app: &App,
+    extra: Option<Vec<Span<'static>>>,
+    width: u16,
+) -> Line<'static> {
     let t = &app.theme;
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let current = app.ui.current_tab;
+    let density = tab_density(width, current);
 
     // Lowercase, and exactly `TAB_BAR_ORIGIN` columns wide — the hit-test
     // measures the bar from the end of this span.
@@ -489,47 +573,83 @@ pub fn build_header_line(app: &App, extra: Option<Vec<Span<'static>>>) -> Line<'
         Style::default().fg(t.brand).bold(),
     )];
 
-    spans.extend(tab_bar_spans(app.ui.current_tab, t));
+    spans.extend(tab_bar_spans(current, density, t));
+
+    let mut chips: Vec<Vec<Span<'static>>> = Vec::new();
 
     if app.ui.paused {
-        spans.push(Span::styled(
+        chips.push(vec![Span::styled(
             " ⏸ paused ",
             Style::default().fg(t.text_inverse).bg(t.status_warn),
-        ));
+        )]);
     }
 
     let alert_count = app.network_intel.active_alert_count();
     if alert_count > 0 {
-        spans.push(Span::styled(
+        chips.push(vec![Span::styled(
             format!(" ⚠ {} ", alert_count),
             Style::default().fg(t.text_inverse).bg(t.status_error),
-        ));
+        )]);
     }
 
     match app.incident_recorder.state() {
         RecorderState::Armed => {
-            spans.push(Span::styled(
+            chips.push(vec![Span::styled(
                 format!(" ● rec {} ", app.incident_recorder.window_label()),
                 Style::default().fg(t.text_inverse).bg(t.status_error),
-            ));
+            )]);
         }
         RecorderState::Frozen => {
-            spans.push(Span::styled(
+            chips.push(vec![Span::styled(
                 " frozen ",
                 Style::default().fg(t.text_inverse).bg(t.status_warn),
-            ));
+            )]);
         }
         RecorderState::Off => {}
     }
 
     if let Some(extra_spans) = extra {
+        // A tab's extras are independent facts separated by blank spans, and
+        // the first should survive when the second does not fit. A label and
+        // its value (`bpf ` `port 53`) stay together.
+        let mut group: Vec<Span<'static>> = Vec::new();
         for s in extra_spans {
-            spans.push(s);
+            if s.content.trim().is_empty() {
+                if !group.is_empty() {
+                    let mut chip = vec![Span::raw("  ")];
+                    chip.append(&mut group);
+                    chips.push(chip);
+                }
+            } else {
+                group.push(s);
+            }
+        }
+        if !group.is_empty() {
+            let mut chip = vec![Span::raw("  ")];
+            chip.append(&mut group);
+            chips.push(chip);
         }
     }
 
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(now, Style::default().fg(t.text_muted)));
+    chips.push(vec![
+        Span::raw("  "),
+        Span::styled(now, Style::default().fg(t.text_muted)),
+    ]);
+
+    let mut used: usize = spans
+        .iter()
+        .map(|s| crate::ui::text::width(&s.content))
+        .sum();
+    for chip in chips {
+        let w: usize = chip
+            .iter()
+            .map(|s| crate::ui::text::width(&s.content))
+            .sum();
+        if used + w <= usize::from(width) {
+            used += w;
+            spans.extend(chip);
+        }
+    }
 
     Line::from(spans)
 }
@@ -784,8 +904,125 @@ pub fn render_config_notice(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text).style(style), row);
 }
 
+/// The footer while a filter is being typed: the text, a cursor, and the two
+/// keys that end it.
+///
+/// Three tabs drew this themselves. Two showed `/ text█` and nothing else, so
+/// the footer's keys vanished and nothing said how to get them back; the
+/// third wrote `Enter apply   Esc cancel` in a style of its own.
+pub fn render_filter_bar(f: &mut Frame, t: &Theme, area: Rect, text: &str) {
+    let mut spans = vec![
+        Span::styled(" / ", Style::default().fg(t.brand).bold()),
+        Span::styled(text.to_string(), Style::default().fg(t.text_primary)),
+        Span::styled("▏", Style::default().fg(t.brand).bold()),
+    ];
+    let hints = hint_spans(t, &[hint("↵", "apply"), hint("esc", "cancel")]);
+    let used: usize = spans
+        .iter()
+        .map(|s| crate::ui::text::width(&s.content))
+        .sum();
+    let hints_w: usize = hints
+        .iter()
+        .map(|s| crate::ui::text::width(&s.content))
+        .sum();
+    let avail = usize::from(area.width);
+    if avail > used + hints_w + 3 {
+        spans.push(Span::raw(" ".repeat(avail - used - hints_w - 1)));
+        spans.extend(hints);
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(t.border)),
+        ),
+        area,
+    );
+}
+
+/// `1 connection`, `2 connections`.
+pub fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// Make text on a selected row readable when its colour is the selection's.
+///
+/// The `terminal` theme's selection ground is ANSI 8, on purpose: it is the
+/// one slot that is a neutral mid-grey in light and dark palettes alike. Its
+/// muted text is ANSI 8 too. So every muted cell on the selected row — an idle
+/// process, a dim count, an age — was drawn grey on the same grey, and the
+/// cursor on an idle row was a blank band. Each table would have to remember
+/// not to dim its selected row; this runs once per frame, after all of them,
+/// and lifts any such cell to the secondary text colour.
+pub fn lift_text_on_selection(buf: &mut ratatui::buffer::Buffer, theme: &Theme) {
+    // `DarkGray` and `Indexed(8)` are the same slot under two names.
+    fn slot(c: Color) -> Color {
+        match c {
+            Color::DarkGray => Color::Indexed(8),
+            c => c,
+        }
+    }
+    let grounds = [slot(theme.selection_bg), slot(theme.highlight_bg)];
+    for cell in buf.content.iter_mut() {
+        let bg = slot(cell.bg);
+        if bg != Color::Reset && grounds.contains(&bg) && slot(cell.fg) == bg {
+            cell.fg = theme.text_secondary;
+        }
+    }
+}
+
+/// The drill path, right-aligned on the verdict row: where `↵` came from,
+/// where it is now, and the key that goes back.
+///
+/// `processes › connections › packets   esc back`. Drawn only while there is
+/// a path, and only if it fits beside what the row already says.
+pub fn render_breadcrumb(f: &mut Frame, app: &App, header: Rect) {
+    if app.ui.drill_path.is_empty() || header.height < 2 {
+        return;
+    }
+    let t = &app.theme;
+    let mut spans = Vec::new();
+    for tab in &app.ui.drill_path {
+        spans.push(Span::styled(
+            tab_label(*tab).1.to_lowercase(),
+            Style::default().fg(t.text_muted),
+        ));
+        spans.push(Span::styled(" › ", Style::default().fg(t.separator)));
+    }
+    spans.push(Span::styled(
+        tab_label(app.ui.current_tab).1.to_lowercase(),
+        Style::default().fg(t.text_primary).bold(),
+    ));
+    spans.push(Span::raw("   "));
+    spans.extend(hint_spans(t, &[hint("esc", "back")]));
+    spans.push(Span::raw(" "));
+    let w: usize = spans
+        .iter()
+        .map(|s| crate::ui::text::width(&s.content))
+        .sum();
+    // Leave the verdict its half of the row.
+    if w + 2 > usize::from(header.width) / 2 {
+        return;
+    }
+    let row = Rect {
+        x: header.x + header.width - w as u16,
+        y: header.y + 1,
+        width: w as u16,
+        height: 1,
+    };
+    f.render_widget(ratatui::widgets::Clear, row);
+    f.render_widget(Paragraph::new(Line::from(spans)), row);
+}
+
 pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines = vec![build_header_line(app, None), build_verdict_line(app)];
+    let mut lines = vec![
+        build_header_line(app, None, area.width),
+        build_verdict_line(app),
+    ];
     if let Some(error) = capture_failure(app).filter(|_| area.height > 3) {
         // Two rows above and the border below.
         let spare = area.height.saturating_sub(3);
@@ -797,12 +1034,13 @@ pub fn render_header(f: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(app.theme.border)),
     );
     f.render_widget(header, area);
+    render_breadcrumb(f, app, area);
 }
 
 /// Header without the verdict row, for the Diagnose tab — which renders the
 /// verdict itself, in full, immediately below.
 pub fn render_header_without_verdict(f: &mut Frame, app: &App, area: Rect) {
-    let header = Paragraph::new(build_header_line(app, None)).block(
+    let header = Paragraph::new(build_header_line(app, None, area.width)).block(
         Block::default()
             .borders(Borders::BOTTOM)
             .border_style(Style::default().fg(app.theme.border)),
@@ -811,16 +1049,28 @@ pub fn render_header_without_verdict(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn render_header_with_extra(f: &mut Frame, app: &App, area: Rect, extra: Vec<Span<'static>>) {
-    let lines = vec![build_header_line(app, Some(extra)), build_verdict_line(app)];
+    let lines = vec![
+        build_header_line(app, Some(extra), area.width),
+        build_verdict_line(app),
+    ];
     let header = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::BOTTOM)
             .border_style(Style::default().fg(app.theme.border)),
     );
     f.render_widget(header, area);
+    render_breadcrumb(f, app, area);
 }
 
-/// Keep coverage on its own rows so narrow terminals do not lose it after tabs.
+/// Rows [`render_attribution_header`] needs: tabs, verdict, rule, coverage.
+pub const ATTRIBUTION_HEADER_ROWS: u16 = 4;
+
+/// Keep coverage on a row of its own so narrow terminals do not lose it after
+/// the tabs.
+///
+/// One row, muted. It was two rows in primary text, which on a tab that also
+/// has a control strip put five rows of chrome above the first panel and made
+/// a standing caveat the loudest thing on the screen.
 pub fn render_attribution_header(f: &mut Frame, app: &App, area: Rect, extra: Vec<Span<'static>>) {
     render_header_with_extra(
         f,
@@ -834,31 +1084,48 @@ pub fn render_attribution_header(f: &mut Frame, app: &App, area: Rect, extra: Ve
             .capture_drops
             .map(|n| n.to_string())
             .unwrap_or_else(|| "not measured".into());
-        let lines = vec![
-            Line::raw(coverage.summary()),
-            Line::raw(format!(
-                "Capture drops: {drops} · polling can miss short-lived flows"
-            )),
-        ];
+        // Bytes in the units every other number on the screen uses. The
+        // collector's own summary prints them raw (`307995/30371761`), which
+        // is right for a log and unreadable at a glance.
+        let summary = coverage.summary();
+        let summary = if summary.starts_with("attributed flows") {
+            format!(
+                "attributed {} of {} flows · {} of {} (last capture interval)",
+                coverage.attributed_flows,
+                coverage.eligible_flows,
+                format_bytes_total(coverage.attributed_payload_bytes),
+                format_bytes_total(coverage.eligible_payload_bytes),
+            )
+        } else {
+            summary
+        };
+        let text =
+            format!(" {summary} · capture drops: {drops} · polling can miss short-lived flows");
         f.render_widget(
-            Paragraph::new(lines),
-            Rect::new(area.x, area.y + 3, area.width, area.height - 3),
+            Paragraph::new(Line::from(Span::styled(
+                ellipsise(&text, usize::from(area.width)),
+                Style::default().fg(app.theme.text_muted),
+            ))),
+            Rect::new(area.x, area.y + 3, area.width, 1),
         );
     }
 }
 
-/// Given a click column within the header row, return which tab was clicked (if any).
-pub fn tab_at_column(col: u16) -> Option<Tab> {
+/// Given a click column within the header row of a `width`-column terminal,
+/// return which tab was clicked (if any). `current` matters because the
+/// narrowest bar names only the current tab.
+pub fn tab_at_column(col: u16, width: u16, current: Tab) -> Option<Tab> {
+    let density = tab_density(width, current);
     let mut x = TAB_BAR_ORIGIN;
     for (i, &tab) in visible_tabs().iter().enumerate() {
         if i > 0 {
             x += TAB_GAP.chars().count() as u16;
         }
-        let width = tab_segment(tab).chars().count() as u16;
-        if col >= x && col < x + width {
+        let w = tab_segment(tab, density, current).chars().count() as u16;
+        if col >= x && col < x + w {
             return Some(tab);
         }
-        x += width;
+        x += w;
     }
     None
 }
@@ -965,6 +1232,7 @@ fn universal_hints() -> Vec<Hint> {
         hint("E", "incident"),
         hint("↑↓", "scroll"),
         hint(FOOTER_TAB_HINT, "tab"),
+        hint(":", "command"),
         hint("?", "help"),
         hint("q", "quit"),
     ]
@@ -1103,6 +1371,30 @@ fn hint_width(hints: &[Hint]) -> usize {
         + hints.len().saturating_sub(1) * 2
 }
 
+/// Which hint a footer that does not fit gives up next, or `None` when what
+/// is left stays whatever the width.
+///
+/// The footer used to pop from the right, and the right end is `? help` and
+/// `q quit`: at 120 columns a tab with eight keys of its own lost the one hint
+/// that leads to all the others. So the order is by what a reader can best
+/// recover without being told. The tab digits are in the bar above; arrows
+/// scroll in every program; the recorder's three keys are on every tab and in
+/// help; `q` quits most things. Then the tab's own keys from the right. The
+/// tab's first key and `? help` are never dropped.
+fn next_hint_to_drop(hints: &[Hint], context: usize) -> Option<usize> {
+    for key in [FOOTER_TAB_HINT, "↑↓", "E", "F", "R", "q", ":"] {
+        if let Some(i) = hints
+            .iter()
+            .enumerate()
+            .skip(context)
+            .find_map(|(i, (k, _))| (k == key).then_some(i))
+        {
+            return Some(i);
+        }
+    }
+    (context > 1).then(|| context - 1)
+}
+
 /// The footer: context keys, then the universal ones, then the toast.
 ///
 /// A universal hint is dropped when the tab has already bound that key — the
@@ -1114,11 +1406,13 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Hi
 
     let mut hints = context_hints;
     let bound: std::collections::HashSet<String> = hints.iter().map(|(k, _)| k.clone()).collect();
+    let before = hints.len();
     hints.extend(
         universal_hints()
             .into_iter()
             .filter(|(k, _)| !bound.contains(k)),
     );
+    let universal_count = hints.len() - before;
 
     let avail = area.width as usize;
 
@@ -1127,13 +1421,16 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Hi
     // where. So it is the footer's *first* claim on the width, and the keys
     // give way to it: a hint the user can rediscover by pressing `?` outranks
     // nothing, but it does not outrank the one line naming the file they just
-    // asked for. Universal hints drop from the right, tab hints last.
+    // asked for. See `next_hint_to_drop` for the order they go in.
     let toast: Option<(String, &str, Color)> = app.ui.export_status.as_ref().map(|status| {
         // Failures say so mid-sentence ("Incident export failed: …",
         // "Egress promote failed: …"), so the check cannot be a prefix.
         let lower = status.to_lowercase();
         let (glyph, color) = if lower.contains("failed") || lower.contains("error") {
             ("✕ ", t.status_error)
+        } else if lower.contains("cancel") {
+            // Nothing happened, by request. Not a success and not a failure.
+            ("· ", t.text_muted)
         } else {
             ("✓ ", t.status_good)
         };
@@ -1148,10 +1445,16 @@ pub fn render_footer(f: &mut Frame, app: &App, area: Rect, context_hints: Vec<Hi
         .map(|(s, _, _)| crate::ui::text::width(s) + 4)
         .unwrap_or(0);
 
-    // `1 +` for the leading space. Never drop the tab's own first hint — a
-    // footer with no keys at all is worse than a clipped one.
-    while hints.len() > 1 && 1 + hint_width(&hints) + toast_width > avail {
-        hints.pop();
+    // `1 +` for the leading space.
+    let mut context = hints.len() - universal_count;
+    while 1 + hint_width(&hints) + toast_width > avail {
+        let Some(drop) = next_hint_to_drop(&hints, context) else {
+            break;
+        };
+        hints.remove(drop);
+        if drop < context {
+            context -= 1;
+        }
     }
 
     let mut spans = vec![Span::raw(" ")];
@@ -1264,21 +1567,27 @@ mod tests {
     }
 
     fn find_first_col(target: Tab) -> Option<u16> {
-        (0..220).find(|&col| tab_at_column(col) == Some(target))
+        (0..220).find(|&col| tab_at_column(col, 220, Tab::Dashboard) == Some(target))
     }
 
     #[test]
     fn tab_at_column_before_tabs_returns_none() {
-        assert!(tab_at_column(0).is_none());
-        assert!(tab_at_column(5).is_none());
+        assert!(tab_at_column(0, 220, Tab::Dashboard).is_none());
+        assert!(tab_at_column(5, 220, Tab::Dashboard).is_none());
     }
 
     #[test]
     fn tab_at_column_hits_dashboard() {
         let col = find_first_col(Tab::Dashboard).expect("Dashboard must be reachable");
-        assert_eq!(tab_at_column(col), Some(Tab::Dashboard));
+        assert_eq!(
+            tab_at_column(col, 220, Tab::Dashboard),
+            Some(Tab::Dashboard)
+        );
         if col > 0 {
-            assert_ne!(tab_at_column(col - 1), Some(Tab::Dashboard));
+            assert_ne!(
+                tab_at_column(col - 1, 220, Tab::Dashboard),
+                Some(Tab::Dashboard)
+            );
         }
     }
 
@@ -1292,14 +1601,14 @@ mod tests {
 
     #[test]
     fn tab_at_column_way_past_end_returns_none() {
-        assert!(tab_at_column(220).is_none());
+        assert!(tab_at_column(220, 220, Tab::Dashboard).is_none());
     }
 
     #[test]
     fn every_tab_in_the_bar_is_clickable() {
         let mut found_tabs = std::collections::HashSet::new();
         for col in 0..220 {
-            if let Some(tab) = tab_at_column(col) {
+            if let Some(tab) = tab_at_column(col, 220, Tab::Dashboard) {
                 found_tabs.insert(format!("{:?}", tab));
             }
         }
@@ -1318,39 +1627,63 @@ mod tests {
     #[test]
     fn the_click_hit_test_agrees_with_what_is_drawn() {
         let theme = crate::theme::by_name("default");
-        for &current in visible_tabs().iter() {
-            let spans = tab_bar_spans(current, &theme);
-            let mut text = String::new();
-            for s in &spans {
-                text.push_str(&s.content);
-            }
-
-            let mut col = TAB_BAR_ORIGIN as usize;
-            for (i, &tab) in visible_tabs().iter().enumerate() {
-                if i > 0 {
-                    col += TAB_GAP.chars().count();
+        // One width per density, and one narrower than any bar.
+        for width in [220u16, 141, 120, 100, 80, 40] {
+            for &current in visible_tabs().iter() {
+                let density = tab_density(width, current);
+                let spans = tab_bar_spans(current, density, &theme);
+                let mut text = String::new();
+                for s in &spans {
+                    text.push_str(&s.content);
                 }
-                let seg = tab_segment(tab);
-                // Every column the segment covers must hit-test to this tab.
-                for offset in 0..seg.chars().count() {
-                    assert_eq!(
-                        tab_at_column((col + offset) as u16),
-                        Some(tab),
-                        "with {current:?} selected, column {} draws {seg:?} \
-                         but hit-tests elsewhere",
-                        col + offset
-                    );
-                }
-                col += seg.chars().count();
-            }
 
-            // And selected vs unselected must not change the geometry.
-            assert_eq!(
-                text.chars().count() + TAB_BAR_ORIGIN as usize,
-                col,
-                "the drawn bar and the hit-test disagree on total width"
-            );
+                let mut col = TAB_BAR_ORIGIN as usize;
+                for (i, &tab) in visible_tabs().iter().enumerate() {
+                    if i > 0 {
+                        col += TAB_GAP.chars().count();
+                    }
+                    let seg = tab_segment(tab, density, current);
+                    assert!(text.contains(&seg), "{seg:?} is not drawn at {width}");
+                    // Every column the segment covers must hit-test to this tab.
+                    for offset in 0..seg.chars().count() {
+                        assert_eq!(
+                            tab_at_column((col + offset) as u16, width, current),
+                            Some(tab),
+                            "at {width} columns with {current:?} selected, column {} \
+                             draws {seg:?} but hit-tests elsewhere",
+                            col + offset
+                        );
+                    }
+                    col += seg.chars().count();
+                }
+
+                assert_eq!(
+                    text.chars().count() + TAB_BAR_ORIGIN as usize,
+                    col,
+                    "the drawn bar and the hit-test disagree on total width"
+                );
+            }
         }
+    }
+
+    /// The bar ran off the right edge below 141 columns: at 120 `9` had no
+    /// name and `0` was gone, at 80 so were `7` and `8`. Every digit has to be
+    /// on screen at every width a terminal is likely to be.
+    #[test]
+    fn every_tab_digit_is_on_screen_at_common_widths() {
+        for width in [80u16, 100, 120, 132, 140, 160, 200] {
+            for &current in visible_tabs().iter() {
+                let density = tab_density(width, current);
+                assert!(
+                    tab_bar_width(density, current) <= width + 1,
+                    "{density:?} bar is {} columns in a {width}-column terminal",
+                    tab_bar_width(density, current)
+                );
+            }
+        }
+        assert_eq!(tab_density(141, Tab::Dashboard), TabDensity::Full);
+        assert_eq!(tab_density(120, Tab::Dashboard), TabDensity::Short);
+        assert_eq!(tab_density(80, Tab::Dashboard), TabDensity::Digits);
     }
 
     /// A key may appear once in a footer. Processes shipped `e:Export` beside

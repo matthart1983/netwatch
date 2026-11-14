@@ -86,7 +86,7 @@ impl Setting {
 const ROWS: &[Setting] = &[
     Setting {
         at: cursor::THEME,
-        label: "Theme",
+        label: "theme",
         raw: |c| c.theme.clone(),
         show: None,
         apply: |c, v| {
@@ -102,7 +102,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::VIEW,
-        label: "View",
+        label: "view",
         raw: |c| c.view.clone(),
         show: None,
         apply: |c, v| {
@@ -118,7 +118,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::DEFAULT_TAB,
-        label: "Default Tab",
+        label: "default tab",
         raw: |c| c.default_tab.clone(),
         show: None,
         apply: |c, v| {
@@ -133,7 +133,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::REFRESH_RATE,
-        label: "Refresh Rate (ms)",
+        label: "refresh rate (ms)",
         raw: |c| c.refresh_rate_ms.to_string(),
         show: None,
         apply: |c, v| {
@@ -148,7 +148,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::CAPTURE_INTERFACE,
-        label: "Capture Interface",
+        label: "capture interface",
         raw: |c| c.capture_interface.clone(),
         show: Some(|c| or_placeholder(&c.capture_interface, "(auto)")),
         apply: |c, v| {
@@ -159,7 +159,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::SHOW_GEO,
-        label: "Show GeoIP",
+        label: "show GeoIP",
         raw: |c| on_off(c.show_geo),
         show: None,
         apply: |c, v| {
@@ -170,7 +170,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::TIMELINE_WINDOW,
-        label: "Timeline Window",
+        label: "timeline window",
         raw: |c| c.timeline_window.clone(),
         show: None,
         apply: |c, v| {
@@ -185,7 +185,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::PACKET_FOLLOW,
-        label: "Packet Follow",
+        label: "packet follow",
         raw: |c| on_off(c.packet_follow),
         show: None,
         apply: |c, v| {
@@ -196,7 +196,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::BPF_FILTER,
-        label: "BPF Filter",
+        label: "BPF filter",
         raw: |c| c.bpf_filter.clone(),
         show: Some(|c| or_placeholder(&c.bpf_filter, "(none)")),
         apply: |c, v| {
@@ -207,7 +207,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::GEOIP_DB,
-        label: "GeoIP DB Path",
+        label: "GeoIP DB path",
         raw: |c| c.geoip_db.clone(),
         // `draw` shows what the session opened, through `geoip_row`.
         show: None,
@@ -219,7 +219,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::GEOIP_ASN_DB,
-        label: "GeoIP ASN DB Path",
+        label: "GeoIP ASN DB path",
         raw: |c| c.geoip_asn_db.clone(),
         // `draw` shows what the session opened, through `geoip_row`.
         show: None,
@@ -231,7 +231,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::BANDWIDTH_THRESHOLD,
-        label: "Bandwidth Threshold",
+        label: "bandwidth threshold",
         raw: |c| c.alerts.bandwidth_threshold.to_string(),
         show: Some(|c| format_bandwidth(c.alerts.bandwidth_threshold)),
         apply: |c, v| {
@@ -242,7 +242,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::PORT_SCAN_THRESHOLD,
-        label: "Port Scan Threshold",
+        label: "port scan threshold",
         raw: |c| c.alerts.port_scan_threshold.to_string(),
         show: None,
         apply: |c, v| {
@@ -253,7 +253,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::AI_INSIGHTS,
-        label: "AI Insights",
+        label: "AI insights",
         raw: |c| on_off(c.insights_enabled),
         show: None,
         apply: |c, v| {
@@ -264,7 +264,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::AI_MODEL,
-        label: "AI Model",
+        label: "AI model",
         raw: |c| c.insights_model.clone(),
         show: None,
         apply: |c, v| {
@@ -278,7 +278,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::AI_ENDPOINT,
-        label: "AI Endpoint",
+        label: "AI endpoint",
         raw: |c| c.insights_endpoint.clone(),
         // Before the URL, like the GeoIP row, so a long one cannot push it
         // out of view.
@@ -298,7 +298,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::GRAPH_STYLE,
-        label: "Graph Style",
+        label: "graph style",
         raw: |c| c.graph_style.clone(),
         show: None,
         apply: |c, v| {
@@ -314,7 +314,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::GRAPH_FADE,
-        label: "Graph Fade (btop)",
+        label: "graph fade",
         raw: |c| on_off(c.graph_fade),
         show: None,
         apply: |c, v| {
@@ -325,7 +325,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::SANDBOX,
-        label: "Sandbox",
+        label: "sandbox",
         raw: |c| c.sandbox.clone(),
         show: None,
         apply: |c, v| {
@@ -340,7 +340,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::GROUPS_COLLAPSED,
-        label: "Groups Start Folded",
+        label: "groups start folded",
         raw: |c| on_off(c.groups_start_collapsed),
         show: None,
         apply: |c, v| {
@@ -351,7 +351,7 @@ const ROWS: &[Setting] = &[
     },
     Setting {
         at: cursor::CONFIRM_QUIT,
-        label: "Confirm Quit",
+        label: "confirm quit",
         raw: |c| on_off(c.confirm_quit),
         show: None,
         apply: |c, v| {
@@ -494,6 +494,26 @@ fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<String> {
     rows
 }
 
+/// The config path for the title: `~` for the home directory, and the start
+/// cut away when it is still too long. The file name is the part that says
+/// which file, so that end is the one that stays.
+fn config_path_label(path: &std::path::Path, max: usize) -> String {
+    let full = path.display().to_string();
+    let short = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && full.starts_with(&home) => {
+            format!("~{}", &full[home.len()..])
+        }
+        _ => full,
+    };
+    let chars: Vec<char> = short.chars().collect();
+    if chars.len() <= max {
+        return short;
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = chars[chars.len() - keep..].iter().collect();
+    format!("…{tail}")
+}
+
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let attribution = app.geo_cache.db_status().attribution();
     // Wide enough for the attribution on one row, with its indent and borders.
@@ -568,9 +588,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     crate::ui::widgets::paint_overlay_bg(f, &app.theme, popup);
 
     let title = if let Some(ref path) = NetwatchConfig::path() {
-        format!(" Settings — {} ", path.display())
+        format!(
+            " settings  {} ",
+            config_path_label(path, popup_width.saturating_sub(14) as usize)
+        )
     } else {
-        " Settings ".to_string()
+        " settings ".to_string()
     };
 
     let block = widgets::panel_block(&app.theme)
@@ -654,7 +677,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     for (at, row) in sandbox_detail.into_iter().enumerate() {
         let lead = if at == 0 {
             Span::styled(
-                format!("  {:<width$}", "Sandbox", width = label_width + 2),
+                format!("  {:<width$}", "sandbox", width = label_width + 2),
                 Style::default().fg(app.theme.brand),
             )
         } else {
@@ -674,7 +697,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     for (indent, text) in note_rows {
         lines.push(Line::raw(format!("{}{text}", " ".repeat(indent))));
     }
-    lines.push(Line::raw("  Setup details: netwatch doctor --json"));
+    lines.push(Line::raw("  setup details: netwatch doctor --json"));
 
     // Status message, on a row of its own above the footer: the rows above can
     // run past the popup, and `✗ Save failed` must not go with them.
@@ -729,36 +752,27 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Footer
-    let footer_spans = if app.ui.settings_editing {
-        vec![
-            Span::styled("Enter", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Apply  "),
-            Span::styled("Esc", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Cancel"),
-        ]
+    // The one key-hint rendering the rest of the tool uses: `↵ edit`, not
+    // `Enter:Edit`.
+    use crate::ui::widgets::{hint, hint_spans};
+    let footer_hints = if app.ui.settings_editing {
+        vec![hint("↵", "apply"), hint("esc", "cancel")]
     } else if is_cycle_through(app.ui.settings_cursor) {
         vec![
-            Span::styled("←→", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Cycle  "),
-            Span::styled("↑↓", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Navigate  "),
-            Span::styled("S", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Save  "),
-            Span::styled("Esc", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Close"),
+            hint("←→", "cycle"),
+            hint("↑↓", "navigate"),
+            hint("S", "save"),
+            hint("esc", "close"),
         ]
     } else {
         vec![
-            Span::styled("↑↓", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Navigate  "),
-            Span::styled("Enter", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Edit  "),
-            Span::styled("S", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Save  "),
-            Span::styled("Esc", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Close"),
+            hint("↑↓", "navigate"),
+            hint("↵", "edit"),
+            hint("S", "save"),
+            hint("esc", "close"),
         ]
     };
+    let footer_spans = hint_spans(&app.theme, &footer_hints);
     let footer = Paragraph::new(Line::from(footer_spans)).alignment(Alignment::Center);
     let footer_area = Rect::new(
         inner.x,
@@ -1085,7 +1099,7 @@ mod tests {
             // Right under the rows it belongs to.
             assert_eq!(
                 at(crate::collectors::geo::DBIP_ATTRIBUTION),
-                at("GeoIP ASN DB Path").map(|row| row + 1)
+                at("GeoIP ASN DB path").map(|row| row + 1)
             );
         }
     }
@@ -1538,7 +1552,7 @@ mod tests {
             for row in [
                 format!("ebpf-reader: {reader}"),
                 snapshot.compact(),
-                "Setup details: netwatch doctor --json".to_string(),
+                "setup details: netwatch doctor --json".to_string(),
             ] {
                 assert!(
                     text.contains(&row),
@@ -1560,7 +1574,7 @@ mod tests {
         let rows = rows_at(&app, 120);
         let sandbox = rows
             .iter()
-            .find(|row| row.contains("Sandbox") && row.contains("best-effort:"))
+            .find(|row| row.contains("sandbox") && row.contains("best-effort:"))
             .unwrap_or_else(|| panic!("{}", rows.join("\n")));
         assert!(!sandbox.contains("worker"), "{sandbox}");
         assert!(

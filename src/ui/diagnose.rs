@@ -219,12 +219,12 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
     }
     let hints = if app.diagnose.show_coverage {
         vec![
-            crate::ui::widgets::hint("↑/↓", "select check"),
+            crate::ui::widgets::hint("↑↓", "check"),
             crate::ui::widgets::hint("t", "run"),
             crate::ui::widgets::hint("x", "cancel"),
             crate::ui::widgets::hint("r", "reload config"),
             crate::ui::widgets::hint("[/]", "target"),
-            crate::ui::widgets::hint("c", "back to issues"),
+            crate::ui::widgets::hint("c", "issues"),
         ]
     } else {
         footer_hints(&view)
@@ -281,9 +281,9 @@ fn coverage_details(
         .map(|at| format!("{}s ago", at.elapsed().as_secs()))
         .unwrap_or_else(|| "no completed sample".into());
     let mut out = vec![
-        ("Why", row.reason.clone()),
-        ("Source", format!("{} · {age}", row.source())),
-        ("Next", row.next_action().to_string()),
+        ("why", row.reason.clone()),
+        ("source", format!("{} · {age}", row.source())),
+        ("next", row.next_action().to_string()),
     ];
     if row.rule == "tcp.bufferbloat_local" {
         out.push((
@@ -294,7 +294,7 @@ fn coverage_details(
     }
     let (active, _, progress) = app.diagnose.active_prober.snapshot();
     if let Some(result) = active.get(&row.rule) {
-        out.push(("Result", result.detail.clone()));
+        out.push(("result", result.detail.clone()));
     }
     if !progress.is_empty()
         && matches!(
@@ -302,7 +302,7 @@ fn coverage_details(
             "ipv6.broken" | "captive.portal" | "pmtu.blackhole"
         )
     {
-        out.push(("Progress", progress));
+        out.push(("progress", progress));
     }
     if row.rule.starts_with("target.") {
         let (targets, _) = app
@@ -361,10 +361,10 @@ fn coverage_details(
         }
     }
     if app.diagnose.tests.any_running("coverage") {
-        out.push(("Running", "measurement in progress…".into()));
+        out.push(("running", "measurement in progress…".into()));
     }
     if let Some(status) = &app.diagnose.status {
-        out.push(("Status", status.clone()));
+        out.push(("status", status.clone()));
     }
     out
 }
@@ -413,11 +413,12 @@ fn draw_coverage(
     // Titles only when there is room for them; the detail panel always names
     // the selected rule's title, so narrow terminals lose nothing essential.
     let wide = area.width >= 130;
-    let mut header = vec!["Area", "Check", "Title", "Status", "Why"];
+    let mut header = vec!["area", "check", "title", "status", "why"];
     if !wide {
         header.remove(2);
     }
-    let header = Row::new(header).style(Style::default().fg(t.key_hint).bold());
+    // Muted, like every other table's header: the key-hint colour is for keys.
+    let header = Row::new(header).style(Style::default().fg(t.text_muted));
     let mut previous_area = "";
     let body: Vec<Row> = rules
         .iter()
@@ -472,7 +473,7 @@ fn draw_coverage(
     let table = Table::new(body, widths)
         .header(header)
         .row_highlight_style(Style::default().bg(t.selection_bg))
-        .highlight_symbol("› ")
+        .highlight_symbol("▸ ")
         .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
         .block(
             widgets::panel_block(t)
@@ -972,10 +973,18 @@ fn render_nothing_open(f: &mut Frame, view: &View, area: Rect) {
         .iter()
         .filter(|r| r.status != Availability::Available)
         .count();
-    let mut quiet = vec![Line::from(Span::styled(
-        " Nothing to report. Diagnose re-checks continuously and raises an issue here when something breaks.",
-        Style::default().fg(t.text_secondary),
-    ))];
+    // Two short lines, not one long one: wrapped at 80 columns the second
+    // half lost its indent and sat against the border.
+    let mut quiet = vec![
+        Line::from(Span::styled(
+            " Nothing to report.",
+            Style::default().fg(t.text_primary),
+        )),
+        Line::from(Span::styled(
+            " Diagnose keeps checking and raises an issue here when something breaks.",
+            Style::default().fg(t.text_secondary),
+        )),
+    ];
     if waiting > 0 {
         quiet.push(Line::from(vec![
             Span::styled(
@@ -1006,6 +1015,8 @@ fn render_nothing_open(f: &mut Frame, view: &View, area: Rect) {
         .collect();
     let history = view.engine.issues().len();
 
+    // The last panel on the page takes every row that is left, so the boxes
+    // reach the footer whichever of them are showing.
     let mut constraints = vec![Constraint::Length(quiet.len() as u16 + 2)];
     if !broken.is_empty() {
         constraints.push(Constraint::Length(broken.len() as u16 + 2));
@@ -1013,7 +1024,9 @@ fn render_nothing_open(f: &mut Frame, view: &View, area: Rect) {
     if history > 0 {
         constraints.push(Constraint::Length(chronology_height(view)));
     }
-    constraints.push(Constraint::Min(0));
+    if let Some(last) = constraints.last_mut() {
+        *last = Constraint::Min(3);
+    }
     let rows = Layout::vertical(constraints).split(area);
 
     f.render_widget(
@@ -1724,6 +1737,10 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
     // leaves the rest of the screen to a background nobody is reading. The
     // earlier content-sized version was right for a panel among panels and
     // wrong for the subject of the view.
+    // Wrapped here rather than by the paragraph, which restarts every
+    // continuation at column 0: an indented remediation step came back flush
+    // left, level with the headings.
+    let lines = crate::ui::text::wrap_hanging(lines, usize::from(area.width.saturating_sub(2)));
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1957,13 +1974,13 @@ mod tests {
         let last = rules::CATALOGUE.len() - 1;
         let s = draw_coverage_text(150, last);
         let id = rules::CATALOGUE[last].id;
-        assert!(s.contains("› "), "{s}");
+        assert!(s.contains("▸ "), "{s}");
         assert!(s.contains(&format!("{}/{}", last + 1, last + 1)), "{s}");
         assert!(s.matches(id).count() >= 2, "row and detail title: {s}");
-        assert!(s.contains("Title"), "{s}");
+        assert!(s.contains(" title "), "{s}");
         // Narrow: titles drop out of the table but the check ids stay whole.
         let s = draw_coverage_text(100, last);
-        assert!(!s.contains("Title"), "{s}");
+        assert!(!s.contains(" title "), "{s}");
         assert!(s.contains(id), "{s}");
     }
 

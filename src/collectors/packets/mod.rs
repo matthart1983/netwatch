@@ -3872,7 +3872,7 @@ fn extract_readable_payload(payload: &[u8]) -> String {
 
 // ── Helpers (formatting extracted to format.rs) ──
 mod format;
-pub use format::{ascii_dump, hex_dump, port_label};
+pub use format::{ascii_dump, ascii_dump_wide, hex_dump, hex_dump_wide, port_label};
 pub(crate) use format::{canonical_ip, format_endpoint};
 use format::{
     format_ipv6, format_mac, icmp_type_name, icmpv6_type_name, ip_protocol_name, parse_arp,

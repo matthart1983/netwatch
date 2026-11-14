@@ -155,7 +155,7 @@ pub fn render(
     let filter_line_height = if has_filter { 1u16 } else { 0 };
     let row_count = filtered.len() as u16;
     let popup_height = (row_count + 4 + filter_line_height).min(area.height.saturating_sub(4));
-    let popup_width = 30u16.min(area.width.saturating_sub(4));
+    let popup_width = 42u16.min(area.width.saturating_sub(4));
 
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
@@ -165,7 +165,7 @@ pub fn render(
     crate::ui::widgets::paint_overlay_bg(f, theme, popup);
 
     let block = widgets::panel_block(theme)
-        .title(" Sort by ")
+        .title(" sort by ")
         .border_style(Style::default().fg(theme.brand));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -194,7 +194,7 @@ pub fn render(
         let is_highlighted = list_idx == state.cursor;
         let is_active = current_col == Some(*orig_idx);
 
-        let marker = if is_highlighted { "▶ " } else { "  " };
+        let marker = if is_highlighted { "▸ " } else { "  " };
         let direction = if is_active {
             if ascending {
                 " ▲"
@@ -215,7 +215,7 @@ pub fn render(
 
         lines.push(Line::from(vec![
             Span::styled(marker, style),
-            Span::styled(format!("{label}{direction}"), style),
+            Span::styled(format!("{}{direction}", label.to_lowercase()), style),
         ]));
     }
 
@@ -233,18 +233,18 @@ pub fn render(
         Rect::new(inner.x, content_y, inner.width, content_height),
     );
 
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(theme.key_hint).bold()),
-        Span::raw(":Move "),
-        Span::styled("S", Style::default().fg(theme.key_hint).bold()),
-        Span::raw(":Dir "),
-        Span::styled("/", Style::default().fg(theme.key_hint).bold()),
-        Span::raw(":Find "),
-        Span::styled("Enter", Style::default().fg(theme.key_hint).bold()),
-        Span::raw(":Ok "),
-        Span::styled("Esc", Style::default().fg(theme.key_hint).bold()),
-        Span::raw(":Cancel"),
-    ]))
+    // The shared hint rendering. Its own `↑↓:Move S:Dir /:Find Enter:Ok
+    // Esc:Cancel` was 39 columns in a 28-column box and lost its last two
+    // keys, the ones that close the picker.
+    let footer = Paragraph::new(Line::from(widgets::hint_spans(
+        theme,
+        &[
+            widgets::hint("↵", "sort"),
+            widgets::hint("S", "reverse"),
+            widgets::hint("/", "find"),
+            widgets::hint("esc", "close"),
+        ],
+    )))
     .alignment(Alignment::Center);
     let footer_area = Rect::new(
         inner.x,

@@ -18,7 +18,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     crate::ui::widgets::paint_overlay_bg(f, &app.theme, popup);
 
     let block = widgets::panel_block(&app.theme)
-        .title(" Help ")
+        .title(" help ")
         .border_style(Style::default().fg(app.theme.brand));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -73,7 +73,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
 fn section_header(theme: &Theme, title: &str) -> Line<'static> {
     Line::from(Span::styled(
-        title.to_string(),
+        // Lowercase, like every other heading in the tool. The section
+        // tables keep their capitals so the generated docs are unchanged.
+        title.to_lowercase(),
         Style::default().fg(theme.brand).bold(),
     ))
 }
@@ -143,7 +145,11 @@ fn build_dense_help_lines(theme: &Theme) -> Vec<Line<'static>> {
         "meters",
         "Red zone is fixed, so you see it coming",
     ));
-    lines.push(key_line(theme, "--", "Not measured — not the same as zero"));
+    lines.push(key_line(
+        theme,
+        crate::ui::widgets::NO_VALUE,
+        "Not measured: not the same as zero",
+    ));
     lines.push(Line::from(""));
 
     lines.push(section_header(theme, "NOTES"));
@@ -213,6 +219,8 @@ const FULL_HELP: &[Section] = &[
         scope: Scope::Global,
         keys: &[
             ("q / Ctrl+C", "Quit"),
+            (":", "Command palette: find and run any action by name"),
+            ("Esc", "Back to the tab ↵ drilled in from"),
             (
                 "1-9, 0",
                 "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Proc/Diagnose/Egress)",
@@ -221,8 +229,14 @@ const FULL_HELP: &[Section] = &[
             ("PgUp/PgDn", "Scroll lists by a page"),
             ("p", "Pause/resume data collection"),
             ("r", "Force refresh all data"),
-            ("s / S", "Sort picker on tabs with a table · S reverses the order"),
-            ("V / v", "Cycle view: full → lite → dense (dense needs 130×44)"),
+            (
+                "s / S",
+                "Sort picker on tabs with a table · S reverses the order",
+            ),
+            (
+                "V / v",
+                "Cycle view: full → lite → dense (dense needs 130×44)",
+            ),
             ("L (shift)", "Switch to the Lite view"),
             ("R (shift)", "Arm/disarm flight recorder"),
             ("F (shift)", "Freeze the current incident window"),
@@ -233,12 +247,11 @@ const FULL_HELP: &[Section] = &[
                 "P (shift)",
                 "Promote observed egress baseline → egress-policy.toml (warn on drift)",
             ),
-            (
-                "t",
-                "Cycle theme — except on Dashboard, Stats, Timeline and Diagnose, where t is the tab's own",
-            ),
             (",", "Open settings menu (←→ / h/l to cycle theme)"),
-            ("M (shift)", "Memory overlay: sizes of the bounded collections"),
+            (
+                "M (shift)",
+                "Memory overlay: sizes of the bounded collections",
+            ),
         ],
     },
     Section {
@@ -283,7 +296,10 @@ const FULL_HELP: &[Section] = &[
                 "Jump to Packets tab with filter for selected connection; on a group row, fold it",
             ),
             ("e", "Export connections to JSON + CSV"),
-            ("W (shift)", "Whois lookup for selected connection's remote IP"),
+            (
+                "W (shift)",
+                "Whois lookup for selected connection's remote IP",
+            ),
             ("T (shift)", "Traceroute to selected connection's remote IP"),
             ("Esc", "Close the traceroute overlay, else clear the filter"),
         ],
@@ -366,7 +382,10 @@ const FULL_HELP: &[Section] = &[
         keys: &[
             ("↑↓ / j/k", "Scroll connection list"),
             ("t", "Cycle time window (1m/5m/15m/30m/1h)"),
-            ("f", "Cycle events: all / crit / warn / conn / dns / rtt / iface"),
+            (
+                "f",
+                "Cycle events: all / crit / warn / conn / dns / rtt / iface",
+            ),
             ("Enter", "Jump to Connections tab"),
         ],
     },
@@ -405,7 +424,10 @@ const FULL_HELP: &[Section] = &[
             ("↑↓ / j/k", "Select a check"),
             ("t", "Run the selected check's test"),
             ("] / [", "Select the next/previous configured target"),
-            ("d", "Enable/disable the selected target (on a target.* check)"),
+            (
+                "d",
+                "Enable/disable the selected target (on a target.* check)",
+            ),
             ("r", "Reload targets and probes from config.toml"),
             ("x", "Cancel running active and target probes"),
         ],

@@ -64,6 +64,8 @@ pub mod ui;
 pub mod uptime;
 
 #[cfg(test)]
+mod layout_tests;
+#[cfg(test)]
 mod scale_tests;
 #[cfg(test)]
 mod testutil;
