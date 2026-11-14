@@ -122,6 +122,11 @@ All notable changes to NetWatch will be documented in this file.
 ## [1.0.0-rc.3] - 2026-11-10
 
 ### Fixed
+- **Windows: `cargo test` no longer crashes on Rust 1.100.** Every unit test aborted at
+  startup with an access violation. `pcap`'s Windows dependency ships an import library
+  that maps `WaitOnAddress` and `WakeByAddressAll` to `vertdll.dll`, and from Rust 1.100
+  the standard library's own calls were bound to it in the unit-test binary. The crate now
+  binds both to the correct DLL itself. Release binaries were never affected.
 - **The capture fix line no longer changes your working directory when netwatch isn't on
   `PATH`.** The line the capture error, the Dashboard banner and `netwatch doctor` give on Linux
   starts `b=$(readlink -f "$(which netwatch)")`. GNU `readlink -f ""` fails and stopped the
