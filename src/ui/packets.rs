@@ -1,6 +1,6 @@
 use crate::app::{App, StreamDirectionFilter};
 use crate::collectors::packets::{
-    ascii_dump, format_endpoint, hex_dump, matches_packet_in, parse_filter, port_label,
+    ascii_dump_wide, format_endpoint, hex_dump_wide, matches_packet_in, parse_filter, port_label,
     CapturedPacket, ExpertSeverity, FilterExpr, StreamDirection,
 };
 use crate::ui::stream_context;
@@ -47,13 +47,25 @@ fn lower_panes(area: Rect) -> (Rect, Option<Rect>) {
 /// below have to stay where they are; a decode that overruns its box is a
 /// smaller problem than three boxes that never sit still.
 fn detail_rows(area: Rect) -> std::rc::Rc<[Rect]> {
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    // Three boxes need three rows of content and six of border. In fewer than
+    // twelve the payload and hex boxes were two borders with nothing between
+    // them, so a short column is the protocol decode and nothing else.
+    let constraints = if area.height < 12 {
+        [
+            Constraint::Min(0),
+            Constraint::Length(0),
+            Constraint::Length(0),
+        ]
+    } else {
+        [
             Constraint::Percentage(50),
             Constraint::Percentage(25),
             Constraint::Percentage(25),
-        ])
+        ]
+    };
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area)
 }
 
@@ -67,7 +79,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let (list_constraint, detail_constraint) = if app.ui.packet_detail_expanded {
         (Constraint::Percentage(25), Constraint::Percentage(75))
     } else {
-        (Constraint::Min(10), Constraint::Length(16))
+        // The detail pane gives rows back on a short terminal. At a fixed 16
+        // the layout asked for 33 rows, and in an 80×24 terminal the solver
+        // found the missing nine by shrinking the header to nothing: the tab
+        // bar was not drawn at all.
+        let detail = 16.min(area.height.saturating_sub(3 + 1 + 8 + 3)).max(5);
+        (Constraint::Min(4), Constraint::Length(detail))
     };
     // The failure takes the verdict's row, and more for a fix that fits. Those
     // rows come off the top before the layout runs, which could shrink a header
@@ -247,7 +264,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
     }
 
     if let Some(e) = crate::ui::widgets::capture_failure(app) {
-        let line1 = crate::ui::widgets::build_header_line(app, Some(extra));
+        let line1 = crate::ui::widgets::build_header_line(app, Some(extra), area.width);
         let mut lines = vec![line1];
         // The tab row above and the border below.
         lines.extend(crate::ui::widgets::capture_failure_lines(
@@ -268,6 +285,27 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
     // copy is just the same sentence twice on one screen.
     } else {
         crate::ui::widgets::render_header_with_extra(f, app, area, extra);
+    }
+}
+
+/// A packet's summary without the `src → dst` it opens with.
+///
+/// The collector writes `192.168.0.32:39542 → 199.232.137.176:443 [ACK]
+/// Seq=… Win=…`, which is right for an export and a filter. In the list the
+/// two endpoints are the columns immediately to the left, so the info column
+/// spent its width repeating them and ran out before the flags and sequence
+/// numbers — the part that tells one ACK from the next. A summary that is
+/// nothing but the endpoints is kept whole.
+pub(crate) fn info_after_endpoints(info: &str) -> &str {
+    let Some((src, rest)) = info.split_once(" → ") else {
+        return info;
+    };
+    if src.contains(' ') {
+        return info;
+    }
+    match rest.split_once(' ') {
+        Some((_dst, tail)) if !tail.trim().is_empty() => tail.trim_start(),
+        _ => info,
     }
 }
 
@@ -538,20 +576,88 @@ fn endpoint_cell(host: &str, port: Option<u16>) -> String {
     }
 }
 
+const PACKET_HEADERS: [&str; 9] = [
+    "!",
+    "#",
+    "time",
+    "source",
+    "destination",
+    "proto",
+    "len",
+    "stream",
+    "info",
+];
+const INFO_COL: usize = 8;
+/// The widest an endpoint cell gets, which fits `host:port (service)`.
+const ENDPOINT_FULL: u16 = 28;
+
+/// The packet list's column widths for a terminal width. Zero hides a column.
+struct PacketCols {
+    widths: [u16; 9],
+}
+
+/// Fit the packet list to the terminal instead of letting the solver squeeze
+/// every column at once.
+///
+/// At a fixed 28 columns per endpoint the table wanted 129 columns. In an
+/// 80-column terminal the solver took the shortfall from the time and the two
+/// endpoints, which left `20:10:` and `104.18.`: three columns on screen and
+/// nothing readable in any of them. Narrow terminals now give up the stream
+/// number and the length (both are in the detail pane), then the milliseconds,
+/// and the endpoints share what is left.
+fn packet_cols(width: u16) -> PacketCols {
+    let inner = width.saturating_sub(2);
+    let narrow = inner < 112;
+    let (time, len, stream, info_min) = if narrow {
+        (8, 0, 0, 16)
+    } else {
+        (13, 5, 7, 22)
+    };
+    let fixed = [2, 6, time, 7, len, stream];
+    let shown = fixed.iter().filter(|w| **w > 0).count() as u16 + 3;
+    let spare = inner.saturating_sub(fixed.iter().sum::<u16>() + (shown - 1) + info_min);
+    let endpoint = (spare / 2).clamp(10, ENDPOINT_FULL);
+    PacketCols {
+        widths: [2, 6, time, endpoint, endpoint, 7, len, stream, info_min],
+    }
+}
+
+/// An endpoint that fits `width` columns and still ends in its port.
+///
+/// The service name goes first, since the proto column already says it. A
+/// host that is still too long is cut in the middle of the cell, not at the
+/// end: `unifi.localdom…:48000` says which socket, `unifi.localdomain:4` does
+/// not.
+fn endpoint_fit(host: &str, port: Option<u16>, width: usize) -> String {
+    let full = endpoint_cell(host, port);
+    if crate::ui::text::width(&full) <= width {
+        return full;
+    }
+    let Some(port) = port else {
+        return truncate_info(host, width);
+    };
+    let plain = format_endpoint(host, port);
+    if crate::ui::text::width(&plain) <= width {
+        return plain;
+    }
+    let tail = format!(":{port}");
+    let room = width.saturating_sub(tail.len());
+    // A cut IPv6 address would lose its closing bracket, and with it the line
+    // between the address and the port.
+    if room < 4 || host.contains(':') {
+        return truncate_info(&plain, width);
+    }
+    format!("{}{tail}", truncate_info(host, room))
+}
+
 fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
+    let cols = packet_cols(area.width);
     let header = Row::new(
-        [
-            "!",
-            "#",
-            "time",
-            "source",
-            "destination",
-            "proto",
-            "len",
-            "stream",
-            "info",
-        ]
-        .map(|h| Cell::from(h).style(Style::default().fg(app.theme.text_muted))),
+        PACKET_HEADERS
+            .iter()
+            .zip(cols.widths)
+            .filter(|(_, w)| *w > 0)
+            .map(|(h, _)| Cell::from(*h).style(Style::default().fg(app.theme.text_muted))),
     )
     .height(1);
 
@@ -641,8 +747,9 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             let src_label = src_resolved.as_deref().unwrap_or(&pkt.src_ip);
             let dst_label = dst_resolved.as_deref().unwrap_or(&pkt.dst_ip);
 
-            let src_display = endpoint_cell(src_label, pkt.src_port);
-            let dst_display = endpoint_cell(dst_label, pkt.dst_port);
+            let endpoint_w = cols.widths[3] as usize;
+            let src_display = endpoint_fit(src_label, pkt.src_port, endpoint_w);
+            let dst_display = endpoint_fit(dst_label, pkt.dst_port, endpoint_w);
 
             let stream_label = pkt
                 .stream_index
@@ -726,7 +833,7 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                     target: None,
                 }) => format!("SSDP {}", method),
                 Some(crate::dpi::AppProtocol::Ftp { command }) => format!("FTP {}", command),
-                _ => pkt.info.clone(),
+                _ => info_after_endpoints(&pkt.info).to_string(),
             };
             // Append the decoded JA4 client name when known, so users
             // scanning the packet list see "HTTPS google.com (Chromium
@@ -791,7 +898,7 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             // is most likely to be looking at, and the one whose id they need
             // to quote. Lift them for the selected row only.
             let dim = |s: Style| fade(readable_when_selected(s, selected, &app.theme));
-            Row::new(vec![
+            let cells = [
                 Cell::from(expert_icon).style(fade(expert_style)),
                 Cell::from(pkt.id.to_string())
                     .style(dim(Style::default().fg(app.theme.text_muted))),
@@ -808,24 +915,31 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
                 // " (Chromium Browser)" which the older 40-char limit
                 // cut off mid-word.
                 Cell::from(truncate_info(&info_text, 120)).style(fade(info_style)),
-            ])
+            ];
+            Row::new(
+                cells
+                    .into_iter()
+                    .zip(cols.widths)
+                    .filter(|(_, w)| *w > 0)
+                    .map(|(cell, _)| cell),
+            )
             .style(row_style)
         })
         .collect();
 
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(2),
-            Constraint::Length(6),
-            Constraint::Length(13),
-            Constraint::Length(28),
-            Constraint::Length(28),
-            Constraint::Length(7),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Min(25),
-        ],
+        cols.widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 0)
+            .map(|(i, w)| {
+                if i == INFO_COL {
+                    Constraint::Min(*w)
+                } else {
+                    Constraint::Length(*w)
+                }
+            }),
     )
     .header(header)
     .block({
@@ -1020,7 +1134,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
 
             // TLS/QUIC-decrypted application data (when SSLKEYLOGFILE
             // matched this flow). The detail pane only summarizes what we
-            // recovered — the bytes themselves live in the Payload Content
+            // recovered — the bytes themselves live in the payload
             // pane below, so we don't duplicate them here.
             if let Some(pt) = &pkt.decrypted_plaintext {
                 let is_quic =
@@ -1040,7 +1154,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 )));
                 // Note any HTTP/3 bodies recovered for this flow — reassembled
                 // across packets when the body spans more than one (Phase 3b).
-                // The decoded bytes render in the Payload Content pane.
+                // The decoded bytes render in the payload pane.
                 if is_quic {
                     let bodies = app.packet_collector.quic_h3_bodies_for_packet(pkt);
                     for decoded in &bodies {
@@ -1193,7 +1307,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
             );
             f.render_widget(proto_detail, rows[0]);
 
-            {
+            if rows[1].height > 0 {
                 // Payload content. For a TLS flow the on-wire payload is
                 // ciphertext (so `payload_text` is just "[N bytes binary
                 // data]"); when we decrypted it, show the actual plaintext
@@ -1220,15 +1334,15 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                                 ));
                                 body.push_str(&preview_decrypted_bytes(&decoded.bytes, 16384));
                             }
-                            " Payload Content (QUIC 1-RTT decrypted) "
+                            " payload  QUIC 1-RTT decrypted "
                         } else {
-                            " Payload Content (TLS decrypted) "
+                            " payload  TLS decrypted "
                         };
                         (body, title, Style::default().fg(app.theme.status_good))
                     } else if has_payload {
                         (
                             pkt.payload_text.clone(),
-                            " Payload Content ",
+                            " payload ",
                             Style::default().fg(app.theme.text_primary),
                         )
                     } else {
@@ -1238,7 +1352,7 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                         // the hex box below at a fixed row.
                         (
                             format!("headers only · {} bytes on the wire", pkt.length),
-                            " Payload Content ",
+                            " payload ",
                             Style::default().fg(app.theme.text_muted),
                         )
                     };
@@ -1283,11 +1397,23 @@ fn render_hex_ascii(
     chunks: std::rc::Rc<[Rect]>,
     theme: &crate::theme::Theme,
 ) {
-    // Dump only the lines the panes have rows for. Each line takes at least
-    // one row, and a 64 KB frame dumps to 4096 lines.
+    // Sixteen bytes to a line where the hex pane has the 53 columns that
+    // takes, eight where it does not. A wrapped line put bytes 11 to 15 under
+    // the offset of the next one, and the ascii pane beside it, which did not
+    // wrap, stopped lining up with the hex after the first row.
+    let hex_cols = usize::from(chunks[0].width.saturating_sub(2));
+    let per_line = if hex_cols >= 6 + 16 * 3 - 1 { 16 } else { 8 };
+    // Dump only the lines the panes have rows for. Each line takes one row,
+    // and a 64 KB frame dumps to 4096 lines.
     let rows = usize::from(chunks[0].height.max(chunks[1].height));
-    let shown = &pkt.raw_bytes[..pkt.raw_bytes.len().min(rows * 16)];
-    render_dumps(f, hex_dump(shown), ascii_dump(shown), chunks, theme);
+    let shown = &pkt.raw_bytes[..pkt.raw_bytes.len().min(rows * per_line)];
+    render_dumps(
+        f,
+        hex_dump_wide(shown, per_line),
+        ascii_dump_wide(shown, per_line),
+        chunks,
+        theme,
+    );
 }
 
 /// The hex and ASCII dump panes, side by side.
@@ -1303,7 +1429,7 @@ fn render_dumps(
         .block(
             widgets::panel_block(theme)
                 .title(Line::from(Span::styled(
-                    " Hex Dump ",
+                    " hex ",
                     Style::default().fg(theme.brand).bold(),
                 )))
                 .border_style(Style::default().fg(theme.border)),
@@ -1663,17 +1789,7 @@ fn format_bytes(b: u64) -> String {
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     // Filter input mode — show editable filter bar
     if app.ui.packet_filter_input {
-        let filter_line = Line::from(vec![
-            Span::styled(" / ", Style::default().fg(app.theme.brand).bold()),
-            Span::raw(&app.ui.packet_filter_text),
-            Span::styled("█", Style::default().fg(app.theme.text_primary)),
-        ]);
-        let bar = Paragraph::new(filter_line).block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(app.theme.key_hint)),
-        );
-        f.render_widget(bar, area);
+        crate::ui::widgets::render_filter_bar(f, &app.theme, area, &app.ui.packet_filter_text);
         return;
     }
 
@@ -2227,6 +2343,52 @@ fn expert_row_style(severity: ExpertSeverity, theme: &crate::theme::Theme) -> St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_packet_columns_fit_every_width() {
+        for width in 60u16..=220 {
+            let cols = packet_cols(width);
+            let shown: Vec<u16> = cols.widths.iter().copied().filter(|w| *w > 0).collect();
+            let total: u16 = shown.iter().sum::<u16>() + shown.len() as u16 - 1;
+            if width >= 80 {
+                assert!(total <= width - 2, "{width}: columns need {total}");
+                assert!(cols.widths[2] >= 8, "{width}: the time is cut");
+                assert!(cols.widths[3] >= 15, "{width}: endpoints are unreadable");
+            }
+        }
+        assert_eq!(packet_cols(140).widths[3], ENDPOINT_FULL);
+    }
+
+    #[test]
+    fn a_narrow_endpoint_keeps_its_port() {
+        assert_eq!(
+            endpoint_fit("unifi.localdomain", Some(48000), 16),
+            "unifi.loc…:48000"
+        );
+        assert_eq!(
+            endpoint_fit("10.0.0.1", Some(443), 28),
+            "10.0.0.1:443 (HTTPS)"
+        );
+        assert_eq!(endpoint_fit("10.0.0.1", Some(443), 14), "10.0.0.1:443");
+    }
+
+    #[test]
+    fn the_info_column_does_not_repeat_the_endpoint_columns() {
+        use super::info_after_endpoints as f;
+        assert_eq!(
+            f("192.168.0.32:39542 → 199.232.137.176:443 [ACK] Seq=1 Win=501"),
+            "[ACK] Seq=1 Win=501"
+        );
+        assert_eq!(f("192.168.0.32 → 192.168.0.1 Echo Request"), "Echo Request");
+        // Nothing after the endpoints: keep them, an empty cell says less.
+        assert_eq!(f("10.0.0.1 → 10.0.0.2"), "10.0.0.1 → 10.0.0.2");
+        // Not an endpoint pair.
+        assert_eq!(
+            f("Who has 192.168.0.6? Tell 192.168.0.1"),
+            "Who has 192.168.0.6? Tell 192.168.0.1"
+        );
+        assert_eq!(f("HTTPS dl.google.com"), "HTTPS dl.google.com");
+    }
+
     use super::*;
     use crate::collectors::packets::{CapturedPacket, ExpertSeverity};
 
@@ -2713,6 +2875,7 @@ mod tests {
     /// used to carry showed.
     #[test]
     fn hex_pane_matches_previous_hex_dump() {
+        use crate::collectors::packets::{ascii_dump, hex_dump};
         use ratatui::{backend::TestBackend, Terminal};
         // Every byte value, then a short last line.
         let raw: Vec<u8> = (0..=255).chain(0..=40).collect();
@@ -2728,9 +2891,9 @@ mod tests {
         let mut pkt = pkt_with_decrypted(None);
         pkt.raw_bytes = raw;
         let theme = crate::theme::by_name("default");
-        // The dump has 19 lines. The panes have fewer rows, and at 80 columns
-        // the hex lines wrap.
-        for (width, height) in [(120, 12), (80, 12), (120, 30)] {
+        // The dump has 19 lines and the panes have fewer rows. At 80 columns
+        // the panes take eight bytes to a line, which is not the old dump.
+        for (width, height) in [(120, 12), (120, 30)] {
             let draw = |old: bool| {
                 let area = Rect::new(0, 0, width, height);
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

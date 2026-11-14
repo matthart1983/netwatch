@@ -816,10 +816,12 @@ start, so there is nothing to validate.
 | `w` | Preview and export the shown packets as PCAPNG or PCAP |
 | `T` | Traceroute |
 | `W` | Whois lookup |
-| `t` | Cycle theme |
+| `t` | The tab's own time control: scale (Dashboard), range (Stats, Timeline), run test (Diagnose) |
 | `V` | Cycle view: full → lite → dense (dense needs 130×44, then grows to fit) |
 | `L` | Switch to the Lite view |
 | `,` | Settings |
+| `:` | Command palette: type part of an action's name, `↵` runs it |
+| `Esc` | Back to the tab `↵` drilled in from |
 | `?` | Help |
 | `q` | Quit (asks first with `confirm_quit = true`). On an overlay, `q` closes it |
 | `Ctrl+C` | Quit at once |

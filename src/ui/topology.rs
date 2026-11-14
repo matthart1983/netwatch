@@ -12,21 +12,43 @@ use ratatui::{
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    // The graph needs GRAPH_MIN_W columns for its two side columns and the
+    // router and ISP boxes between them. Under that it used to keep its
+    // fourteen rows to say "Terminal too small for graph view", and left the
+    // hop table — which draws at any width — one row of data. A panel that
+    // cannot draw gives its rows to the one that can.
+    let graph_fits = area.width >= GRAPH_MIN_W + 2 && area.height >= 3 + 10 + 5 + 3;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(14),   // topology graph (gets the slack)
-            Constraint::Length(9), // hop detail table — fixed compact
-            Constraint::Length(3), // footer
-        ])
+        .constraints(if graph_fits {
+            [
+                Constraint::Length(3), // header
+                Constraint::Min(14),   // topology graph (gets the slack)
+                Constraint::Length(9), // hop detail table — fixed compact
+                Constraint::Length(3), // footer
+            ]
+        } else {
+            [
+                Constraint::Length(3),
+                Constraint::Length(0),
+                Constraint::Min(5),
+                Constraint::Length(3),
+            ]
+        })
         .split(area);
 
     widgets::render_header(f, app, chunks[0]);
-    render_topology_graph(f, app, chunks[1]);
-    render_hop_detail(f, app, chunks[2]);
+    if graph_fits {
+        render_topology_graph(f, app, chunks[1]);
+    }
+    render_hop_detail(f, app, chunks[2], !graph_fits);
     render_footer(f, app, chunks[3]);
 }
+
+/// Narrowest panel interior the graph can be drawn in.
+const GRAPH_MIN_W: u16 = 90;
+/// A hop row without its host: dot, number, ip, rtt, loss, jitter and gaps.
+const HOP_FIXED_W: usize = 2 + 4 + 1 + 1 + 19 + 8 + 1 + 5 + 1 + 6;
 
 // ── Topology graph ──────────────────────────────────────────
 
@@ -60,6 +82,18 @@ fn build_remote_nodes(app: &App) -> (Vec<RemoteNode>, Vec<RemoteNode>) {
         let Some(ip) = crate::app::parse_addr_parts(&conn.remote_addr).0 else {
             continue;
         };
+        // A wildcard is where a listener waits, not a host it talks to, and
+        // loopback is this machine: `localhost` and the resolver stub at
+        // 127.0.0.53 were listed under "lan peers".
+        // `0.0.0.0` and `::` were drawn in the LAN column as peers, with
+        // every listening socket on the machine counted against them.
+        if ip == "*"
+            || ip
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|addr| addr.is_unspecified() || addr.is_loopback())
+        {
+            continue;
+        }
         let is_local = is_private_ip(&ip);
         let entry = remotes.entry(ip.clone()).or_insert_with(|| {
             (
@@ -135,7 +169,7 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if inner.height < 8 || inner.width < 90 {
+    if inner.height < 8 || inner.width < GRAPH_MIN_W {
         let msg = Paragraph::new(" Terminal too small for graph view")
             .style(Style::default().fg(t.text_muted));
         f.render_widget(msg, inner);
@@ -292,7 +326,7 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
     let isp_status = if isp_rtt.is_some() {
         format!("up  {}", isp_rtt_str)
     } else {
-        "T:Traceroute".to_string()
+        "T to trace".to_string()
     };
     f.render_widget(
         Paragraph::new(vec![
@@ -685,7 +719,7 @@ fn connection_text(
     }
 }
 
-fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
+fn render_hop_detail(f: &mut Frame, app: &App, area: Rect, graph_hidden: bool) {
     let t = &app.theme;
     let result =
         crate::app::safe_lock(&app.traceroute_runner.result, "topology::render_hop_detail");
@@ -696,6 +730,18 @@ fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
         TracerouteStatus::Running => " ⏳ running… ".to_string(),
         TracerouteStatus::Done => format!(" {} hops ", result.hops.len()),
         TracerouteStatus::Error(_) => " error ".to_string(),
+    };
+    // The graph gives its rows to this table when it cannot draw. Say so, or
+    // a narrow terminal just looks like a tab with no topology on it.
+    let title_right = if graph_hidden {
+        format!(
+            "{}· graph needs {}×{} ",
+            title_right,
+            GRAPH_MIN_W + 2,
+            3 + 10 + 5 + 3
+        )
+    } else {
+        title_right
     };
     let title_right_color = match &result.status {
         TracerouteStatus::Running => t.status_warn,
@@ -722,8 +768,16 @@ fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let header =
-        "  hop   host                              ip                    rtt      loss    jitter";
+    // The host column gives up what an 80-column terminal does not have. At
+    // a fixed 32 the row was 80 wide in a 76-column panel: the header lost
+    // `loss` to `los` and every row lost its jitter.
+    let host_w = (inner.width as usize)
+        .saturating_sub(2 + HOP_FIXED_W)
+        .clamp(12, 32);
+    let header = format!(
+        "  {:>3}  {:<host_w$} {:<19}{:>8} {:>5} {:>6}",
+        "hop", "host", "ip", "rtt", "loss", "jitter"
+    );
     let header_area = Rect {
         x: inner.x + 1,
         y: inner.y,
@@ -775,7 +829,10 @@ fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
     let max_rows = inner.height.saturating_sub(1) as usize;
     for (i, hop) in result.hops.iter().take(max_rows).enumerate() {
         let row_y = inner.y + 1 + i as u16;
-        render_hop_row(f, t, inner, row_y, hop);
+        let later_hop_clean = result.hops[i + 1..]
+            .iter()
+            .any(|h| !h.rtt_ms.is_empty() && h.rtt_ms.iter().all(|r| r.is_some()));
+        render_hop_row(f, t, inner, row_y, hop, later_hop_clean, host_w);
     }
 }
 
@@ -785,6 +842,9 @@ fn render_hop_row(
     inner: Rect,
     row_y: u16,
     hop: &crate::collectors::traceroute::TracerouteHop,
+    // Whether a hop further along answered every probe.
+    later_hop_clean: bool,
+    host_w: usize,
 ) {
     let host = hop
         .host
@@ -813,10 +873,12 @@ fn render_hop_row(
         Some(var.sqrt())
     };
 
+    // The panel's own legend: ok, over 50 ms, over 200 ms. The table used a
+    // different scale — amber from 10 ms — so a 14 ms hop was drawn as a
+    // warning two rows under a legend that called it fine.
     let rtt_color = match avg_rtt {
-        Some(r) if r < 10.0 => t.status_good,
-        Some(r) if r < 50.0 => t.status_warn,
-        Some(r) if r < 200.0 => t.accent_amber(),
+        Some(r) if r < 50.0 => t.status_good,
+        Some(r) if r < 200.0 => t.status_warn,
         Some(_) => t.status_error,
         None => t.text_muted,
     };
@@ -824,8 +886,15 @@ fn render_hop_row(
     let rtt_str = avg_rtt
         .map(|r| format!("{:.1}ms", r))
         .unwrap_or_else(|| "—".to_string());
+    // A router that drops or rate-limits probes addressed to itself while
+    // the hops behind it answer every one is not losing traffic: packets
+    // plainly got through it. Calling that `67%` loss sends people to
+    // debug a gateway that is working.
+    let silent = loss_pct > 0.0 && later_hop_clean;
     let loss_str = if loss_pct == 0.0 {
         "0%".to_string()
+    } else if silent {
+        "quiet".to_string()
     } else {
         format!("{:.0}%", loss_pct)
     };
@@ -841,7 +910,7 @@ fn render_hop_row(
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:<32}", truncate(&host, 32)),
+            format!("{:<host_w$}", truncate(&host, host_w)),
             Style::default().fg(if hop.ip.is_some() {
                 t.text_primary
             } else {
@@ -859,6 +928,8 @@ fn render_hop_row(
             format!("{:>5}", loss_str),
             Style::default().fg(if loss_pct == 0.0 {
                 t.status_good
+            } else if silent {
+                t.text_muted
             } else {
                 t.status_warn
             }),

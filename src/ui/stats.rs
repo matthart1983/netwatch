@@ -7,15 +7,19 @@ use crate::ui::widgets;
 use ratatui::{prelude::*, widgets::Paragraph};
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    // The breakdown panels give up rows before anything else does. Asking for
+    // eleven on a 24-row terminal left the solver six rows short, and it took
+    // them from the header: the verdict row went first, then the tab bar.
+    let breakdown = area.height.saturating_sub(3 + 1 + 4 + 8 + 3).clamp(5, 11);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Length(2),  // range chips
-            Constraint::Length(4),  // 5 KPI tiles
-            Constraint::Length(11), // 3 breakdown panels
-            Constraint::Min(8),     // throughput chart
-            Constraint::Length(3),  // footer
+            Constraint::Length(3),         // header
+            Constraint::Length(1),         // range chips
+            Constraint::Length(4),         // 5 KPI tiles
+            Constraint::Length(breakdown), // 3 breakdown panels
+            Constraint::Min(8),            // throughput chart
+            Constraint::Length(3),         // footer
         ])
         .split(area);
 
@@ -175,10 +179,12 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
         ])
         .split(area);
 
-    let elapsed = app.session_started_at.elapsed().as_secs().max(1);
-
-    let pkts_per_sec = stats.total_packets / elapsed;
-    let avg_label = format!("{}/s avg", format_count(pkts_per_sec));
+    // These tiles count the capture ring, not the session: the ring holds the
+    // last few thousand packets and forgets the rest. Each says so. The first
+    // used to print the ring's size as `packets` over a per-second average
+    // made by dividing that size by the session's age, a number that fell
+    // towards zero the longer netwatch ran.
+    let avg_label = "held in the capture ring".to_string();
     render_kpi_tile(
         f,
         app,
@@ -190,7 +196,7 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
     );
 
     let bytes_label = format!(
-        "rx {}  tx {}",
+        "iface ↓{} ↑{}",
         format_bytes_short(stats.rx_bytes),
         format_bytes_short(stats.tx_bytes),
     );
@@ -245,7 +251,7 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
         "0".to_string()
     };
     let retrans_label = format!(
-        "{} of {}",
+        "{} of {} in ring",
         stats.retrans_count,
         format_count(stats.total_packets)
     );
@@ -337,6 +343,12 @@ fn render_breakdowns(
 
 struct BreakdownItem {
     label: String,
+    /// What the bar is drawn from: the quantity itself, in one unit for the
+    /// whole panel.
+    magnitude: f64,
+    /// What is printed, scaled to `unit`. Never compared across rows: the
+    /// bars used to be drawn from it, so `906 B` filled the track and
+    /// `261.2 MB` above it got a third.
     value: f64,
     unit: &'static str,
     color: Color,
@@ -382,14 +394,17 @@ fn render_breakdown_panel(
 
     let max_val = items
         .iter()
-        .map(|i| i.value)
+        .map(|i| i.magnitude)
         .fold(0.0f64, f64::max)
         .max(1.0);
 
     let max_rows = inner.height as usize;
     let rendered = items.iter().take(max_rows).count();
     for (i, item) in items.iter().take(max_rows).enumerate() {
-        let filled = ((item.value / max_val) * bar_w as f64).round() as usize;
+        // Proportional, but never an empty track beside a number: anything
+        // measured gets its one cell.
+        let filled = (((item.magnitude / max_val) * bar_w as f64).round() as usize)
+            .max(usize::from(item.magnitude > 0.0 && bar_w > 0));
         let bar: String = (0..bar_w)
             .map(|j| if j < filled { '█' } else { '░' })
             .collect();
@@ -432,42 +447,52 @@ fn render_breakdown_panel(
 
 fn render_protocol_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
     let t = &app.theme;
-    let mut totals: HashMap<&'static str, u64> = HashMap::new();
+    let mut totals: HashMap<&str, u64> = HashMap::new();
     for p in packets {
-        let label = classify_protocol(&p.protocol);
-        *totals.entry(label).or_insert(0) += p.length as u64;
+        *totals.entry(protocol_label(&p.protocol)).or_insert(0) += p.length as u64;
     }
     let total: u64 = totals.values().sum();
     if total == 0 {
         render_breakdown_panel(f, app, area, "protocol  by bytes", Vec::new());
         return;
     }
-    let mut items: Vec<BreakdownItem> = totals
-        .into_iter()
-        .map(|(label, bytes)| BreakdownItem {
-            label: label.to_string(),
-            value: bytes as f64 / total as f64 * 100.0,
-            unit: "%",
-            color: protocol_palette(label, t),
-        })
+    let mut ranked: Vec<(&str, u64)> = totals.into_iter().collect();
+    // By bytes, then by name: equal shares must not swap rows between frames.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let item = |label: String, bytes: u64, color: Color| BreakdownItem {
+        label,
+        magnitude: bytes as f64,
+        value: bytes as f64 / total as f64 * 100.0,
+        unit: "%",
+        color,
+    };
+    let mut items: Vec<BreakdownItem> = ranked
+        .iter()
+        .take(5)
+        .map(|&(label, bytes)| item(label.to_string(), bytes, protocol_palette(label, t)))
         .collect();
-    items.sort_by(|a, b| {
-        b.value
-            .partial_cmp(&a.value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    items.truncate(6);
+    let rest: u64 = ranked.iter().skip(5).map(|r| r.1).sum();
+    if rest > 0 {
+        items.push(item(
+            format!("others ({})", ranked.len() - 5),
+            rest,
+            t.text_muted,
+        ));
+    }
     render_breakdown_panel(f, app, area, "protocol  by bytes", items);
 }
 
-fn classify_protocol(p: &str) -> &'static str {
+/// The name a packet's protocol is counted under.
+///
+/// The packet's own label — `HTTPS`, `QUIC`, `SSH` — which is what the
+/// Packets tab calls it. This used to recognise five names and file the rest
+/// under `other`, and the five did not include anything a web browser
+/// speaks: a machine downloading over HTTPS read `other 99.4%`.
+fn protocol_label(p: &str) -> &str {
     match p {
-        "TCP" => "TCP",
-        "UDP" => "UDP",
-        "DNS" => "DNS",
-        "ICMP" | "ICMPv6" => "ICMP",
-        "ARP" => "ARP",
-        _ => "other",
+        "ICMPv6" => "ICMP",
+        "" => "other",
+        p => p,
     }
 }
 
@@ -478,7 +503,8 @@ fn protocol_palette(label: &str, t: &crate::theme::Theme) -> Color {
         "DNS" => t.status_good,
         "ICMP" => t.status_warn,
         "ARP" => t.brand,
-        _ => t.text_muted,
+        "HTTPS" | "TLS" | "QUIC" | "HTTP" => t.rx_rate,
+        _ => t.text_secondary,
     }
 }
 
@@ -508,6 +534,7 @@ fn render_processes_breakdown(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, p)| BreakdownItem {
             label: p.process_name.clone(),
+            magnitude: p.rx_bytes as f64,
             value: bytes_to_unit_value(p.rx_bytes),
             unit: bytes_to_unit_str(p.rx_bytes),
             color: palette[i % palette.len()],
@@ -518,6 +545,7 @@ fn render_processes_breakdown(f: &mut Frame, app: &App, area: Rect) {
     if other_bytes > 0 {
         items.push(BreakdownItem {
             label: format!("others ({})", by_rx.len().saturating_sub(5)),
+            magnitude: other_bytes as f64,
             value: bytes_to_unit_value(other_bytes),
             unit: bytes_to_unit_str(other_bytes),
             color: t.text_muted,
@@ -565,6 +593,7 @@ fn render_remotes_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket]
                 .unwrap_or_else(|| label.clone());
             BreakdownItem {
                 label: display,
+                magnitude: *bytes as f64,
                 value: bytes_to_unit_value(*bytes),
                 unit: bytes_to_unit_str(*bytes),
                 color: palette[i % palette.len()],
@@ -576,6 +605,7 @@ fn render_remotes_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket]
     if other_bytes > 0 {
         items.push(BreakdownItem {
             label: format!("others ({})", sorted.len().saturating_sub(5)),
+            magnitude: other_bytes as f64,
             value: bytes_to_unit_value(other_bytes),
             unit: bytes_to_unit_str(other_bytes),
             color: t.text_muted,
@@ -686,6 +716,9 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
 
     let peak_rx = *agg_rx.iter().max().unwrap_or(&0);
     let peak_tx = *agg_tx.iter().max().unwrap_or(&0);
+    // The header still reports the true peak; only the plot's ceiling moves.
+    let (rx_max, rx_clipped) = crate::graph::spike_capped_max(&agg_rx);
+    let (tx_max, tx_clipped) = crate::graph::spike_capped_max(&agg_tx);
     let avg_rx = if !agg_rx.is_empty() {
         agg_rx.iter().sum::<u64>() / agg_rx.len() as u64
     } else {
@@ -700,7 +733,7 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         .title(
             Line::from(Span::styled(
                 format!(
-                    " {}  RX/TX ",
+                    " {}  rx/tx ",
                     format_duration(app.session_started_at.elapsed().as_secs())
                 ),
                 Style::default().fg(t.text_muted),
@@ -717,17 +750,25 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
     // Header summary line
     let header_line = Line::from(vec![
         Span::styled(
-            format!("● RX peak {}", widgets::format_bytes_rate(peak_rx as f64)),
+            format!("● rx peak {}", widgets::format_bytes_rate(peak_rx as f64)),
             Style::default().fg(t.rx_rate),
         ),
         Span::styled("    ", Style::default()),
         Span::styled(
-            format!("● TX peak {}", widgets::format_bytes_rate(peak_tx as f64)),
+            format!("● tx peak {}", widgets::format_bytes_rate(peak_tx as f64)),
             Style::default().fg(t.tx_rate),
         ),
         Span::styled("    ", Style::default()),
         Span::styled(
-            format!("avg {}", widgets::format_bytes_rate(avg_rx as f64)),
+            format!(
+                "avg {}{}",
+                widgets::format_bytes_rate(avg_rx as f64),
+                if rx_clipped || tx_clipped {
+                    "    spike clipped"
+                } else {
+                    ""
+                }
+            ),
             Style::default().fg(t.text_muted),
         ),
     ]);
@@ -761,19 +802,21 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         height: tx_h,
     };
 
-    crate::graph::render(
+    crate::graph::render_with_max(
         f,
         rx_area,
         &agg_rx,
+        rx_max,
         app.graph_style,
         t.rx_rate,
         t.status_warn,
         app.graph_opts(),
     );
-    crate::graph::render(
+    crate::graph::render_with_max(
         f,
         tx_area,
         &agg_tx,
+        tx_max,
         app.graph_style,
         t.tx_rate,
         t.status_warn,

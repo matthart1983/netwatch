@@ -1446,7 +1446,8 @@ impl App {
         let interfaces = self.traffic.interfaces();
         self.process_bandwidth.update(&conns, &interfaces);
         update_top_conn_history(&mut self.caches.top_conn_history, &conns);
-        update_top_proc_rx_history(&mut self.caches.top_proc_rx_history, &conns);
+        update_top_proc_history(&mut self.caches.top_proc_rx_history, &conns, |c| c.rx_rate);
+        update_top_proc_history(&mut self.caches.top_proc_tx_history, &conns, |c| c.tx_rate);
     }
 
     fn sample_rtt_from_streams(&mut self) {
@@ -1674,6 +1675,9 @@ pub fn draw_frame(f: &mut Frame, app: &mut App) {
     if let Some(dialog) = &app.capture_export {
         dialog.render(f, area, &app.theme);
     }
+    if app.ui.palette.open {
+        ui::palette::render(f, app, area);
+    }
     if app.ui.quit_pending {
         ui::quit_confirm::render(f, app, area);
     }
@@ -1690,6 +1694,7 @@ pub fn draw_frame(f: &mut Frame, app: &mut App) {
     // Last, after every widget has drawn: no control character reaches the
     // terminal, whichever view or path put it in a cell. Ingest already
     // replaces them in what we collect; this catches whatever it missed.
+    ui::widgets::lift_text_on_selection(f.buffer_mut(), &app.theme);
     ui::sanitize::scrub_buffer(f.buffer_mut());
     if ui::monochrome::requested() {
         ui::monochrome::strip(f.buffer_mut(), app.theme.bg);
@@ -1771,7 +1776,20 @@ where
     // Each iteration is: render → wait → handle → repeat.
     // Collectors run on background threads and share state via Arc<Mutex<T>>.
     loop {
-        if let Err(error) = terminal.draw(|f| draw_frame(f, &mut app)) {
+        // One frame, shown whole. Without the bracket a terminal paints the
+        // frame as its bytes arrive, and a tab switch — where most cells
+        // change — can be on screen half-drawn: the new tab's title over the
+        // old tab's table. Terminals that do not know the sequence ignore it.
+        let _ = crossterm::queue!(
+            std::io::stdout(),
+            crossterm::terminal::BeginSynchronizedUpdate
+        );
+        let drawn = terminal.draw(|f| draw_frame(f, &mut app)).map(|_| ());
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EndSynchronizedUpdate
+        );
+        if let Err(error) = drawn {
             // A hangup fails the frame's write, the one the TUI is blocked in
             // when a frozen SSH session drops. Its SIGHUP comes from the
             // kernel before the write fails when netwatch leads the session,
@@ -2324,11 +2342,13 @@ pub(crate) fn top_conn_host(addr: &str) -> &str {
     }
 }
 
-/// Samples retained per (process, pid) for the Processes tab's RX chart.
+/// Samples retained per (process, pid) for the Processes tab's chart.
 ///
-/// Public because that chart's header names the window it covers, which is
-/// this many samples at the refresh interval.
-pub const TOP_PROC_HISTORY_LEN: usize = 60;
+/// As many as an interface keeps, so the chart can draw one sample per
+/// sub-column as every other throughput chart does. At sixty, a wide chart
+/// had to repeat each sample across two or three columns and a one-second
+/// burst became a solid block.
+pub const TOP_PROC_HISTORY_LEN: usize = tick_history_len(1000);
 const IFACE_EVENTS_CAP: usize = 200;
 
 #[derive(Debug, Clone)]
@@ -2348,11 +2368,13 @@ pub enum IfaceChangeKind {
     Removed,
 }
 
-/// Capture per-(process, pid) RX rate into a rolling 60-sample history used by
-/// the Process drill-in chart. Mirrors update_top_conn_history but keyed by pid.
-fn update_top_proc_rx_history(
+/// Capture one direction's per-(process, pid) rate into a rolling 60-sample
+/// history used by the Process drill-in chart. Mirrors
+/// update_top_conn_history but keyed by pid.
+fn update_top_proc_history(
     history: &mut HashMap<(String, Option<u32>), VecDeque<u64>>,
     conns: &[Connection],
+    rate: impl Fn(&Connection) -> Option<f64>,
 ) {
     let mut current: HashMap<(String, Option<u32>), f64> = HashMap::new();
     for c in conns {
@@ -2361,7 +2383,7 @@ fn update_top_proc_rx_history(
         }
         let name = crate::collectors::connections::process_label(c.process_name.as_deref(), c.pid);
         let entry = current.entry((name, c.pid)).or_insert(0.0);
-        *entry += c.rx_rate.unwrap_or(0.0);
+        *entry += rate(c).unwrap_or(0.0);
     }
     history.retain(|k, _| current.contains_key(k));
     for (key, rate) in current {
@@ -2447,7 +2469,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::Down(MouseButton::Left) => {
             // Header row: click on tabs (row 0 or 1 within header area)
             if row < 3 {
-                if let Some(tab) = ui::widgets::tab_at_column(col) {
+                if let Some(tab) = ui::widgets::tab_at_column(col, area.width, app.ui.current_tab) {
                     app.ui.current_tab = tab;
                     return;
                 }
@@ -2472,7 +2494,10 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         // selected row, not to the visible window — which
                         // made clicks land on rows further down than the
                         // one the user clicked.
-                        let inner = crate::ui::connections::table_inner_area(area);
+                        let inner = crate::ui::connections::table_inner_area(
+                            area,
+                            crate::ui::connections::visible_row_count(app),
+                        );
                         if row < inner.y || row >= inner.y + inner.height {
                             return;
                         }
@@ -2559,7 +2584,10 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                     }
                     Tab::Processes => {
-                        let inner = crate::ui::processes::table_inner_area(area);
+                        let inner = crate::ui::processes::table_inner_area(
+                            area,
+                            app.process_bandwidth.ranked().len(),
+                        );
                         if mouse.row > inner.y && mouse.row < inner.bottom() {
                             let total = app.process_bandwidth.ranked().len();
                             let visible = inner.height.saturating_sub(1) as usize;
@@ -2582,7 +2610,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         // Map against the same window the renderer computes,
                         // not `scroll + visible_row` — that was issue #28 on
                         // the Connections tab and the bug is identical here.
-                        let inner = crate::ui::egress::table_inner_area(area);
+                        let inner = crate::ui::egress::table_inner_area(app, area);
                         if row < inner.y || row >= inner.y + inner.height {
                             return;
                         }
@@ -2807,6 +2835,20 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     if app.ui.show_settings {
         return handle_settings_key(app, key);
     }
+    // The palette owns the keyboard while it is open. A command is the key
+    // it names, sent through this same function once the palette has closed.
+    if app.ui.palette.open {
+        if is_ctrl_c(key) {
+            return true;
+        }
+        return match ui::palette::handle_key(&mut app.ui.palette, app.ui.current_tab, key.code) {
+            ui::palette::Outcome::Run(code) => route_key(
+                app,
+                crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
+            ),
+            ui::palette::Outcome::Stay | ui::palette::Outcome::Closed => false,
+        };
+    }
     // Lite owns its whole key surface — the full TUI's ~40 bindings would
     // undermine the point of the view. Handled after the help overlay so `?`
     // still works, and before everything else.
@@ -2891,7 +2933,52 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         return false;
     }
-    handle_main_key(app, key)
+
+    // Drill-through. `↵` on a process, a timeline event or a topology peer
+    // opens Connections on it, and `↵` on a connection opens Packets on it:
+    // each of those is a step into the thing under the cursor, and `esc`
+    // should be the step back out. It used to do nothing, and the way back
+    // was remembering which digit you came from. The path is kept only for
+    // `↵` moves; a tab chosen by its digit is a new place, not a deeper one.
+    if key.code == KeyCode::Esc && esc_steps_back(app) {
+        if let Some(back) = app.ui.drill_path.pop() {
+            // The filter the drill applied belongs to the drill.
+            if app.ui.current_tab == Tab::Packets {
+                app.ui.packet_filter_active = None;
+                app.ui.packet_filter_text.clear();
+            }
+            app.ui.current_tab = back;
+            return false;
+        }
+    }
+    let before = app.ui.current_tab;
+    let quit = handle_main_key(app, key);
+    let after = app.ui.current_tab;
+    if after != before {
+        if key.code == KeyCode::Enter {
+            if !app.ui.drill_path.contains(&after) {
+                app.ui.drill_path.push(before);
+            }
+        } else {
+            app.ui.drill_path.clear();
+        }
+    }
+    quit
+}
+
+/// Whether `esc` is free to mean "back one drill level": there is a level to
+/// go back to, and nothing on this tab has a narrower claim on the key.
+fn esc_steps_back(app: &App) -> bool {
+    if app.ui.drill_path.is_empty() {
+        return false;
+    }
+    match app.ui.current_tab {
+        Tab::Packets => !app.ui.stream_view_open,
+        Tab::Connections => !app.ui.traceroute_view_open,
+        // `esc` clears the traceroute here.
+        Tab::Topology => false,
+        _ => true,
+    }
 }
 
 /// Whether a key answers "yes" to the egress removal prompt.
@@ -2919,6 +3006,15 @@ fn handle_help_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Down | KeyCode::Char('j') => {
             app.ui.scroll.help_scroll += 1;
         }
+        // The overlay lists `PgUp/PgDn` among the keys that scroll, and is
+        // itself six pages long. They did nothing here.
+        KeyCode::PageUp => {
+            app.ui.scroll.help_scroll = app.ui.scroll.help_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            app.ui.scroll.help_scroll += 10;
+        }
+        KeyCode::Home => app.ui.scroll.help_scroll = 0,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         _ => {}
     }
@@ -3276,6 +3372,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.show_help = !app.ui.show_help;
             app.ui.scroll.help_scroll = 0;
         }
+        KeyCode::Char(':') => app.ui.palette.open(),
         KeyCode::Char('M') => {
             // Capital M — debug overlay for bounded-collection sizes.
             // Intentionally only the uppercase variant so it doesn't
@@ -3288,13 +3385,10 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             // file (Horizon 3: observe → *promote* → warn-on-drift).
             app.promote_egress_policy();
         }
-        KeyCode::Char('t') if t_cycles_theme(app.ui.current_tab) => {
-            let names = crate::theme::THEME_NAMES;
-            let current = names.iter().position(|&n| n == app.theme.name).unwrap_or(0);
-            let next = (current + 1) % names.len();
-            app.user_config.theme = names[next].to_string();
-            app.theme = crate::theme::by_name(names[next]);
-        }
+        // `t` is not the theme. It was, on the six tabs that had no `t` of
+        // their own, which made one key a per-tab control on four tabs and a
+        // global repaint on the rest: pressing it for a time range one tab
+        // over changed every colour on the screen. The theme is in `,`.
         KeyCode::Char(',') => {
             app.ui.show_settings = !app.ui.show_settings;
             app.ui.settings_editing = false;
@@ -3915,30 +4009,19 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.promote_selected_egress();
         }
         KeyCode::Enter if app.ui.current_tab == Tab::Timeline => {
-            let window_secs = app.ui.timeline_window.seconds();
-            let now = std::time::Instant::now();
-            let window_start = now - std::time::Duration::from_secs(window_secs);
-            let mut sorted: Vec<&crate::collectors::connections::TrackedConnection> = app
-                .connection_timeline
-                .tracked
-                .iter()
-                .filter(|t| t.last_seen >= window_start)
-                .collect();
-            sorted.sort_by(|a, b| {
-                b.is_active
-                    .cmp(&a.is_active)
-                    .then_with(|| a.first_seen.cmp(&b.first_seen))
-            });
-            if let Some(tracked) = sorted.get(app.ui.scroll.timeline_scroll) {
-                let (remote_ip, _) = parse_addr_parts(&tracked.key.remote_addr);
-                if let Some(ip) = remote_ip {
-                    app.ui.packet_filter_text = ip.clone();
-                    app.ui.packet_filter_active = Some(ip);
-                    app.ui.packet_filter_input = false;
-                    app.ui.scroll.packet_scroll = 0;
-                    app.ui.packet_follow = false;
-                    app.ui.current_tab = Tab::Connections;
-                }
+            // The remote of the row under the cursor, from the list the table
+            // draws. This used to rebuild its own list of connections in a
+            // different order — active first, oldest first — and index it
+            // with the table's cursor, so `↵` opened whichever connection
+            // happened to share the row number.
+            if let Some(host) = crate::ui::timeline::selected_remote(app) {
+                let ip = host.trim_matches(|c| c == '[' || c == ']').to_string();
+                app.ui.packet_filter_text = ip.clone();
+                app.ui.packet_filter_active = Some(ip);
+                app.ui.packet_filter_input = false;
+                app.ui.scroll.packet_scroll = 0;
+                app.ui.packet_follow = false;
+                app.ui.current_tab = Tab::Connections;
             }
         }
         KeyCode::Enter if app.ui.current_tab == Tab::Dashboard => {
@@ -4105,39 +4188,6 @@ pub const fn probe_history_len(refresh_ms: u64) -> usize {
     };
     let probe_secs = tick_secs * HEALTH_PROBE_TICKS as u64;
     (HISTORY_WINDOW_SECS / probe_secs) as usize
-}
-
-/// Tabs that bind `t` to a control of their own, so theme cycling must not
-/// claim it there.
-///
-/// The list exists because the guard used to be an inline `!=` chain: adding
-/// the Dashboard's scale toggle without extending it meant `t` silently
-/// cycled the theme instead, which looks like the toggle not working rather
-/// than like a key collision. Theme cycling is still reachable from `,` on
-/// every tab.
-pub(crate) const TABS_WITH_OWN_T: &[Tab] =
-    &[Tab::Dashboard, Tab::Stats, Tab::Timeline, Tab::Diagnose];
-
-/// Whether `t` means "next theme" on this tab.
-pub(crate) fn t_cycles_theme(tab: Tab) -> bool {
-    !TABS_WITH_OWN_T.contains(&tab)
-}
-
-#[cfg(test)]
-mod key_conflict_tests {
-    use super::*;
-
-    /// A tab that advertises `t` for its own control must not also be cycling
-    /// the theme underneath it.
-    #[test]
-    fn tabs_with_their_own_t_do_not_also_cycle_the_theme() {
-        for &tab in TABS_WITH_OWN_T {
-            assert!(!t_cycles_theme(tab), "{tab:?} binds t itself");
-        }
-        for tab in [Tab::Connections, Tab::Packets, Tab::Topology, Tab::Egress] {
-            assert!(t_cycles_theme(tab), "{tab:?} has no t of its own");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -5829,7 +5879,7 @@ mod render_safety_tests {
         f
     }
 
-    /// Tabs in a cleartext payload show as `·` in Payload Content and the
+    /// Tabs in a cleartext payload show as `·` in the payload pane and the
     /// stream view. ratatui 0.30 leaves control characters out of laid-out
     /// text, so a raw tab vanished and `id\tname\tstatus` read as
     /// `idnamestatus`, with tab indentation gone. Under 0.27 each tab had a
@@ -5846,7 +5896,7 @@ mod render_safety_tests {
 
         let screen = rows(&draw(&mut app));
         assert!(
-            screen.iter().any(|r| r.contains("Payload Content")),
+            screen.iter().any(|r| r.contains("╭ payload ")),
             "{screen:#?}"
         );
         for needle in ["id·name·status", "··indented"] {
@@ -6223,7 +6273,7 @@ mod conn_view_tests {
         let screen: Vec<String> = (0..buffer.area.height).map(line).collect();
 
         let rows = fresh.rows(&app.ui.connection_collapsed);
-        let inner = table_inner_area(buffer.area);
+        let inner = table_inner_area(buffer.area, rows.len());
         let highlighted = (inner.y + 1..inner.y + inner.height)
             .find(|&y| buffer[(inner.x + 1, y)].bg == app.theme.selection_bg);
         if rows.is_empty() {
@@ -6248,10 +6298,12 @@ mod conn_view_tests {
             ConnRow::Parent { group, .. } => {
                 assert!(selected_connection(app).is_none(), "{step}");
                 assert_eq!(selected_group_key(app).as_ref(), Some(&group.key), "{step}");
-                assert!(drawn.contains(&group.key), "{step}: {drawn}");
+                let name = crate::ui::connections::group_name(&group.key);
+                assert!(drawn.contains(name), "{step}: {drawn}");
                 let title = format!(
-                    " detail  {}  {} connections ",
-                    group.key, group.rollup.conns
+                    " detail  {}  {} ",
+                    name,
+                    crate::ui::widgets::plural(group.rollup.conns, "connection")
                 );
                 assert!(
                     screen.iter().any(|l| l.contains(&title)),
@@ -6382,7 +6434,10 @@ mod conn_view_tests {
             app.ui.connection_group = mode;
             app.ui.scroll.connection_scroll = 0;
             check(&mut app, "before scrolling");
-            let inner = table_inner_area(app.ui.last_area);
+            let inner = table_inner_area(
+                app.ui.last_area,
+                crate::ui::connections::visible_row_count(&app),
+            );
 
             for _ in 0..30 {
                 mouse(&mut app, MouseEventKind::ScrollDown, inner.y + 1);
@@ -6414,7 +6469,10 @@ mod conn_view_tests {
         app.ui.scroll.connection_scroll = 0;
         check(&mut app, "at the first header");
         let before = current_view(&app).rows(&app.ui.connection_collapsed).len();
-        let inner = table_inner_area(app.ui.last_area);
+        let inner = table_inner_area(
+            app.ui.last_area,
+            crate::ui::connections::visible_row_count(&app),
+        );
         mouse(
             &mut app,
             MouseEventKind::Down(MouseButton::Left),

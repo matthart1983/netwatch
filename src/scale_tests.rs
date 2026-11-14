@@ -531,7 +531,7 @@ fn ten_thousand_rows_render_true_count() {
     let lines = screen(app);
     let header = lines
         .iter()
-        .position(|l| l.contains("proto  remote"))
+        .position(|l| l.contains("proto remote"))
         .expect("no connection table on screen");
     let drawn: Vec<&String> = lines[header + 1..]
         .iter()

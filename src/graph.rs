@@ -419,6 +419,37 @@ pub fn robust_max(data: &[u64], percentile: f64) -> u64 {
     p.max(headroom).max(1)
 }
 
+/// Fewest busy samples before a lone spike can be told from the series itself.
+const SPIKE_MIN_SAMPLES: usize = 20;
+/// How far above the body of the series the peak has to stand to be clipped.
+const SPIKE_RATIO: u64 = 5;
+
+/// A ceiling for a rate graph that a lone spike cannot flatten.
+///
+/// A throughput graph scaled to its peak is right until one second of
+/// 40 MB/s lands in five minutes of 200 KB/s: every other column rounds to
+/// the baseline and the graph says the link was idle. When the peak stands
+/// at least [`SPIKE_RATIO`] times above the 98th percentile of the busy
+/// samples, the ceiling drops to twice that percentile and the spike clips
+/// at full height. A burst that lasts — more than a fiftieth of the busy
+/// samples — moves the percentile with it and is never clipped.
+///
+/// Returns the ceiling and whether it clips anything, so the caller can say
+/// so beside the graph: a clipped plot with no note reads as a lower peak.
+pub fn spike_capped_max(data: &[u64]) -> (u64, bool) {
+    let peak = data.iter().copied().max().unwrap_or(0);
+    let mut busy: Vec<u64> = data.iter().copied().filter(|&v| v > 0).collect();
+    if busy.len() < SPIKE_MIN_SAMPLES {
+        return (peak, false);
+    }
+    busy.sort_unstable();
+    let body = busy[((busy.len() - 1) as f64 * 0.98).floor() as usize];
+    if peak / body.max(1) < SPIKE_RATIO {
+        return (peak, false);
+    }
+    (body.saturating_mul(2), true)
+}
+
 /// The span of time a plot `width` columns wide covers, in seconds.
 ///
 /// This is the plot's *capacity*, not how much of it happens to be filled.
@@ -632,10 +663,12 @@ fn rgb(c: Color) -> Option<(u8, u8, u8)> {
 }
 
 /// Lowest fraction of the row's foreground color the bottommost
-/// visible row receives. Higher than the chart fade (0.55 vs 0.30) so
-/// table text stays legible at the dim end — fade reads as visual
-/// hierarchy, not as illegibility.
-const MIN_ROW_FADE_ALPHA: f32 = 0.55;
+/// visible row receives. Well above the chart fade (0.30), because the
+/// fade multiplies whatever colour the row already has: an idle row is
+/// drawn muted, and muted text at the old 0.55 was a third of the way to
+/// the background — the last rows of an idle process list could not be
+/// read. Fade is visual hierarchy, not illegibility.
+const MIN_ROW_FADE_ALPHA: f32 = 0.78;
 
 /// Render `data` into `area` using the chosen style.
 ///
@@ -1137,6 +1170,31 @@ mod tests {
             robust >= 90,
             "a real spread must not be clamped away, got {robust}"
         );
+    }
+
+    #[test]
+    fn a_lone_spike_is_clipped_and_a_burst_is_not() {
+        // Steady traffic with one second of something else.
+        let mut lone = vec![200u64; 300];
+        lone[150] = 40_000;
+        assert_eq!(spike_capped_max(&lone), (400, true));
+
+        // The same height held for ten seconds is the story, not an outlier.
+        let mut burst = vec![200u64; 300];
+        for v in burst.iter_mut().skip(100).take(10) {
+            *v = 40_000;
+        }
+        assert_eq!(spike_capped_max(&burst), (40_000, false));
+
+        // Ordinary variation, too few busy samples, and nothing at all.
+        let wavy: Vec<u64> = (0..300).map(|i| 100 + (i % 7) * 40).collect();
+        assert_eq!(spike_capped_max(&wavy), (340, false));
+        let mut sparse = vec![0u64; 300];
+        sparse[10] = 5;
+        sparse[200] = 9_000;
+        assert_eq!(spike_capped_max(&sparse), (9_000, false));
+        assert_eq!(spike_capped_max(&[]), (0, false));
+        assert_eq!(spike_capped_max(&[0; 50]), (0, false));
     }
 
     #[test]

@@ -907,11 +907,19 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let groups = connection_groups(app);
     let conns: usize = groups.iter().map(|g| g.conns.len()).sum();
-    let meta = if groups.len() == conns {
+    let no_rates = widgets::capture_failure(app).is_some()
+        && groups
+            .iter()
+            .flat_map(|g| g.conns.iter())
+            .all(|c| c.rx_rate.is_none() && c.tx_rate.is_none() && c.rtt_ms.is_none());
+    let mut meta = if groups.len() == conns {
         format!("{conns} · sorted by concern")
     } else {
         format!("{conns} in {} processes · sorted by concern", groups.len())
     };
+    if no_rates {
+        meta.push_str(" · rates and rtt need capture");
+    }
 
     let inner = widgets::Panel::new("connections")
         .tab_badge(crate::app::Tab::Connections)
@@ -931,33 +939,65 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
     const RETR: u16 = 6;
     // `receiver-limited` is the longest verdict at 16, plus a column of gap.
     const VERDICT: u16 = 17;
-    let fixed = PROC + RATE * 2 + RTT + RETR + VERDICT;
-    if inner.width <= fixed + 20 {
+
+    // Which columns this frame can afford. Index order is the header's.
+    //
+    // Two things take columns away. With capture off nothing can measure a
+    // per-connection rate or round trip, and three columns of `–` on every
+    // row are the tool failing quietly: they go, and the panel's metadata
+    // says why. And a narrow terminal used to blank the whole table rather
+    // than squeeze it, which at 80 columns left a titled, empty box as the
+    // dashboard's largest panel. Columns now drop in the order a reader can
+    // best do without them, and the table is drawn with what is left.
+    const NAMES: [&str; 8] = [
+        "process", "remote", "app", "rx/s", "tx/s", "rtt", "retr", "verdict",
+    ];
+    const FIXED: [u16; 8] = [PROC, 0, 0, RATE, RATE, RTT, RETR, VERDICT];
+    let mut keep = [true; 8];
+    if no_rates {
+        keep[3] = false;
+        keep[4] = false;
+        keep[5] = false;
+    }
+    // `retr 0` and `verdict —` on every row are two columns that say "nothing
+    // here" a dozen times. They appear when a row has something to put in
+    // them, which is also when they are worth reading.
+    let all = || groups.iter().flat_map(|g| g.conns.iter());
+    keep[6] = all().any(|c| c.retrans > 0);
+    keep[7] = all().any(|c| c.verdict.is_some());
+    let fixed_of =
+        |keep: &[bool; 8]| -> u16 { (0..8).filter(|&i| keep[i]).map(|i| FIXED[i]).sum() };
+    // retr, verdict, rtt, then the rates: least to most missed.
+    for drop in [6usize, 7, 5, 4, 3] {
+        if inner.width > fixed_of(&keep) + 20 {
+            break;
+        }
+        keep[drop] = false;
+    }
+    let elastic = inner.width.saturating_sub(fixed_of(&keep) + 2);
+    if elastic < 12 {
         return;
     }
-    let elastic = inner.width - fixed;
-    let remote_w = elastic * 2 / 5;
+    // Under ~36 columns two elastic names are two truncated names.
+    if elastic < 36 {
+        keep[2] = false;
+    }
+    let remote_w = if keep[2] { elastic * 2 / 5 } else { elastic };
     let app_w = elastic - remote_w;
 
-    let widths = [
-        Constraint::Length(PROC),
-        Constraint::Length(remote_w),
-        Constraint::Length(app_w),
-        Constraint::Length(RATE),
-        Constraint::Length(RATE),
-        Constraint::Length(RTT),
-        Constraint::Length(RETR),
-        Constraint::Length(VERDICT),
-    ];
+    let widths: Vec<Constraint> = [PROC, remote_w, app_w, RATE, RATE, RTT, RETR, VERDICT]
+        .into_iter()
+        .zip(keep)
+        .filter(|&(_, k)| k)
+        .map(|(w, _)| Constraint::Length(w))
+        .collect();
 
-    // No `rtt 60s` column: it was ten columns wide, its header promised a
-    // sparkline, and every cell in it was the empty string. Ten columns the
-    // remote and app names can actually use.
     let header = Row::new(
-        [
-            "process", "remote", "app", "rx/s", "tx/s", "rtt", "retr", "verdict",
-        ]
-        .map(|h| Cell::from(h).style(Style::default().fg(t.text_muted))),
+        NAMES
+            .into_iter()
+            .zip(keep)
+            .filter(|&(_, k)| k)
+            .map(|(h, _)| Cell::from(h).style(Style::default().fg(t.text_muted))),
     );
 
     let all = dash_rows(&groups, &app.ui.dashboard_collapsed);
@@ -992,26 +1032,29 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
                     .alignment(Alignment::Right),
                 ),
                 _ => Cell::from(
-                    Line::from(Span::styled("–", Style::default().fg(t.text_muted)))
-                        .alignment(Alignment::Right),
+                    Line::from(Span::styled(
+                        widgets::NO_VALUE,
+                        Style::default().fg(t.text_muted),
+                    ))
+                    .alignment(Alignment::Right),
                 ),
             };
-            Row::new(vec![
+            let cells = vec![
                 Cell::from(r.process.clone()).style(if r.bold {
                     Style::default().fg(t.text_primary).bold()
                 } else {
                     Style::default().fg(t.text_primary)
                 }),
-                Cell::from(truncate(&r.remote, remote_w as usize - 1)).style(Style::default().fg(
-                    if r.muted_remote {
+                Cell::from(truncate(&r.remote, (remote_w as usize).saturating_sub(1))).style(
+                    Style::default().fg(if r.muted_remote {
                         // A count is not an address. Dimming it keeps the
                         // column scannable as "where is this going".
                         t.text_muted
                     } else {
                         t.text_secondary
-                    },
-                )),
-                Cell::from(truncate(&r.app, app_w as usize - 1))
+                    }),
+                ),
+                Cell::from(truncate(&r.app, (app_w as usize).saturating_sub(1)))
                     .style(Style::default().fg(t.text_muted)),
                 rate(r.rx_rate, t.rx_rate),
                 rate(r.tx_rate, t.tx_rate),
@@ -1019,7 +1062,7 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
                     Line::from(Span::styled(
                         match r.rtt_ms {
                             Some(v) => format!("{}ms", fmt_ms(v)),
-                            None => "–".to_string(),
+                            None => widgets::NO_VALUE.to_string(),
                         },
                         Style::default().fg(t.text_primary),
                     ))
@@ -1043,11 +1086,18 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
                 match r.verdict {
                     Some(v) => Cell::from(Line::from(widgets::socket_verdict_chip(t, v))),
                     None => Cell::from(Line::from(Span::styled(
-                        "–",
+                        widgets::NO_VALUE,
                         Style::default().fg(t.text_muted),
                     ))),
                 },
-            ])
+            ];
+            Row::new(
+                cells
+                    .into_iter()
+                    .zip(keep)
+                    .filter(|&(_, k)| k)
+                    .map(|(c, _)| c),
+            )
             .style(if is_selected {
                 Style::default().bg(t.selection_bg)
             } else {
@@ -1628,10 +1678,11 @@ fn render_interfaces(f: &mut Frame, app: &App, area: Rect) {
     // Whatever the rates and the name do not need. The address is the column
     // that degrades gracefully — a truncated IP is still recognisable, a
     // truncated rate is a wrong number.
-    let addr_w = inner
-        .width
-        .saturating_sub(2 + NAME_W + RATE_W * 2 + 2)
-        .max(4);
+    let addr_w = inner.width.saturating_sub(2 + NAME_W + RATE_W * 2 + 2);
+    // Under eight columns the address goes. It was held at four, which the
+    // row did not have: at 80 columns it showed `192…` and pushed `tx/s` off
+    // the panel's edge.
+    let addr_w = if addr_w < 8 { 0 } else { addr_w };
 
     let row = |x: u16, y: u16, spans: Vec<Span<'static>>| {
         (
@@ -1655,7 +1706,7 @@ fn render_interfaces(f: &mut Frame, app: &App, area: Rect) {
             format!(
                 "  {:<nw$}{:<aw$} {:>rw$} {:>rw$}",
                 "iface",
-                "address",
+                if addr_w > 0 { "address" } else { "" },
                 "rx/s",
                 "tx/s",
                 nw = NAME_W as usize - 2,
@@ -1704,7 +1755,11 @@ fn render_interfaces(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     format!(
                         "{:<w$}",
-                        truncate(&addr, addr_w as usize),
+                        if addr_w > 0 {
+                            truncate(&addr, addr_w as usize)
+                        } else {
+                            String::new()
+                        },
                         w = addr_w as usize
                     ),
                     Style::default().fg(t.text_muted),

@@ -258,7 +258,16 @@ impl ProcessBandwidthCollector {
         ranked.sort_by(|a, b| {
             let bw_b = b.rx_rate + b.tx_rate;
             let bw_a = a.rx_rate + a.tx_rate;
-            bw_b.partial_cmp(&bw_a).unwrap_or(std::cmp::Ordering::Equal)
+            // Name then pid under equal rates: the rows come out of a map,
+            // and an idle machine is all ties.
+            bw_b.partial_cmp(&bw_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.process_name
+                        .to_lowercase()
+                        .cmp(&b.process_name.to_lowercase())
+                })
+                .then_with(|| a.pid.cmp(&b.pid))
         });
 
         self.ranked = ranked;

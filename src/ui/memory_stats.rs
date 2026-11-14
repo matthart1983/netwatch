@@ -157,7 +157,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Clear, popup);
     crate::ui::widgets::paint_overlay_bg(f, &app.theme, popup);
     let block = widgets::panel_block(&app.theme)
-        .title(" Memory ")
+        .title(" memory ")
         .border_style(Style::default().fg(app.theme.brand));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -227,15 +227,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
 
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "M / Esc",
-            Style::default()
-                .fg(app.theme.key_hint)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(":Close — green <70% fill, yellow <90%, red ≥90%"),
-    ]));
+    let mut footer =
+        crate::ui::widgets::hint_spans(&app.theme, &[crate::ui::widgets::hint("M esc", "close")]);
+    footer.push(Span::styled(
+        "   fill: green under 70%, yellow under 90%, red above",
+        Style::default().fg(app.theme.text_muted),
+    ));
+    lines.push(Line::from(footer));
 
     f.render_widget(Paragraph::new(lines), inner);
 }

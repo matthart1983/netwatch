@@ -44,25 +44,44 @@ pub fn sort(procs: &mut [ProcessBandwidth], column: usize, ascending: bool) {
             "CPU%" => cmp_f64(a.cpu_percent.unwrap_or(0.0), b.cpu_percent.unwrap_or(0.0)),
             _ => std::cmp::Ordering::Equal,
         };
+        // Ties keep one order from tick to tick. An idle machine is all
+        // ties — every rate is zero — and the collector's map order under
+        // them reshuffled the table once a second with the cursor on a
+        // different process each time.
         apply_direction(ord, ascending)
+            .then_with(|| cmp_case_insensitive(&a.process_name, &b.process_name))
+            .then_with(|| a.pid.cmp(&b.pid))
     });
 }
 
-fn layout_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+/// Rows the drill-in panel needs: its borders, a header and five remotes.
+const DRILL_IN_MIN_ROWS: u16 = 8;
+
+/// The tab's bands for a table of `rows` processes.
+///
+/// The table is as tall as its contents and no taller: ten processes used to
+/// sit in a twenty-row box above an eight-row drill-in whose graph had three
+/// rows to draw in. What the list does not need goes to the drill-in.
+fn layout_chunks(area: Rect, rows: usize) -> std::rc::Rc<[Rect]> {
+    let header = widgets::ATTRIBUTION_HEADER_ROWS;
+    let room = area
+        .height
+        .saturating_sub(header + 1 + DRILL_IN_MIN_ROWS + 3);
+    let table = (rows.max(1) as u16).saturating_add(3).min(room).max(4);
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // header and attribution coverage
-            Constraint::Length(2), // sort chips
-            Constraint::Min(8),    // table (`Min` so it grows on taller terminals)
-            Constraint::Length(8), // drill-in panel — top-5 hosts + header + "others" + borders
-            Constraint::Length(3), // footer
+            Constraint::Length(header),         // header and attribution coverage
+            Constraint::Length(1),              // sort chips
+            Constraint::Length(table),          // table
+            Constraint::Min(DRILL_IN_MIN_ROWS), // drill-in panel, down to the footer
+            Constraint::Length(3),              // footer
         ])
         .split(area)
 }
 
-pub fn table_inner_area(area: Rect) -> Rect {
-    let table = layout_chunks(area)[2];
+pub fn table_inner_area(area: Rect, rows: usize) -> Rect {
+    let table = layout_chunks(area, rows)[2];
     Rect::new(
         table.x + 1,
         table.y + 1,
@@ -71,7 +90,7 @@ pub fn table_inner_area(area: Rect) -> Rect {
     )
 }
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = layout_chunks(area);
+    let chunks = layout_chunks(area, app.process_bandwidth.ranked().len());
     widgets::render_attribution_header(f, app, chunks[0], vec![]);
     render_sort_chips(f, app, chunks[1]);
 
@@ -165,8 +184,102 @@ fn render_sort_chips(f: &mut Frame, app: &App, area: Rect) {
 
 // ── Table ───────────────────────────────────────────────────
 
+/// One column of the process table: the header and every row are cut from
+/// this, so they cannot disagree about where a column starts.
+///
+/// They used to be a literal header string and a row of hand-counted
+/// `format!` widths. The pid was `{:>5}`, Linux pids run to seven digits, and
+/// each long one pushed the rest of its row two columns right of its header.
+struct Col {
+    header: &'static str,
+    width: usize,
+    right: bool,
+    /// Per-process rates, totals and round trips come from captured packets.
+    needs_capture: bool,
+}
+
+impl Col {
+    /// `text` in this column, with the column's one-space gutter.
+    fn cell(&self, text: &str) -> String {
+        let text = truncate(text, self.width);
+        let pad = self.width.saturating_sub(crate::ui::text::width(&text));
+        if self.right {
+            format!("{}{text} ", " ".repeat(pad))
+        } else {
+            format!("{text}{} ", " ".repeat(pad))
+        }
+    }
+}
+
+const fn col(header: &'static str, width: usize, right: bool, needs_capture: bool) -> Col {
+    Col {
+        header,
+        width,
+        right,
+        needs_capture,
+    }
+}
+
+const COLS: [Col; 9] = [
+    col("process", 18, false, false),
+    // `pid_max` on a 64-bit kernel is 4194304: seven digits.
+    col("pid", 8, true, false),
+    col("conns", 6, true, false),
+    col("rx/s", 10, true, true),
+    col("tx/s", 10, true, true),
+    col("rx total", 9, true, true),
+    col("tx total", 9, true, true),
+    col("rtt", 7, true, true),
+    col("cpu", 7, true, false),
+];
+
+/// True when capture is off and no process has a rate, a total or a round
+/// trip to show: the five columns that need packets would be `–` on every
+/// row, so the table leaves them out and its title says why.
+fn rates_unavailable(app: &App, ranked: &[ProcessBandwidth]) -> bool {
+    widgets::capture_failure(app).is_some()
+        && ranked.iter().all(|p| {
+            p.rx_rate < 1.0
+                && p.tx_rate < 1.0
+                && p.rx_bytes == 0
+                && p.tx_bytes == 0
+                && p.rtt_ms.is_none()
+        })
+}
+
+/// Which of [`COLS`] a table `width` columns wide draws.
+///
+/// The capture columns go when nothing can fill them. Then, while the row is
+/// wider than the table, the session totals and the round trip go — in that
+/// order, the least-read first — so `cpu` at the right-hand end is never the
+/// column that falls off, as it was at 80 columns.
+fn visible_cols(no_rates: bool, width: usize) -> [bool; COLS.len()] {
+    let mut keep = [true; COLS.len()];
+    for (k, c) in keep.iter_mut().zip(&COLS) {
+        *k = !no_rates || !c.needs_capture;
+    }
+    let total = |keep: &[bool; COLS.len()]| -> usize {
+        2 + COLS
+            .iter()
+            .zip(keep)
+            .filter(|(_, k)| **k)
+            .map(|(c, _)| c.width + 1)
+            .sum::<usize>()
+    };
+    // rx total, tx total, rtt.
+    for drop in [5usize, 6, 7] {
+        if total(&keep) <= width {
+            break;
+        }
+        keep[drop] = false;
+    }
+    keep
+}
+
 fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: Rect) {
     let t = &app.theme;
+    let no_rates = rates_unavailable(app, ranked);
+    let keep = visible_cols(no_rates, usize::from(area.width.saturating_sub(4)));
 
     let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
@@ -175,7 +288,11 @@ fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], a
         )))
         .title(
             Line::from(Span::styled(
-                format!(" {} ", ranked.len()),
+                if no_rates {
+                    format!(" {} · rates and rtt need capture ", ranked.len())
+                } else {
+                    format!(" {} ", ranked.len())
+                },
                 Style::default().fg(t.text_muted),
             ))
             .alignment(Alignment::Right),
@@ -187,7 +304,14 @@ fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], a
         return;
     }
 
-    let header = "  process              pid    conns    rx/s        tx/s      rx total    tx total    rtt      cpu";
+    let header: String = std::iter::once("  ".to_string())
+        .chain(
+            COLS.iter()
+                .zip(keep)
+                .filter(|&(_, k)| k)
+                .map(|(c, _)| c.cell(c.header)),
+        )
+        .collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             header,
@@ -217,7 +341,7 @@ fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], a
         } else {
             1.0
         };
-        render_process_row(f, app, inner, row_y, proc, is_selected, row_alpha);
+        render_process_row(f, app, inner, row_y, proc, is_selected, row_alpha, keep);
     }
 
     if ranked.is_empty() {
@@ -239,73 +363,91 @@ fn render_process_row(
     proc: &ProcessBandwidth,
     is_selected: bool,
     row_alpha: f32,
+    keep: [bool; COLS.len()],
 ) {
     let t = &app.theme;
     let active = proc.rx_rate > 0.0 || proc.tx_rate > 0.0;
-    let dot_color = if active { t.status_good } else { t.text_muted };
-    let main_color = if active { t.text_primary } else { t.text_muted };
+    // Muted text on the selected row would be invisible in the `terminal`
+    // theme, where muted text and the selection ground are both ANSI 8: the
+    // cursor on an idle process was a blank grey band. The selected row is
+    // the one being read, so it is never dimmed.
+    let muted = if is_selected {
+        t.text_primary
+    } else {
+        t.text_muted
+    };
+    let dot_color = if active { t.status_good } else { muted };
+    // A process with no traffic this second is still a row to read, as a
+    // connection is in the Connections table: its name is primary text and
+    // its counts secondary. Only a value that is zero or unmeasured is muted.
+    // The whole row used to be, so with capture off the table was a block of
+    // grey under the one selected line.
+    let secondary = if is_selected {
+        t.text_primary
+    } else {
+        t.text_secondary
+    };
+    let total_color = |bytes: u64| if bytes > 0 { t.text_primary } else { muted };
 
-    let pid_str = proc
-        .pid
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "—".into());
-    let line = Line::from(vec![
-        Span::styled(
-            if is_selected { "▸ " } else { "● " },
-            Style::default().fg(if is_selected { t.brand } else { dot_color }),
+    let (rtt_str, rtt_color) = match proc.rtt_ms {
+        Some(rtt) if rtt < 1.0 => (format!("{:.1}ms", rtt), t.status_good),
+        Some(rtt) if rtt < 50.0 => (format!("{:.0}ms", rtt), t.status_good),
+        Some(rtt) if rtt < 200.0 => (format!("{:.0}ms", rtt), t.status_warn),
+        Some(rtt) => (format!("{:.0}ms", rtt), t.status_error),
+        None => (widgets::NO_VALUE.to_string(), muted),
+    };
+    let (cpu_str, cpu_color) = match proc.cpu_percent {
+        Some(cpu) if cpu >= 10.0 => (format!("{:.1}%", cpu), t.status_warn),
+        Some(cpu) => (format!("{:.1}%", cpu), t.text_primary),
+        None => (widgets::NO_VALUE.to_string(), muted),
+    };
+    // In `COLS` order.
+    let cells: [(String, Color); 9] = [
+        (proc.process_name.clone(), t.text_primary),
+        (
+            proc.pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| widgets::NO_VALUE.into()),
+            secondary,
         ),
-        Span::styled(
-            format!("{:<18}", truncate(&proc.process_name, 18)),
-            Style::default().fg(main_color),
+        (proc.connection_count.to_string(), secondary),
+        (
+            widgets::format_bytes_rate(proc.rx_rate),
+            if active { t.rx_rate } else { muted },
         ),
-        Span::styled(
-            format!(" {:>5}", pid_str),
-            Style::default().fg(t.text_muted),
+        (
+            widgets::format_bytes_rate(proc.tx_rate),
+            if active { t.tx_rate } else { muted },
         ),
-        Span::styled(
-            format!("  {:>4}", proc.connection_count),
-            Style::default().fg(t.text_muted),
+        (
+            widgets::format_bytes_total(proc.rx_bytes),
+            total_color(proc.rx_bytes),
         ),
-        Span::styled(
-            format!("  {:>10}", widgets::format_bytes_rate(proc.rx_rate)),
-            Style::default().fg(if active { t.rx_rate } else { t.text_muted }),
+        (
+            widgets::format_bytes_total(proc.tx_bytes),
+            total_color(proc.tx_bytes),
         ),
-        Span::raw(" "),
-        Span::styled(
-            format!(" {:>9}", widgets::format_bytes_rate(proc.tx_rate)),
-            Style::default().fg(if active { t.tx_rate } else { t.text_muted }),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!(" {:>7}", widgets::format_bytes_total(proc.rx_bytes)),
-            Style::default().fg(main_color),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!(" {:>7}", widgets::format_bytes_total(proc.tx_bytes)),
-            Style::default().fg(main_color),
-        ),
-        Span::raw("   "),
-        {
-            let (rtt_str, rtt_color) = match proc.rtt_ms {
-                Some(rtt) if rtt < 1.0 => (format!("{:.1}ms", rtt), t.status_good),
-                Some(rtt) if rtt < 50.0 => (format!("{:.0}ms", rtt), t.status_good),
-                Some(rtt) if rtt < 200.0 => (format!("{:.0}ms", rtt), t.status_warn),
-                Some(rtt) => (format!("{:.0}ms", rtt), t.status_error),
-                None => ("—".to_string(), t.text_muted),
-            };
-            Span::styled(format!("{:>6}", rtt_str), Style::default().fg(rtt_color))
-        },
-        Span::raw("   "),
-        {
-            let (cpu_str, cpu_color) = match proc.cpu_percent {
-                Some(cpu) if cpu >= 10.0 => (format!("{:.1}%", cpu), t.status_warn),
-                Some(cpu) => (format!("{:.1}%", cpu), t.text_primary),
-                None => ("—".to_string(), t.text_muted),
-            };
-            Span::styled(format!("{:>5}", cpu_str), Style::default().fg(cpu_color))
-        },
-    ]);
+        (rtt_str, rtt_color),
+        (cpu_str, cpu_color),
+    ];
+    let mut spans = vec![Span::styled(
+        if is_selected { "▸ " } else { "● " },
+        Style::default().fg(if is_selected { t.brand } else { dot_color }),
+    )];
+    spans.extend(
+        COLS.iter()
+            .zip(cells)
+            .zip(keep)
+            .enumerate()
+            .filter(|&(_, (_, k))| k)
+            .map(|(i, ((c, (text, color)), _))| {
+                let style = Style::default().fg(color);
+                // The name is the row's handle, bold as a group's is in
+                // Connections.
+                Span::styled(c.cell(&text), if i == 0 { style.bold() } else { style })
+            }),
+    );
+    let line = Line::from(spans);
 
     let row_area = Rect {
         x: inner.x + 1,
@@ -343,13 +485,17 @@ fn render_drill_in(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: 
         Some(p) => format!(
             " {}  pid {} ",
             p.process_name,
-            p.pid.map(|x| x.to_string()).unwrap_or_else(|| "—".into())
+            p.pid
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| widgets::NO_VALUE.into())
         ),
         None => " detail ".to_string(),
     };
+    let no_rates = rates_unavailable(app, ranked);
     let title_right = match selected {
+        Some(p) if no_rates => format!(" {} sockets  ↑↓ to switch ", p.connection_count),
         Some(p) => format!(
-            " {} sockets  {} RX  ↑↓ to switch ",
+            " {} sockets  {} rx  ↑↓ to switch ",
             p.connection_count,
             widgets::format_bytes_total(p.rx_bytes)
         ),
@@ -370,6 +516,12 @@ fn render_drill_in(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: 
         );
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Two columns in from the border, where the Connections detail starts.
+    let inner = Rect {
+        x: inner.x + 2.min(inner.width),
+        width: inner.width.saturating_sub(4),
+        ..inner
+    };
 
     if inner.height < 4 {
         return;
@@ -378,10 +530,10 @@ fn render_drill_in(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: 
     let Some(proc) = selected else {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "↑↓ to select a process",
+                "no process selected",
                 Style::default().fg(t.text_muted),
             ))),
-            Rect::new(inner.x + 2, inner.y + 1, inner.width.saturating_sub(2), 1),
+            Rect::new(inner.x, inner.y, inner.width, 1),
         );
         return;
     };
@@ -390,22 +542,38 @@ fn render_drill_in(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(32),
-            Constraint::Length(22),
+            Constraint::Length(34),
+            Constraint::Length(24),
             Constraint::Min(0),
         ])
         .split(inner);
 
-    render_top_remotes(f, app, cols[0], proc);
+    render_top_remotes(f, app, cols[0], proc, no_rates);
     render_socket_states(f, app, cols[1], proc);
-    render_rx_chart(f, app, cols[2], proc);
+    // Without capture there is no per-process rate to plot: an empty chart
+    // over `peak 0  avg 0  p99 0` claimed a measurement that was never made.
+    if !no_rates {
+        render_chart(f, app, cols[2], proc);
+    }
 }
 
-fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth) {
+fn render_top_remotes(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    proc: &ProcessBandwidth,
+    no_rates: bool,
+) {
     let t = &app.theme;
+    // Label, a nine-column figure, and a gap before the socket states.
+    let label_w = (area.width as usize).saturating_sub(13).max(8);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "top remotes",
+            format!(
+                "{:<label_w$} {:>9}",
+                "top remotes",
+                if no_rates { "conns" } else { "rate" }
+            ),
             Style::default().fg(t.text_muted),
         ))),
         Rect::new(area.x, area.y, area.width, 1),
@@ -427,7 +595,14 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
             continue;
         }
         let host = host_only(&c.remote_addr);
-        if host.is_empty() {
+        // A wildcard is where a listener waits, not a remote it talks to.
+        if host.is_empty()
+            || host == "*"
+            || host
+                .trim_matches(|c| c == '[' || c == ']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_unspecified())
+        {
             continue;
         }
         let entry = per_host.entry(host).or_insert((0.0, 0));
@@ -460,18 +635,31 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
 
     let max_rows = area.height.saturating_sub(1) as usize;
 
-    for (i, (host, rate, _n)) in sorted.iter().take(max_rows.min(5)).enumerate() {
+    // Every remote when they fit; otherwise all but the last row, which
+    // counts the rest. It stopped at five whatever the panel's height.
+    let shown = if sorted.len() <= max_rows {
+        sorted.len()
+    } else {
+        max_rows.saturating_sub(1)
+    };
+    for (i, (host, rate, n)) in sorted.iter().take(shown).enumerate() {
         let row_y = area.y + 1 + i as u16;
-        let label_w = (area.width as usize).saturating_sub(11).max(8);
+        // With no capture the figure is how many connections go there, which
+        // is measured, not a rate of `0`, which is not.
+        let figure = if no_rates {
+            Span::styled(format!(" {n:>9}"), Style::default().fg(t.text_secondary))
+        } else {
+            Span::styled(
+                format!(" {:>9}", widgets::format_bytes_rate(*rate)),
+                Style::default().fg(if *rate > 0.0 { t.rx_rate } else { t.text_muted }),
+            )
+        };
         let line = Line::from(vec![
             Span::styled(
                 format!("{:<width$}", truncate(host, label_w), width = label_w),
                 Style::default().fg(t.text_primary),
             ),
-            Span::styled(
-                format!(" {:>9}", widgets::format_bytes_rate(*rate)),
-                Style::default().fg(t.rx_rate),
-            ),
+            figure,
         ]);
         f.render_widget(
             Paragraph::new(line),
@@ -479,14 +667,14 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
         );
     }
 
-    let remaining = sorted.len().saturating_sub(5);
-    if remaining > 0 && max_rows >= 6 {
+    let remaining = sorted.len().saturating_sub(shown);
+    if remaining > 0 && max_rows >= 2 {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("others ({})", remaining),
+                format!("+ {remaining} more"),
                 Style::default().fg(t.text_muted),
             ))),
-            Rect::new(area.x, area.y + 1 + 5, area.width, 1),
+            Rect::new(area.x, area.y + 1 + shown as u16, area.width, 1),
         );
     }
 }
@@ -512,7 +700,7 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
     let t = &app.theme;
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "SOCKET STATES",
+            "socket states",
             Style::default().fg(t.text_muted),
         ))),
         Rect::new(area.x, area.y, area.width, 1),
@@ -534,11 +722,13 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
     drop(conns);
 
     let order: &[(&str, Color)] = &[
-        ("ESTABLISHED", t.status_good),
-        ("LISTEN", t.status_info),
-        ("TIME_WAIT", t.status_warn),
-        ("CLOSE_WAIT", t.text_muted),
-        ("FIN_WAIT", t.text_muted),
+        // The Connections table's rule: ordinary states are text, and the
+        // half-closed ones an application has left open take the warning.
+        ("ESTABLISHED", t.text_secondary),
+        ("LISTEN", t.text_muted),
+        ("TIME_WAIT", t.text_muted),
+        ("CLOSE_WAIT", t.status_warn),
+        ("FIN_WAIT", t.status_warn),
         ("SYN", t.text_muted),
     ];
 
@@ -550,12 +740,27 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
         }
         let line = Line::from(vec![
             Span::styled(
-                format!("{:<14}", label),
+                // The counting keys stay the kernel's; the reader gets the
+                // tool's lowercase words, as in the Connections table.
+                format!(
+                    "{:<14}",
+                    match *label {
+                        "FIN_WAIT" => "fin-wait".to_string(),
+                        "SYN" => "syn".to_string(),
+                        other => widgets::state_label(other),
+                    }
+                ),
                 Style::default().fg(if count > 0 { *color } else { t.text_muted }),
             ),
+            // A state with no sockets keeps its row, so the list does not
+            // jump, but it is not a number to read.
             Span::styled(
                 format!(" {:>4}", count),
-                Style::default().fg(t.text_primary),
+                Style::default().fg(if count > 0 {
+                    t.text_primary
+                } else {
+                    t.text_muted
+                }),
             ),
         ]);
         f.render_widget(
@@ -565,25 +770,63 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
     }
 }
 
-fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth) {
+/// The process's throughput, drawn as the Interfaces and Stats charts are: a
+/// header with both rates and the peak, rx over tx, and a time axis.
+///
+/// It was one rx plot under a bare `rx 60s` with `peak avg p99` on the last
+/// row — a different chart from every other one in the app.
+fn render_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth) {
     let t = &app.theme;
     if area.width < 8 || area.height < 3 {
         return;
     }
 
     let key = (proc.process_name.clone(), proc.pid);
-    let buf = app.caches.top_proc_rx_history.get(&key);
-    let data: Vec<u64> = buf.map(|b| b.iter().copied().collect()).unwrap_or_default();
+    let series = |map: &HashMap<(String, Option<u32>), std::collections::VecDeque<u64>>| {
+        map.get(&key)
+            .map(|b| b.iter().copied().collect::<Vec<u64>>())
+            .unwrap_or_default()
+    };
+    let rx = series(&app.caches.top_proc_rx_history);
+    let tx = series(&app.caches.top_proc_tx_history);
+    let peak = rx.iter().chain(&tx).copied().max().unwrap_or(0);
+    let avg = if rx.is_empty() {
+        0
+    } else {
+        rx.iter().sum::<u64>() / rx.len() as u64
+    };
+    // The header reports the true peak; only the plot's ceiling moves.
+    let (rx_max, rx_clipped) = crate::graph::spike_capped_max(&rx);
+    let (tx_max, tx_clipped) = crate::graph::spike_capped_max(&tx);
 
-    let window = crate::ui::lite::window_label(
-        crate::app::TOP_PROC_HISTORY_LEN,
-        app.user_config.refresh_rate_ms,
-    );
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("RX {window}"),
-            Style::default().fg(t.text_muted),
-        ))),
+        Paragraph::new(Line::from(vec![
+            Span::styled("● rx ", Style::default().fg(t.rx_rate)),
+            Span::styled(
+                widgets::format_bytes_rate(proc.rx_rate),
+                Style::default().fg(t.rx_rate).bold(),
+            ),
+            Span::raw("    "),
+            Span::styled("● tx ", Style::default().fg(t.tx_rate)),
+            Span::styled(
+                widgets::format_bytes_rate(proc.tx_rate),
+                Style::default().fg(t.tx_rate).bold(),
+            ),
+            Span::raw("    "),
+            Span::styled(
+                format!(
+                    "peak {}  avg {}{}",
+                    widgets::format_bytes_rate(peak as f64),
+                    widgets::format_bytes_rate(avg as f64),
+                    if rx_clipped || tx_clipped {
+                        "    spike clipped"
+                    } else {
+                        ""
+                    }
+                ),
+                Style::default().fg(t.text_muted),
+            ),
+        ])),
         Rect::new(area.x, area.y, area.width, 1),
     );
 
@@ -591,62 +834,59 @@ fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth
     if chart_h < 1 {
         return;
     }
-    let chart_area = Rect::new(area.x, area.y + 1, area.width, chart_h);
-    if !data.is_empty() {
-        // The whole buffer across the chart, so it is the window the header
-        // names: one sample per column left a wide chart empty on the left
-        // and cut a narrow one short.
-        let fitted = crate::ui::dense::fit_window(
-            &data,
-            crate::app::TOP_PROC_HISTORY_LEN,
-            chart_area.width as usize * crate::graph::samples_per_column(app.graph_style),
+    if rx.is_empty() && tx.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "collecting…",
+                Style::default().fg(t.text_muted),
+            ))),
+            Rect::new(area.x, area.y + 1, area.width, 1),
         );
-        crate::graph::render(
+        return;
+    }
+
+    // rx over tx, as on Interfaces. With one row there is only room for rx.
+    let rx_h = if chart_h >= 2 { chart_h / 2 } else { chart_h };
+    let tx_h = chart_h - rx_h;
+    // One sample per sub-column, newest at the right, exactly as the
+    // Interfaces chart draws: stretching a short history across the width
+    // turned each sample into a block two or three columns wide.
+    crate::graph::render_with_max(
+        f,
+        Rect::new(area.x, area.y + 1, area.width, rx_h),
+        &rx,
+        rx_max.max(1),
+        app.graph_style,
+        t.rx_rate,
+        t.status_warn,
+        app.graph_opts(),
+    );
+    if tx_h > 0 {
+        crate::graph::render_with_max(
             f,
-            chart_area,
-            &fitted,
+            Rect::new(area.x, area.y + 1 + rx_h, area.width, tx_h),
+            &tx,
+            tx_max.max(1),
             app.graph_style,
-            t.rx_rate,
+            t.tx_rate,
             t.status_warn,
             app.graph_opts(),
         );
-    } else {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "  collecting…",
-                Style::default().fg(t.text_muted),
-            ))),
-            chart_area,
-        );
     }
 
-    // Footer stats — peak / avg / p99 from the per-process buffer
-    let peak = *data.iter().max().unwrap_or(&0);
-    let avg = if !data.is_empty() {
-        data.iter().sum::<u64>() / data.len() as u64
-    } else {
-        0
-    };
-    let p99 = if data.is_empty() {
-        0
-    } else {
-        let mut sorted = data.clone();
-        sorted.sort();
-        let idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
-        sorted[idx]
-    };
-    let footer_y = area.y + area.height - 1;
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(
-                "peak {}  avg {}  p99 {}",
-                widgets::format_bytes_rate(peak as f64),
-                widgets::format_bytes_rate(avg as f64),
-                widgets::format_bytes_rate(p99 as f64)
+            crate::graph::time_axis(
+                area.width,
+                crate::graph::axis_window_secs(
+                    area.width,
+                    app.graph_style,
+                    app.user_config.refresh_rate_ms,
+                ),
             ),
             Style::default().fg(t.text_muted),
         ))),
-        Rect::new(area.x, footer_y, area.width, 1),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
     );
 }
 
@@ -700,13 +940,63 @@ mod tests {
         assert_eq!(socket_state_row(""), "OTHER");
     }
 
-    /// The RX chart spreads the per-process history across its width, in
-    /// either graph style, and its header names the window that history
-    /// covers. It drew one sample per column (two in the dots style) under a
-    /// fixed `RX 60s`, so a wide chart left its left side empty and a narrow
-    /// bar chart showed less than the 60 samples it claimed.
+    /// An idle process is still a row to read: its name is primary text, as
+    /// a connection's is in the Connections table. Only the unmeasured cell
+    /// is muted. The whole row was, so with capture off the table was grey.
     #[test]
-    fn the_rx_chart_fills_its_width_with_the_window_it_names() {
+    fn an_idle_process_row_is_not_greyed_out() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.user_config.graph_fade = false;
+        let proc = crate::collectors::process_bandwidth::ProcessBandwidth {
+            process_name: "idle".into(),
+            pid: Some(42),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            connection_count: 3,
+            rtt_ms: None,
+            cpu_percent: None,
+        };
+        let area = Rect::new(0, 0, 100, 1);
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                super::render_process_row(
+                    f,
+                    &app,
+                    area,
+                    0,
+                    &proc,
+                    false,
+                    1.0,
+                    [true; super::COLS.len()],
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let t = &app.theme;
+        let fg_at = |needle: &str| {
+            let row: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
+            let byte = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {row}"));
+            let x = row[..byte].chars().count() as u16;
+            buf[(x, 0)].fg
+        };
+        assert_eq!(fg_at("idle"), t.text_primary);
+        assert_eq!(fg_at("42"), t.text_secondary);
+        assert_eq!(fg_at(crate::ui::widgets::NO_VALUE), t.text_muted);
+    }
+
+    /// The drill-in chart is the Interfaces chart: both rates in the header,
+    /// rx over tx, a time axis, and one sample per sub-column. It stretched
+    /// sixty samples across the width, so a one-second burst was a solid
+    /// block several columns wide.
+    #[test]
+    fn the_chart_draws_one_sample_per_sub_column() {
         use crate::graph::GraphStyle;
         use ratatui::{backend::TestBackend, layout::Rect, Terminal};
         let mut app =
@@ -722,41 +1012,47 @@ mod tests {
             rtt_ms: None,
             cpu_percent: None,
         };
-        app.caches.top_proc_rx_history.insert(
-            ("curl".into(), Some(1)),
-            vec![1000; crate::app::TOP_PROC_HISTORY_LEN].into(),
-        );
-        for (style, width) in [
-            (GraphStyle::Bars, 80),
-            (GraphStyle::Dots, 80),
-            (GraphStyle::Bars, 40),
-        ] {
+        let key = ("curl".to_string(), Some(1));
+        let width = 80u16;
+        let draw = |app: &crate::app::App| {
+            let area = Rect::new(0, 0, width, 6);
+            let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+            terminal
+                .draw(|f| super::render_chart(f, app, area, &proc))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..6u16)
+                .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<String>>()
+        };
+        for style in [GraphStyle::Bars, GraphStyle::Dots] {
             app.graph_style = style;
-            // 60 samples at each rate. 150 seconds is not `3m`.
-            for (refresh_rate_ms, label) in [
-                (1000, "RX 60s"),
-                (500, "RX 30s"),
-                (2500, "RX 150s"),
-                (5000, "RX 5m"),
-            ] {
-                app.user_config.refresh_rate_ms = refresh_rate_ms;
-                let area = Rect::new(0, 0, width, 6);
-                let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
-                terminal
-                    .draw(|f| super::render_rx_chart(f, &app, area, &proc))
-                    .unwrap();
-                let buf = terminal.backend().buffer();
-                let header: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
-                assert_eq!(header.trim_end(), label);
-                // A full-scale sample reaches the chart's top row.
-                for x in 0..width {
-                    assert_ne!(
-                        buf[(x, 1)].symbol(),
-                        " ",
-                        "column {x} empty, {style:?} {width} wide at {refresh_rate_ms} ms"
-                    );
-                }
+
+            // A full history at full scale fills both halves edge to edge.
+            let full: std::collections::VecDeque<u64> =
+                vec![1000; crate::app::TOP_PROC_HISTORY_LEN].into();
+            app.caches
+                .top_proc_rx_history
+                .insert(key.clone(), full.clone());
+            app.caches.top_proc_tx_history.insert(key.clone(), full);
+            let rows = draw(&app);
+            assert!(rows[0].starts_with("● rx 1 KB/s    ● tx 0"), "{}", rows[0]);
+            assert!(rows[5].starts_with('-'), "{}", rows[5]);
+            assert!(rows[5].trim_end().ends_with("now"), "{}", rows[5]);
+            for y in [1, 3] {
+                assert!(!rows[y].contains(' '), "{style:?} row {y}: {:?}", rows[y]);
             }
+
+            // One busy second is one column wide, not a block.
+            let mut lone = vec![0u64; crate::app::TOP_PROC_HISTORY_LEN];
+            let at = lone.len() - 10;
+            lone[at] = 1000;
+            app.caches
+                .top_proc_rx_history
+                .insert(key.clone(), lone.into());
+            let rows = draw(&app);
+            let tall = rows[1].chars().filter(|c| *c != ' ').count();
+            assert_eq!(tall, 1, "{style:?}: {:?}", rows[1]);
         }
     }
 }

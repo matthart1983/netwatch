@@ -55,21 +55,24 @@ pub fn sort_interfaces(
     });
 }
 
+/// Rows the detail panel needs for its metadata column.
+const DETAIL_MIN_ROWS: u16 = 13;
+
+/// Height of the table panel: its borders, its header and one row per
+/// interface, within what the screen can give it.
+///
+/// The table used to take every row the detail panel did not, so a machine
+/// with two interfaces drew two rows in a sixteen-row box and a thirteen-row
+/// throughput graph underneath it. A list is as tall as its contents; the
+/// graph is the panel that can use the rest.
+fn table_height(rows: usize, area_height: u16) -> u16 {
+    // header 3, chips 1, footer 3
+    let room = area_height.saturating_sub(3 + 1 + 3 + DETAIL_MIN_ROWS);
+    let wanted = (rows.max(1) as u16).saturating_add(3);
+    wanted.min(room).max(4)
+}
+
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Length(2),  // chip row
-            Constraint::Min(8),     // table
-            Constraint::Length(13), // detail panel
-            Constraint::Length(3),  // footer
-        ])
-        .split(area);
-
-    widgets::render_header(f, app, chunks[0]);
-    render_chip_row(f, app, chunks[1]);
-
     // Interfaces tab needs to filter+sort, so we materialize a mutable copy
     // here. Once per render of the Interfaces tab is the budget; the Arc on
     // the read path keeps the other 99% of callers cheap.
@@ -84,6 +87,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             &app.interface_info,
         );
     }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),                                         // header
+            Constraint::Length(1),                                         // chip row
+            Constraint::Length(table_height(filtered.len(), area.height)), // table
+            Constraint::Min(DETAIL_MIN_ROWS),                              // detail panel
+            Constraint::Length(3),                                         // footer
+        ])
+        .split(area);
+
+    widgets::render_header(f, app, chunks[0]);
+    render_chip_row(f, app, chunks[1]);
 
     render_interfaces_table(f, app, &filtered, chunks[2]);
     render_detail_panel(f, app, &filtered, chunks[3]);
@@ -506,9 +523,11 @@ fn render_detail_meta(
         .unwrap_or(0);
 
     let label_w = 12usize;
+    // Only what is read from the interface. `SSID`, `link rate` and `uptime`
+    // were here as a fixed `—` on every interface, and `collisions` as a fixed
+    // `0` in the healthy colour: three rows that could never have a value and
+    // one that claimed a measurement nobody took.
     let rows: Vec<(&str, String, Color)> = vec![
-        ("SSID", "—".to_string(), t.text_muted),
-        ("link rate", "—".to_string(), t.text_muted),
         ("MAC", mac, t.text_primary),
         ("gateway", gateway, t.text_primary),
         ("DNS", dns, t.text_primary),
@@ -530,8 +549,6 @@ fn render_detail_meta(
                 t.status_warn
             },
         ),
-        ("collisions", "0".to_string(), t.status_good),
-        ("uptime", "—".to_string(), t.text_muted),
     ];
 
     let lines: Vec<Line> = rows
@@ -560,7 +577,9 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
     let rx_hist: Vec<u64> = iface.rx_history.iter().copied().collect();
     let tx_hist: Vec<u64> = iface.tx_history.iter().copied().collect();
     let peak_rx = *rx_hist.iter().max().unwrap_or(&0);
-    let _peak_tx = *tx_hist.iter().max().unwrap_or(&0);
+    // The header still reports the true peak; only the plot's ceiling moves.
+    let (rx_max, rx_clipped) = crate::graph::spike_capped_max(&rx_hist);
+    let (tx_max, tx_clipped) = crate::graph::spike_capped_max(&tx_hist);
     let avg_rx = if !rx_hist.is_empty() {
         rx_hist.iter().sum::<u64>() / rx_hist.len() as u64
     } else {
@@ -575,13 +594,13 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("● RX ", Style::default().fg(t.rx_rate)),
+            Span::styled("● rx ", Style::default().fg(t.rx_rate)),
             Span::styled(
                 widgets::format_bytes_rate(iface.rx_rate),
                 Style::default().fg(t.rx_rate).bold(),
             ),
             Span::raw("    "),
-            Span::styled("● TX ", Style::default().fg(t.tx_rate)),
+            Span::styled("● tx ", Style::default().fg(t.tx_rate)),
             Span::styled(
                 widgets::format_bytes_rate(iface.tx_rate),
                 Style::default().fg(t.tx_rate).bold(),
@@ -589,9 +608,14 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
             Span::raw("    "),
             Span::styled(
                 format!(
-                    "peak {}  avg {}",
+                    "peak {}  avg {}{}",
                     widgets::format_bytes_rate(peak_rx as f64),
                     widgets::format_bytes_rate(avg_rx as f64),
+                    if rx_clipped || tx_clipped {
+                        "    spike clipped"
+                    } else {
+                        ""
+                    }
                 ),
                 Style::default().fg(t.text_muted),
             ),
@@ -620,20 +644,22 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
         height: tx_h,
     };
 
-    crate::graph::render(
+    crate::graph::render_with_max(
         f,
         rx_area,
         &rx_hist,
+        rx_max,
         app.graph_style,
         t.rx_rate,
         t.status_warn,
         app.graph_opts(),
     );
 
-    crate::graph::render(
+    crate::graph::render_with_max(
         f,
         tx_area,
         &tx_hist,
+        tx_max,
         app.graph_style,
         t.tx_rate,
         t.status_warn,

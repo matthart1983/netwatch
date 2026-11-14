@@ -17,13 +17,13 @@ use crate::ui::text::truncate_end as truncate;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 use std::time::SystemTime;
 
 const SPARK: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Rows of chrome above the table body: tab bar (3) + table border + header.
-const HEADER_ROWS: u16 = 5;
+const HEADER_ROWS: u16 = widgets::ATTRIBUTION_HEADER_ROWS;
 
 /// A destination paired with its display label and policy verdict.
 type ScoredDest<'a> = (&'a str, &'a EgressDest, Verdict);
@@ -392,16 +392,33 @@ fn vol(b: u64) -> String {
     }
 }
 
+/// Rows the panels under the tree take: the detail pane and the warnings.
+fn below_tree(app: &App) -> (u16, u16) {
+    let warn_h = if app.egress_profiler.recent_violation_count() > 0 {
+        6
+    } else {
+        0
+    };
+    let detail_h = if app.ui.egress_detail { 7 } else { 0 };
+    (detail_h, warn_h)
+}
+
+/// Height of the tree panel: every row the detail pane and the warnings
+/// leave, so the page's boxes reach the footer.
+fn tree_height(area: Rect, below: u16) -> u16 {
+    area.height.saturating_sub(HEADER_ROWS + below + 3).max(5)
+}
+
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let has_warnings = app.egress_profiler.recent_violation_count() > 0;
-    let warn_h: u16 = if has_warnings { 6 } else { 0 };
-    let detail_h: u16 = if app.ui.egress_detail { 7 } else { 0 };
+    let (detail_h, warn_h) = below_tree(app);
+    let has_warnings = warn_h > 0;
+    let tree_h = tree_height(area, detail_h + warn_h);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(HEADER_ROWS), // header and attribution coverage
-            Constraint::Min(5),              // tree
+            Constraint::Length(tree_h),      // tree
             Constraint::Length(detail_h),    // detail pane (d)
             Constraint::Length(warn_h),      // warnings
             Constraint::Length(3),           // footer
@@ -452,7 +469,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     let mut extra = vec![
         Span::raw("  "),
-        Span::styled("EGRESS", Style::default().fg(t.brand).bold()),
+        Span::styled("egress", Style::default().fg(t.brand).bold()),
         Span::raw(format!("  {procs} processes · {dests} destinations")),
     ];
     // Note: on a narrow terminal the tab bar consumes this row entirely, so
@@ -677,12 +694,14 @@ fn summary_line(app: &App, rows: &[EgressRow<'_>]) -> Line<'static> {
 
 /// The table's inner rect — shared with the mouse handler so a click maps to
 /// the row the user actually sees (the lesson from issue #28).
-pub fn table_inner_area(area: Rect) -> Rect {
+pub fn table_inner_area(app: &App, area: Rect) -> Rect {
+    let (detail_h, warn_h) = below_tree(app);
+    let tree_h = tree_height(area, detail_h + warn_h);
     Rect {
         x: area.x + 1,
         y: area.y + HEADER_ROWS + 1,
         width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(HEADER_ROWS + 2 + 3),
+        height: tree_h.saturating_sub(2),
     }
 }
 
@@ -797,19 +816,19 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let header = Row::new(vec![
-        "Process / destination",
-        "IP",
-        "Out",
-        "In",
-        "Activity",
-        "Active",
-        "Policy",
+        "process / destination",
+        "ip",
+        "out",
+        "in",
+        "activity",
+        "active",
+        "policy",
     ])
     .style(Style::default().fg(t.key_hint).bold());
 
     let shown = lines.len();
     let right = format!(
-        " {}–{} of {}  sort[{}]{} ",
+        " {}–{} of {}  sort: {}{} ",
         (start + 1).min(rows.len()),
         start + shown,
         rows.len(),
@@ -882,7 +901,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         .scroll
         .egress_scroll
         .min(rows.len().saturating_sub(1));
-    let block = widgets::panel_block(t).title(" Detail ");
+    let block = widgets::panel_block(t).title(" detail ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -896,14 +915,14 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             worst,
             ..
         } => vec![
-            kv(t, "Process", profile.process.clone()),
-            kv(t, "Destinations", format!("{dests}")),
+            kv(t, "process", profile.process.clone()),
+            kv(t, "destinations", format!("{dests}")),
             kv(
                 t,
-                "Volume",
+                "volume",
                 format!("{} out · {} in", vol(*bytes_out), vol(*bytes_in)),
             ),
-            kv(t, "Worst verdict", worst.label().to_string()),
+            kv(t, "worst verdict", worst.label().to_string()),
         ],
         EgressRow::Dest {
             label,
@@ -913,10 +932,10 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         } => {
             // The whole point of the pane: the untruncated name.
             let mut v = vec![
-                kv(t, "Destination", format!("{}:{}", label, dest.port)),
+                kv(t, "destination", format!("{}:{}", label, dest.port)),
                 kv(
                     t,
-                    "Address",
+                    "address",
                     format!(
                         "{}{}",
                         if dest.last_ip.is_empty() {
@@ -932,12 +951,12 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 kv(
                     t,
-                    "Volume",
+                    "volume",
                     format!("{} out · {} in", vol(dest.bytes_out), vol(dest.bytes_in)),
                 ),
                 kv(
                     t,
-                    "Active",
+                    "active",
                     format!(
                         "{}   ECH  {}",
                         dwell(dest.count),
@@ -948,7 +967,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
             v.push(match verdict {
                 Verdict::Asn(org) => Line::from(vec![
                     Span::styled(
-                        format!("{:<14}", "Verdict"),
+                        format!("{:<14}", "verdict"),
                         Style::default().fg(t.text_muted),
                     ),
                     Span::styled(
@@ -956,7 +975,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(t.status_warn),
                     ),
                 ]),
-                other => kv(t, "Verdict", other.label().to_string()),
+                other => kv(t, "verdict", other.label().to_string()),
             });
             v
         }
@@ -1008,19 +1027,7 @@ fn render_warnings(f: &mut Frame, app: &App, area: Rect) {
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     if app.ui.egress_filter_input {
-        let line = Line::from(vec![
-            Span::styled(" / ", Style::default().fg(t.brand).bold()),
-            Span::styled(
-                app.ui.egress_filter_text.clone(),
-                Style::default().fg(t.text_primary),
-            ),
-            Span::styled("▏", Style::default().fg(t.brand).bold()),
-            Span::styled(
-                "    Enter apply   Esc cancel",
-                Style::default().fg(t.text_muted),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(t.bg)), area);
+        widgets::render_filter_bar(f, t, area, &app.ui.egress_filter_text);
         return;
     }
     // A destructive edit takes the whole footer and names the part that
@@ -1049,73 +1056,127 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg)), area);
         return;
     }
-    let hint = |k: &'static str, label: &'static str| {
-        vec![
-            Span::styled(k, Style::default().fg(t.key_hint).bold()),
-            Span::raw(format!(" {label}   ")),
-        ]
-    };
     // Navigation on the first line, the actions that write to the policy file
     // on the second. Two lines because the policy actions deserve their real
     // names — "promote" is jargon for "add to policy", and a destructive
     // action should not be a bare letter buried in a run of six.
+    //
+    // Drawn with the shared hint rendering under the same rule every other
+    // tab's footer has. This one had its own: primary-colour labels three
+    // spaces apart, no rule, and no `? help`.
+    use crate::ui::text::width as cells;
+    let avail = usize::from(area.width);
+    let line_width = |spans: &[Span]| -> usize { spans.iter().map(|s| cells(&s.content)).sum() };
+
+    let mut nav_hints = vec![
+        widgets::hint("s", "sort"),
+        widgets::hint("/", "filter"),
+        widgets::hint("space", "fold"),
+        widgets::hint(
+            "z",
+            if app.ui.egress_collapsed.all_collapsed() {
+                "expand all"
+            } else {
+                "fold all"
+            },
+        ),
+        widgets::hint("d", "detail"),
+        widgets::hint(
+            "H",
+            if app.ui.egress_show_history {
+                "hide history"
+            } else {
+                "show history"
+            },
+        ),
+        widgets::hint(":", "command"),
+        widgets::hint("?", "help"),
+        widgets::hint("q", "quit"),
+    ];
+    // `q` goes first, then the tab's keys from the right; `? help` stays.
+    let hints_width = |hints: &[widgets::Hint]| -> usize {
+        hints
+            .iter()
+            .map(|(k, l)| cells(k) + 1 + cells(l))
+            .sum::<usize>()
+            + hints.len().saturating_sub(1) * 2
+    };
+    while 1 + hints_width(&nav_hints) > avail && nav_hints.len() > 2 {
+        let last = nav_hints.len() - 1;
+        let drop = if nav_hints[last].0 == "q" {
+            last
+        } else {
+            last - 1
+        };
+        nav_hints.remove(drop);
+    }
     let mut nav = vec![Span::raw(" ")];
-    nav.extend(hint("s", "sort"));
-    nav.extend(hint("/", "filter"));
-    nav.extend(hint("space", "fold"));
-    nav.extend(hint(
-        "z",
-        if app.ui.egress_collapsed.all_collapsed() {
-            "expand all"
-        } else {
-            "fold all"
-        },
-    ));
-    nav.extend(hint("d", "detail"));
-    nav.extend(hint(
-        "H",
-        if app.ui.egress_show_history {
-            "hide history"
-        } else {
-            "show history"
-        },
-    ));
-    // Teach the two glyphs that aren't self-evident, rather than restating
-    // that the linter never blocks — that belongs in the docs, not on every
-    // frame.
-    nav.push(Span::styled("~ asn", Style::default().fg(t.status_warn)));
-    nav.push(Span::styled(
-        " = whole-AS match   ",
-        Style::default().fg(t.text_muted),
-    ));
-    nav.push(Span::styled(
-        "— no rule",
-        Style::default().fg(t.status_warn),
-    ));
-    nav.push(Span::styled(
-        " = unchecked",
-        Style::default().fg(t.text_muted),
-    ));
+    nav.extend(widgets::hint_spans(t, &nav_hints));
 
     let mut actions = vec![Span::raw(" ")];
-    actions.extend(hint("↵", "add to policy"));
-    actions.extend(hint("x", "remove from policy"));
-    actions.extend(hint("P", "add all"));
-    actions.extend(hint("e", "export"));
+    actions.extend(widgets::hint_spans(
+        t,
+        &[
+            widgets::hint("↵", "add to policy"),
+            widgets::hint("x", "remove from policy"),
+            widgets::hint("P", "add all"),
+            widgets::hint("e", "export"),
+        ],
+    ));
 
-    // The shared header slot for `export_status` sits on the row the tab bar
-    // consumes at any ordinary width, so on this tab the outcome of a policy
-    // edit was never actually visible — a key that declines to act looked
-    // identical to a key that does nothing. Say it here, where there is room.
-    let mut lines = vec![Line::from(nav), Line::from(actions)];
+    // The outcome of a policy edit, right-aligned on the actions row: a key
+    // that declines to act must not look like a key that does nothing. With
+    // nothing to report, the row's spare width teaches the two glyphs that
+    // are not self-evident — whole, or not at all.
+    let used = line_width(&actions);
     if let Some(status) = &app.ui.export_status {
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(status.clone(), Style::default().fg(t.status_good)),
-        ]));
+        let lower = status.to_lowercase();
+        let (glyph, color) = if lower.contains("failed") || lower.contains("error") {
+            ("✕ ", t.status_error)
+        } else if lower.contains("cancel") {
+            // Nothing happened, by request. Not a success and not a failure.
+            ("· ", t.text_muted)
+        } else {
+            ("✓ ", t.status_good)
+        };
+        let room = avail.saturating_sub(used + 5);
+        if room >= 12 {
+            let text = widgets::ellipsise(status, room);
+            let pad = avail.saturating_sub(used + 3 + cells(&text));
+            actions.push(Span::raw(" ".repeat(pad)));
+            actions.push(Span::styled(glyph, Style::default().fg(color).bold()));
+            actions.push(Span::styled(text, Style::default().fg(color)));
+        }
+    } else {
+        let legend = vec![
+            Span::styled("~ asn", Style::default().fg(t.status_warn)),
+            Span::styled(
+                " allowed by network, not by name   ",
+                Style::default().fg(t.text_muted),
+            ),
+            Span::styled("—", Style::default().fg(t.status_warn)),
+            Span::styled(
+                " no policy rule covers it",
+                Style::default().fg(t.text_muted),
+            ),
+        ];
+        let legend_w = line_width(&legend);
+        if avail > used + legend_w + 4 {
+            actions.push(Span::raw(" ".repeat(avail - used - legend_w - 1)));
+            actions.extend(legend);
+        }
     }
 
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg)), area);
+    f.render_widget(
+        Paragraph::new(vec![Line::from(nav), Line::from(actions)])
+            .style(Style::default().bg(t.bg))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(t.border)),
+            ),
+        area,
+    );
 }
 
 #[cfg(test)]
