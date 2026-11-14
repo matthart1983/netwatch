@@ -2,6 +2,13 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.40.1] - 2026-11-15
+
+This release carries the full contents of 1.0.0-rc.4 (listed below) under the 0.40.1 number. It is not a fixes-only patch.
+
+### Changed
+- Dependency updates: the GitHub Actions group (#210), the cargo minor group (#208) and jsonschema 0.61.1 (#209).
+
 ## [1.0.0-rc.4] - 2026-11-14
 
 ### Added
