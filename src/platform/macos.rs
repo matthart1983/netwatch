@@ -200,7 +200,7 @@ fn parse_route_get_interface(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    const IFCONFIG_OUTPUT: &str = "\
+    const IFCONFIG_WITH_STATUS: &str = "\
 lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
 \tinet 127.0.0.1 netmask 0xff000000
 en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
@@ -223,7 +223,7 @@ utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
     /// says the link is down.
     #[test]
     fn an_inactive_interface_is_down_whatever_its_up_flag_says() {
-        let up: HashMap<String, bool> = parse_ifconfig_output(IFCONFIG_OUTPUT)
+        let up: HashMap<String, bool> = parse_ifconfig_output(IFCONFIG_WITH_STATUS)
             .into_iter()
             .map(|i| (i.name, i.is_up))
             .collect();
