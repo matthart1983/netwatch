@@ -82,3 +82,42 @@ mod tests {
         assert_eq!(hello_world(), "Hello, World!");
     }
 }
+
+/// Binds `WaitOnAddress` and `WakeByAddressAll` to the DLL they live in,
+/// before the linker can take them from somewhere else.
+///
+/// `pcap` depends on `windows-sys` 0.36, which links `windows.lib`: one
+/// import library for the whole Win32 API. It maps these two functions to
+/// `vertdll.dll`, the runtime for code inside a VBS enclave, which exports
+/// functions of the same names. From Rust 1.100 the standard library's own
+/// references to them are resolved by the first library link.exe finds them
+/// in, searching onward from the standard library, and in the unit-test
+/// binary that is `windows.lib`. The process then loaded `vertdll.dll` and
+/// died with an access violation the first time a thread parked: every unit
+/// test, on its first channel receive.
+///
+/// A reference from one of this crate's own objects is resolved first, and
+/// against the library named here. Once the symbols are defined, the
+/// standard library's references need no search. The release binary was
+/// never affected; this keeps `cargo test` working on Windows.
+#[cfg(all(windows, target_env = "msvc"))]
+mod wait_on_address {
+    use core::ffi::c_void;
+
+    #[link(name = "synchronization")]
+    extern "system" {
+        fn WaitOnAddress(
+            address: *const c_void,
+            compare_address: *const c_void,
+            address_size: usize,
+            milliseconds: u32,
+        ) -> i32;
+        fn WakeByAddressAll(address: *const c_void);
+    }
+
+    #[used]
+    static WAIT: unsafe extern "system" fn(*const c_void, *const c_void, usize, u32) -> i32 =
+        WaitOnAddress;
+    #[used]
+    static WAKE: unsafe extern "system" fn(*const c_void) = WakeByAddressAll;
+}
