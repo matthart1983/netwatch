@@ -8,7 +8,12 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # chrono is unmaintained (all versions) with no safe upgrade. It comes in
+    # through netwatch-sdk and directly. Dates only; no exposure. Replace it
+    # with `time` or `jiff` before 1.0.0, then remove this ignore.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no advisory about its behaviour; to be replaced before 1.0.0" },
+]
 
 [licenses]
 # Everything the tree uses today, all compatible with shipping an MIT
