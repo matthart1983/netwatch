@@ -634,6 +634,11 @@ jobs:
       - name: Build the apt tree
         run: |
           set -eux
+          # apt-ftparchive ships in apt-utils, which the runner image no longer
+          # includes.
+          command -v apt-ftparchive > /dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils
+          }
           # Keep whatever is already published: apt clients pin versions, and
           # dropping older debs breaks anyone holding one back.
           mkdir -p pages/apt/pool/main pages/apt/dists/stable/main/binary-amd64 \
