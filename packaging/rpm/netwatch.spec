@@ -12,9 +12,9 @@
 # below 1.0.0 and allows, where it allows no hyphen). scripts/release.sh writes
 # both. `spec_version_matches_the_crate` in tests/packaging.rs fails the build
 # if they drift.
-%global upstream 1.0.0-rc.4
+%global upstream 1.0.0
 Name:           netwatch
-Version:        1.0.0~rc.4
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -100,6 +100,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Thu Nov 19 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 1.0.0-1
+- Diagnose with rule maturity and earned verdicts, DNS and interface rule repairs, CIDR packet filters
+
 * Sat Nov 14 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 1.0.0~rc.4-1
 - Diagnose rule maturity, earned verdicts, DNS and interface rule repairs, CIDR packet filters
 

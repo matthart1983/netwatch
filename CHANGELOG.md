@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [1.0.0] - 2026-11-19
 
 The 1.0 release. It is 1.0.0-rc.4 with these changes; see the rc entries below for everything new since 0.40.
 
