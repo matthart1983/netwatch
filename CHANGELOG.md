@@ -2,6 +2,17 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+The 1.0 release. It is 1.0.0-rc.4 with these changes; see the rc entries below for everything new since 0.40.
+
+### Changed
+- Dependency updates: the GitHub Actions group (#210), the cargo minor group (#208) and jsonschema 0.61.1 (#209).
+- `cargo deny` ignores RUSTSEC-2026-0543 (chrono is unmaintained, with no vulnerability reported). chrono is to be replaced in 1.1 (#213).
+
+### Fixed
+- The release workflow's apt job installs `apt-utils` when the runner lacks `apt-ftparchive`, which stopped the apt repository from being updated for 0.40.1 (#211).
+
 ## [1.0.0-rc.4] - 2026-11-14
 
 ### Added
