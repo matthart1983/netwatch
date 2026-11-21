@@ -507,9 +507,27 @@ jobs:
       - name: Generate the SBOM
         id: sbom
         run: |
-          cargo cyclonedx --format json --spec-version 1.5 --all-features --override-filename netwatch.cdx
+          cargo cyclonedx --format json --spec-version 1.5 --all-features --target all --override-filename netwatch.cdx
           mv netwatch.cdx.json "netwatch-${RELEASE_TAG#v}.cdx.json"
           echo "path=netwatch-${RELEASE_TAG#v}.cdx.json" >> "$GITHUB_OUTPUT"
+      # The one SBOM is attested against every artifact, so it must name
+      # every crate each binary links. Checked against the cargo-auditable
+      # list inside each binary; phantom is waived because the SBOM covers
+      # all platforms and each binary links only its own.
+      - name: Install sbom-attest
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: sbom-attest@0.4.6
+      - name: Check the SBOM against every binary
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dir=$(mktemp -d)
+          for a in *.tar.gz; do tar xzf "$a" -C "$dir"; done
+          for a in *.zip; do unzip -q -o "$a" -d "$dir"; done
+          for bin in "$dir"/netwatch-*; do
+            sbom-attest audit "${{ steps.sbom.outputs.path }}" --binary "$bin" --waive phantom --summary "$GITHUB_STEP_SUMMARY"
+          done
       - name: Attest the SBOM
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
