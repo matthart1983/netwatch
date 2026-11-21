@@ -97,7 +97,7 @@ unicode-width = "=0.2.2"
 # ui::text cuts strings between the graphemes ratatui lays out, so a name is
 # never split inside an emoji sequence. Already in the tree through ratatui.
 unicode-segmentation = "1"
-maxminddb = "0.32"
+maxminddb = "0.33"
 # Used for QUIC Initial decryption (RFC 9001): HKDF-Expand-Label, AES-128-GCM
 # AEAD, and AES-128-ECB header protection via `ring::aead::quic`. Already in
 # the tree as a transitive dep of rustls; pinning explicitly so the QUIC
