@@ -179,7 +179,7 @@ harness = false
 embed-manifest = "1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["net", "ioctl", "hostname", "uio", "poll", "user"] }
+nix = { version = "0.32", features = ["net", "ioctl", "hostname", "uio", "poll", "user"] }
 # The TUI's shutdown deadline waits for signals on a thread of its own.
 # crossterm already depends on it, so nothing new is compiled.
 signal-hook = "0.4"
@@ -195,7 +195,7 @@ jsonschema = { version = "=0.61.1", default-features = false }
 # The terminal-restore tests run netwatch on a pty (`term`) and signal it
 # (`signal`). Same crate as above, so nothing new is compiled.
 [target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.31", features = ["term", "signal"] }
+nix = { version = "0.32", features = ["term", "signal"] }
 
 # Phase 1 sandbox (Linux): drop CAP_NET_RAW / CAP_BPF / CAP_PERFMON after
 # pcap + eBPF are up, then restrict via Landlock: filesystem, plus TCP deny on
