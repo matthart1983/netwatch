@@ -235,7 +235,7 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
           tool: cargo-binstall
       - run: |
